@@ -47,10 +47,10 @@ set(HDMI ON)
 #set(CPU_MHZ 460)
 set(CPU_MHZ 252)
 #set(CPU_MHZ 133)
-set (PORT_VERSION "1.2.D")
+set (PORT_VERSION "1.2.E")
 
-#set(ZERO ON)
-set(ZERO2 ON)
+set(ZERO ON)
+#set(ZERO2 ON)
 #set (PICO_PC ON)
 #set (MURM ON)
 #set (MURM2 ON)
@@ -61,7 +61,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(PICO_BOARD waveshare_rp2040_pizero CACHE STRING "Board type")
+set(PICO_BOARD pico2 CACHE STRING "Board type")
 #set(PICO_PLATFORM rp2350-arm-s)
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
@@ -81,11 +81,11 @@ ELSEIF(PICO_PC)
     SET(BUILD_NAME "PC${PROJECT_NAME}")
     set (PWM_PIN0 27)
 ELSEIF(ZERO)
-    SET(BUILD_NAME "z0${PROJECT_NAME}-")
+    SET(BUILD_NAME "z0${PROJECT_NAME}")
     #set (PWM_PIN0 11)
 ELSEIF(ZERO2)
-    SET(BUILD_NAME "z2${PROJECT_NAME}-")
-    set (PWM_PIN0 11)
+    SET(BUILD_NAME "z0${PROJECT_NAME}")
+    #set (PWM_PIN0 11)
     #set (BUTTER_PSRAM_GPIO 47)
 ELSE()
     SET(BUILD_NAME "m1${PROJECT_NAME}")
@@ -97,7 +97,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
 
-project(p2-spec C CXX ASM)
+project(${PROJECT_NAME} C CXX ASM)
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
@@ -136,7 +136,7 @@ message(STATUS "")
 add_executable(${PROJECT_NAME} ${SRC})
 
 # pull in common dependencies
-target_link_libraries(p2-spec PRIVATE
+target_link_libraries(${PROJECT_NAME} PRIVATE
     psram
     audio
     graphics
@@ -169,7 +169,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 if (PICO_CYW43_SUPPORTED)
-    target_link_libraries(p2-spec pico_cyw43_arch_none)
+    target_link_libraries(${PROJECT_NAME} pico_cyw43_arch_none)
 endif()
 
 ##pico_enable_stdio_uart(${PROJECT_NAME} 0)
@@ -343,9 +343,9 @@ ELSEIF(ZERO)
 
         LOAD_WAV_PIO=17
 
-        BEEPER_PIN=11
-        PWM_PIN0=12
-        PWM_PIN1=13
+        BEEPER_PIN=12
+        PWM_PIN0=10
+        PWM_PIN1=11
         SOUND_FREQUENCY=30600
         I2S_FREQUENCY=30600
 
@@ -392,9 +392,9 @@ ELSEIF(ZERO2)
 
         LOAD_WAV_PIO=17
 
-        BEEPER_PIN=11
-        PWM_PIN0=12
-        PWM_PIN1=13
+        BEEPER_PIN=12
+        PWM_PIN0=10
+        PWM_PIN1=11
         SOUND_FREQUENCY=30600
         I2S_FREQUENCY=30600
 
@@ -432,6 +432,7 @@ ELSEIF(ZERO2)
         DEFAULT_THROTTLING=0
 
         PICO_RP2350A=0
+        PICO_RP2350=1
         PICO_PIO_USE_GPIO_BASE=1
     )
 ELSE()
