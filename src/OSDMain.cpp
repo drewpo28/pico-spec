@@ -373,8 +373,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT) {
             if (mFile != "") {
                 mFile.erase(0, 1);
                 string fname = FileUtils::DSK_Path + "/" + mFile;
-                ESPectrum::Betadisk.EjectDisk(0);
-                ESPectrum::Betadisk.InsertDisk(0, fname);
+                rvmWD1793InsertDisk(&ESPectrum::fdd, 0, fname);
                 Config::save();
             }
             if (VIDEO::OSD) OSD::drawStats(); // Redraw stats for 16:9 modes
@@ -846,14 +845,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT) {
                                     if (mFile != "") {
                                         mFile.erase(0, 1);
                                         string fname = FileUtils::DSK_Path + "/" + mFile;
-                                        ESPectrum::Betadisk.EjectDisk(dsk_num - 1);
-                                        ESPectrum::Betadisk.InsertDisk(dsk_num - 1, fname);
+                                        rvmWD1793InsertDisk(&ESPectrum::fdd, dsk_num - 1, fname);
                                         Config::save();
                                         return;
                                     }
                                 } else
                                 if (opt2 == 2) {
-                                    ESPectrum::Betadisk.EjectDisk(dsk_num - 1);
+                                    wdDiskEject(&ESPectrum::fdd, dsk_num - 1);
                                     Config::save();
                                     return;
                                 }
