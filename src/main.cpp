@@ -9,6 +9,7 @@
 #include <hardware/vreg.h>
 #include <hardware/sync.h>
 #include <hardware/flash.h>
+#include "hardware/structs/qmi.h"
 
 #include "ESPectrum.h"
 #include "Config.h"
@@ -988,10 +989,32 @@ int main() {
     hw_set_bits(&vreg_and_chip_reset_hw->vreg, VREG_AND_CHIP_RESET_VREG_VSEL_BITS);
     sleep_ms(10);
     set_sys_clock_khz(CPU_MHZ * KHZ, true);
-#elif PICO_RP2350
-    vreg_set_voltage(VREG_VOLTAGE_1_10);
-    sleep_ms(10);
-    set_sys_clock_khz(CPU_MHZ * KHZ, 0);
+#elif ZERO2
+    vreg_set_voltage(VREG_VOLTAGE_1_10); // Set voltage  //
+    delay(100);
+    set_sys_clock_khz(CPU_MHZ * KHZ, true);
+
+    // #define QMI_COOLDOWN 30     // 0xc0000000 [31:30] COOLDOWN     (0x1) Chip select cooldown period
+    // #define QMI_PAGEBREAK 28    // 0x30000000 [29:28] PAGEBREAK    (0x0) When page break is enabled, chip select will...
+    // #define QMI_SELECT_SETUP 25 // 0x02000000 [25]    SELECT_SETUP (0) Add up to one additional system clock cycle of setup...
+    // #define QMI_SELECT_HOLD 23  // 0x01800000 [24:23] SELECT_HOLD  (0x0) Add up to three additional system clock cycles of active...
+    // #define QMI_MAX_SELECT 17   // 0x007e0000 [22:17] MAX_SELECT   (0x00) Enforce a maximum assertion duration for this window's...
+    // #define QMI_MIN_DESELECT 12 // 0x0001f000 [16:12] MIN_DESELECT (0x00) After this window's chip select is deasserted, it...
+    // #define QMI_RXDELAY 8       // 0x00000700 [10:8]  RXDELAY      (0x0) Delay the read data sample timing, in units of one half...
+    // #define QMI_CLKDIV 0        // 0x000000ff [7:0]   CLKDIV       (0x04) Clock divisor
+    // qmi_hw->m[1].timing = (1 << QMI_COOLDOWN) | (2 << QMI_PAGEBREAK) | (3 << QMI_SELECT_HOLD) | (18 << QMI_MAX_SELECT) | (4 << QMI_MIN_DESELECT) | (6 << QMI_RXDELAY) | (6 << QMI_CLKDIV);
+
+    // uint clkdiv = 4;
+    // uint rxdelay = 4;
+    // hw_write_masked(
+    // &qmi_hw->m[0].timing,
+    //         ((clkdiv << QMI_M0_TIMING_CLKDIV_LSB) & QMI_M0_TIMING_CLKDIV_BITS) |
+    //         ((rxdelay << QMI_M0_TIMING_RXDELAY_LSB) & QMI_M0_TIMING_RXDELAY_BITS),
+    //         QMI_M0_TIMING_CLKDIV_BITS | QMI_M0_TIMING_RXDELAY_BITS
+    // );
+    // busy_wait_us(1000);
+    // set_sys_clock_khz(CPU_MHZ * KHZ, true);
+
 #else
     volatile uint32_t *qmi_m0_timing = (uint32_t *)0x400d000c;
     vreg_disable_voltage_limit();

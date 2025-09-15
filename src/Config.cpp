@@ -234,8 +234,7 @@ void Config::load2() {
         std::string fn;
         nvs_get_str((s + ".file").c_str(), fn, sts);
         if (!fn.empty()) {
-            ESPectrum::Betadisk.EjectDisk(i);
-            ESPectrum::Betadisk.InsertDisk(i, fn);
+            rvmWD1793InsertDisk(&ESPectrum::fdd, i, fn);
         }
     }
 }
@@ -448,7 +447,7 @@ void Config::save() {
             nvs_set_u8(handle, (s + ".fdMode").c_str(), ft.fdMode);
             nvs_set_str(handle, (s + ".fileSearch").c_str(), ft.fileSearch.c_str());
             s = "drive" + to_string(i);
-            nvs_set_str(handle, (s + ".file").c_str(), ESPectrum::Betadisk.Drive[i].Available ? ESPectrum::Betadisk.Drive[i].FName.c_str() : "");
+            nvs_set_str(handle, (s + ".file").c_str(), ESPectrum::fdd.disk[i]->fname.c_str());
         }
         nvs_set_u8(handle,"scanlines",Config::scanlines);
         nvs_set_u8(handle,"render",Config::render);

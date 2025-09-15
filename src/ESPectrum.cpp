@@ -196,7 +196,7 @@ int ESPectrum::TapeNameScroller = 0;
 //=======================================================================================
 
 bool ESPectrum::trdos = false;
-WD1793 ESPectrum::Betadisk;
+rvmWD1793 ESPectrum::fdd;
 
 /// @brief  Mouse support
 int32_t ESPectrum::mouseX = 0;
@@ -695,7 +695,7 @@ if (butter_psram_size() >= (0x04000 * (64+2 - 23))) {
     if (Config::joystick == JOY_FULLER) Ports::port[0x7f] = 0xff; // Fuller
 
     // Init disk controller
-    Betadisk.Init();
+    rvmWD1793Reset(&fdd);
 
     // Reset cpu
     CPU::reset();
@@ -753,7 +753,7 @@ void ESPectrum::reset()
     // Reinit disk controller
     // Betadisk.ShutDown();
     // Betadisk.Init();
-    Betadisk.EnterIdle();
+    // Betadisk.EnterIdle();
 
     Tape::tapeFileName = "none";
     if (Tape::tape.obj.fs != NULL) {
