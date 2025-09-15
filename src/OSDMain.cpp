@@ -851,8 +851,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT) {
                                     }
                                 } else
                                 if (opt2 == 2) {
-                                    wdDiskEject(&ESPectrum::fdd, dsk_num - 1);
-                                    Config::save();
+                                    if (ESPectrum::fdd.disk[ESPectrum::fdd.diskS])
+                                    {
+                                        wdDiskEject(&ESPectrum::fdd, dsk_num - 1);
+                                        Config::save();
+                                    }
                                     return;
                                 }
                             } else {
