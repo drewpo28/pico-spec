@@ -256,14 +256,18 @@ static const char *MENU_TAPEPLAYER2[2] = { "Real input\n", "Entrada real\n" };
     "Drive A\t>\n"\
     "Drive B\t>\n"\
     "Drive C\t>\n"\
-    "Drive D\t>\n"
+    "Drive D\t>\n"\
+	"Fast Mode\t>\n"
 #define MENU_BETADISK_ES \
     "Unidades\n"\
     "Unidad A\t>\n"\
     "Unidad B\t>\n"\
     "Unidad C\t>\n"\
-    "Unidad D\t>\n"
+    "Unidad D\t>\n"\
+	"Modo rápido\t>\n"
 static const char *MENU_BETADISK[2] = { MENU_BETADISK_EN,MENU_BETADISK_ES };
+
+static const char *MENU_FASTMODE[2] = { "Fast Mode\n", "Modo rápido\n" };
 
 #define MENU_BETADRIVE_EN \
     "Drive#\n"\

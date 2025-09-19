@@ -113,6 +113,8 @@ public:
 
     static bool StartMsg;    
 
+    static bool trdosFastMode;
+
 };
 
 #endif // Config.h

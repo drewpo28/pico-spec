@@ -73,6 +73,7 @@ uint8_t  Config::secondJoy = 2; // NPAD#2
 uint8_t  Config::kempstonPort = 0x37;
 uint8_t  Config::throtling = DEFAULT_THROTTLING;
 bool     Config::CursorAsJoy = true;
+bool     Config::trdosFastMode = false;
 
 uint8_t Config::scanlines = 0;
 uint8_t Config::render = 0;
@@ -240,8 +241,7 @@ void Config::load2() {
         std::string fn;
         nvs_get_str((s + ".file").c_str(), fn, sts);
         if (!fn.empty()) {
-            ESPectrum::Betadisk.EjectDisk(i);
-            ESPectrum::Betadisk.InsertDisk(i, fn);
+            rvmWD1793InsertDisk(&ESPectrum::fdd, i, fn);
         }
     }
 }
@@ -337,6 +337,7 @@ void Config::load() {
         nvs_get_u8("throtling1", Config::throtling, sts);
 #endif
         nvs_get_b("CursorAsJoy", CursorAsJoy, sts);
+        nvs_get_b("trdosFastMode", trdosFastMode, sts);
         nvs_get_str("SNA_Path", FileUtils::SNA_Path, sts);
         nvs_get_str("TAP_Path", FileUtils::TAP_Path, sts);
         nvs_get_str("DSK_Path", FileUtils::DSK_Path, sts);
@@ -442,6 +443,7 @@ void Config::save() {
         nvs_set_u8(handle,"throtling1",Config::throtling);
 #endif
         nvs_set_str(handle,"CursorAsJoy", CursorAsJoy ? "true" : "false");
+        nvs_set_str(handle,"trdosFastMode", trdosFastMode ? "true" : "false");
         nvs_set_str(handle,"SNA_Path",FileUtils::SNA_Path.c_str());
         nvs_set_str(handle,"TAP_Path",FileUtils::TAP_Path.c_str());
         nvs_set_str(handle,"DSK_Path",FileUtils::DSK_Path.c_str());
@@ -454,7 +456,7 @@ void Config::save() {
             nvs_set_u8(handle, (s + ".fdMode").c_str(), ft.fdMode);
             nvs_set_str(handle, (s + ".fileSearch").c_str(), ft.fileSearch.c_str());
             s = "drive" + to_string(i);
-            nvs_set_str(handle, (s + ".file").c_str(), ESPectrum::Betadisk.Drive[i].Available ? ESPectrum::Betadisk.Drive[i].FName.c_str() : "");
+            nvs_set_str(handle, (s + ".file").c_str(), ESPectrum::fdd.disk[i] ? ESPectrum::fdd.disk[i]->fname.c_str() : "");
         }
         nvs_set_u8(handle,"scanlines",Config::scanlines);
         nvs_set_u8(handle,"render",Config::render);
