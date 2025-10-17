@@ -37,7 +37,7 @@ set(VGA_HDMI ON)
 
 #set(CPU_MHZ 252)
 set(CPU_MHZ 378)
-set (PORT_VERSION "1.2.H")
+set (PORT_VERSION "1.2.H6")
 
 #set (MURM ON)
 #set (MURM2 ON)
@@ -397,7 +397,7 @@ ELSEIF(PICO_DV)
         PWM_PIN0=26 # R
         PWM_PIN1=27 # L
         BEEPER_PIN=28 # not implemented
-        SOUND_FREQUENCY=30600
+        SOUND_FREQUENCY=31250
 
         # SDCARD
         SDCARD_SPI_BUS=spi1

@@ -99,6 +99,7 @@ public:
     static void BeeperGetSample();
     static void CovoxGetSample();
     static void AYGetSample();
+    static bool __not_in_flash_func(AY_timer_callback)(repeating_timer_t *rt);
     static uint8_t audioBuffer_L[ESP_AUDIO_SAMPLES_PENTAGON];
     static uint8_t audioBuffer_R[ESP_AUDIO_SAMPLES_PENTAGON];
     static uint8_t audioBufferCovox[ESP_AUDIO_SAMPLES_PENTAGON];

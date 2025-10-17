@@ -384,8 +384,8 @@ void pcm_call() {
             v32[1] = *(buff_L + m_off);
             ++m_off;
         }
-        i2s_write(&i2s_config, v32, 1);
-    //    i2s_dma_write(&i2s_config, v32);
+    //    i2s_write(&i2s_config, v32, 1);
+        i2s_dma_write(&i2s_config, v32);
     } else {
         uint16_t outL = 0;
         uint16_t outR = 0;
@@ -441,7 +441,7 @@ void pcm_setup(int hz, size_t size) {
         }
     }
     m_let_process_it = false;
-    //hz; // 44100;	//44000 //44100 //96000 //22050
-	// negative timeout means exact delay (rather than delay between callbacks)
-	add_repeating_timer_us(-1000000 / hz, timer_callback, NULL, &m_timer);
+        //hz; // 44100;	//44000 //44100 //96000 //22050
+        // negative timeout means exact delay (rather than delay between callbacks)
+        add_repeating_timer_us(-1000000 / hz, timer_callback, NULL, &m_timer);
 }

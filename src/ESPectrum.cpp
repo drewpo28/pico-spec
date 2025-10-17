@@ -1097,12 +1097,69 @@ IRAM_ATTR void ESPectrum::AYGetSample() {
     }
 }
 
-uint8_t debug_number = 0;
+// === Таймер ===
+bool __not_in_flash_func(ESPectrum::AY_timer_callback)(repeating_timer_t *rt)
+{
+    // uint32_t audbufpos = audbufcntAY++;
+    // if (multiplicator) audbufpos >>= multiplicator;
+    // if (audbufpos > audbufcntAY) {
+    //     chip0.gen_sound(audbufpos - audbufcntAY, audbufcntAY);
+    //     if (Config::turbosound)
+    //         chip1.gen_sound(audbufpos - audbufcntAY, audbufcntAY);
+    //     audbufcntAY = audbufpos;
+    // }
+    // uint8_t chip0Sample[2] = {0,0};
+    // uint8_t chip1Sample[2] = {0,0};
 
+    // if (AY_emu) {
+    //     if (Config::turbosound != 0 || AySound::selected_chip == 0) {
+    //         uint8_t *p0 = chip0.gen_sound();
+    //         if (p0) { chip0Sample[0] = p0[0]; chip0Sample[1] = p0[1]; }
+    //     }
+    //     if (Config::turbosound != 0 || AySound::selected_chip == 1) {
+    //         uint8_t *p1 = chip1.gen_sound();
+    //         if (p1) { chip1Sample[0] = p1[0]; chip1Sample[1] = p1[1]; }
+    //     }
+    // }
+
+    // // 4. Смешивание
+    // int32_t mix_L = 0;
+    // int32_t mix_R = mix_L;
+
+    // if (AY_emu) {
+    //     if (Config::turbosound != 0 || AySound::selected_chip == 0) {
+    //         mix_L += chip0Sample[0];
+    //         mix_R += chip0Sample[1];
+    //     }
+    //     if (Config::turbosound != 0 || AySound::selected_chip == 1) {
+    //         mix_L += chip1Sample[0];
+    //         mix_R += chip1Sample[1];
+    //     }
+    // }
+
+    // // 5. Ограничение значений (для 8-бит)
+    // uint8_t out_L = mix_L > 255 ? 255 : (mix_L < 0 ? 0 : mix_L);
+    // uint8_t out_R = mix_R > 255 ? 255 : (mix_R < 0 ? 0 : mix_R);
+
+    // pwm_audio_write(&out_L, &out_R, 1, nullptr, 0);
+
+    return true;
+}
+
+uint8_t debug_number = 0;
 //=======================================================================================
 // MAIN LOOP
 //=======================================================================================
 void ESPectrum::loop() {
+  
+    // if (AY_emu) {
+    //     int hz = 44100;
+    //     repeating_timer_t timer_audio;
+    //     if (!add_repeating_timer_us(-(1000000/hz), AY_timer_callback, NULL, &timer_audio))
+    //     {
+    //     }
+    // }
+
   for(;;) {
     if (debug_number != 0) {
         char msg[16];
@@ -1111,6 +1168,8 @@ void ESPectrum::loop() {
         debug_number = 0;
     }
     ts_start = time_us_64();
+
+    pwm_audio_write((uint8_t*)audioBuffer_L, (uint8_t*)audioBuffer_R, samplesPerFrame, 0, 0);
 
     // Send audioBuffer to pwmaudio
     audbufcnt = 0;
@@ -1186,7 +1245,6 @@ void ESPectrum::loop() {
                 audioBuffer_R[i] = v;
             }
         }
-        pwm_audio_write((uint8_t*)audioBuffer_L, (uint8_t*)audioBuffer_R, samplesPerFrame, 0, 0);
       }
     }
     processKeyboard();
