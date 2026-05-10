@@ -113,7 +113,8 @@ private:
 };
 
 #if !PICO_RP2040
-extern SAASound saaChip;
+// saaChip is heap-allocated by SaaSubsys when Config::SAA1099 is true; nullptr otherwise.
+extern SAASound* saaChip;
 #endif
 
 #endif // SAASound_h

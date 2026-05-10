@@ -37,6 +37,7 @@ visit https://zxespectrum.speccy.org/contacto
 
 #include "AySound.h"
 #include "SAASound.h"
+#include "Subsystem.h"
 #include "CPU.h"
 #include "Config.h"
 #include "ESPectrum.h"
@@ -181,7 +182,7 @@ void repeat_handler(void) {
 //=======================================================================================
 uint8_t ESPectrum::audioBuffer_L[ESP_AUDIO_SAMPLES_PENTAGON] = {0};
 uint8_t ESPectrum::audioBuffer_R[ESP_AUDIO_SAMPLES_PENTAGON] = {0};
-uint8_t ESPectrum::audioBufferCovox[ESP_AUDIO_SAMPLES_PENTAGON] = {0};
+uint8_t* ESPectrum::audioBufferCovox = nullptr;
 uint8_t ESPectrum::overSamplebuf[ESP_AUDIO_SAMPLES_PENTAGON] = {0};
 signed char ESPectrum::aud_volume = ESP_VOLUME_DEFAULT;
 bool ESPectrum::vol_changed = false;
@@ -196,9 +197,9 @@ uint32_t ESPectrum::audbufcntCovox = 0;
 uint32_t ESPectrum::faudbufcntCovox = 0;
 
 #if !PICO_RP2040
-uint8_t ESPectrum::audioBufferPIT[ESP_AUDIO_SAMPLES_PENTAGON] = {0};
-uint8_t ESPectrum::audioBufferMIDI_L[ESP_AUDIO_SAMPLES_PENTAGON] = {0};
-uint8_t ESPectrum::audioBufferMIDI_R[ESP_AUDIO_SAMPLES_PENTAGON] = {0};
+uint8_t* ESPectrum::audioBufferPIT = nullptr;
+uint8_t* ESPectrum::audioBufferMIDI_L = nullptr;
+uint8_t* ESPectrum::audioBufferMIDI_R = nullptr;
 uint32_t ESPectrum::audbufcntPIT = 0;
 uint32_t ESPectrum::faudbufcntPIT = 0;
 uint32_t ESPectrum::audbufcntSAA = 0;
@@ -872,26 +873,29 @@ void ESPectrum::setup() {
 
   pwm_audio_set_volume(aud_volume);
 
-  // AY Sound
+  // AY Sound — chip0 is always-on (required by 128K/Pentagon).
+  // chip1 (TurboSound second AY) is allocated on demand by TurboSubsys.
   Debug::log("setup: AY init begin");
   chip0.init();
   chip0.set_sound_format(Audio_freq, 1, 8);
   chip0.set_stereo(AYEMU_MONO, NULL);
   chip0.reset();
-  chip1.init();
-  chip1.set_sound_format(Audio_freq, 1, 8);
-  chip1.set_stereo(AYEMU_MONO, NULL);
-  chip1.reset();
   Debug::log("setup: AY init done");
 
+  // Optional audio subsystems: alloc memory only if their Config flag is set.
+  // MB02 / DivMMC were already initialized above (they need MemESP ready) —
+  // sync our subsystem flags to reflect that state.
+  // tape_player mode disables AY/SAA emulation regardless of Config (see below).
+  TurboSubsys::request(!Config::tape_player && Config::turbosound != 0);
+  CovoxSubsys::request(Config::covox != 0);
 #if !PICO_RP2040
-  Debug::log("setup: SAA init begin");
-  // SAA1099 Sound
-  saaChip.init();
-  saaChip.set_sound_format(Audio_freq, 1, 8);
-  saaChip.reset();
-  Debug::log("setup: SAA init done");
+  PitSubsys::request(Z80Ops::isByte);
+  SaaSubsys::request(!Config::tape_player && Config::SAA1099);
+  MidiSubsys::request(Config::midi != 0);
+  Mb02Subsys::syncFromState();
+  DivMmcSubsys::syncFromState();
 #endif
+  Subsystems::applyPending();
 
   // Init tape
   Debug::log("setup: Tape init begin");
@@ -926,8 +930,8 @@ void ESPectrum::setup() {
 
 #if !PICO_RP2040
   // KR580VI53 (8253 PIT) — reset to silent state
-  if (Z80Ops::isByte) {
-    memset(audioBufferPIT, 0, sizeof(audioBufferPIT));
+  if (Z80Ops::isByte && audioBufferPIT) {
+    memset(audioBufferPIT, 0, ESP_AUDIO_SAMPLES_PENTAGON);
     memset(Ports::pitChannels, 0, sizeof(Ports::pitChannels));
   }
 #endif
@@ -1041,12 +1045,14 @@ void ESPectrum::reset(uint8_t romInUse) {
   memset(overSamplebuf, 0, sizeof(overSamplebuf));
   memset(audioBuffer_L, 0, sizeof(audioBuffer_L));
   memset(audioBuffer_R, 0, sizeof(audioBuffer_R));
-  memset(audioBufferCovox, 0, sizeof(audioBufferCovox));
+  if (audioBufferCovox) memset(audioBufferCovox, 0, ESP_AUDIO_SAMPLES_PENTAGON);
   memset(chip0.SamplebufAY_L, 0, sizeof(chip0.SamplebufAY_L));
-  memset(chip1.SamplebufAY_R, 0, sizeof(chip1.SamplebufAY_R));
+  if (chip1) memset(chip1->SamplebufAY_R, 0, sizeof(chip1->SamplebufAY_R));
 #if !PICO_RP2040
-  memset(saaChip.SamplebufSAA_L, 0, sizeof(saaChip.SamplebufSAA_L));
-  memset(saaChip.SamplebufSAA_R, 0, sizeof(saaChip.SamplebufSAA_R));
+  if (saaChip) {
+    memset(saaChip->SamplebufSAA_L, 0, sizeof(saaChip->SamplebufSAA_L));
+    memset(saaChip->SamplebufSAA_R, 0, sizeof(saaChip->SamplebufSAA_R));
+  }
 #endif
   lastCovoxVal = lastaudioBit = 0;
 
@@ -1094,21 +1100,36 @@ void ESPectrum::reset(uint8_t romInUse) {
 #endif
   }
 
+  // Reconfigure optional subsystems against current Config and apply
+  // synchronously here (we're outside the main loop's frame boundary).
+  TurboSubsys::request(!Config::tape_player && Config::turbosound != 0);
+  CovoxSubsys::request(Config::covox != 0);
+#if !PICO_RP2040
+  PitSubsys::request(Z80Ops::isByte);
+  SaaSubsys::request(!Config::tape_player && Config::SAA1099);
+  MidiSubsys::request(Config::midi != 0);
+#endif
+  Subsystems::applyPending();
+
   // Reset AY emulation
   chip0.init();
   chip0.set_sound_format(Audio_freq, 1, 8);
   chip0.set_stereo(AYEMU_MONO, NULL);
   chip0.reset();
-  chip1.init();
-  chip1.set_sound_format(Audio_freq, 1, 8);
-  chip1.set_stereo(AYEMU_MONO, NULL);
-  chip1.reset();
+  if (chip1) {
+    chip1->init();
+    chip1->set_sound_format(Audio_freq, 1, 8);
+    chip1->set_stereo(AYEMU_MONO, NULL);
+    chip1->reset();
+  }
 
 #if !PICO_RP2040
   // Reset SAA1099 emulation
-  saaChip.init();
-  saaChip.set_sound_format(Audio_freq, 1, 8);
-  saaChip.reset();
+  if (saaChip) {
+    saaChip->init();
+    saaChip->set_sound_format(Audio_freq, 1, 8);
+    saaChip->reset();
+  }
 #endif
 
   CPU::reset();
@@ -1117,8 +1138,8 @@ void ESPectrum::reset(uint8_t romInUse) {
 
 #if !PICO_RP2040
   // KR580VI53 (8253 PIT) — reset to silent state
-  if (Z80Ops::isByte) {
-    memset(audioBufferPIT, 0, sizeof(audioBufferPIT));
+  if (Z80Ops::isByte && audioBufferPIT) {
+    memset(audioBufferPIT, 0, ESP_AUDIO_SAMPLES_PENTAGON);
     memset(Ports::pitChannels, 0, sizeof(Ports::pitChannels));
   }
 #endif
@@ -1445,6 +1466,7 @@ __not_in_flash("audio") void ESPectrum::BeeperGetSample() {
 }
 
 __not_in_flash("audio") void ESPectrum::CovoxGetSample() {
+  if (!audioBufferCovox) return;
   uint32_t audbufpos = CPU::tstates / audioCOVOXDivider;
   if (multiplicator)
     audbufpos >>= multiplicator;
@@ -1463,8 +1485,9 @@ __not_in_flash("audio") void ESPectrum::AYGetSample() {
     if (multiplicator) audbufpos >>= multiplicator;
     if (audbufpos > audbufcntAY) {
         chip0.gen_sound(audbufpos - audbufcntAY, audbufcntAY);
-    if (Config::turbosound)
-            chip1.gen_sound(audbufpos - audbufcntAY, audbufcntAY);
+        // chip1 only present when TurboSubsys::enabled
+    if (Config::turbosound && chip1)
+            chip1->gen_sound(audbufpos - audbufcntAY, audbufcntAY);
     audbufcntAY = audbufpos;
   }
 }
@@ -1473,8 +1496,8 @@ __not_in_flash("audio") void ESPectrum::AYGetSample() {
 __not_in_flash("audio") void ESPectrum::SAAGetSample() {
   uint32_t audbufpos = CPU::tstates / audioAYDivider; // SAA counter = 8MHz/256 = 31.25kHz, same rate as AY
   if (multiplicator) audbufpos >>= multiplicator;
-  if (audbufpos > audbufcntSAA) {
-    saaChip.gen_sound(audbufpos - audbufcntSAA, audbufcntSAA);
+  if (audbufpos > audbufcntSAA && saaChip) {
+    saaChip->gen_sound(audbufpos - audbufcntSAA, audbufcntSAA);
     audbufcntSAA = audbufpos;
   }
 }
@@ -1483,7 +1506,7 @@ __not_in_flash("audio") void ESPectrum::PITGetSample() {
   uint32_t audbufpos = CPU::tstates >> 7; // /128 instead of /112 — fast shift for PIT buffer position
   if (multiplicator)
     audbufpos >>= multiplicator;
-  if (audbufpos > audbufcntPIT) {
+  if (audbufpos > audbufcntPIT && audioBufferPIT) {
     Ports::pitGenSound(audioBufferPIT + audbufcntPIT, audbufpos - audbufcntPIT);
     audbufcntPIT = audbufpos;
   }
@@ -1621,6 +1644,10 @@ void ESPectrum::loop() {
     audbufcntPIT = 0;
 #endif
 
+    // Frame boundary: safe to apply pending subsystem (de)allocations.
+    // Audio producers and the mixer are quiescent here.
+    Subsystems::applyPending();
+
     lastBeeperTstates = 0;
     accumulatorFP = 0;
     beeperSampleAccum = 0;
@@ -1704,7 +1731,7 @@ void ESPectrum::loop() {
             dc_fade_q8 = 256u;
           }
         }
-        if (Config::covox && faudbufcntCovox < samplesPerFrame) {
+        if (CovoxSubsys::enabled && Config::covox && faudbufcntCovox < samplesPerFrame) {
           uint8_t *sound_buf = audioBufferCovox + faudbufcntCovox;
           int sound_bufsize = samplesPerFrame - faudbufcntCovox;
           while (sound_bufsize-- > 0) {
@@ -1713,7 +1740,7 @@ void ESPectrum::loop() {
         }
 #if !PICO_RP2040
         // KR580VI53 (8253 PIT) — complete buffer for remaining frame
-        if (Z80Ops::isByte && faudbufcntPIT < samplesPerFrame) {
+        if (PitSubsys::enabled && Z80Ops::isByte && faudbufcntPIT < samplesPerFrame) {
           Ports::pitGenSound(audioBufferPIT + faudbufcntPIT,
                              samplesPerFrame - faudbufcntPIT);
         }
@@ -1727,29 +1754,31 @@ void ESPectrum::loop() {
         }
         if (AY_emu && faudbufcntAY < samplesPerFrame) {
             if(Config::turbosound != 0 || AySound::selected_chip == 0) chip0.gen_sound(samplesPerFrame - faudbufcntAY , faudbufcntAY);
-            if(Config::turbosound != 0 || AySound::selected_chip == 1) chip1.gen_sound(samplesPerFrame - faudbufcntAY , faudbufcntAY);
+            if((Config::turbosound != 0 || AySound::selected_chip == 1) && chip1) chip1->gen_sound(samplesPerFrame - faudbufcntAY , faudbufcntAY);
         }
 #if !PICO_RP2040
-        if (SAA_emu && faudbufcntSAA < samplesPerFrame)
+        if (SaaSubsys::enabled && saaChip && faudbufcntSAA < samplesPerFrame)
         {
           if (Tape::tapeStatus == TAPE_LOADING) {
-            memset(saaChip.SamplebufSAA_L, 0, sizeof(saaChip.SamplebufSAA_L));
-            memset(saaChip.SamplebufSAA_R, 0, sizeof(saaChip.SamplebufSAA_R));
+            memset(saaChip->SamplebufSAA_L, 0, sizeof(saaChip->SamplebufSAA_L));
+            memset(saaChip->SamplebufSAA_R, 0, sizeof(saaChip->SamplebufSAA_R));
           } else {
-            saaChip.gen_sound(samplesPerFrame - faudbufcntSAA, faudbufcntSAA);
+            saaChip->gen_sound(samplesPerFrame - faudbufcntSAA, faudbufcntSAA);
           }
         }
-        if (Midi::enabled == 3)
+        if (MidiSubsys::enabled && Midi::enabled == 3 && audioBufferMIDI_L && audioBufferMIDI_R)
         {
           MidiSynth::gen_sound(audioBufferMIDI_L, audioBufferMIDI_R, samplesPerFrame);
         }
 #endif
         // Hoist frame-invariant source flags outside the mix loop
         bool mix_chip0 = AY_emu && (Config::turbosound != 0 || AySound::selected_chip == 0);
-        bool mix_chip1 = AY_emu && (Config::turbosound != 0 || AySound::selected_chip == 1);
+        bool mix_chip1 = AY_emu && (Config::turbosound != 0 || AySound::selected_chip == 1) && TurboSubsys::enabled && chip1;
+        bool mix_covox = CovoxSubsys::enabled && audioBufferCovox;
 #if !PICO_RP2040
-        bool mix_saa = SAA_emu;
-        bool mix_midi = (Midi::enabled == 3);
+        bool mix_saa = SaaSubsys::enabled && saaChip;
+        bool mix_midi = MidiSubsys::enabled && (Midi::enabled == 3) && audioBufferMIDI_L && audioBufferMIDI_R;
+        bool mix_pit = PitSubsys::enabled && audioBufferPIT;
 #endif
         bool fddSndEnabledMix = Config::trdosSoundLed;
 #if !PICO_RP2040
@@ -1758,11 +1787,11 @@ void ESPectrum::loop() {
         bool mix_fdd = fddSndEnabledMix && (fddSound.click_count > 0 || fddSound.motor_noise);
         for (int i = 0; i < samplesPerFrame; i++)
         {
-          int beeper_L = overSamplebuf[i] + audioBufferCovox[i]
+          int beeper_L = overSamplebuf[i];
+          if (mix_covox) beeper_L += audioBufferCovox[i];
 #if !PICO_RP2040
-                         + audioBufferPIT[i]
+          if (mix_pit) beeper_L += audioBufferPIT[i];
 #endif
-              ;
           if (mix_fdd) beeper_L += getFDDSample(i);
           int beeper_R = beeper_L;
           if (mix_chip0) {
@@ -1770,13 +1799,13 @@ void ESPectrum::loop() {
             beeper_R += chip0.SamplebufAY_R[i];
           }
           if (mix_chip1) {
-            beeper_L += chip1.SamplebufAY_L[i];
-            beeper_R += chip1.SamplebufAY_R[i];
+            beeper_L += chip1->SamplebufAY_L[i];
+            beeper_R += chip1->SamplebufAY_R[i];
           }
 #if !PICO_RP2040
           if (mix_saa) {
-            beeper_L += saaChip.SamplebufSAA_L[i];
-            beeper_R += saaChip.SamplebufSAA_R[i];
+            beeper_L += saaChip->SamplebufSAA_L[i];
+            beeper_R += saaChip->SamplebufSAA_R[i];
           }
           if (mix_midi) {
             beeper_L += audioBufferMIDI_L[i];

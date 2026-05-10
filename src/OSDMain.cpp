@@ -41,6 +41,7 @@ visit https://zxespectrum.speccy.org/contacto
 
 #include "OSDMain.h"
 #include "FileUtils.h"
+#include "Subsystem.h"
 #include "CPU.h"
 #include "Video.h"
 #include "ESPectrum.h"
@@ -2450,6 +2451,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::turbosound = opt2 - 1;
                                     if (Config::turbosound != prev) {
                                         Config::save();
+                                        TurboSubsys::request(Config::turbosound != 0);
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -2485,6 +2487,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::covox = opt2 - 1;
                                     if (Config::covox != prev) {
                                         Config::save();
+                                        CovoxSubsys::request(Config::covox != 0);
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -2528,6 +2531,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             OSD::osdCenteredMsg("Timex disabled", LEVEL_WARN, 2000);
                                         }
                                         Config::save();
+                                        SaaSubsys::request(Config::SAA1099);
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -2559,6 +2563,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         if (Midi::enabled)
                                             Midi::init();
                                         Config::save();
+                                        MidiSubsys::request(Config::midi != 0);
 #if defined(MIDI_TX_PIN) && defined(LOAD_WAV_PIO) && (LOAD_WAV_PIO == MIDI_TX_PIN)
                                         if ((Config::midi == 1 || Config::midi == 2) && Config::real_player)
                                             osdCenteredMsg(MSG_MIDI_PIN_CONFLICT[Config::lang], LEVEL_WARN, 3000);
@@ -3001,6 +3006,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             VIDEO::gigascreen_auto_countdown = 0;
                                         }
                                         Config::save();
+#if !PICO_RP2040
+                                        // Free 52 KB prev framebuffer when disabling.
+                                        GsSubsys::request(Config::gigascreen_enabled);
+#endif
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;

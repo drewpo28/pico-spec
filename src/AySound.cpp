@@ -54,8 +54,9 @@ visit https://zxespectrum.speccy.org/contacto
 int AySound::selected_chip = 0;
 
 AySound chip0(0);
-AySound chip1(1);
-AySound* chips[2] = { &chip0, &chip1 };
+// chip1 lives in heap; managed by TurboSubsys (see Subsystem.cpp).
+AySound* chip1 = nullptr;
+AySound* chips[2] = { &chip0, nullptr };
 
 /* sound chip volume envelops (will calculated by gen_env()) */
 // static int bEnvGenInit = 0;

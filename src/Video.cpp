@@ -35,6 +35,7 @@ visit https://zxespectrum.speccy.org/contacto
 
 #include "Video.h"
 #include "Debug.h"
+#include "Subsystem.h"
 #include "Tape.h"
 #include "FileUtils.h"
 #include "VidPrecalc.h"
@@ -874,18 +875,89 @@ static int fbCalcLines(int count) {
     return count;
 }
 
-static uint8_t *sharedFB_block = nullptr;
-static void **sharedFB_arr1 = nullptr;  // pointer array for frameBuffer
-static void **sharedFB_arr2 = nullptr;  // pointer array for prevFrameBuffer
+// Two separate blocks: main FB (always present) and prev FB (Gigascreen only).
+// Splitting them lets GsSubsys free 52 020 B of SRAM when Gigascreen is off.
+static uint8_t *sharedFB_main = nullptr;  // 104 040 B, allocated once at boot
+static uint8_t *sharedFB_prev = nullptr;  //  52 020 B, allocated by GsSubsys
+static void **sharedFB_arr1 = nullptr;    // pointer array for frameBuffer
+static void **sharedFB_arr2 = nullptr;    // pointer array for prevFrameBuffer
+
+// Cached current resolution so GsSubsys can re-call setupSharedFBPointers
+// without reaching back into vidmodes[].
+static int sharedFB_lines = 0;
+static int sharedFB_stride = 0;
 
 static void setupSharedFBPointers(Graphics<unsigned char> &vga, int lines, int stride) {
-    int prev_stride = stride / 2; // 4-bit packed
+    sharedFB_lines = lines;
+    sharedFB_stride = stride;
     for (int i = 0; i < lines; i++) {
-        sharedFB_arr1[i] = sharedFB_block + i * stride;
-        sharedFB_arr2[i] = sharedFB_block + FB_MAX_SIZE + i * prev_stride;
+        sharedFB_arr1[i] = sharedFB_main + i * stride;
     }
     vga.frameBuffer = (unsigned char **)sharedFB_arr1;
-    vga.prevFrameBuffer = (unsigned char **)sharedFB_arr2;
+    if (sharedFB_prev && sharedFB_arr2) {
+        int prev_stride = stride / 2; // 4-bit packed
+        for (int i = 0; i < lines; i++) {
+            sharedFB_arr2[i] = sharedFB_prev + i * prev_stride;
+        }
+        vga.prevFrameBuffer = (unsigned char **)sharedFB_arr2;
+    } else {
+        vga.prevFrameBuffer = nullptr;
+    }
+}
+
+// GsSubsys storage and apply() — implemented here so it can touch the
+// sharedFB_* internals directly. Declared in Subsystem.h.
+volatile bool GsSubsys::enabled = false;
+bool GsSubsys::wanted = false;
+bool GsSubsys::dirty = false;
+
+void GsSubsys::request(bool on) {
+    wanted = on;
+    if (wanted != enabled) dirty = true;
+}
+
+bool GsSubsys::apply() {
+    dirty = false;
+    if (wanted == enabled) return true;
+
+    if (wanted) {
+        if (!sharedFB_prev) {
+            sharedFB_prev = (uint8_t*)malloc(FB_PREV_SIZE);
+            if (!sharedFB_prev) {
+                wanted = false;
+                Config::gigascreen_enabled = false;
+                VIDEO::gigascreen_enabled = false;
+                return false;
+            }
+            memset(sharedFB_prev, 0, FB_PREV_SIZE);
+        }
+        if (!sharedFB_arr2) {
+            sharedFB_arr2 = (void**)malloc(FB_MAX_LINES * sizeof(void*));
+            if (!sharedFB_arr2) {
+                free(sharedFB_prev); sharedFB_prev = nullptr;
+                wanted = false;
+                Config::gigascreen_enabled = false;
+                VIDEO::gigascreen_enabled = false;
+                return false;
+            }
+        }
+        // Re-derive prev pointer array from the current resolution.
+        int prev_stride = sharedFB_stride / 2;
+        for (int i = 0; i < sharedFB_lines; i++) {
+            sharedFB_arr2[i] = sharedFB_prev + i * prev_stride;
+        }
+        VIDEO::vga.prevFrameBuffer = (unsigned char**)sharedFB_arr2;
+        enabled = true;
+    } else {
+        // Drop pointer first so render path stops accessing prevFrameBuffer.
+        // Producers (renderers) check vga.prevFrameBuffer != nullptr before use
+        // (see MainScreen_Snow*); border path already had a null-guard.
+        VIDEO::vga.prevFrameBuffer = nullptr;
+        enabled = false;
+        free(sharedFB_arr2);  sharedFB_arr2  = nullptr;
+        free(sharedFB_prev);  sharedFB_prev  = nullptr;
+    }
+    return true;
 }
 #endif
 
@@ -906,28 +978,31 @@ void VIDEO::Init() {
     vga.useInterrupt_flag = false;
 
 #if !PICO_RP2040
-    // Allocate shared data block for main + prev framebuffers at max resolution
-    // BEFORE vga.init() — while heap is still unfragmented (full MEM_REMAIN available).
-    // The block is never freed; changeMode() only reconfigures pointer arrays.
-    if (!sharedFB_block) {
-        sharedFB_block = (uint8_t *)malloc((FB_MAX_SIZE + FB_PREV_SIZE));
-        if (sharedFB_block) {
-            memset(sharedFB_block, 0, (FB_MAX_SIZE + FB_PREV_SIZE));
+    // Allocate the main framebuffer block at max resolution BEFORE vga.init() —
+    // while heap is still unfragmented. Main block is never freed; the prev
+    // block (Gigascreen, +52 KB) is allocated on demand by GsSubsys.
+    if (!sharedFB_main) {
+        sharedFB_main = (uint8_t *)malloc(FB_MAX_SIZE);
+        if (sharedFB_main) {
+            memset(sharedFB_main, 0, FB_MAX_SIZE);
             sharedFB_arr1 = (void **)malloc(FB_MAX_LINES * sizeof(void *));
-            sharedFB_arr2 = (void **)malloc(FB_MAX_LINES * sizeof(void *));
-            if (!sharedFB_arr1 || !sharedFB_arr2) {
-                free(sharedFB_block); sharedFB_block = nullptr;
-                free(sharedFB_arr1); sharedFB_arr1 = nullptr;
-                free(sharedFB_arr2); sharedFB_arr2 = nullptr;
+            if (!sharedFB_arr1) {
+                free(sharedFB_main); sharedFB_main = nullptr;
             }
         }
     }
-    if (sharedFB_block) {
+    if (sharedFB_main) {
         int lines = fbCalcLines(
             vidmodes[Mode][vmodeproperties::vRes] / vidmodes[Mode][vmodeproperties::vDiv]);
         int stride = (vidmodes[Mode][vmodeproperties::hRes] + 3) & ~3;
         setupSharedFBPointers(vga, lines, stride);
         // frameBuffer is set — vga.init()'s allocateFrameBuffers() will skip allocation
+    }
+    // Pre-allocate prev framebuffer if Gigascreen is enabled at boot,
+    // BEFORE the heap fragments.
+    if (Config::gigascreen_enabled) {
+        GsSubsys::request(true);
+        GsSubsys::apply();
     }
 #endif
 
@@ -1331,7 +1406,10 @@ extern size_t getContiguousHeap(void);
 #if !PICO_RP2040
 void VIDEO::InitPrevBuffer() {
     if (!vga.prevFrameBuffer) {
-        vga.prevFrameBuffer = vga.allocateFrameBuffer();
+        // Use the GsSubsys-managed prev buffer rather than a one-off
+        // allocateFrameBuffer() — keeps a single owner for the 52 KB block.
+        GsSubsys::request(true);
+        GsSubsys::apply();
     }
     if (!vga.prevFrameBuffer) return;
     const int h = VIDEO::vga.yres;
@@ -1356,9 +1434,11 @@ IRAM_ATTR void VIDEO::MainScreen_Blank(unsigned int statestoadd, bool contended)
     if (CPU::tstates >= tstateDraw) {
 
         if (brdChange) DrawBorder(); // Needed to avoid tearing in demos like Gabba (Pentagon)
-        
+
         lineptr32 = (uint32_t *)(vga.frameBuffer[linedraw_cnt]) + lineptr_offset;
-        prevLineptr16 = (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset;
+        prevLineptr16 = vga.prevFrameBuffer
+                          ? (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset
+                          : (uint16_t *)lineptr32;
 
         coldraw_cnt = 0;
 
@@ -1425,7 +1505,9 @@ IRAM_ATTR void VIDEO::MainScreen_Blank_Snow(unsigned int statestoadd, bool conte
         if (brdChange) DrawBorder();
 
         lineptr32 = (uint32_t *)(vga.frameBuffer[linedraw_cnt]) + lineptr_offset;
-        prevLineptr16 = (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset;
+        prevLineptr16 = vga.prevFrameBuffer
+                          ? (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset
+                          : (uint16_t *)lineptr32;
 
         coldraw_cnt = 0;
 
@@ -1489,7 +1571,9 @@ IRAM_ATTR void VIDEO::MainScreen_Blank_Snow_Opcode(bool contended) {
         if (brdChange) DrawBorder();
 
         lineptr32 = (uint32_t *)(vga.frameBuffer[linedraw_cnt]) + lineptr_offset;
-        prevLineptr16 = (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset;
+        prevLineptr16 = vga.prevFrameBuffer
+                          ? (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset
+                          : (uint16_t *)lineptr32;
 
         coldraw_cnt = 0;
 

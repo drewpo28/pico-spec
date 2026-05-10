@@ -36,8 +36,11 @@ public:
     // Signal disk change to BS-DOS after hot-swap
     static void signalDiskChange();
 
+    // Heap-allocated by Mb02Subsys when Config::mb02 != 0; nullptr otherwise.
+    // Public so Subsystem.cpp can manage it; treat as private elsewhere.
+    static uint8_t* page0_composite;
+
 private:
-    static uint8_t page0_composite[0x2000]; // EPROM mode composite buffer
     static bool disk_changed;      // temporary flag for disk change signal
 
     // SRAM pages use MemESP::ram[ram_base_idx + page] descriptors
