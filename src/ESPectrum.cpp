@@ -1719,9 +1719,9 @@ void ESPectrum::loop() {
         }
 #endif
         {
-            bool fddSndEnabled = Config::trdosSoundLed;
+            bool fddSndEnabled = (Config::trdosSoundLed & 2) != 0;
 #if !PICO_RP2040
-            if (MB02::enabled) fddSndEnabled = Config::mb02SoundLed;
+            if (MB02::enabled) fddSndEnabled = (Config::mb02SoundLed & 2) != 0;
 #endif
             if (fddSndEnabled) FDDGenSound();
         }
@@ -1751,9 +1751,9 @@ void ESPectrum::loop() {
         bool mix_saa = SAA_emu;
         bool mix_midi = (Midi::enabled == 3);
 #endif
-        bool fddSndEnabledMix = Config::trdosSoundLed;
+        bool fddSndEnabledMix = (Config::trdosSoundLed & 2) != 0;
 #if !PICO_RP2040
-        if (MB02::enabled) fddSndEnabledMix = Config::mb02SoundLed;
+        if (MB02::enabled) fddSndEnabledMix = (Config::mb02SoundLed & 2) != 0;
 #endif
         bool mix_fdd = fddSndEnabledMix && (fddSound.click_count > 0 || fddSound.motor_noise);
         for (int i = 0; i < samplesPerFrame; i++)
@@ -1883,7 +1883,7 @@ void ESPectrum::loop() {
 #endif
         ;
 #if !PICO_RP2040
-    if (MB02::enabled && Config::mb02SoundLed) {
+    if (MB02::enabled && (Config::mb02SoundLed & 1)) {
         // MB-02+ I/O skips the WD1793 command-dispatch paths that drive
         // rvmWD1793::led, so mirror the panel LED off the port-0x13 motor state.
         uint8_t mb02_led = ESPectrum::mb02_fdd.led;
@@ -1895,7 +1895,7 @@ void ESPectrum::loop() {
         }
     } else
 #endif
-    if (hasFdd && Config::trdosSoundLed) {
+    if (hasFdd && (Config::trdosSoundLed & 1)) {
         if (ESPectrum::fdd.led) {
             VIDEO::vga.fillRect(312, 3, 4, 4, zxColor(fdd.led == 2 ? 2 : 1, 1));
         } else {
