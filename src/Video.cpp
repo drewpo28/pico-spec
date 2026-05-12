@@ -856,16 +856,13 @@ void VIDEO::vgataskinit(void *unused) {
 ///TaskHandle_t VIDEO::videoTaskHandle;
 
 #if !PICO_RP2040
-// Shared framebuffer data block — allocated once at boot for max resolution (360x288).
-// Both main FB and prevFB (Gigascreen) live in the same contiguous block.
-// changeMode() reconfigures pointer arrays without any alloc/free.
-#define FB_MAX_LINES 289   // calcLines(288)
-#define FB_MAX_STRIDE 360
-#define FB_MAX_SIZE (FB_MAX_LINES * FB_MAX_STRIDE)  // 104,040 bytes per FB
-// prevFrameBuffer stores only lower 4 bits of palette index per pixel
-// (Gigascreen blendLUT only uses prev & 0x0F). Pack 2 px per byte → half size.
-#define FB_PREV_STRIDE (FB_MAX_STRIDE / 2)
-#define FB_PREV_SIZE (FB_MAX_LINES * FB_PREV_STRIDE)  // 52,020 bytes
+// Shared framebuffer pointer arrays sized for the build-time maximum line count
+// so they don't need realloc on mode changes. The actual data blocks
+// (sharedFB_main / sharedFB_prev) are sized to fit the current mode — see
+// ensureMainFB / ensurePrevFB.
+// prevFrameBuffer is 4-bit packed (2 px/byte): Gigascreen blendLUT only uses
+// prev & 0x0F, so the upper nibble is free for the next pixel.
+#define FB_MAX_LINES 289   // calcLines(288), the largest mode (360x288)
 
 static int fbCalcLines(int count) {
     if (count == 288) return 289;
@@ -876,16 +873,57 @@ static int fbCalcLines(int count) {
 }
 
 // Two separate blocks: main FB (always present) and prev FB (Gigascreen only).
-// Splitting them lets GsSubsys free 52 020 B of SRAM when Gigascreen is off.
-static uint8_t *sharedFB_main = nullptr;  // 104 040 B, allocated once at boot
-static uint8_t *sharedFB_prev = nullptr;  //  52 020 B, allocated by GsSubsys
-static void **sharedFB_arr1 = nullptr;    // pointer array for frameBuffer
+// Splitting them lets GsSubsys free up to 52 020 B of SRAM when Gigascreen is off.
+// Each block is sized to fit the current video mode, not the build-time maximum,
+// and grown/shrunk via realloc on mode changes (see ensureMainFB/ensurePrevFB).
+static uint8_t *sharedFB_main = nullptr;  // sized for current mode
+static uint8_t *sharedFB_prev = nullptr;  // sized for current mode (Gigascreen only)
+static size_t sharedFB_main_size = 0;     // actual byte capacity of sharedFB_main
+static size_t sharedFB_prev_size = 0;     // actual byte capacity of sharedFB_prev
+static void **sharedFB_arr1 = nullptr;    // pointer array for frameBuffer (FB_MAX_LINES slots)
 static void **sharedFB_arr2 = nullptr;    // pointer array for prevFrameBuffer
 
 // Cached current resolution so GsSubsys can re-call setupSharedFBPointers
 // without reaching back into vidmodes[].
 static int sharedFB_lines = 0;
 static int sharedFB_stride = 0;
+
+static inline size_t fbMainBytes(int lines, int stride) {
+    return (size_t)lines * (size_t)stride;
+}
+static inline size_t fbPrevBytes(int lines, int stride) {
+    return (size_t)lines * (size_t)(stride / 2);  // 4-bit packed: 2 px/byte
+}
+
+// Realloc sharedFB_main to fit lines×stride. Returns true on success.
+// On grow failure the original block (and size) is preserved.
+// Caller must rebuild sharedFB_arr1 afterwards — realloc may move the block.
+static bool ensureMainFB(int lines, int stride) {
+    size_t want = fbMainBytes(lines, stride);
+    if (sharedFB_main && sharedFB_main_size == want) return true;
+    uint8_t *p = (uint8_t*)realloc(sharedFB_main, want);
+    if (!p) return false;
+    if (want > sharedFB_main_size) {
+        memset(p + sharedFB_main_size, 0, want - sharedFB_main_size);
+    }
+    sharedFB_main = p;
+    sharedFB_main_size = want;
+    return true;
+}
+
+// Same contract for the prev buffer.
+static bool ensurePrevFB(int lines, int stride) {
+    size_t want = fbPrevBytes(lines, stride);
+    if (sharedFB_prev && sharedFB_prev_size == want) return true;
+    uint8_t *p = (uint8_t*)realloc(sharedFB_prev, want);
+    if (!p) return false;
+    if (want > sharedFB_prev_size) {
+        memset(p + sharedFB_prev_size, 0, want - sharedFB_prev_size);
+    }
+    sharedFB_prev = p;
+    sharedFB_prev_size = want;
+    return true;
+}
 
 static void setupSharedFBPointers(Graphics<unsigned char> &vga, int lines, int stride) {
     sharedFB_lines = lines;
@@ -921,20 +959,18 @@ bool GsSubsys::apply() {
     if (wanted == enabled) return true;
 
     if (wanted) {
-        if (!sharedFB_prev) {
-            sharedFB_prev = (uint8_t*)malloc(FB_PREV_SIZE);
-            if (!sharedFB_prev) {
-                wanted = false;
-                Config::gigascreen_enabled = false;
-                VIDEO::gigascreen_enabled = false;
-                return false;
-            }
-            memset(sharedFB_prev, 0, FB_PREV_SIZE);
+        // Size prev FB to the *current* mode (sharedFB_lines × sharedFB_stride),
+        // not the build-time max. Saves SRAM at lower resolutions.
+        if (!ensurePrevFB(sharedFB_lines, sharedFB_stride)) {
+            wanted = false;
+            Config::gigascreen_enabled = false;
+            VIDEO::gigascreen_enabled = false;
+            return false;
         }
         if (!sharedFB_arr2) {
             sharedFB_arr2 = (void**)malloc(FB_MAX_LINES * sizeof(void*));
             if (!sharedFB_arr2) {
-                free(sharedFB_prev); sharedFB_prev = nullptr;
+                free(sharedFB_prev); sharedFB_prev = nullptr; sharedFB_prev_size = 0;
                 wanted = false;
                 Config::gigascreen_enabled = false;
                 VIDEO::gigascreen_enabled = false;
@@ -956,6 +992,7 @@ bool GsSubsys::apply() {
         enabled = false;
         free(sharedFB_arr2);  sharedFB_arr2  = nullptr;
         free(sharedFB_prev);  sharedFB_prev  = nullptr;
+        sharedFB_prev_size = 0;
     }
     return true;
 }
@@ -978,29 +1015,27 @@ void VIDEO::Init() {
     vga.useInterrupt_flag = false;
 
 #if !PICO_RP2040
-    // Allocate the main framebuffer block at max resolution BEFORE vga.init() —
-    // while heap is still unfragmented. Main block is never freed; the prev
-    // block (Gigascreen, +52 KB) is allocated on demand by GsSubsys.
-    if (!sharedFB_main) {
-        sharedFB_main = (uint8_t *)malloc(FB_MAX_SIZE);
-        if (sharedFB_main) {
-            memset(sharedFB_main, 0, FB_MAX_SIZE);
-            sharedFB_arr1 = (void **)malloc(FB_MAX_LINES * sizeof(void *));
-            if (!sharedFB_arr1) {
-                free(sharedFB_main); sharedFB_main = nullptr;
-            }
-        }
+    // Allocate the main framebuffer block sized for the *initial* mode BEFORE
+    // vga.init() — while heap is still unfragmented. It can be realloc'd later
+    // on changeMode (see ensureMainFB). The prev block (Gigascreen) is allocated
+    // on demand by GsSubsys, also sized for the current mode.
+    int initLines = fbCalcLines(
+        vidmodes[Mode][vmodeproperties::vRes] / vidmodes[Mode][vmodeproperties::vDiv]);
+    int initStride = (vidmodes[Mode][vmodeproperties::hRes] + 3) & ~3;
+    if (!sharedFB_arr1) {
+        sharedFB_arr1 = (void **)malloc(FB_MAX_LINES * sizeof(void *));
     }
-    if (sharedFB_main) {
-        int lines = fbCalcLines(
-            vidmodes[Mode][vmodeproperties::vRes] / vidmodes[Mode][vmodeproperties::vDiv]);
-        int stride = (vidmodes[Mode][vmodeproperties::hRes] + 3) & ~3;
-        setupSharedFBPointers(vga, lines, stride);
+    if (sharedFB_arr1 && ensureMainFB(initLines, initStride)) {
+        setupSharedFBPointers(vga, initLines, initStride);
         // frameBuffer is set — vga.init()'s allocateFrameBuffers() will skip allocation
+    } else {
+        // Out of memory for shared FB — fall back to legacy allocator path.
+        free(sharedFB_arr1); sharedFB_arr1 = nullptr;
+        free(sharedFB_main); sharedFB_main = nullptr; sharedFB_main_size = 0;
     }
     // Pre-allocate prev framebuffer if Gigascreen is enabled at boot,
     // BEFORE the heap fragments.
-    if (Config::gigascreen_enabled) {
+    if (sharedFB_main && Config::gigascreen_enabled) {
         GsSubsys::request(true);
         GsSubsys::apply();
     }
@@ -1059,13 +1094,28 @@ void VIDEO::changeMode() {
     bool sameDims = (vga.frameBuffer && vga.xres == newW && vga.yres == newH);
 
 #if !PICO_RP2040
-    // Shared block path: no alloc/free, just reconfigure pointers
-    if (sharedFB_block) {
+    // Shared block path: realloc to fit the new mode (saves SRAM at smaller
+    // resolutions; grows on the way up). Pointer arrays rebuilt afterwards.
+    if (sharedFB_main) {
         if (!sameDims) {
-            vga.frameBuffer = nullptr;  // blank output while reconfiguring
-            SaveRect.clear();
             int lines = fbCalcLines(newH);
             int stride = (newW + 3) & ~3;
+            // Try to ensure capacity BEFORE touching live state. On failure,
+            // abort the mode change so the driver never indexes past the block.
+            if (!ensureMainFB(lines, stride)) {
+                Debug::log("changeMode: ensureMainFB(%dx%d) OOM, keeping old mode",
+                           newW, newH);
+                return;
+            }
+            if (GsSubsys::enabled) {
+                if (!ensurePrevFB(lines, stride)) {
+                    Debug::log("changeMode: ensurePrevFB OOM, disabling Gigascreen");
+                    GsSubsys::request(false);
+                    GsSubsys::apply();
+                }
+            }
+            vga.frameBuffer = nullptr;  // blank output while reconfiguring
+            SaveRect.clear();
             setupSharedFBPointers(vga, lines, stride);
         }
     } else
@@ -1139,7 +1189,7 @@ void VIDEO::changeMode() {
 
     // 4. Allocate framebuffer (non-shared path only)
 #if !PICO_RP2040
-    if (!sharedFB_block) {
+    if (!sharedFB_main) {
 #endif
         if (sameDims) {
             // frameBuffer already nulled above for non-shared; won't reach here for shared
