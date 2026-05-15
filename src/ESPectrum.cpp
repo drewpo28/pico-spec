@@ -689,18 +689,20 @@ void ESPectrum::setup() {
     MemESP::ram[2].assign_ram(new unsigned char[MEM_PG_SZ], 2, false);
     MemESP::ram[3].assign_ram(new unsigned char[MEM_PG_SZ], 3, false);
     ram_pages += 3;
+    // pages 4 and 6 — assign_ram falls back to butter/PSRAM/swap when heap
+    // is below MEM_REMAIN (reserved for framebuffer). 5 and 7 are static
+    // SRAM (pages57). On RP2040 the static pages46 buffer doesn't exist.
+    assign_ram(4);
+    assign_ram(6);
 #else
-    // RP2350: pages 0-3 are pre-bound to static `pages0123` SRAM buffer
-    // (MemESP.cpp). Skip assign_ram so we don't overwrite the static buffer.
+    // RP2350: pages 0-3 pre-bound to static `pages0123`, pages 4,6 to
+    // `pages46`, pages 5,7 to `pages57` (MemESP.cpp). Skip assign_ram so we
+    // don't overwrite the static buffers. Pages 5,7 historically not
+    // counted in ram_pages — keep that behaviour.
     ram_pages += 4;
-#endif
-    // pages 4, 5, 6, 7 are now all in static SRAM buffers (pages46/pages57)
-    // for guaranteed POINTER backing — see MemESP.cpp temp[] init.
-    // Pages 4,6 historically counted in ram_pages via assign_ram; keep that
-    // behaviour so MEM_PG_CNT-aware page-bound checks treat them as RAM.
-    // Pages 5,7 historically not counted — leave them untracked.
     ram_pages += 2;
-    Debug::log("setup: ext_ram: pages 4-7 in static SRAM, freeHeap=%u", getFreeHeap());
+#endif
+    Debug::log("setup: ext_ram: pages 0-7 done, freeHeap=%u", getFreeHeap());
     for (size_t i = 8; i < (MEM_PG_CNT + 2); ++i) {
       assign_ram(i);
     }
@@ -710,18 +712,28 @@ void ESPectrum::setup() {
   } else {
     Debug::log("setup: no ext_ram path, freeHeap=%u", getFreeHeap());
 #if PICO_RP2350
-    // RP2350: pages 0-3 are pre-bound to static `pages0123` (MemESP.cpp).
+    // RP2350: pages 0-3 pre-bound to static `pages0123`, pages 4,6 to
+    // `pages46` (MemESP.cpp). Pages 5,7 historically not counted.
     ram_pages += 4;
+    ram_pages += 2;
 #else
     // RP2040: page 0 not supported without virtual memory; pages 1-3 essential.
     MemESP::ram[1].assign_ram(new unsigned char[MEM_PG_SZ], 1, false);
     MemESP::ram[2].assign_ram(new unsigned char[MEM_PG_SZ], 2, false);
     MemESP::ram[3].assign_ram(new unsigned char[MEM_PG_SZ], 3, false);
     ram_pages += 3;
+    // Pages 4,6 only if enough heap remains for framebuffer (MEM_REMAIN).
+    // No ext_ram and 16col mode is disabled on RP2040, so if heap is too
+    // tight these pages stay unbacked (machine effectively 48K).
+    if (getFreeHeap() >= MEM_PG_SZ + MEM_REMAIN) {
+        MemESP::ram[4].assign_ram(new unsigned char[MEM_PG_SZ], 4, false);
+        ++ram_pages;
+    }
+    if (getFreeHeap() >= MEM_PG_SZ + MEM_REMAIN) {
+        MemESP::ram[6].assign_ram(new unsigned char[MEM_PG_SZ], 6, false);
+        ++ram_pages;
+    }
 #endif
-    // Pages 4 and 6 — pre-bound to static `pages46` (MemESP.cpp).
-    // Pages 5,7 historically not counted — leave them untracked.
-    ram_pages += 2;
     Debug::log("setup: no ext_ram: pages done, freeHeap=%u", getFreeHeap());
   }
   // Load romset
