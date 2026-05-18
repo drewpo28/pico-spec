@@ -1697,13 +1697,22 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             menu_level = 2;
                             // Build Betadisk root menu dynamically so drive status refreshes.
                             string betamenu = MENU_BETADISK_TITLE[Config::lang];
+                            betamenu += string(MENU_BETADISK_MODE[Config::lang]) + "\t"
+                                      + (Config::betadisk ? "On" : "Off") + "\n";
                             for (uint8_t i = 0; i < 4; i++) {
                                 string label = string("Drive ") + MENU_BETA_DRIVE_LETTERS[i];
                                 string fname = ESPectrum::fdd.disk[i] ? ESPectrum::fdd.disk[i]->fname : "";
-                                betamenu += formatSlotRow(label, fname, Config::driveWP[i], true);
-                                betamenu += "\n";
+                                string row = formatSlotRow(label, fname, Config::driveWP[i], true);
+                                if (!Config::betadisk) row = "\x01" + row;
+                                betamenu += row + "\n";
                             }
-                            betamenu += MENU_BETADISK_TAIL[Config::lang];
+                            {
+                                string fm = MENU_BETADISK_FASTMODE[Config::lang];
+                                string sl = MENU_BETADISK_SNDLED[Config::lang];
+                                string rm = MENU_BETADISK_ROM[Config::lang];
+                                if (!Config::betadisk) { fm = "\x01" + fm; sl = "\x01" + sl; rm = "\x01" + rm; }
+                                betamenu += fm + sl + rm;
+                            }
 
                             // Save the backing rect only on the very first draw so the
                             // stack has exactly one entry to pop on Esc (otherwise the
@@ -1713,15 +1722,31 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             menu_saverect = betaFirstDraw;
                             uint8_t dsk_num = menuRun(betamenu);
                             betaFirstDraw = false;
-                            if (dsk_num > 0 && dsk_num < 5) {
+                            if (dsk_num == 1) {
+                                // Mode toggle
+                                Config::betadisk = !Config::betadisk;
+                                if (!Config::betadisk && ESPectrum::trdos) {
+                                    ESPectrum::trdos = false;
+                                    MemESP::recoverPage0();
+                                }
+                                Config::save();
+                                menu_curopt = 1;
+                                continue;
+                            }
+                            else if (!Config::betadisk && dsk_num >= 2 && dsk_num <= 8) {
+                                // Dimmed rows — ignore
+                                menu_curopt = dsk_num;
+                                continue;
+                            }
+                            else if (dsk_num >= 2 && dsk_num <= 5) {
                                 // Per-drive submenu: Insert / Eject / Write Protect.
-                                uint8_t slot = dsk_num - 1;
+                                uint8_t slot = dsk_num - 2;
                                 menu_saverect = true;
                                 menu_curopt = 1;
                                 while (1) {
                                     menu_level = 3;
                                     string drvmenu = MENU_BETADRIVE[Config::lang];
-                                    drvmenu.replace(drvmenu.find("#",0),1,(string)" " + char(64 + dsk_num));
+                                    drvmenu.replace(drvmenu.find("#",0),1,(string)" " + MENU_BETA_DRIVE_LETTERS[slot]);
                                     // Fill WP toggle marker.
                                     size_t wpPos = drvmenu.rfind("[ ]");
                                     if (wpPos != string::npos && Config::driveWP[slot]) {
@@ -1778,7 +1803,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     }
                                 }
                             }
-                            else if (dsk_num == 5) {
+                            else if (dsk_num == 6) {
                                 menu_level = 3;
                                 menu_curopt = 1;
                                 menu_saverect = true;
@@ -1803,14 +1828,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         menu_curopt = opt2;
                                         menu_saverect = false;
                                     } else {
-                                        menu_curopt = 5;
+                                        menu_curopt = 6;
                                         menu_level = 2;
                                         menu_saverect = false;
                                         break;
                                     }
                                 }
                             }
-                            else if (dsk_num == 6) {
+                            else if (dsk_num == 7) {
                                 // Disk Sound & LED
                                 menu_level = 3;
                                 menu_curopt = Config::trdosSoundLed + 1;
@@ -1834,14 +1859,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         menu_curopt = opt2;
                                         menu_saverect = false;
                                     } else {
-                                        menu_curopt = 6;
+                                        menu_curopt = 7;
                                         menu_level = 2;
                                         menu_saverect = false;
                                         break;
                                     }
                                 }
                             }
-                            else if (dsk_num == 7) {
+                            else if (dsk_num == 8) {
                                 // TR-DOS ROM selector
                                 menu_level = 3;
                                 menu_curopt = 1;
@@ -1871,7 +1896,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         menu_curopt = opt2;
                                         menu_saverect = false;
                                     } else {
-                                        menu_curopt = 7;
+                                        menu_curopt = 8;
                                         menu_level = 2;
                                         menu_saverect = false;
                                         break;
@@ -3571,6 +3596,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     OSD::osdCenteredMsg("Timex disabled", LEVEL_WARN, 2000);
                                 }
 #endif
+                                // TR-DOS is mandatory on Pentagon
+                                if ((arch == "Pentagon" || arch == "P512" || arch == "P1024") && !Config::betadisk) {
+                                    Config::betadisk = true;
+                                    OSD::osdCenteredMsg("Betadisk enabled", LEVEL_INFO, 1500);
+                                }
                                 Config::save();
                                 Config::requestMachine(arch, romset);
                             }

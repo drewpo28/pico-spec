@@ -408,16 +408,10 @@ static const char *MENU_STORAGE_MAIN_NO_SD[2] = { MENU_STORAGE_MAIN_NO_SD_EN, ME
 #define MENU_BETADISK_TITLE_EN "Drives\n"
 #define MENU_BETADISK_TITLE_ES "Unidades\n"
 static const char *MENU_BETADISK_TITLE[2] = { MENU_BETADISK_TITLE_EN, MENU_BETADISK_TITLE_ES };
-
-#define MENU_BETADISK_TAIL_EN \
-	"Fast Mode\t>\n"\
-	"Disk Sound&LED\t>\n"\
-	"ROM\t>\n"
-#define MENU_BETADISK_TAIL_ES \
-	"Modo rápido\t>\n"\
-	"Sonido y LED del disco\t>\n"\
-	"ROM\t>\n"
-static const char *MENU_BETADISK_TAIL[2] = { MENU_BETADISK_TAIL_EN, MENU_BETADISK_TAIL_ES };
+static const char *MENU_BETADISK_MODE[2]  = { "Mode", "Modo" };
+static const char *MENU_BETADISK_FASTMODE[2] = { "Fast Mode\t>\n",   "Modo rápido\t>\n" };
+static const char *MENU_BETADISK_SNDLED[2]   = { "Sound & LED\t>\n", "Sonido y LED\t>\n" };
+static const char *MENU_BETADISK_ROM[2]      = { "ROM\t>\n",         "ROM\t>\n" };
 
 // Drive labels used by the dynamic menu builder.
 static const char *MENU_BETA_DRIVE_LETTERS[4] = { "A", "B", "C", "D" };

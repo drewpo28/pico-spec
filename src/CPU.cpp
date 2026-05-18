@@ -189,6 +189,12 @@ void CPU::reset() {
     }
 #endif
 
+    // TR-DOS (betadisk) is mandatory on Pentagon — force on without saving.
+    if (Z80Ops::isPentagon && !Config::betadisk) Config::betadisk = true;
+
+    // Timex video is incompatible with Byte ROM sets — auto-disable.
+    if (Z80Ops::isByte && Config::timex_video) Config::timex_video = false;
+
     updateStatesInFrame();
 
     tstates = 0;
