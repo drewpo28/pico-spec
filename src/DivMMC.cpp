@@ -680,6 +680,10 @@ uint8_t DivMMC::mmc_read() {
             mmc_last_command = 0;
             return 1;
 
+        case 0x41: // CMD1 SEND_OP_COND (MMC-style init used by Wild Player)
+            mmc_last_command = 0;
+            return 0;
+
         case 0x48: // CMD8 SEND_IF_COND
             // R7 response: R1 + 4-byte echo of command argument (voltage + check pattern).
             // SDv2 host expects: 0x01, 0x00, 0x00, 0x01, 0xAA — then FF until next command.
@@ -785,11 +789,19 @@ uint8_t DivMMC::mmc_read() {
             }
             return 0xFF;
 
+        case 0x50: // CMD16 SET_BLOCKLEN — R1=00 (accepted)
+            mmc_last_command = 0;
+            return 0;
+
         case 0x77: // CMD55 APP_CMD (prefix for ACMD) — R1=00 once
             mmc_last_command = 0;
             return 0;
 
         case 0x69: // ACMD41 SD_SEND_OP_COND — R1=00 (init complete) once
+            mmc_last_command = 0;
+            return 0;
+
+        case 0x7B: // CMD59 CRC_ON_OFF — R1=00 (accepted)
             mmc_last_command = 0;
             return 0;
 
@@ -836,6 +848,14 @@ void DivMMC::mmc_write(uint8_t value) {
         case 0x40: // CMD0 GO_IDLE_STATE
             if (mmc_index_command == 5) {
                 mmc_r1 = 1; // Idle
+                mmc_index_command = 0;
+            } else {
+                mmc_index_command++;
+            }
+            break;
+
+        case 0x41: // CMD1 SEND_OP_COND (MMC-style init used by Wild Player)
+            if (mmc_index_command == 5) {
                 mmc_index_command = 0;
             } else {
                 mmc_index_command++;
@@ -1225,6 +1245,7 @@ void DivMMC::zc_init() {
     mmc_ocr[3] = 0x00;
     mmc_ocr[4] = 0x00;
 
+    if (!mmc_sector_buf) mmc_sector_buf = (uint8_t*)calloc(512, 1);
     mmc_last_command = 0;
     mmc_index_command = 0;
     mmc_r1 = 1;
