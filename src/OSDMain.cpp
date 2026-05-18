@@ -1822,22 +1822,22 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             else if (dsk_num == 6) {
                                 // Disk Sound & LED
                                 menu_level = 3;
-                                menu_curopt = 1;
+                                menu_curopt = Config::trdosSoundLed + 1;
                                 menu_saverect = true;
                                 while (1) {
                                     string menu = MENU_SOUNDLED[Config::lang];
-                                    menu += MENU_YESNO[Config::lang];
-                                    uint8_t prev = Config::trdosSoundLed;
-                                    if (prev) {
-                                        menu.replace(menu.find("[Y",0),2,"[*");
-                                        menu.replace(menu.find("[N",0),2,"[ ");
-                                    } else {
-                                        menu.replace(menu.find("[Y",0),2,"[ ");
-                                        menu.replace(menu.find("[N",0),2,"[*");
+                                    menu += MENU_SOUNDLED_SEL[Config::lang];
+                                    int mpos = -1;
+                                    int idx = 0;
+                                    while ((mpos = menu.find("[ ]", mpos + 1)) != (int)string::npos) {
+                                        if (idx == Config::trdosSoundLed)
+                                            menu.replace(mpos, 3, "[*]");
+                                        idx++;
                                     }
+                                    uint8_t prev = Config::trdosSoundLed;
                                     uint8_t opt2 = menuRun(menu);
                                     if (opt2) {
-                                        Config::trdosSoundLed = (opt2 == 1);
+                                        Config::trdosSoundLed = opt2 - 1;
                                         if (Config::trdosSoundLed != prev)
                                             Config::save();
                                         menu_curopt = opt2;
@@ -2145,24 +2145,24 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                             }
                             else if (Config::mb02 && mb02_num == 6) {
-                                // Sound & LED toggle.
+                                // Sound & LED selector: Off / LED / Sound / Sound+LED.
                                 menu_level = 3;
-                                menu_curopt = 1;
+                                menu_curopt = Config::mb02SoundLed + 1;
                                 menu_saverect = true;
                                 while (1) {
                                     string menu = MENU_SOUNDLED[Config::lang];
-                                    menu += MENU_YESNO[Config::lang];
-                                    uint8_t prev = Config::mb02SoundLed;
-                                    if (prev) {
-                                        menu.replace(menu.find("[Y",0),2,"[*");
-                                        menu.replace(menu.find("[N",0),2,"[ ");
-                                    } else {
-                                        menu.replace(menu.find("[Y",0),2,"[ ");
-                                        menu.replace(menu.find("[N",0),2,"[*");
+                                    menu += MENU_SOUNDLED_SEL[Config::lang];
+                                    int mpos = -1;
+                                    int idx = 0;
+                                    while ((mpos = menu.find("[ ]", mpos + 1)) != (int)string::npos) {
+                                        if (idx == Config::mb02SoundLed)
+                                            menu.replace(mpos, 3, "[*]");
+                                        idx++;
                                     }
+                                    uint8_t prev = Config::mb02SoundLed;
                                     uint8_t opt2 = menuRun(menu);
                                     if (opt2) {
-                                        Config::mb02SoundLed = (opt2 == 1);
+                                        Config::mb02SoundLed = opt2 - 1;
                                         if (Config::mb02SoundLed != prev)
                                             Config::save();
                                         menu_curopt = opt2;

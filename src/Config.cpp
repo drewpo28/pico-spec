@@ -95,7 +95,7 @@ uint8_t  Config::kempstonPort = 0x1F;
 uint8_t  Config::throtling = DEFAULT_THROTTLING;
 bool     Config::CursorAsJoy = true;
 bool     Config::trdosFastMode = false;
-bool     Config::trdosSoundLed = false;
+uint8_t  Config::trdosSoundLed = 0; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
 uint8_t  Config::trdosBios = 2; // Default: 5.05D
 bool     Config::driveWP[4] = { true, true, true, true };
 #if !PICO_RP2040
@@ -103,7 +103,7 @@ uint8_t  Config::esxdos = 0;
 string   Config::esxdos_hdf_image[2] = {"", ""};
 uint8_t  Config::mb02 = 0;
 bool     Config::mb02WP[4] = { true, true, true, true };
-bool     Config::mb02SoundLed = false;
+uint8_t  Config::mb02SoundLed = 0; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
 bool     Config::zcontroller = false;
 #endif
 
@@ -552,7 +552,12 @@ void Config::load() {
 #endif
         nvs_get_b("CursorAsJoy", CursorAsJoy, sts);
         nvs_get_b("trdosFastMode", trdosFastMode, sts);
-        nvs_get_b("trdosSoundLed", trdosSoundLed, sts);
+        if (!nvs_get_u8("trdosSoundLedMode", trdosSoundLed, sts)) {
+            // Migrate legacy bool key: true -> Sound+Led (3), false -> Off (0)
+            bool old = false;
+            nvs_get_b("trdosSoundLed", old, sts);
+            trdosSoundLed = old ? 3 : 0;
+        }
         nvs_get_u8("trdosBios", trdosBios, sts);
         for (int i = 0; i < 4; i++) {
             char k[12]; snprintf(k, sizeof(k), "drive%d.wp", i);
@@ -569,7 +574,12 @@ void Config::load() {
             char k[12]; snprintf(k, sizeof(k), "mb02d%d.wp", i);
             nvs_get_b(k, mb02WP[i], sts);
         }
-        nvs_get_b("mb02SoundLed", mb02SoundLed, sts);
+        if (!nvs_get_u8("mb02SoundLedMode", mb02SoundLed, sts)) {
+            // Migrate legacy bool key: true -> Sound+Led (3), false -> Off (0)
+            bool old = false;
+            nvs_get_b("mb02SoundLed", old, sts);
+            mb02SoundLed = old ? 3 : 0;
+        }
         nvs_get_b("zcontroller", zcontroller, sts);
 #endif
         nvs_get_str("SNA_Path", FileUtils::SNA_Path, sts);
@@ -775,7 +785,7 @@ void Config::save() {
 #endif
     nvs_set_str(buf,"CursorAsJoy", CursorAsJoy ? "true" : "false");
     nvs_set_str(buf,"trdosFastMode", trdosFastMode ? "true" : "false");
-    nvs_set_str(buf,"trdosSoundLed", trdosSoundLed ? "true" : "false");
+    nvs_set_u8(buf,"trdosSoundLedMode", trdosSoundLed);
     nvs_set_u8(buf,"trdosBios", trdosBios);
     for (int i = 0; i < 4; i++) {
         char k[12]; snprintf(k, sizeof(k), "drive%d.wp", i);
@@ -790,7 +800,7 @@ void Config::save() {
         char k[12]; snprintf(k, sizeof(k), "mb02d%d.wp", i);
         nvs_set_str(buf, k, mb02WP[i] ? "true" : "false");
     }
-    nvs_set_str(buf,"mb02SoundLed", mb02SoundLed ? "true" : "false");
+    nvs_set_u8(buf,"mb02SoundLedMode", mb02SoundLed);
     nvs_set_str(buf,"zcontroller", zcontroller ? "true" : "false");
 #endif
     nvs_set_str(buf,"SNA_Path",FileUtils::SNA_Path.c_str());
