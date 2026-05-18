@@ -193,7 +193,9 @@ void CPU::reset() {
     if (Z80Ops::isPentagon && !Config::betadisk) Config::betadisk = true;
 
     // Timex video is incompatible with Byte ROM sets — auto-disable.
+#if !PICO_RP2040
     if (Z80Ops::isByte && Config::timex_video) Config::timex_video = false;
+#endif
 
     updateStatesInFrame();
 
