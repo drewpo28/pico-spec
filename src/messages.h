@@ -415,7 +415,7 @@ static const char *MENU_BETADISK_TITLE[2] = { MENU_BETADISK_TITLE_EN, MENU_BETAD
 
 #define MENU_BETADISK_TAIL_EN \
 	"Fast Mode\t>\n"\
-	"Disk Sound & LED\t>\n"\
+	"Disk Sound&LED\t>\n"\
 	"ROM\t>\n"
 #define MENU_BETADISK_TAIL_ES \
 	"Modo rápido\t>\n"\
