@@ -271,10 +271,6 @@ static const char *MENU_ROM_TITLE[2] = { MENU_ROM_TITLE_EN,MENU_ROM_TITLE_ES };
 #define MENU_ALL_TITLE_ES "Abrir fichero"
 static const char *MENU_ALL_TITLE[2] = { MENU_ALL_TITLE_EN,MENU_ALL_TITLE_ES };
 
-#define OSD_DSK_NEEDS_PENTAGON_EN "  Disk needs Pentagon mode  "
-#define OSD_DSK_NEEDS_PENTAGON_ES " Disco requiere modo Pentagon "
-static const char *OSD_DSK_NEEDS_PENTAGON[2] = { OSD_DSK_NEEDS_PENTAGON_EN,OSD_DSK_NEEDS_PENTAGON_ES };
-
 #define OSD_16COL_NEEDS_PENTAGON_EN "  16col is Pentagon only  "
 #define OSD_16COL_NEEDS_PENTAGON_ES "  16col solo en Pentagon  "
 static const char *OSD_16COL_NEEDS_PENTAGON[2] = { OSD_16COL_NEEDS_PENTAGON_EN,OSD_16COL_NEEDS_PENTAGON_ES };

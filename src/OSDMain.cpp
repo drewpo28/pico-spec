@@ -1195,21 +1195,17 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     // F5 in the browser opens the slot picker, where Enter mounts
                     // into the focused slot and the popup stays open for more
                     // operations until Esc closes it back to the file dialog.
-                    if (Z80Ops::isPentagon || (Z80Ops::is128 && Z80Ops::isByte)) {
-                        if (!fromZip) FileUtils::DSK_Path = FileUtils::ALL_Path;
-                        if (forcePopup) {
-                            Config::driveWP[0] = true;
-                            diskSlotDialog(IFACE_BETA, 0, fname);
-                            forcePopup = false;
-                            goto f5_retry;
-                        }
-                        rvmWD1793InsertDisk(&ESPectrum::fdd, 0, fname);
-                        if (ESPectrum::fdd.disk[0])
-                            ESPectrum::fdd.disk[0]->writeprotect = Config::driveWP[0];
-                        Config::save();
-                    } else {
-                        OSD::osdCenteredMsg(OSD_DSK_NEEDS_PENTAGON[Config::lang], LEVEL_WARN);
+                    if (!fromZip) FileUtils::DSK_Path = FileUtils::ALL_Path;
+                    if (forcePopup) {
+                        Config::driveWP[0] = true;
+                        diskSlotDialog(IFACE_BETA, 0, fname);
+                        forcePopup = false;
+                        goto f5_retry;
                     }
+                    rvmWD1793InsertDisk(&ESPectrum::fdd, 0, fname);
+                    if (ESPectrum::fdd.disk[0])
+                        ESPectrum::fdd.disk[0]->writeprotect = Config::driveWP[0];
+                    Config::save();
                 }
 #if !PICO_RP2040
                 else if (ext == "mbd") {

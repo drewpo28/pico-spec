@@ -967,7 +967,7 @@ IRAM_ATTR void Z80::check_trdos() {
     if (MB02::enabled) return;   // MB-02 uses tape-compatible hooks, not 0x3Dxx trap
 #endif
 
-    if (ESPectrum::trdos == true || Z80Ops::isPentagon || (Z80Ops::is128 && Z80Ops::isByte)) {
+    if (!Z80Ops::isALF) {
 
         if (!ESPectrum::trdos) {
 
