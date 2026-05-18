@@ -855,6 +855,15 @@ void VIDEO::vgataskinit(void *unused) {
 
 ///TaskHandle_t VIDEO::videoTaskHandle;
 
+extern size_t getContiguousHeap(void);
+
+// Minimum heap headroom before calling FatFS f_open. ff_memalloc reserves
+// (FF_MAX_LFN+1)*2 + MAXDIRB(FF_MAX_LFN) ≈ 1-2 KB for LFN/VFAT scratch. SDK
+// malloc panics on OOM (no NULL return), so we must gate this with sbrk
+// headroom (the only allocator-friendly free-memory measure). Needed by
+// SaveRectT below on every platform — keep outside the !PICO_RP2040 block.
+#define FF_OPEN_HEAP_FLOOR 4096u
+
 #if !PICO_RP2040
 // Shared framebuffer pointer arrays sized for the build-time maximum line count
 // so they don't need realloc on mode changes. The actual data blocks
@@ -894,14 +903,6 @@ static inline size_t fbMainBytes(int lines, int stride) {
 static inline size_t fbPrevBytes(int lines, int stride) {
     return (size_t)lines * (size_t)(stride / 2);  // 4-bit packed: 2 px/byte
 }
-
-extern size_t getContiguousHeap(void);
-
-// Minimum heap headroom before calling FatFS f_open. ff_memalloc reserves
-// (FF_MAX_LFN+1)*2 + MAXDIRB(FF_MAX_LFN) ≈ 1-2 KB for LFN/VFAT scratch. SDK
-// malloc panics on OOM (no NULL return), so we must gate this with sbrk
-// headroom (the only allocator-friendly free-memory measure).
-#define FF_OPEN_HEAP_FLOOR 4096u
 
 // FB allocation happens once at boot via these. Mode-change runtime resize
 // was removed because heap fragmentation made grow impossible — switching
