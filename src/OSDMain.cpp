@@ -4510,6 +4510,36 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     } else if (opt2 == 6) {
                         Z80::triggerNMI();
                         return;
+                    } else if (opt2 == 7) {
+                        // Debug Log toggle
+                        menu_level = 2;
+                        menu_curopt = 1;
+                        menu_saverect = true;
+                        while (1) {
+                            string dl_menu = MENU_DEBUG_LOG[Config::lang];
+                            dl_menu += MENU_YESNO[Config::lang];
+                            bool prev_dl = Debug::log_enabled;
+                            if (prev_dl) {
+                                dl_menu.replace(dl_menu.find("[Y",0),2,"[*");
+                                dl_menu.replace(dl_menu.find("[N",0),2,"[ ");
+                            } else {
+                                dl_menu.replace(dl_menu.find("[Y",0),2,"[ ");
+                                dl_menu.replace(dl_menu.find("[N",0),2,"[*");
+                            }
+                            uint8_t opt3 = menuRun(dl_menu);
+                            if (opt3) {
+                                Debug::log_enabled = (opt3 == 1);
+                                if (Debug::log_enabled != prev_dl) {
+                                    Config::save();
+                                }
+                                menu_curopt = opt3;
+                                menu_saverect = false;
+                            } else {
+                                menu_curopt = 7;
+                                menu_level = 1;
+                                break;
+                            }
+                        }
                     } else {
                         menu_curopt = 8;
                         break;

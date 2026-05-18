@@ -5,6 +5,8 @@
 
 static uint32_t log_counter = 0;
 
+bool Debug::log_enabled = false;
+
 void Debug::led_blink()
 {
 #if DEBUG
@@ -42,9 +44,8 @@ void Debug::log(const char* fmt, ...)
     printf("%s\n", buf);
 }
 
-void Debug::log2SD(const string& data)
+void Debug::log2SD_impl(const string& data)
 {
-#if DEBUG
     if (!FileUtils::fsMount) return;
     static const char* nvs = STORAGE_LOG;
 
@@ -64,7 +65,7 @@ void Debug::log2SD(const string& data)
     }
     logEntry += std::string(prefix) + data + "\n";
 
-    // Лимит 10KB — перезаписываем с начала при переполнении
+    // Лимит 200KB — перезаписываем с начала при переполнении
     FIL* handle = fopen2(nvs, FA_WRITE | FA_OPEN_APPEND);
     if (!handle) {
         FileUtils::mkdirParents(CONFIG_DIR);
@@ -80,10 +81,9 @@ void Debug::log2SD(const string& data)
         f_write(handle, logEntry.c_str(), logEntry.size(), &btw);
         fclose2(handle);
     }
-#endif
 }
 
-void Debug::log2SD(const char* fmt, ...)
+void Debug::log2SD_impl(const char* fmt, ...)
 {
     if (!FileUtils::fsMount) return;
 
@@ -93,16 +93,18 @@ void Debug::log2SD(const char* fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    log2SD(std::string(buf));
+    log2SD_impl(std::string(buf));
 }
 
 extern "C" void debug_log2sd(const char* fmt, ...)
 {
+    if (!Debug::log_enabled) return;
+
     char buf[256];
     va_list args;
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    Debug::log2SD(std::string(buf));
+    Debug::log2SD_impl(std::string(buf));
 }

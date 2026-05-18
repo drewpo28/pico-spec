@@ -393,8 +393,6 @@ ELSEIF(PICO_PC)
         set(PICO_PC_KBD_DATA 1)
     endif()
     target_compile_definitions(${PROJECT_NAME} PRIVATE
-        DEBUG=0
-
         $<$<BOOL:${PICO_PC_DBG_UART}>:PICO_DEFAULT_UART=0>
         $<$<BOOL:${PICO_PC_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=0>
         $<$<BOOL:${PICO_PC_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=1>
@@ -477,8 +475,6 @@ ELSEIF(PICO_DV)
         set(MIDI_TX_PIN 21)
     endif()
     target_compile_definitions(${PROJECT_NAME} PRIVATE
-        DEBUG=0
-
         $<$<BOOL:${PICO_DV_DBG_UART}>:PICO_DEFAULT_UART=1>
         $<$<BOOL:${PICO_DV_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=20>
         $<$<BOOL:${PICO_DV_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=21>
@@ -551,7 +547,6 @@ ELSEIF(ZERO)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
     endif()
     target_compile_definitions(${PROJECT_NAME} PRIVATE
-        DEBUG=0
         $<$<BOOL:${ZERO_DBG_UART}>:PICO_DEFAULT_UART=0>
         $<$<BOOL:${ZERO_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=16>
         $<$<BOOL:${ZERO_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=13>
@@ -618,7 +613,6 @@ ELSEIF(ZERO2)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
     endif()
     target_compile_definitions(${PROJECT_NAME} PRIVATE
-        DEBUG=0
         $<$<BOOL:${ZERO2_DBG_UART}>:PICO_DEFAULT_UART=1>
         $<$<BOOL:${ZERO2_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=20>
         $<$<BOOL:${ZERO2_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=21>
@@ -702,7 +696,6 @@ ELSE()
         set(MURM1_KBD_DATA_PIN  1)
     endif()
     target_compile_definitions(${PROJECT_NAME} PRIVATE
-        DEBUG=0
         $<$<BOOL:${MURM1_DBG_UART}>:PICO_DEFAULT_UART=0>
         $<$<BOOL:${MURM1_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=0>
         $<$<BOOL:${MURM1_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=1>

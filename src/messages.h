@@ -793,7 +793,10 @@ static const char *MENU_RESET[2] = { MENU_RESET_EN, MENU_RESET_ES };
     "BP List\t{HK_BP_LIST}\n"\
     "Jump to\t{HK_JUMP_TO}\n"\
     "Input Poke\t{HK_POKE}\n"\
-	"Trigger NMI\t{HK_NMI}\n"
+	"Trigger NMI\t{HK_NMI}\n"\
+	"Debug Log\t>\n"
+
+static const char *MENU_DEBUG_LOG[2] = { "Write debug.log\n", "Escribir debug.log\n" };
 
 #define MOS_FILE "/.firmware"
 #define MENU_RESET_MOS_EN \

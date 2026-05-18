@@ -477,6 +477,7 @@ void Config::load() {
         }
 #endif
         nvs_get_b("Issue2", Issue2, sts);
+        nvs_get_b("debug_log", Debug::log_enabled, sts);
         nvs_get_b("flashload", flashload, sts);
         nvs_get_b("rightSpace", rightSpace, sts);
         nvs_get_b("wasd", wasd, sts);
@@ -753,6 +754,7 @@ void Config::save() {
     nvs_set_u8(buf,"gs_enabled", Config::gs_enabled);
     nvs_set_u8(buf,"gs_ram_size", Config::gs_ram_size);
     nvs_set_str(buf,"Issue2", Issue2 ? "true" : "false");
+    nvs_set_str(buf,"debug_log", Debug::log_enabled ? "true" : "false");
     nvs_set_str(buf,"flashload", flashload ? "true" : "false");
     nvs_set_str(buf,"tape_player", tape_player ? "true" : "false");
     nvs_set_str(buf,"real_player", real_player ? "true" : "false");
