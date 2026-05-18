@@ -406,13 +406,11 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     }
 
     // Kempston Joystick
-    // Standard Kempston decodes A5=0 (so port 0x1F catches 0x00..0x1F).
-    // Non-standard kempstonPort values (0x37, 0x5F) use exact low-byte match.
+    // Standard Kempston decodes A5=0 — always honored so games like Dizzy
+    // that read port 0x1F keep working even when an alternate kempstonPort
+    // (0x37, 0x5F) is selected for boards that also map joystick reads there.
     if (Config::joystick == JOY_KEMPSTON) {
-      bool kempston_hit = (Config::kempstonPort == 0x1F)
-                              ? ((p8 & 0x20) == 0)
-                              : (p8 == Config::kempstonPort);
-      if (kempston_hit)
+      if (((p8 & 0x20) == 0) || (p8 == Config::kempstonPort))
         return ia ? (port[Config::kempstonPort] ^ 0xA0)
                   : port[Config::kempstonPort];
     }
@@ -706,17 +704,17 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // Ports: 0x00FF/0x01FF (original), 0x04FF/0x05FF (Light/Middle revisions)
     //        0x00FE/0x01FE (FPGA48all.tap and some other programs use a8=0xFE)
     // Accessible only when TR-DOS ROM is NOT mapped (DOS/ = 1)
-    if (ESPectrum::SAA_emu && !ESPectrum::trdos && (a8 == 0xFF)) {
+    if (ESPectrum::SAA_emu && saaChip && !ESPectrum::trdos && (a8 == 0xFF)) {
       if (address & 0x0100) {
         // Register select (bit 8 set): 0x01FF, 0x05FF, etc.
         // Generate samples before selectRegister — it advances external envelope clock
         if (Tape::tapeStatus != TAPE_LOADING) ESPectrum::SAAGetSample();
-        saaChip.selectRegister(data);
+        saaChip->selectRegister(data);
         return;
       } else {
         // Data write (bit 8 clear): 0x00FF, 0x04FF, etc.
         if (Tape::tapeStatus != TAPE_LOADING) ESPectrum::SAAGetSample();
-        saaChip.setRegisterData(data);
+        saaChip->setRegisterData(data);
         return;
       }
     }

@@ -73,7 +73,7 @@ struct input_bits_t {
 };
 
 input_bits_t gamepad1_bits = { false, false, false, false, false, false, false, false };
-static input_bits_t gamepad2_bits = { false, false, false, false, false, false, false, false };
+input_bits_t gamepad2_bits = { false, false, false, false, false, false, false, false };
 
 uint8_t nes_pad2_for_alf(void) {
     input_bits_t& bits = Config::secondJoy != 1 ? gamepad2_bits : gamepad1_bits;
@@ -366,14 +366,14 @@ extern "C" bool handleScancode(const uint32_t ps2scancode) {
 // gamepad1_bits.X set by the USB pad, decide it's a release, and push a
 // ghost release. The USB pad next callback would then see gamepad1_bits.X
 // reset and push a duplicate press → button stuck.
-static uint8_t nespad_prev_state = 0;
+static uint32_t nespad_prev_state = 0;
 
 static void nespad_tick1(void) {
     nespad_read();
-    uint8_t cur = nespad_state;
-    uint8_t prev = nespad_prev_state;
-    uint8_t pressed  = cur & ~prev;   // 0->1 transitions
-    uint8_t released = ~cur & prev;   // 1->0 transitions
+    uint32_t cur = nespad_state;
+    uint32_t prev = nespad_prev_state;
+    uint32_t pressed  = cur & ~prev;   // 0->1 transitions
+    uint32_t released = ~cur & prev;   // 1->0 transitions
     nespad_prev_state = cur;
     if (!pressed && !released) return;
 

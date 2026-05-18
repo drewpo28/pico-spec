@@ -41,6 +41,7 @@ visit https://zxespectrum.speccy.org/contacto
 
 #include "OSDMain.h"
 #include "FileUtils.h"
+#include "Subsystem.h"
 #include "CPU.h"
 #include "Video.h"
 #include "ESPectrum.h"
@@ -76,6 +77,24 @@ extern "C" void graphics_set_dither(bool enabled);
 
 #include <string>
 #include <cstdio>
+
+#if USE_NESPAD
+#include "nespad.h"
+#else
+static const uint32_t nespad_state = 0, nespad_state2 = 0;
+#endif
+struct input_bits_t {
+  bool a: true;
+  bool b: true;
+  bool select: true;
+  bool start: true;
+  bool right: true;
+  bool left: true;
+  bool up: true;
+  bool down: true;
+};
+extern input_bits_t gamepad1_bits;
+extern input_bits_t gamepad2_bits;
 
 extern "C" uint8_t TFT_FLAGS;
 extern "C" uint8_t TFT_INVERSION;
@@ -236,6 +255,7 @@ IRAM_ATTR void OSD::click() {
 }
 void close_all(void);
 void OSD::esp_hard_reset() {
+    Debug::log("esp_hard_reset called from %p", __builtin_return_address(0));
     if (Config::audio_driver == 3) send_to_595(LOW(AY_Enable));
     close_all();
     watchdog_enable(1, true);
@@ -681,31 +701,24 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
     }
 
 #ifdef VGA_HDMI
+    // Mode switches require a hard reset — heap fragmentation breaks runtime
+    // framebuffer grow. Save the *old* vm to pending (loaded after reboot for
+    // the rollback confirmation), write the new vm to main config, then reset.
     if (hkIdx == Config::HK_VIDMODE_60) { // HDMI 60Hz
         uint8_t &vm = SELECT_VGA ? Config::vga_video_mode : Config::hdmi_video_mode;
         if (vm == Config::VM_640x480_60) return;
-        uint8_t saved_vm = vm;
+        Config::savePendingVideoMode(); // captures old vm
         vm = Config::VM_640x480_60;
         Config::save();
-        VIDEO::changeMode();
-        if (!videoModeConfirm(10)) {
-            vm = saved_vm;
-            Config::save();
-            VIDEO::changeMode();
-        }
+        esp_hard_reset();
     } else
     if (hkIdx == Config::HK_VIDMODE_50) { // HDMI 50Hz
         uint8_t &vm = SELECT_VGA ? Config::vga_video_mode : Config::hdmi_video_mode;
         if (vm == Config::VM_640x480_50) return;
-        uint8_t saved_vm = vm;
+        Config::savePendingVideoMode(); // captures old vm
         vm = Config::VM_640x480_50;
         Config::save();
-        VIDEO::changeMode();
-        if (!videoModeConfirm(10)) {
-            vm = saved_vm;
-            Config::save();
-            VIDEO::changeMode();
-        }
+        esp_hard_reset();
     } else
 #endif
     if (hkIdx == Config::HK_HW_INFO) { // Show mem info
@@ -1804,22 +1817,22 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             else if (dsk_num == 6) {
                                 // Disk Sound & LED
                                 menu_level = 3;
-                                menu_curopt = 1;
+                                menu_curopt = Config::trdosSoundLed + 1;
                                 menu_saverect = true;
                                 while (1) {
                                     string menu = MENU_SOUNDLED[Config::lang];
-                                    menu += MENU_YESNO[Config::lang];
-                                    uint8_t prev = Config::trdosSoundLed;
-                                    if (prev) {
-                                        menu.replace(menu.find("[Y",0),2,"[*");
-                                        menu.replace(menu.find("[N",0),2,"[ ");
-                                    } else {
-                                        menu.replace(menu.find("[Y",0),2,"[ ");
-                                        menu.replace(menu.find("[N",0),2,"[*");
+                                    menu += MENU_SOUNDLED_SEL[Config::lang];
+                                    int mpos = -1;
+                                    int idx = 0;
+                                    while ((mpos = menu.find("[ ]", mpos + 1)) != (int)string::npos) {
+                                        if (idx == Config::trdosSoundLed)
+                                            menu.replace(mpos, 3, "[*]");
+                                        idx++;
                                     }
+                                    uint8_t prev = Config::trdosSoundLed;
                                     uint8_t opt2 = menuRun(menu);
                                     if (opt2) {
-                                        Config::trdosSoundLed = (opt2 == 1);
+                                        Config::trdosSoundLed = opt2 - 1;
                                         if (Config::trdosSoundLed != prev)
                                             Config::save();
                                         menu_curopt = opt2;
@@ -2127,24 +2140,24 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                             }
                             else if (Config::mb02 && mb02_num == 6) {
-                                // Sound & LED toggle.
+                                // Sound & LED selector: Off / LED / Sound / Sound+LED.
                                 menu_level = 3;
-                                menu_curopt = 1;
+                                menu_curopt = Config::mb02SoundLed + 1;
                                 menu_saverect = true;
                                 while (1) {
                                     string menu = MENU_SOUNDLED[Config::lang];
-                                    menu += MENU_YESNO[Config::lang];
-                                    uint8_t prev = Config::mb02SoundLed;
-                                    if (prev) {
-                                        menu.replace(menu.find("[Y",0),2,"[*");
-                                        menu.replace(menu.find("[N",0),2,"[ ");
-                                    } else {
-                                        menu.replace(menu.find("[Y",0),2,"[ ");
-                                        menu.replace(menu.find("[N",0),2,"[*");
+                                    menu += MENU_SOUNDLED_SEL[Config::lang];
+                                    int mpos = -1;
+                                    int idx = 0;
+                                    while ((mpos = menu.find("[ ]", mpos + 1)) != (int)string::npos) {
+                                        if (idx == Config::mb02SoundLed)
+                                            menu.replace(mpos, 3, "[*]");
+                                        idx++;
                                     }
+                                    uint8_t prev = Config::mb02SoundLed;
                                     uint8_t opt2 = menuRun(menu);
                                     if (opt2) {
-                                        Config::mb02SoundLed = (opt2 == 1);
+                                        Config::mb02SoundLed = opt2 - 1;
                                         if (Config::mb02SoundLed != prev)
                                             Config::save();
                                         menu_curopt = opt2;
@@ -2450,6 +2463,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::turbosound = opt2 - 1;
                                     if (Config::turbosound != prev) {
                                         Config::save();
+                                        TurboSubsys::request(Config::turbosound != 0);
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -2485,6 +2499,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::covox = opt2 - 1;
                                     if (Config::covox != prev) {
                                         Config::save();
+                                        CovoxSubsys::request(Config::covox != 0);
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -2528,6 +2543,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             OSD::osdCenteredMsg("Timex disabled", LEVEL_WARN, 2000);
                                         }
                                         Config::save();
+                                        SaaSubsys::request(Config::SAA1099);
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -2559,6 +2575,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         if (Midi::enabled)
                                             Midi::init();
                                         Config::save();
+                                        MidiSubsys::request(Config::midi != 0);
 #if defined(MIDI_TX_PIN) && defined(LOAD_WAV_PIO) && (LOAD_WAV_PIO == MIDI_TX_PIN)
                                         if ((Config::midi == 1 || Config::midi == 2) && Config::real_player)
                                             osdCenteredMsg(MSG_MIDI_PIN_CONFLICT[Config::lang], LEVEL_WARN, 3000);
@@ -2743,22 +2760,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 if (opt2) {
                                     uint8_t new_vm = opt2 - 1; // opt2 is 1-based, VM_* is 0-based
                                     if (new_vm != curVideoMode) {
-                                        uint8_t saved_vm = curVideoMode;
+                                        // Save old vm as pending for post-reboot rollback confirmation,
+                                        // then commit new vm and hard reset — runtime FB resize is
+                                        // unreliable due to heap fragmentation.
+                                        Config::savePendingVideoMode();
                                         curVideoMode = new_vm;
                                         Config::save();
-#ifdef VGA_HDMI
-                                        VIDEO::changeMode();
-                                        if (!videoModeConfirm(10)) {
-                                            // Rollback
-                                            curVideoMode = saved_vm;
-                                            Config::save();
-                                            VIDEO::changeMode();
-                                        }
-                                        // Exit OSD after mode switch
-                                        return;
-#else
                                         OSD::esp_hard_reset();
-#endif
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -3001,6 +3009,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             VIDEO::gigascreen_auto_countdown = 0;
                                         }
                                         Config::save();
+#if !PICO_RP2040
+                                        // Free 52 KB prev framebuffer when disabling.
+                                        GsSubsys::request(Config::gigascreen_enabled);
+#endif
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -7254,12 +7266,13 @@ size_t getContiguousHeap(void) {
 }
 
 // Generic read-only text dialog with vertical scroll
-void OSD::showTextDialog(const char* title, const char* text) {
-    click();
-
-    unsigned short sx = scrAlignCenterX(OSD_W);
-    unsigned short sy = scrAlignCenterY(OSD_H);
-    VIDEO::SaveRect.save(sx, sy, OSD_W, OSD_H);
+void OSD::showTextDialog(const char* title, const char* text, bool blocking, int* scroll_state) {
+    if (blocking) {
+        click();
+        unsigned short sx = scrAlignCenterX(OSD_W);
+        unsigned short sy = scrAlignCenterY(OSD_H);
+        VIDEO::SaveRect.save(sx, sy, OSD_W, OSD_H);
+    }
 
     // Parse text into line pointers (zero-copy: index into original text)
     const int MAX_DLGLINES = 64;
@@ -7280,7 +7293,8 @@ void OSD::showTextDialog(const char* title, const char* text) {
     const int visCols = osdMaxCols();
     // rows: 0=OSD_TITLE, 1=title, 2=separator, ... last=OSD_BOTTOM → content rows = maxRows-4
     const int visRows = osdMaxRows() - 4;
-    int scroll = 0;
+    int scroll_local = 0;
+    int& scroll = scroll_state ? *scroll_state : scroll_local;
     bool needRedraw = true;
 
     auto drawContent = [&]() {
@@ -7340,19 +7354,17 @@ void OSD::showTextDialog(const char* title, const char* text) {
     };
 
     fabgl::VirtualKeyItem Nextkey;
-
-    while (1) {
+    do {
         if (needRedraw) {
             drawContent();
             needRedraw = false;
         }
-
-        while (!ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable())
-            sleep_ms(5);
-
+        if (!ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
+            if (blocking) { sleep_ms(5); continue; }
+            else break;  // очередь пуста — выходим, caller сам перерисует позже
+        }
         ESPectrum::PS2Controller.keyboard()->getNextVirtualKey(&Nextkey);
         if (!Nextkey.down) continue;
-
         if (is_enter(Nextkey.vk) || is_back(Nextkey.vk)) {
             click();
             break;
@@ -7367,9 +7379,8 @@ void OSD::showTextDialog(const char* title, const char* text) {
         } else if (Nextkey.vk == fabgl::VK_PAGEDOWN) {
             scroll += visRows; if (scroll > maxScroll) scroll = maxScroll; needRedraw = true;
         }
-    }
-
-    VIDEO::SaveRect.restore_last();
+    } while(blocking);
+    if (blocking) VIDEO::SaveRect.restore_last();
 }
 
 void OSD::HWInfo() {
@@ -8056,21 +8067,102 @@ extern "C" int hid_app_format_devices_info(char* buf, int bufsz);
 extern "C" int xinput_app_format_devices_info(char* buf, int bufsz);
 
 void OSD::HIDDevices() {
+    extern int hid_app_format_devices_info(char* buf, int bufsz);
+    extern int xinput_app_format_devices_info(char* buf, int bufsz);
+
     char (&buf)[OSD_INFO_BUF_SZ] = osd_info_buf;
-    buf[0] = '\0';
-    int xpos = xinput_app_format_devices_info(buf, sizeof(buf));
-    if (xpos < 0) xpos = 0;
-    if (xpos >= (int)sizeof(buf)) xpos = sizeof(buf) - 1;
-    buf[xpos] = '\0';
-    int hpos = hid_app_format_devices_info(buf + xpos, sizeof(buf) - xpos);
-    if (hpos < 0) hpos = 0;
-    if (xpos + hpos >= (int)sizeof(buf)) hpos = sizeof(buf) - xpos - 1;
-    buf[xpos + hpos] = '\0';
-    if (xpos == 0 && hpos == 0) {
-        snprintf(buf, sizeof(buf),
-            "No HID/XInput devices.\n\nPlug in a USB device\nand reopen this dialog.\n");
+
+    unsigned short sx = scrAlignCenterX(OSD_W);
+    unsigned short sy = scrAlignCenterY(OSD_H);
+    VIDEO::SaveRect.save(sx, sy, OSD_W, OSD_H);
+
+    fabgl::VirtualKeyItem Nextkey;
+    uint32_t last_draw = 0;
+    int hid_scroll = 0;
+
+    bool down = false;
+    while (true) {
+        // Non-blocking key check
+        if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
+            ESPectrum::PS2Controller.keyboard()->getNextVirtualKey(&Nextkey);
+            if (down && !Nextkey.down && (is_enter(Nextkey.vk) || is_back(Nextkey.vk))) {
+                click();
+                break;
+            }
+            if (Nextkey.down) {
+                down = (is_enter(Nextkey.vk) || is_back(Nextkey.vk));
+                if (Nextkey.vk == fabgl::VK_UP || Nextkey.vk == fabgl::VK_DOWN || Nextkey.vk == fabgl::VK_PAGEUP || Nextkey.vk == fabgl::VK_PAGEDOWN) {
+                    ESPectrum::PS2Controller.keyboard()->injectVirtualKey(Nextkey.vk, true);
+                }
+                last_draw = 0; // forse redraw
+            }
+        }
+
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if (now - last_draw < 1000) {
+            sleep_ms(5);
+            continue;
+        }
+        last_draw = now;
+
+        buf[0] = '\0';
+        int xpos = xinput_app_format_devices_info(buf, sizeof(buf));
+        if (xpos < 0) xpos = 0;
+        buf[xpos] = '\0';
+        int hpos = hid_app_format_devices_info(buf + xpos, sizeof(buf) - xpos);
+        if (hpos < 0) hpos = 0;
+        buf[xpos + hpos] = '\0';
+        if (xpos == 0 && hpos == 0)
+            snprintf(buf, sizeof(buf), "No HID/XInput devices.\n");
+#ifdef USE_NESPAD
+        int used = (xpos + hpos > 0) ? xpos + hpos : (int)strlen(buf);
+        snprintf(buf + used, sizeof(buf) - used,
+            "NES1: %c%c%c%c %c%c%c%c %c%c%c%c\n"
+            "NES2: %c%c%c%c %c%c%c%c %c%c%c%c\n"
+            "joy1: U%d D%d L%d R%d  A%d B%d St%d Se%d\n"
+            "joy2: U%d D%d L%d R%d  A%d B%d St%d Se%d\n",
+            // NES1
+            (nespad_state & DPAD_UP)     ? 'U' : '.',
+            (nespad_state & DPAD_DOWN)   ? 'D' : '.',
+            (nespad_state & DPAD_LEFT)   ? 'L' : '.',
+            (nespad_state & DPAD_RIGHT)  ? 'R' : '.',
+            (nespad_state & DPAD_A)      ? 'A' : '.',
+            (nespad_state & DPAD_B)      ? 'B' : '.',
+            (nespad_state & DPAD_X)      ? 'X' : '.',
+            (nespad_state & DPAD_Y)      ? 'Y' : '.',
+            (nespad_state & DPAD_LT)     ? '<' : '.',
+            (nespad_state & DPAD_RT)     ? '>' : '.',
+            (nespad_state & DPAD_START)  ? 'S' : '.',
+            (nespad_state & DPAD_SELECT) ? 's' : '.',
+            // NES2
+            (nespad_state2 & DPAD_UP)     ? 'U' : '.',
+            (nespad_state2 & DPAD_DOWN)   ? 'D' : '.',
+            (nespad_state2 & DPAD_LEFT)   ? 'L' : '.',
+            (nespad_state2 & DPAD_RIGHT)  ? 'R' : '.',
+            (nespad_state2 & DPAD_A)      ? 'A' : '.',
+            (nespad_state2 & DPAD_B)      ? 'B' : '.',
+            (nespad_state2 & DPAD_X)      ? 'X' : '.',
+            (nespad_state2 & DPAD_Y)      ? 'Y' : '.',
+            (nespad_state2 & DPAD_LT)     ? '<' : '.',
+            (nespad_state2 & DPAD_RT)     ? '>' : '.',
+            (nespad_state2 & DPAD_START)  ? 'S' : '.',
+            (nespad_state2 & DPAD_SELECT) ? 's' : '.',
+            // gamepad1_bits
+            (int)gamepad1_bits.up,    (int)gamepad1_bits.down,
+            (int)gamepad1_bits.left,  (int)gamepad1_bits.right,
+            (int)gamepad1_bits.a,     (int)gamepad1_bits.b,
+            (int)gamepad1_bits.start, (int)gamepad1_bits.select,
+            // gamepad2_bits
+            (int)gamepad2_bits.up,    (int)gamepad2_bits.down,
+            (int)gamepad2_bits.left,  (int)gamepad2_bits.right,
+            (int)gamepad2_bits.a,     (int)gamepad2_bits.b,
+            (int)gamepad2_bits.start, (int)gamepad2_bits.select
+        );
+#endif
+        showTextDialog(Config::lang ? "Disp. HID live" : "HID devices (live)", buf, false, &hid_scroll);
     }
-    showTextDialog(Config::lang ? "Disp. HID" : "HID devices", buf);
+
+    VIDEO::SaveRect.restore_last();
 }
 
 static void __not_in_flash_func(flash_block)(const uint8_t* buffer, size_t flash_target_offset) {

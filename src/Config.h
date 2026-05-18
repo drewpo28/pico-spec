@@ -200,7 +200,7 @@ public:
     static bool StartMsg;    
 
     static bool trdosFastMode;
-    static bool trdosSoundLed;
+    static uint8_t trdosSoundLed; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
     static uint8_t trdosBios; // 0=5.03, 1=5.04TM, 2=5.05D
     static bool driveWP[4];   // TR-DOS per-slot write protect (Drive A..D)
 #if !PICO_RP2040
@@ -210,7 +210,7 @@ public:
     static string esxdos_hdf_image[2];
     static uint8_t mb02;     // 0=OFF 1=ON (MB-02+ disk interface, mutually exclusive with TR-DOS/DivMMC)
     static bool mb02WP[4];   // MB-02+ per-slot write protect
-    static bool mb02SoundLed;// MB-02+ disk sound & LED
+    static uint8_t mb02SoundLed;// MB-02+ disk sound & LED: 0=Off, 1=Led, 2=Sound, 3=Sound+Led
     static bool zcontroller; // Z-Controller SD on ports 0x77/0x57 (mutually exclusive with esxDOS/MB-02+)
 #endif
     

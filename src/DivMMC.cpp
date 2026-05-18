@@ -3,6 +3,7 @@
 #if !PICO_RP2040
 
 #include <cstring>
+#include <stdlib.h>
 #include "MemESP.h"
 #include "Config.h"
 #include "Debug.h"
@@ -50,11 +51,11 @@ uint8_t DivMMC::ide_cylinder_hi = 0;
 uint8_t DivMMC::ide_head = 0;
 uint8_t DivMMC::ide_status = 0;
 uint8_t DivMMC::ide_error = 0;
-uint8_t DivMMC::ide_buffer[512];
+uint8_t* DivMMC::ide_buffer = nullptr;
 int DivMMC::ide_data_index = -1;
 bool DivMMC::ide_data_write = false;
 uint32_t DivMMC::ide_hdf_data_offset[2] = {128, 128};
-uint8_t DivMMC::ide_identity[2][106];
+uint8_t (*DivMMC::ide_identity)[106] = nullptr;
 uint16_t DivMMC::ide_cylinders[2] = {0, 0};
 uint16_t DivMMC::ide_heads[2] = {0, 0};
 uint16_t DivMMC::ide_sectors[2] = {0, 0};
@@ -75,7 +76,7 @@ int DivMMC::mmc_ocr_index = -1;
 uint32_t DivMMC::mmc_read_address = 0;
 uint32_t DivMMC::mmc_write_address = 0;
 
-uint8_t DivMMC::mmc_sector_buf[512];
+uint8_t* DivMMC::mmc_sector_buf = nullptr;
 uint32_t DivMMC::mmc_sector_buf_addr = 0xFFFFFFFF;
 bool DivMMC::mmc_sector_dirty = false;
 
@@ -96,6 +97,23 @@ void DivMMC::init() {
     enabled = (Config::esxdos != 0);
     divsd_mode = (Config::esxdos == 3);
     divide_mode = (Config::esxdos == 2);
+
+    // Allocate misc state buffers on first enable. Owned by DivMmcSubsys;
+    // freed only on full disable path below if all bank caches are also gone.
+    if (enabled) {
+        if (!mmc_sector_buf) mmc_sector_buf = (uint8_t*)calloc(512, 1);
+        if (!ide_buffer)     ide_buffer     = (uint8_t*)calloc(512, 1);
+        if (!ide_identity)   ide_identity   = (uint8_t(*)[106])calloc(2 * 106, 1);
+        if (!mmc_sector_buf || !ide_buffer || !ide_identity) {
+            Debug::log("DivMMC: OOM (misc buffers)");
+            free(mmc_sector_buf); mmc_sector_buf = nullptr;
+            free(ide_buffer);     ide_buffer     = nullptr;
+            free(ide_identity);   ide_identity   = nullptr;
+            enabled = false;
+            Config::esxdos = 0;
+            return;
+        }
+    }
 
     // Free previous allocations if switching modes or disabling
     if (!enabled) {

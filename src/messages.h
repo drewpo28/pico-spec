@@ -432,6 +432,17 @@ static const char *MENU_IMG_TITLE[2] = { "esxDOS Image\n", "Imagen esxDOS\n" };
 
 static const char *MENU_FASTMODE[2] = { "Fast Mode\n", "Modo rápido\n" };
 static const char *MENU_SOUNDLED[2] = { "Sound & LED\n", "Sonido y LED\n" };
+#define MENU_SOUNDLED_SEL_EN \
+    "Off\t[ ]\n"\
+    "LED\t[ ]\n"\
+    "Sound\t[ ]\n"\
+    "Sound+LED\t[ ]\n"
+#define MENU_SOUNDLED_SEL_ES \
+    "Off\t[ ]\n"\
+    "LED\t[ ]\n"\
+    "Sonido\t[ ]\n"\
+    "Sonido+LED\t[ ]\n"
+static const char *MENU_SOUNDLED_SEL[2] = { MENU_SOUNDLED_SEL_EN, MENU_SOUNDLED_SEL_ES };
 static const char *MENU_NMI_TITLE[2] = { "NMI\n", "NMI\n" };
 #define MENU_NMI_EN "NMI\n" "Magic Button\n"
 #define MENU_NMI_ES "NMI\n" "Magic Button\n"

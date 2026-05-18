@@ -35,6 +35,7 @@ visit https://zxespectrum.speccy.org/contacto
 
 #include "Video.h"
 #include "Debug.h"
+#include "Subsystem.h"
 #include "Tape.h"
 #include "FileUtils.h"
 #include "VidPrecalc.h"
@@ -855,16 +856,13 @@ void VIDEO::vgataskinit(void *unused) {
 ///TaskHandle_t VIDEO::videoTaskHandle;
 
 #if !PICO_RP2040
-// Shared framebuffer data block — allocated once at boot for max resolution (360x288).
-// Both main FB and prevFB (Gigascreen) live in the same contiguous block.
-// changeMode() reconfigures pointer arrays without any alloc/free.
-#define FB_MAX_LINES 289   // calcLines(288)
-#define FB_MAX_STRIDE 360
-#define FB_MAX_SIZE (FB_MAX_LINES * FB_MAX_STRIDE)  // 104,040 bytes per FB
-// prevFrameBuffer stores only lower 4 bits of palette index per pixel
-// (Gigascreen blendLUT only uses prev & 0x0F). Pack 2 px per byte → half size.
-#define FB_PREV_STRIDE (FB_MAX_STRIDE / 2)
-#define FB_PREV_SIZE (FB_MAX_LINES * FB_PREV_STRIDE)  // 52,020 bytes
+// Shared framebuffer pointer arrays sized for the build-time maximum line count
+// so they don't need realloc on mode changes. The actual data blocks
+// (sharedFB_main / sharedFB_prev) are sized to fit the current mode — see
+// ensureMainFB / ensurePrevFB.
+// prevFrameBuffer is 4-bit packed (2 px/byte): Gigascreen blendLUT only uses
+// prev & 0x0F, so the upper nibble is free for the next pixel.
+#define FB_MAX_LINES 289   // calcLines(288), the largest mode (360x288)
 
 static int fbCalcLines(int count) {
     if (count == 288) return 289;
@@ -874,18 +872,134 @@ static int fbCalcLines(int count) {
     return count;
 }
 
-static uint8_t *sharedFB_block = nullptr;
-static void **sharedFB_arr1 = nullptr;  // pointer array for frameBuffer
-static void **sharedFB_arr2 = nullptr;  // pointer array for prevFrameBuffer
+// Two separate blocks: main FB (always present) and prev FB (Gigascreen only).
+// Splitting them lets GsSubsys free up to 52 020 B of SRAM when Gigascreen is off.
+// Each block is sized to fit the current video mode, not the build-time maximum,
+// and grown/shrunk via realloc on mode changes (see ensureMainFB/ensurePrevFB).
+static uint8_t *sharedFB_main = nullptr;  // sized for current mode
+static uint8_t *sharedFB_prev = nullptr;  // sized for current mode (Gigascreen only)
+static size_t sharedFB_main_size = 0;     // actual byte capacity of sharedFB_main
+static size_t sharedFB_prev_size = 0;     // actual byte capacity of sharedFB_prev
+static void **sharedFB_arr1 = nullptr;    // pointer array for frameBuffer (FB_MAX_LINES slots)
+static void **sharedFB_arr2 = nullptr;    // pointer array for prevFrameBuffer
+
+// Cached current resolution so GsSubsys can re-call setupSharedFBPointers
+// without reaching back into vidmodes[].
+static int sharedFB_lines = 0;
+static int sharedFB_stride = 0;
+
+static inline size_t fbMainBytes(int lines, int stride) {
+    return (size_t)lines * (size_t)stride;
+}
+static inline size_t fbPrevBytes(int lines, int stride) {
+    return (size_t)lines * (size_t)(stride / 2);  // 4-bit packed: 2 px/byte
+}
+
+extern size_t getContiguousHeap(void);
+
+// Minimum heap headroom before calling FatFS f_open. ff_memalloc reserves
+// (FF_MAX_LFN+1)*2 + MAXDIRB(FF_MAX_LFN) ≈ 1-2 KB for LFN/VFAT scratch. SDK
+// malloc panics on OOM (no NULL return), so we must gate this with sbrk
+// headroom (the only allocator-friendly free-memory measure).
+#define FF_OPEN_HEAP_FLOOR 4096u
+
+// FB allocation happens once at boot via these. Mode-change runtime resize
+// was removed because heap fragmentation made grow impossible — switching
+// video modes now triggers a hard reset (see Config::pending_vga/hdmi mode).
+static bool ensureMainFB(int lines, int stride) {
+    size_t want = fbMainBytes(lines, stride);
+    if (sharedFB_main && sharedFB_main_size == want) return true;
+    if (sharedFB_main) { free(sharedFB_main); sharedFB_main = nullptr; sharedFB_main_size = 0; }
+    uint8_t *p = (uint8_t*)malloc(want);
+    if (!p) return false;
+    memset(p, 0, want);
+    sharedFB_main = p;
+    sharedFB_main_size = want;
+    return true;
+}
+
+static bool ensurePrevFB(int lines, int stride) {
+    size_t want = fbPrevBytes(lines, stride);
+    if (sharedFB_prev && sharedFB_prev_size == want) return true;
+    if (sharedFB_prev) { free(sharedFB_prev); sharedFB_prev = nullptr; sharedFB_prev_size = 0; }
+    uint8_t *p = (uint8_t*)malloc(want);
+    if (!p) return false;
+    memset(p, 0, want);
+    sharedFB_prev = p;
+    sharedFB_prev_size = want;
+    return true;
+}
 
 static void setupSharedFBPointers(Graphics<unsigned char> &vga, int lines, int stride) {
-    int prev_stride = stride / 2; // 4-bit packed
+    sharedFB_lines = lines;
+    sharedFB_stride = stride;
     for (int i = 0; i < lines; i++) {
-        sharedFB_arr1[i] = sharedFB_block + i * stride;
-        sharedFB_arr2[i] = sharedFB_block + FB_MAX_SIZE + i * prev_stride;
+        sharedFB_arr1[i] = sharedFB_main + i * stride;
     }
     vga.frameBuffer = (unsigned char **)sharedFB_arr1;
-    vga.prevFrameBuffer = (unsigned char **)sharedFB_arr2;
+    if (sharedFB_prev && sharedFB_arr2) {
+        int prev_stride = stride / 2; // 4-bit packed
+        for (int i = 0; i < lines; i++) {
+            sharedFB_arr2[i] = sharedFB_prev + i * prev_stride;
+        }
+        vga.prevFrameBuffer = (unsigned char **)sharedFB_arr2;
+    } else {
+        vga.prevFrameBuffer = nullptr;
+    }
+}
+
+// GsSubsys storage and apply() — implemented here so it can touch the
+// sharedFB_* internals directly. Declared in Subsystem.h.
+volatile bool GsSubsys::enabled = false;
+bool GsSubsys::wanted = false;
+bool GsSubsys::dirty = false;
+
+void GsSubsys::request(bool on) {
+    wanted = on;
+    if (wanted != enabled) dirty = true;
+}
+
+bool GsSubsys::apply() {
+    dirty = false;
+    if (wanted == enabled) return true;
+
+    if (wanted) {
+        // Size prev FB to the *current* mode (sharedFB_lines × sharedFB_stride),
+        // not the build-time max. Saves SRAM at lower resolutions.
+        if (!ensurePrevFB(sharedFB_lines, sharedFB_stride)) {
+            wanted = false;
+            Config::gigascreen_enabled = false;
+            VIDEO::gigascreen_enabled = false;
+            return false;
+        }
+        if (!sharedFB_arr2) {
+            sharedFB_arr2 = (void**)malloc(FB_MAX_LINES * sizeof(void*));
+            if (!sharedFB_arr2) {
+                free(sharedFB_prev); sharedFB_prev = nullptr; sharedFB_prev_size = 0;
+                wanted = false;
+                Config::gigascreen_enabled = false;
+                VIDEO::gigascreen_enabled = false;
+                return false;
+            }
+        }
+        // Re-derive prev pointer array from the current resolution.
+        int prev_stride = sharedFB_stride / 2;
+        for (int i = 0; i < sharedFB_lines; i++) {
+            sharedFB_arr2[i] = sharedFB_prev + i * prev_stride;
+        }
+        VIDEO::vga.prevFrameBuffer = (unsigned char**)sharedFB_arr2;
+        enabled = true;
+    } else {
+        // Drop pointer first so render path stops accessing prevFrameBuffer.
+        // Producers (renderers) check vga.prevFrameBuffer != nullptr before use
+        // (see MainScreen_Snow*); border path already had a null-guard.
+        VIDEO::vga.prevFrameBuffer = nullptr;
+        enabled = false;
+        free(sharedFB_arr2);  sharedFB_arr2  = nullptr;
+        free(sharedFB_prev);  sharedFB_prev  = nullptr;
+        sharedFB_prev_size = 0;
+    }
+    return true;
 }
 #endif
 
@@ -906,28 +1020,29 @@ void VIDEO::Init() {
     vga.useInterrupt_flag = false;
 
 #if !PICO_RP2040
-    // Allocate shared data block for main + prev framebuffers at max resolution
-    // BEFORE vga.init() — while heap is still unfragmented (full MEM_REMAIN available).
-    // The block is never freed; changeMode() only reconfigures pointer arrays.
-    if (!sharedFB_block) {
-        sharedFB_block = (uint8_t *)malloc((FB_MAX_SIZE + FB_PREV_SIZE));
-        if (sharedFB_block) {
-            memset(sharedFB_block, 0, (FB_MAX_SIZE + FB_PREV_SIZE));
-            sharedFB_arr1 = (void **)malloc(FB_MAX_LINES * sizeof(void *));
-            sharedFB_arr2 = (void **)malloc(FB_MAX_LINES * sizeof(void *));
-            if (!sharedFB_arr1 || !sharedFB_arr2) {
-                free(sharedFB_block); sharedFB_block = nullptr;
-                free(sharedFB_arr1); sharedFB_arr1 = nullptr;
-                free(sharedFB_arr2); sharedFB_arr2 = nullptr;
-            }
-        }
+    // Allocate the main framebuffer block sized for the *initial* mode BEFORE
+    // vga.init() — while heap is still unfragmented. It can be realloc'd later
+    // on changeMode (see ensureMainFB). The prev block (Gigascreen) is allocated
+    // on demand by GsSubsys, also sized for the current mode.
+    int initLines = fbCalcLines(
+        vidmodes[Mode][vmodeproperties::vRes] / vidmodes[Mode][vmodeproperties::vDiv]);
+    int initStride = (vidmodes[Mode][vmodeproperties::hRes] + 3) & ~3;
+    if (!sharedFB_arr1) {
+        sharedFB_arr1 = (void **)malloc(FB_MAX_LINES * sizeof(void *));
     }
-    if (sharedFB_block) {
-        int lines = fbCalcLines(
-            vidmodes[Mode][vmodeproperties::vRes] / vidmodes[Mode][vmodeproperties::vDiv]);
-        int stride = (vidmodes[Mode][vmodeproperties::hRes] + 3) & ~3;
-        setupSharedFBPointers(vga, lines, stride);
+    if (sharedFB_arr1 && ensureMainFB(initLines, initStride)) {
+        setupSharedFBPointers(vga, initLines, initStride);
         // frameBuffer is set — vga.init()'s allocateFrameBuffers() will skip allocation
+    } else {
+        // Out of memory for shared FB — fall back to legacy allocator path.
+        free(sharedFB_arr1); sharedFB_arr1 = nullptr;
+        free(sharedFB_main); sharedFB_main = nullptr; sharedFB_main_size = 0;
+    }
+    // Pre-allocate prev framebuffer if Gigascreen is enabled at boot,
+    // BEFORE the heap fragments.
+    if (sharedFB_main && Config::gigascreen_enabled) {
+        GsSubsys::request(true);
+        GsSubsys::apply();
     }
 #endif
 
@@ -984,14 +1099,17 @@ void VIDEO::changeMode() {
     bool sameDims = (vga.frameBuffer && vga.xres == newW && vga.yres == newH);
 
 #if !PICO_RP2040
-    // Shared block path: no alloc/free, just reconfigure pointers
-    if (sharedFB_block) {
+    // Shared block path: realloc to fit the new mode (saves SRAM at smaller
+    // resolutions; grows on the way up). Pointer arrays rebuilt afterwards.
+    if (sharedFB_main) {
         if (!sameDims) {
-            vga.frameBuffer = nullptr;  // blank output while reconfiguring
-            SaveRect.clear();
-            int lines = fbCalcLines(newH);
-            int stride = (newW + 3) & ~3;
-            setupSharedFBPointers(vga, lines, stride);
+            // Runtime resolution change is not supported — mode-switch callers
+            // savePendingVideoMode() then esp_hard_reset(). If we got here with
+            // a dim change anyway, refuse: heap fragmentation has no in-place
+            // remedy and a NULL frameBuffer would SIGBUS-storm the renderer.
+            Debug::log("changeMode: ignored runtime dim change %dx%d -> %dx%d",
+                       (int)vga.xres, (int)vga.yres, newW, newH);
+            return;
         }
     } else
 #endif
@@ -1064,7 +1182,7 @@ void VIDEO::changeMode() {
 
     // 4. Allocate framebuffer (non-shared path only)
 #if !PICO_RP2040
-    if (!sharedFB_block) {
+    if (!sharedFB_main) {
 #endif
         if (sameDims) {
             // frameBuffer already nulled above for non-shared; won't reach here for shared
@@ -1331,7 +1449,10 @@ extern size_t getContiguousHeap(void);
 #if !PICO_RP2040
 void VIDEO::InitPrevBuffer() {
     if (!vga.prevFrameBuffer) {
-        vga.prevFrameBuffer = vga.allocateFrameBuffer();
+        // Use the GsSubsys-managed prev buffer rather than a one-off
+        // allocateFrameBuffer() — keeps a single owner for the 52 KB block.
+        GsSubsys::request(true);
+        GsSubsys::apply();
     }
     if (!vga.prevFrameBuffer) return;
     const int h = VIDEO::vga.yres;
@@ -1356,9 +1477,11 @@ IRAM_ATTR void VIDEO::MainScreen_Blank(unsigned int statestoadd, bool contended)
     if (CPU::tstates >= tstateDraw) {
 
         if (brdChange) DrawBorder(); // Needed to avoid tearing in demos like Gabba (Pentagon)
-        
+
         lineptr32 = (uint32_t *)(vga.frameBuffer[linedraw_cnt]) + lineptr_offset;
-        prevLineptr16 = (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset;
+        prevLineptr16 = vga.prevFrameBuffer
+                          ? (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset
+                          : (uint16_t *)lineptr32;
 
         coldraw_cnt = 0;
 
@@ -1425,7 +1548,9 @@ IRAM_ATTR void VIDEO::MainScreen_Blank_Snow(unsigned int statestoadd, bool conte
         if (brdChange) DrawBorder();
 
         lineptr32 = (uint32_t *)(vga.frameBuffer[linedraw_cnt]) + lineptr_offset;
-        prevLineptr16 = (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset;
+        prevLineptr16 = vga.prevFrameBuffer
+                          ? (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset
+                          : (uint16_t *)lineptr32;
 
         coldraw_cnt = 0;
 
@@ -1489,7 +1614,9 @@ IRAM_ATTR void VIDEO::MainScreen_Blank_Snow_Opcode(bool contended) {
         if (brdChange) DrawBorder();
 
         lineptr32 = (uint32_t *)(vga.frameBuffer[linedraw_cnt]) + lineptr_offset;
-        prevLineptr16 = (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset;
+        prevLineptr16 = vga.prevFrameBuffer
+                          ? (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset
+                          : (uint16_t *)lineptr32;
 
         coldraw_cnt = 0;
 
@@ -2381,8 +2508,19 @@ void SaveRectT::save(int16_t x, int16_t y, int16_t w, int16_t h) {
         return;
     }
     if (FileUtils::fsMount) {
+        // FatFS f_open calls ff_memalloc() for LFN/VFAT buffers. SDK malloc
+        // panics on OOM (no NULL return), so reject before opening when the
+        // heap can't satisfy it. Bail to a dummy push — restore will redraw
+        // the underlying screen instead of crashing.
+        if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) {
+            offsets.push_back(off);
+            return;
+        }
         FIL f;
-        f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS);
+        if (f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) {
+            offsets.push_back(off); // open failed — dummy
+            return;
+        }
         f_lseek(&f, off);
         UINT bw;
         f_write(&f, &x, 2, &bw);
@@ -2460,8 +2598,17 @@ void SaveRectT::restore_last() {
         return;
     }
     if (FileUtils::fsMount) {
+        // f_open allocates LFN scratch — gate with heap floor; on shortage the
+        // dialog underneath just redraws on close (no restore happens).
+        if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) {
+            if (offsets.empty()) offsets.push_back(0);
+            return;
+        }
         FIL f;
-        f_open(&f, "/tmp/save_rect.tmp", FA_READ);
+        if (f_open(&f, "/tmp/save_rect.tmp", FA_READ) != FR_OK) {
+            if (offsets.empty()) offsets.push_back(0);
+            return;
+        }
         f_lseek(&f, off);
         UINT br;
         f_read(&f, &x, 2, &br);
@@ -2500,9 +2647,10 @@ void SaveRectT::store_ram(const void* p, size_t sz) {
         offsets.push_back(0);
     }
     size_t off = offsets.back();
+    if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) return; // skip — no LFN scratch room
     UINT bw;
     FIL f;
-    f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS);
+    if (f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) return;
     f_lseek(&f, off);
     f_write(&f, p, sz, &bw);
     f_close(&f);
@@ -2512,9 +2660,16 @@ void SaveRectT::restore_ram(void* p, size_t sz) {
     if (offsets.empty()) return;
     offsets.pop_back();
     size_t off = offsets.back();
+    if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) {
+        if (offsets.empty()) offsets.push_back(0);
+        return;
+    }
     UINT br;
     FIL f;
-    f_open(&f, "/tmp/save_rect.tmp", FA_READ);
+    if (f_open(&f, "/tmp/save_rect.tmp", FA_READ) != FR_OK) {
+        if (offsets.empty()) offsets.push_back(0);
+        return;
+    }
     f_lseek(&f, off);
     f_read(&f, p, sz, &br);
     f_close(&f);

@@ -95,7 +95,8 @@ const uint16_t SAASound::pdm_x4[8][16] = {
 };
 
 #if !PICO_RP2040
-SAASound saaChip;
+// saaChip lives in heap; managed by SaaSubsys (see Subsystem.cpp).
+SAASound* saaChip = nullptr;
 #endif
 
 SAASound::SAASound() {

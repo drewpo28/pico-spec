@@ -64,6 +64,7 @@ enum hid_handler_t : uint8_t {
   HID_HANDLER_F710_DINPUT,     // Logitech F710 D-input vendor handler
   HID_HANDLER_GP_2563_0575,    // 2563:0575 vendor handler
   HID_HANDLER_GP_FEED_2320,    // FEED:2320 vendor handler
+  HID_HANDLER_GP_0810_0001,    // 0810:0001 DragonRise/GameStick wireless
   HID_HANDLER_GENERIC_GAMEPAD, // tinyusb-parsed Joystick/Gamepad
   HID_HANDLER_GENERIC_CONS,    // Consumer control
   HID_HANDLER_NO_RPT_INFO,     // composite report id not found
@@ -177,6 +178,23 @@ static inline bool is_logitech_f710_dinput(uint16_t vid, uint16_t pid)
   return vid == 0x046D && pid == 0xC219;
 }
 
+// "Game Stick Lite" wireless 2.4GHz gamepad — DragonRise-based clone.
+// VID=0810, PID=0001. Composite HID: two interfaces (kbd + mouse boot
+// protocol), both carrying the same 8-byte joystick report.
+// Report layout (Report ID already stripped by process_generic_report):
+//   [0]    LX (0x80=center)
+//   [1]    LY (0x80=center)
+//   [2]    RX (0x80=center)
+//   [3]    RY (0x80=center)
+//   [4]    low-nibble  hat  (0=N,1=NE,2=E,3=SE,4=S,5=SW,6=W,7=NW, 0xF=neutral)
+//          high-nibble      X=0x10, A=0x20, B=0x40, Y=0x80
+//   [5]    L=0x01, R=0x02, LT=0x04, RT=0x08, SELECT=0x10, START=0x20
+//   [6]    (reserved / L3=0x01, R3=0x02 on some revisions)
+static inline bool is_gp_0810_0001(uint16_t vid, uint16_t pid)
+{
+  return vid == 0x0810 && pid == 0x0001;
+}
+
 struct input_bits_t {
   bool a: true;
   bool b: true;
@@ -203,6 +221,7 @@ static void process_ds5_gamepad(uint8_t instance, uint8_t const* report, uint16_
 static void process_f710_dinput(uint8_t instance, uint8_t const* report, uint16_t len);
 static void process_gp_2563_0575(uint8_t instance, uint8_t const* report, uint16_t len);
 static void process_gp_feed_2320(uint8_t instance, uint8_t const* report, uint16_t len);
+static void process_gp_0810_0001(uint8_t instance, uint8_t const* report, uint16_t len);
 
 //--------------------------------------------------------------------+
 // TinyUSB Callbacks
@@ -286,6 +305,17 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
     }
   }
 
+  // 0810:0001 announces boot kbd/mouse protocol but is a gamepad dongle.
+  // TinyUSB sends SET_PROTOCOL(BOOT) which makes the dongle go silent.
+  // Switch to report protocol so it starts sending HID reports.
+  if (is_gp_0810_0001(vid, pid)) {
+    if (itf_protocol != HID_ITF_PROTOCOL_NONE) {
+      tuh_hid_set_protocol(dev_addr, instance, HID_PROTOCOL_REPORT);
+      // tuh_hid_receive_report will be called below — that's fine,
+      // it will re-arm after set_protocol completes asynchronously.
+    }
+  }
+  
   // request to receive report
   // tuh_hid_report_received_cb() will be invoked when report is available
   if ( !tuh_hid_receive_report(dev_addr, instance) )
@@ -312,6 +342,26 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
 {
   uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
 
+  // 0810:0001 registers with boot kbd/mouse protocol but sends joystick
+  // reports — intercept before the boot-protocol switch.
+  if (is_gp_0810_0001(hid_info[instance].vid, hid_info[instance].pid)) {
+    // Update snap so OSD can show reports rx / last bytes
+    if (instance < CFG_TUH_HID && report && len) {
+      hid_snap_t& s = hid_snap[instance];
+      s.report_total++;
+      s.last_report_len = len;
+      uint16_t n = len < HID_SNAP_REPORT_BYTES ? len : HID_SNAP_REPORT_BYTES;
+      memcpy(s.last_report, report, n);
+      s.last_report_saved = (uint8_t)n;
+    }
+    if (len >= 8 && (report[0] == 0x01 || report[0] == 0x02)) {
+      process_gp_0810_0001(instance, report + 1, len - 1);
+    }
+    if (!tuh_hid_receive_report(dev_addr, instance))
+      printf("Error: cannot request to receive report\r\n");
+    return;
+  }
+  
   if (instance < CFG_TUH_HID && report && len) {
     hid_snap_t& s = hid_snap[instance];
     s.report_total++;
@@ -1042,6 +1092,112 @@ static void process_gp_feed_2320(uint8_t instance, uint8_t const* report, uint16
 }
 
 //--------------------------------------------------------------------+
+// "Game Stick Lite" 0810:0001 — DragonRise wireless clone.
+// Called with Report ID already stripped; payload is 7 bytes.
+//--------------------------------------------------------------------+
+static void process_gp_0810_0001(uint8_t instance, uint8_t const* report, uint16_t len)
+{
+    // Report layout (Report ID stripped, 7 bytes follow):
+    // [0] unused (0x80)
+    // [1] unused (0x80)
+    // [2] LX / crosspad X: 0x00=left, 0x80=center, 0xFF=right
+    // [3] LY / crosspad Y: 0x00=up,   0x80=center, 0xFF=down
+    // [4] high-nibble: R-stick+face (0x1=up/Y, 0x2=right/B, 0x4=down/A, 0x8=left/X)
+    //     low-nibble:  hat (0xF=neutral, unused since sticks cover directions)
+    // [5] LB=0x01, RB=0x02, LT=0x04, RT=0x08, Select=0x10, Start=0x20
+    // [6] reserved
+    if (len < 7) return;
+
+    uint8_t lx  = report[2];
+    uint8_t ly  = report[3];
+    uint8_t b4  = report[4];
+    uint8_t b5  = report[5];
+
+    // Left stick / crosspad directions
+    bool up    = ly < 0x40;
+    bool down  = ly > 0xC0;
+    bool left  = lx < 0x40;
+    bool right = lx > 0xC0;
+
+    // Face buttons (high nibble of byte[4])
+    // Per user report: Y=0x10, B=0x20, A=0x40, X=0x80
+    bool btn_y      = (b4 & 0x10) != 0;
+    bool btn_b      = (b4 & 0x20) != 0;
+    bool btn_a      = (b4 & 0x40) != 0;
+    bool btn_x      = (b4 & 0x80) != 0;
+
+    // Shoulder buttons and system
+    bool btn_lb     = (b5 & 0x01) != 0;
+    bool btn_rb     = (b5 & 0x02) != 0;
+    bool btn_lt     = (b5 & 0x04) != 0;
+    bool btn_rt     = (b5 & 0x08) != 0;
+    bool btn_select = (b5 & 0x10) != 0;
+    bool btn_start  = (b5 & 0x20) != 0;
+
+    (void)btn_lt; (void)btn_rt; // available for future rebinding
+
+    // D-pad + OSD navigation (edge-detected)
+    if (up != gamepad1_bits.up) {
+        joyPushData(fabgl::VirtualKey::VK_MENU_UP, up);
+        if (Config::secondJoy != 1) joyPushData(fabgl::VirtualKey::VK_DPAD_UP, up);
+    }
+    if (down != gamepad1_bits.down) {
+        joyPushData(fabgl::VirtualKey::VK_MENU_DOWN, down);
+        if (Config::secondJoy != 1) joyPushData(fabgl::VirtualKey::VK_DPAD_DOWN, down);
+    }
+    if (left != gamepad1_bits.left) {
+        joyPushData(fabgl::VirtualKey::VK_MENU_LEFT, left);
+        if (Config::secondJoy != 1) joyPushData(fabgl::VirtualKey::VK_DPAD_LEFT, left);
+    }
+    if (right != gamepad1_bits.right) {
+        joyPushData(fabgl::VirtualKey::VK_MENU_RIGHT, right);
+        if (Config::secondJoy != 1) joyPushData(fabgl::VirtualKey::VK_DPAD_RIGHT, right);
+    }
+
+    // A = fire, B = alt-fire (PlayStation-style: Cross=confirm, Circle=back)
+    if (btn_a != gamepad1_bits.b) {
+        joyPushData(fabgl::VirtualKey::VK_MENU_ENTER, btn_a);
+        if (Config::secondJoy != 1) joyPushData(fabgl::VirtualKey::VK_DPAD_FIRE, btn_a);
+    }
+    if (btn_b != gamepad1_bits.a) {
+        if (Config::secondJoy != 1) joyPushData(fabgl::VirtualKey::VK_DPAD_ALTFIRE, btn_b);
+    }
+    if (btn_start != gamepad1_bits.start) {
+        joyPushData(fabgl::VirtualKey::VK_MENU_HOME, btn_start);
+        if (Config::secondJoy != 1) joyPushData(fabgl::VirtualKey::VK_DPAD_START, btn_start);
+    }
+    if (btn_select != gamepad1_bits.select) {
+        joyPushData(fabgl::VirtualKey::VK_MENU_BS, btn_select);
+        if (Config::secondJoy != 1) joyPushData(fabgl::VirtualKey::VK_DPAD_SELECT, btn_select);
+    }
+
+    // X / Y / L / R → rebindable extras
+    static bool prev_x = false, prev_y = false, prev_l = false, prev_r = false;
+    if (btn_x != prev_x) { kbdPushData(fabgl::VirtualKey::VK_JOY_X, btn_x); prev_x = btn_x; }
+    if (btn_y != prev_y) { kbdPushData(fabgl::VirtualKey::VK_JOY_Y, btn_y); prev_y = btn_y; }
+    if (btn_lb != prev_l) { kbdPushData(fabgl::VirtualKey::VK_JOY_Z, btn_lb); prev_l = btn_lb; }
+    if (btn_rb != prev_r) { kbdPushData(fabgl::VirtualKey::VK_JOY_C, btn_rb); prev_r = btn_rb; }
+
+    gamepad1_bits.up     = up;
+    gamepad1_bits.down   = down;
+    gamepad1_bits.left   = left;
+    gamepad1_bits.right  = right;
+    gamepad1_bits.a      = btn_a;
+    gamepad1_bits.b      = btn_b;
+    gamepad1_bits.start  = btn_start;
+    gamepad1_bits.select = btn_select;
+
+    uint16_t dec = 0;
+    if (up)         dec |= HID_DEC_UP;     if (down)       dec |= HID_DEC_DOWN;
+    if (left)       dec |= HID_DEC_LEFT;   if (right)      dec |= HID_DEC_RIGHT;
+    if (btn_a)      dec |= HID_DEC_A;      if (btn_b)      dec |= HID_DEC_B;
+    if (btn_x)      dec |= HID_DEC_X;      if (btn_y)      dec |= HID_DEC_Y;
+    if (btn_lb)     dec |= HID_DEC_L;      if (btn_rb)     dec |= HID_DEC_R;
+    if (btn_start)  dec |= HID_DEC_START;  if (btn_select) dec |= HID_DEC_SELECT;
+    hid_snap_set_decoded(instance, HID_HANDLER_GP_0810_0001, dec);
+}
+
+//--------------------------------------------------------------------+
 // Consumer Control (multimedia keys)
 //--------------------------------------------------------------------+
 
@@ -1110,6 +1266,12 @@ static void process_generic_report(uint8_t dev_addr, uint8_t instance, uint8_t c
   if (is_gp_feed_2320(hid_info[instance].vid, hid_info[instance].pid)
       && len >= 8 && report[0] == 0x07) {
     process_gp_feed_2320(instance, report + 1, len - 1);
+    return;
+  }
+
+  if (is_gp_0810_0001(hid_info[instance].vid, hid_info[instance].pid)
+      && len >= 8 && (report[0] == 0x01 || report[0] == 0x02)) {
+    process_gp_0810_0001(instance, report + 1, len - 1);
     return;
   }
 
@@ -1220,6 +1382,7 @@ extern "C" int hid_app_format_devices_info(char* buf, int bufsz)
       "F710 D-input",   // F710_DINPUT
       "GP 2563:0575",   // GP_2563_0575
       "GP FEED:2320",   // GP_FEED_2320
+      "GP 0810:0001",   // GP_0810_0001
       "generic gamepad",// GENERIC_GAMEPAD
       "consumer ctrl",  // GENERIC_CONS
       "no rpt info!",   // NO_RPT_INFO

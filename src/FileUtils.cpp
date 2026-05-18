@@ -126,23 +126,26 @@ inline void fclose(FIL& f) {
 }
 
 // Create every directory along an absolute path (intermediate components
-// included). Existing directories are tolerated; this matches the behaviour
-// of `mkdir -p` against FatFs.
-void FileUtils::mkdirParents(const char* path) {
-    if (!path || !*path) return;
+// included). Returns true when the full path exists after the call.
+// FR_EXIST is treated as success; any other failure short-circuits and
+// returns false so callers can refuse to write into a non-existent dir.
+bool FileUtils::mkdirParents(const char* path) {
+    if (!path || !*path) return false;
     char buf[128];
     size_t len = strlen(path);
-    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    if (len >= sizeof(buf)) return false;
     memcpy(buf, path, len);
     buf[len] = 0;
     for (size_t i = 1; i < len; ++i) {
         if (buf[i] == '/') {
             buf[i] = 0;
-            f_mkdir(buf);
+            FRESULT r = f_mkdir(buf);
+            if (r != FR_OK && r != FR_EXIST) return false;
             buf[i] = '/';
         }
     }
-    f_mkdir(buf);
+    FRESULT r = f_mkdir(buf);
+    return r == FR_OK || r == FR_EXIST;
 }
 
 void FileUtils::initFileSystem() {
