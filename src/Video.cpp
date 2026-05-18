@@ -66,7 +66,7 @@ extern "C" void vga_reinit(void);
 
 VGA8Bit VIDEO::vga;
 
-extern "C" uint8_t* getLineBuffer(int line) {
+extern "C" uint8_t* __not_in_flash_func(getLineBuffer)(int line) {
     if (!VIDEO::vga.frameBuffer) return 0;
     return (uint8_t*)VIDEO::vga.frameBuffer[line];
 }
@@ -175,6 +175,7 @@ static const uint8_t ulaplus_default_palette[64] = {
 };
 uint8_t VIDEO::ulaplus_palette[64];
 bool VIDEO::ulaplus_palette_dirty = false;
+bool VIDEO::ulaplus_alubytes_dirty = false;
 // AluBytesUlaPlus moved to flash — see roms/AluBytesUlaPlus.c
 
 // 16col mode (Pentagon, Alone Coder)
@@ -698,24 +699,24 @@ void VIDEO::ulaPlusUpdateBorder() {
 void VIDEO::ulaPlusDisable() {
     ulaplus_enabled = false;
     ulaplus_palette_dirty = false;
+    ulaplus_alubytes_dirty = false;
     flashing = 0;
     // Dither is meaningful only with ULA+; force it off so palette[64..127]
     // (which now hold default G3R3B2 values, not Bayer neighbours) won't be
     // sampled by the HDMI ISR.
     graphics_set_dither(false);
-    // Restore palette: indices 0-63 back to G3R3B2 defaults, then 0-15 to Spectrum (solid)
-    for (int i = 0; i < 64; i++)
+    // Restore palette: indices 0-63 back to G3R3B2 defaults, then 0-15 to Spectrum (solid).
+    // When GigaScreen is enabled we must NOT touch slots 17..63 — those hold blend
+    // values built at boot, and rewriting them here would force a heavy 120-entry
+    // re-emit and race with HDMI DMA reading conv_color from port-write context.
+    int g3r3b2_upper = Config::gigascreen_enabled ? 17 : 64;
+    for (int i = 0; i < g3r3b2_upper; i++)
         graphics_set_palette(i, paletteTransform(grb_to_rgb888(i)));
     for (int i = 0; i < 16; i++) {
         uint32_t color = paletteTransform(spectrum_rgb888[i]);
         graphics_set_palette(i, color);
         vga_set_palette_entry_solid(i, color);
     }
-
-    // Restore GigaScreen blend palette (slots 17-136) if GigaScreen is configured,
-    // since palette entries 17-63 were overwritten by ULA+ above
-    if (Config::gigascreen_enabled)
-        initGigascreenBlendLUT();
 
     for (int n = 0; n < 16; n++)
         AluByte[n] = (unsigned int*)AluBytesStd_flash[n];
@@ -1659,6 +1660,11 @@ static uint8_t gigsBlendLUT[256]; // indexed by (prev * 16 + cur)
 static bool gigsBlendLUTReady = false;
 
 void initGigascreenBlendLUT() {
+    // One-shot. Table + palette slots 17..136 only depend on spectrum_rgb888[],
+    // which never changes after boot. Re-entering this from an emulation context
+    // (e.g. ULA+ disable -> palette restore) races with HDMI DMA reading conv_color
+    // and produces palette tearing at the top of the screen.
+    if (gigsBlendLUTReady) return;
     uint8_t nextSlot = 17; // start after ORANGE(16)
 
     // For each pair (i, j), compute average RGB and assign palette slot
@@ -2148,8 +2154,15 @@ IRAM_ATTR void VIDEO::EndFrame() {
 
     // Flush deferred ULA+ palette updates so HDMI DMA sees consistent palette
     // for the entire next frame (prevents top-of-screen palette tearing)
-    if (ulaplus_enabled)
-        ulaPlusFlushPalette();
+    if (ulaplus_enabled) {
+        if (ulaplus_alubytes_dirty) {
+            ulaplus_alubytes_dirty = false;
+            ulaplus_palette_dirty = false; // full rebuild supersedes per-entry flush
+            regenerateUlaPlusAluBytes();
+        } else {
+            ulaPlusFlushPalette();
+        }
+    }
 #endif
 
     static uint8_t skipCnt = 0;

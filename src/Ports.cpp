@@ -650,7 +650,9 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
           if (new_on && !VIDEO::ulaplus_enabled) {
             VIDEO::ulaplus_enabled = true;
             VIDEO::flashing = 0;
-            VIDEO::regenerateUlaPlusAluBytes();
+            // Defer heavy AluByte/palette rebuild to EndFrame so it runs during
+            // HDMI blanking and not from inside Z80 port-write context
+            VIDEO::ulaplus_alubytes_dirty = true;
             VIDEO::ulaPlusUpdateBorder();
           } else if (!new_on && VIDEO::ulaplus_enabled) {
             VIDEO::ulaPlusDisable();

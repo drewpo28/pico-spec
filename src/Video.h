@@ -260,6 +260,7 @@ public:
   static uint8_t ulaplus_reg;
   static uint8_t ulaplus_palette[64];
   static bool ulaplus_palette_dirty;  // deferred palette flush for HDMI sync
+  static bool ulaplus_alubytes_dirty; // deferred AluByte/palette rebuild for HDMI sync
   // AluBytesUlaPlus moved to flash (AluBytesUlaPlus_flash in roms/AluBytesUlaPlus.c)
   static void regenerateUlaPlusAluBytes();
   static void ulaPlusUpdatePaletteEntry(uint8_t entry);
