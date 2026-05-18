@@ -43,6 +43,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "MemESP.h"
 #include "Config.h"
 #include "OSDMain.h"
+#include "LEDIndicators.h"
 #include "hardconfig.h"
 #include "hardpins.h"
 #include "Z80_JLS/z80.h"
@@ -2231,6 +2232,11 @@ IRAM_ATTR void VIDEO::EndFrame() {
     }
 #endif
 
+    if (Config::ledIndicators) {
+        LED::decay();
+        LED::draw();
+    }
+
     framecnt++;
 }
 
@@ -2418,10 +2424,25 @@ IRAM_ATTR void VIDEO::MiddleBorder() {
     }
 }
 
+// LED indicator strip occupies pixels x=4..85 in the bottom-OSD y range.
+// In uint16_t border-cell units (step=4), that aligns to col 0..44.
+static constexpr int LED_OSD_X_END_U16 = 44;
+
 IRAM_ATTR void VIDEO::BottomBorder() {
+    const bool ledsOn = Config::ledIndicators;
+    const int led_y_start = VIDEO::isFullBorder288() ? 268 :
+                            VIDEO::isFullBorder240() ? 220 :
+                            (Config::aspect_16_9 ? 176 : 220);
+    const int led_y_end = led_y_start + 15;
     while (lastBrdTstate <= CPU::tstates) {
         if (brdcol_cnt < brdcol_retrace) {
-            Update_Border();
+            if (ledsOn &&
+                brdlin_cnt >= led_y_start && brdlin_cnt <= led_y_end &&
+                brdcol_cnt < LED_OSD_X_END_U16) {
+                // Skip — preserve LED strip
+            } else {
+                Update_Border();
+            }
         } else if (brdcol_retrace < brdcol_end) {
             int lastPair = (brdcol_retrace - 1) & ~1;
             int curPair = brdcol_cnt & ~1;
@@ -2453,12 +2474,15 @@ IRAM_ATTR void VIDEO::BottomBorder_OSD() {
     // OSD x coords in uint16_t units, aligned down/up to brdcol_step for step=4
     const int osd_x_start = isFB ? (94 & ~(brdcol_step - 1)) : (84 & ~(brdcol_step - 1));
     const int osd_x_end = isFB ? ((166 + brdcol_step - 1) & ~(brdcol_step - 1)) : ((156 + brdcol_step - 1) & ~(brdcol_step - 1));
+    const bool ledsOn = Config::ledIndicators;
     while (lastBrdTstate <= CPU::tstates) {
         if (brdcol_cnt < brdcol_retrace) {
             if (brdlin_cnt < osd_y_start || brdlin_cnt > osd_y_end) {
                 Update_Border();
-            } else if (brdcol_cnt < osd_x_start || brdcol_cnt >= osd_x_end) {
-                Update_Border();
+            } else {
+                const bool inStats = (brdcol_cnt >= osd_x_start && brdcol_cnt < osd_x_end);
+                const bool inLED = ledsOn && (brdcol_cnt < LED_OSD_X_END_U16);
+                if (!inStats && !inLED) Update_Border();
             }
         } else if (brdcol_retrace < brdcol_end) {
             int lastPair = (brdcol_retrace - 1) & ~1;

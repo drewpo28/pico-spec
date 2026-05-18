@@ -51,6 +51,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Snapshot.h"
 #include "MemESP.h"
 #include "Tape.h"
+#include "LEDIndicators.h"
 #include "ZipExtract.h"
 #include "pwm_audio.h"
 #include "Z80_JLS/z80.h"
@@ -3231,6 +3232,47 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             }
                         }
                         #endif
+                        // LED indicators ON/OFF (last option in Video menu).
+                        // Option number is 7 on RP2040, 13 on RP2350.
+                        #if PICO_RP2040
+                        else if (options_num == 7) {
+                        #else
+                        else if (options_num == 13) {
+                        #endif
+                            menu_level = 2;
+                            menu_curopt = 1;
+                            menu_saverect = true;
+                            while (1) {
+                                string opt_menu = MENU_LEDINDICATORS[Config::lang];
+                                opt_menu += MENU_YESNO[Config::lang];
+                                bool prev_opt = Config::ledIndicators;
+                                if (prev_opt) {
+                                    opt_menu.replace(opt_menu.find("[Y",0),2,"[*");
+                                    opt_menu.replace(opt_menu.find("[N",0),2,"[ ");
+                                } else {
+                                    opt_menu.replace(opt_menu.find("[Y",0),2,"[ ");
+                                    opt_menu.replace(opt_menu.find("[N",0),2,"[*");
+                                }
+                                uint8_t opt2 = menuRun(opt_menu);
+                                if (opt2) {
+                                    Config::ledIndicators = (opt2 == 1);
+                                    if (Config::ledIndicators != prev_opt) {
+                                        if (!Config::ledIndicators) LED::clear();
+                                        Config::save();
+                                    }
+                                    menu_curopt = opt2;
+                                    menu_saverect = false;
+                                } else {
+                                    #if PICO_RP2040
+                                    menu_curopt = 7;
+                                    #else
+                                    menu_curopt = 13;
+                                    #endif
+                                    menu_level = 1;
+                                    break;
+                                }
+                            }
+                        }
                     } else {
                         menu_curopt = 4;
                         break;

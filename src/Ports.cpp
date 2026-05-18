@@ -40,6 +40,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "CPU.h"
 #include "Config.h"
 #include "ESPectrum.h"
+#include "LEDIndicators.h"
 #include "MemESP.h"
 #include "Tape.h"
 #include "Video.h"
@@ -202,6 +203,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   }
 
   if (MEM_PG_CNT > 64 && address == 0xAFF7) {
+    LED::touchR(LED::PAGING);
     return portAFF7;
   }
   bool ia = Z80Ops::isALF;
@@ -231,6 +233,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
           data &= port[row];
       }
     }
+    if (Tape::tapeStatus == TAPE_LOADING) LED::touchR(LED::TAPE);
     if (Tape::TapePortRead()) return data;
     // Turbo loaders at 0xFE00+ write to port254 to set border colors, which
     // on Issue2 hardware feeds bit3 back into EAR input (bit6), inverting
@@ -266,6 +269,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
 #if !PICO_RP2040
     // ULA+ data port read
     if (Config::ulaplus && address == 0xFF3B) {
+      LED::touchR(LED::ULAPLUS);
       uint8_t reg = VIDEO::ulaplus_reg;
       if ((reg & 0xC0) == 0x00)
         return VIDEO::ulaplus_palette[reg & 0x3F];
@@ -276,10 +280,12 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // Bit 6 = "receiver full" — reflect real UART FIFO state
     // enabled 2=ShamaZX HW, 3=Soft Synth (both use ShamaZX ports)
     if (Midi::enabled >= 2 && address == 0xA1CF) {
+      LED::touchR(LED::MIDI);
       return Midi::busy() ? 0x40 : 0x00;
     }
     // ShamaZX MIDI — read from 0xA0CF (parallel mode handshake)
     if (Midi::enabled >= 2 && address == 0xA0CF) {
+      LED::touchR(LED::MIDI);
       return 0x00;
     }
 #ifdef USE_GS
@@ -293,6 +299,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     if (GS::enabled && !DivMMC::divide_mode) {
       uint8_t a8 = address & 0xFF;
       if (a8 == 0xB3 || a8 == 0xBB) {
+        LED::touchR(LED::GS);
         ioContentionLate(MemESP::ramContended[rambank]);
         return (a8 == 0xB3) ? GS::hostReadB3() : GS::hostReadBB();
       }
@@ -300,11 +307,13 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
 #endif
     // Timex SCLD port read (port 0x00FF) — skip when TR-DOS is active (port conflict)
     if (Config::timex_video && !ESPectrum::trdos && address == 0x00FF) {
+      LED::touchR(LED::TIMEX);
       ioContentionLate(MemESP::ramContended[rambank]);
       return VIDEO::timex_port_ff;
     }
     // Z80 DMA / zxnDMA port read: listen on both 0x0B and 0x6B
     if (Config::dma_mode && ((address & 0xFF) == 0x0B || (address & 0xFF) == 0x6B)) {
+      LED::touchR(LED::DMA);
       ioContentionLate(MemESP::ramContended[rambank]);
       return Z80DMA::readPort();
     }
@@ -317,6 +326,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     if (MB02::enabled) {
       uint8_t lo = address & 0xFF;
       if ((lo & 0x9F) == 0x0F) { // WD2797 registers
+        LED::touchR(LED::MB02);
         FDDStep_MB02(true); // force step — WD2797 needs step advancement for Seek/Restore
         ioContentionLate(MemESP::ramContended[rambank]);
         uint8_t r = (lo >> 5) & 3;
@@ -324,6 +334,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         return val;
       }
       if (lo == 0x13) { // Floppy status
+        LED::touchR(LED::MB02);
         FDDStep_MB02(true);
         ioContentionLate(MemESP::ramContended[rambank]);
         return MB02::readPort13();
@@ -333,18 +344,22 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     if (DivMMC::enabled) {
       uint8_t lo = address & 0xFF;
       if (lo == 0xE3) {
+        LED::touchR(LED::SD);
         return (DivMMC::conmem ? 0x80 : 0) | (DivMMC::mapram ? 0x40 : 0) | DivMMC::bank;
       }
       if (DivMMC::divide_mode) {
         if ((lo & 0xE3) == 0xA3) {
+          LED::touchR(LED::SD);
           uint8_t reg = (lo >> 2) & 0x07;
           return DivMMC::ide_read(reg);
         }
       } else {
         if (lo == 0xEB) {
+          LED::touchR(LED::SD);
           return DivMMC::mmc_read();
         }
         if (lo == 0xE7) {
+          LED::touchR(LED::SD);
           return 0xFF;
         }
       }
@@ -352,8 +367,8 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
 
     if (DivMMC::zc_enabled) {
       uint8_t lo = address & 0xFF;
-      if (lo == 0x77) return DivMMC::zc_read_status();
-      if (lo == 0x57) return DivMMC::zc_read_data();
+      if (lo == 0x77) { LED::touchR(LED::ZCTRL); return DivMMC::zc_read_status(); }
+      if (lo == 0x57) { LED::touchR(LED::ZCTRL); return DivMMC::zc_read_data(); }
     }
 #endif
 
@@ -374,11 +389,13 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       case 0x23:
       case 0x43:
       case 0x63:
+        LED::touchR(LED::BETA);
         FDDStep(false);
 
         return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
 
       case 0xe3: {
+        LED::touchR(LED::BETA);
         FDDStep(true);
 
         uint8_t v = 0;
@@ -394,12 +411,15 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     /// if (ESPectrum::ps2mouse && Config::mouse == 1)
     {
       if ((address & 0x05ff) == 0x01df) {
+        LED::touchR(LED::KEMPMOUSE);
         return (uint8_t)ESPectrum::mouseX;
       }
       if ((address & 0x05ff) == 0x05df) {
+        LED::touchR(LED::KEMPMOUSE);
         return (uint8_t)ESPectrum::mouseY;
       }
       if ((address & 0x05ff) == 0x00df) {
+        LED::touchR(LED::KEMPMOUSE);
         return 0xff & (ESPectrum::mouseButtonL ? 0xfd : 0xff) &
                (ESPectrum::mouseButtonR ? 0xfe : 0xff);
       }
@@ -410,9 +430,11 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // that read port 0x1F keep working even when an alternate kempstonPort
     // (0x37, 0x5F) is selected for boards that also map joystick reads there.
     if (Config::joystick == JOY_KEMPSTON) {
-      if (((p8 & 0x20) == 0) || (p8 == Config::kempstonPort))
+      if (((p8 & 0x20) == 0) || (p8 == Config::kempstonPort)) {
+        LED::touchR(LED::KEMPJOY);
         return ia ? (port[Config::kempstonPort] ^ 0xA0)
                   : port[Config::kempstonPort];
+      }
     }
 
     // Fuller Joystick
@@ -422,6 +444,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // Sound (AY-3-8912)
     if (ESPectrum::AY_emu) {
       if ((address & 0xC002) == 0xC000) {
+        LED::touchR(LED::AY);
         if (ia) {
           return chips[AySound::selected_chip]->getRegisterData() | newAlfBit;
         }
@@ -431,6 +454,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     if (!Z80Ops::isPentagon) {
       data = getFloatBusData();
       if ((!Z80Ops::is48) && !Z80Ops::isALF && ((address & 0x8002) == 0)) {
+        LED::touchR(LED::PAGING);
         // //  Solo en el modelo 128K, pero no en los +2/+2A/+3, si se lee el
         // puerto
         // //  0x7ffd, el valor leído es reescrito en el puerto 0x7ffd.
@@ -495,6 +519,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   p_states = CPU::tstates;
 
   if (address == 0xAFF7) {
+    LED::touchW(LED::PAGING);
     uint8_t prev = portAFF7;
     uint8_t d6 = data & 0b00111111; // limit it for 64 planes
     if (prev != d6) {
@@ -556,6 +581,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // ULA =======================================================================
   if ((address & 0x0001) == 0) {
     port254 = data;
+    LED::touchW(LED::BEEPER);
     // Border color
     if (VIDEO::borderColor != data) {
       VIDEO::brdChange = true;
@@ -584,6 +610,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // AY
     // ========================================================================
     if ((ESPectrum::AY_emu) && ((address & 0x8002) == 0x8000)) {
+      LED::touchW(LED::AY);
       if ((address & 0x4000) != 0) {
         chips[AySound::selected_chip]->selectRegister(data);
       } else {
@@ -630,11 +657,13 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // ULA+ ports (odd addresses: 0xBF3B register select, 0xFF3B data)
     if (Config::ulaplus) {
       if (address == 0xBF3B) {
+        LED::touchW(LED::ULAPLUS);
         VIDEO::ulaplus_reg = data;
         ioContentionLate(MemESP::ramContended[rambank]);
         return;
       }
       if (address == 0xFF3B) {
+        LED::touchW(LED::ULAPLUS);
         uint8_t reg = VIDEO::ulaplus_reg;
         if ((reg & 0xC0) == 0x00) {
           // Palette group write
@@ -665,6 +694,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
 #endif
     int covox = Config::covox;
     if ((covox == 1 && a8 == 0xFB) || (covox == 2 && a8 == 0xDD)) {
+      LED::touchW(LED::COVOX);
       ESPectrum::lastCovoxVal = data;
       ESPectrum::CovoxGetSample();
     }
@@ -673,6 +703,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // 0xA0CF = control port: TX data byte here
     // 0xA1CF = data port: write 0xFF/0x3F for init, read status (bit 6 = receiver full)
     if (Midi::enabled >= 2 && address == 0xA0CF) {
+      LED::touchW(LED::MIDI);
       Midi::send(data);
       return;
     }
@@ -680,6 +711,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // General Sound — host-side data/command ports
     if (GS::enabled && !DivMMC::divide_mode) {
       if (a8 == 0xB3 || a8 == 0xBB) {
+        LED::touchW(LED::GS);
         if (a8 == 0xB3) GS::hostWriteB3(data);
         else            GS::hostWriteBB(data);
         ioContentionLate(MemESP::ramContended[rambank]);
@@ -689,6 +721,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
 #endif
     // Z80 DMA / zxnDMA port write: listen on both 0x0B and 0x6B
     if (Config::dma_mode && (a8 == 0x0B || a8 == 0x6B)) {
+      LED::touchW(LED::DMA);
       Z80DMA::writePort(data);
       ioContentionLate(MemESP::ramContended[rambank]);
       return;
@@ -696,6 +729,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // Timex SCLD video mode register (port 0x00FF, bit 8 clear)
     // Skip when TR-DOS is active — port 0xFF is the Beta-128 system register
     if (Config::timex_video && !ESPectrum::trdos && a8 == 0xFF && !(address & 0x0100)) {
+      LED::touchW(LED::TIMEX);
       VIDEO::timex_port_ff = data & 0x3F;
       VIDEO::timex_mode = data & 0x07;
       VIDEO::timex_hires_ink = (data >> 3) & 0x07;
@@ -707,6 +741,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     //        0x00FE/0x01FE (FPGA48all.tap and some other programs use a8=0xFE)
     // Accessible only when TR-DOS ROM is NOT mapped (DOS/ = 1)
     if (ESPectrum::SAA_emu && saaChip && !ESPectrum::trdos && (a8 == 0xFF)) {
+      LED::touchW(LED::SAA);
       if (address & 0x0100) {
         // Register select (bit 8 set): 0x01FF, 0x05FF, etc.
         // Generate samples before selectRegister — it advances external envelope clock
@@ -733,6 +768,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       }
     }
     if ((ESPectrum::AY_emu) && ((address & 0x8002) == 0x8000)) {
+      LED::touchW(LED::AY);
       if (a8 == 0xFF) { // Old TS way
         AySound::selected_chip = 0;
       } else if (a8 == 0xFE && Config::turbosound > 1) {
@@ -751,6 +787,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     if (MB02::enabled) {
       uint8_t lo = address & 0xFF;
       if ((lo & 0x9F) == 0x0F) { // WD2797 registers
+        LED::touchW(LED::MB02);
         FDDStep_MB02(false);
         uint8_t reg = (lo >> 5) & 3;
         rvmWD1793Write(&ESPectrum::mb02_fdd, reg, data);
@@ -764,10 +801,12 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         return;
       }
       if (lo == 0x13) { // Floppy control
+        LED::touchW(LED::MB02);
         MB02::writePort13(data);
         return;
       }
       if (lo == 0x17) { // Memory paging
+        LED::touchW(LED::MB02);
         MB02::writePort17(data);
         return;
       }
@@ -776,6 +815,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     if (DivMMC::enabled) {
       uint8_t lo = address & 0xFF;
       if (lo == 0xE3) {
+        LED::touchW(LED::SD);
         DivMMC::bank = data & (DIVMMC_NUM_BANKS - 1);
         if (data & 0x40) DivMMC::mapram = true;
         DivMMC::conmem = (data & 0x80) != 0;
@@ -784,16 +824,19 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       }
       if (DivMMC::divide_mode) {
         if ((lo & 0xE3) == 0xA3) {
+          LED::touchW(LED::SD);
           uint8_t reg = (lo >> 2) & 0x07;
           DivMMC::ide_write(reg, data);
           return;
         }
       } else {
         if (lo == 0xEB) {
+          LED::touchW(LED::SD);
           DivMMC::mmc_write(data);
           return;
         }
         if (lo == 0xE7) {
+          LED::touchW(LED::SD);
           DivMMC::mmc_cs(data);
           return;
         }
@@ -802,8 +845,8 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
 
     if (DivMMC::zc_enabled) {
       uint8_t lo = address & 0xFF;
-      if (lo == 0x77) { DivMMC::zc_write_config(data); return; }
-      if (lo == 0x57) { DivMMC::zc_write_data(data); return; }
+      if (lo == 0x77) { LED::touchW(LED::ZCTRL); DivMMC::zc_write_config(data); return; }
+      if (lo == 0x57) { LED::touchW(LED::ZCTRL); DivMMC::zc_write_data(data); return; }
     }
 #endif
 
@@ -816,11 +859,13 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       case 0x23:
       case 0x43:
       case 0x63:
+        LED::touchW(LED::BETA);
         FDDStep(false);
         rvmWD1793Write(&ESPectrum::fdd, ((address >> 5) & 0x3), data);
         break;
       case 0xe3:
 
+        LED::touchW(LED::BETA);
         FDDStep(true);
 
         // Change active disk unit
@@ -864,6 +909,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   }
   // Pentagon only
   if (Z80Ops::isPentagon && ((address & 0x1008) == 0)) { // 1008 !-> EFF7
+    LED::touchW(LED::PAGING);
     if (!MemESP::pagingLock) {
       uint8_t prev = MemESP::page0ram;
       MemESP::notMore128 = bitRead(data, 2);
@@ -878,6 +924,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // for banking, not #7FFD. Letting #7FFD writes through here corrupts
   // videoLatch/pagingLock and produces a black screen on ALF.
   if ((!Z80Ops::is48) && !Z80Ops::isALF && ((address & 0x8002) == 0)) { // 8002 !-> 7FFD
+    LED::touchW(LED::PAGING);
     if (!MemESP::pagingLock) {
       uint8_t D5 = bitRead(data, 5);
       if (Z80Ops::is1024) {

@@ -81,6 +81,7 @@ public:
     static string   last_ram_file;
     static uint8_t  esp32rev;
     static bool     slog_on;
+    static bool     ledIndicators;
     const static bool     aspect_16_9; /// TODO:
     static uint8_t  lang;
     static bool     AY48;
