@@ -1021,25 +1021,42 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             }
         }
         else if (hkIdx == Config::HK_GIGASCREEN) {
-            if (Config::gigascreen_enabled)
-            {
-                Config::gigascreen_onoff = (Config::gigascreen_onoff + 1) % 3; // Off -> On -> Auto -> Off
-                if (Config::gigascreen_onoff == 1) {
 #if !PICO_RP2040
-                    VIDEO::InitPrevBuffer(); // seed prev from current FB to avoid stale-frame flash
-#endif
-                    VIDEO::gigascreen_enabled = true;
+            Config::gigascreen_onoff = (Config::gigascreen_onoff + 1) % 3; // Off -> On -> Auto -> Off
+            bool want_on = (Config::gigascreen_onoff != 0);
+            if (want_on) {
+                if (!Config::gigascreen_enabled) {
+                    initGigascreenBlendLUT();
+                    Config::gigascreen_enabled = true;
+                    GsSubsys::request(true);
+                    GsSubsys::apply();
+                    if (!VIDEO::vga.prevFrameBuffer) {
+                        // OOM — fall back to Off.
+                        Config::gigascreen_enabled = false;
+                        Config::gigascreen_onoff = 0;
+                        VIDEO::gigascreen_enabled = false;
+                        VIDEO::gigascreen_auto_countdown = 0;
+                    } else {
+                        VIDEO::InitPrevBuffer();
+                    }
                 }
-                else {
-                    VIDEO::gigascreen_enabled = false;
+                if (Config::gigascreen_enabled) {
+                    VIDEO::gigascreen_enabled = (Config::gigascreen_onoff == 1);
                     VIDEO::gigascreen_auto_countdown = 0;
                 }
-                std::string menu = Config::gigascreen_onoff == 1 ? OSD_GIGASCREEN_ON[Config::lang]
-                                 : Config::gigascreen_onoff == 2 ? OSD_GIGASCREEN_AUTO[Config::lang]
-                                 : OSD_GIGASCREEN_OFF[Config::lang];
-                osdCenteredMsg(menu, LEVEL_INFO, 500);
-                Config::save();
+            } else {
+                // Off — release the 52 KB prev framebuffer.
+                Config::gigascreen_enabled = false;
+                VIDEO::gigascreen_enabled = false;
+                VIDEO::gigascreen_auto_countdown = 0;
+                GsSubsys::request(false);
             }
+            std::string menu = Config::gigascreen_onoff == 1 ? OSD_GIGASCREEN_ON[Config::lang]
+                             : Config::gigascreen_onoff == 2 ? OSD_GIGASCREEN_AUTO[Config::lang]
+                             : OSD_GIGASCREEN_OFF[Config::lang];
+            osdCenteredMsg(menu, LEVEL_INFO, 500);
+            Config::save();
+#endif
         } else if (hkIdx == Config::HK_MAX_SPEED || KeytoESP == fabgl::VK_NUMLOCK) {
         ESPectrum::maxSpeed = !ESPectrum::maxSpeed;
         std::string menu = ESPectrum::maxSpeed ? OSD_MAXSPEED_ON[Config::lang] : OSD_MAXSPEED_OFF[Config::lang];
@@ -2987,53 +3004,49 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         #if !PICO_RP2040
                         else if (options_num == 7) {
                             menu_level = 2;
-                            menu_curopt = 1;
+                            menu_curopt = Config::gigascreen_onoff + 1;
                             menu_saverect = true;
                             while (1) {
                                 string opt_menu = MENU_GIGASCREEN[Config::lang];
-                                opt_menu += MENU_YESNO[Config::lang];
-                                bool prev_opt = Config::gigascreen_enabled;
-                                if (prev_opt) {
-                                    opt_menu.replace(opt_menu.find("[Y",0),2,"[*");
-                                    opt_menu.replace(opt_menu.find("[N",0),2,"[ ");
-                                } else {
-                                    opt_menu.replace(opt_menu.find("[Y",0),2,"[ ");
-                                    opt_menu.replace(opt_menu.find("[N",0),2,"[*");
+                                opt_menu += MENU_GIGASCREEN_SEL[Config::lang];
+                                uint8_t prev_onoff = Config::gigascreen_onoff;
+                                int mpos = -1;
+                                int idx = 0;
+                                while ((mpos = opt_menu.find("[ ]", mpos + 1)) != (int)string::npos) {
+                                    if (idx == prev_onoff)
+                                        opt_menu.replace(mpos, 3, "[*]");
+                                    idx++;
                                 }
                                 uint8_t opt2 = menuRun(opt_menu);
                                 if (opt2) {
-                                    if (opt2 == 1)
-                                        Config::gigascreen_enabled = true;
-                                    else
-                                        Config::gigascreen_enabled = false;
-
-                                    if (Config::gigascreen_enabled != prev_opt) {
-                                        if (Config::gigascreen_enabled) {
-#if !PICO_RP2040
+                                    Config::gigascreen_onoff = opt2 - 1; // 0=Off, 1=On, 2=Auto
+                                    if (Config::gigascreen_onoff != prev_onoff) {
+                                        bool want_on = (Config::gigascreen_onoff != 0);
+                                        if (want_on) {
                                             initGigascreenBlendLUT();
-                                            VIDEO::InitPrevBuffer();
+                                            Config::gigascreen_enabled = true;
+                                            GsSubsys::request(true);
+                                            // Allocate immediately so InitPrevBuffer can seed it.
+                                            GsSubsys::apply();
                                             if (!VIDEO::vga.prevFrameBuffer) {
+                                                // OOM — fall back to Off.
                                                 Config::gigascreen_enabled = false;
+                                                Config::gigascreen_onoff = 0;
                                                 VIDEO::gigascreen_enabled = false;
-                                            }
-#endif
-                                            if (Config::gigascreen_onoff == 0)
-                                                Config::gigascreen_onoff = 1; // Off->On when enabling
-                                            if (Config::gigascreen_onoff == 1)
-                                                VIDEO::gigascreen_enabled = true;
-                                            else {
-                                                VIDEO::gigascreen_enabled = false;
+                                                VIDEO::gigascreen_auto_countdown = 0;
+                                            } else {
+                                                VIDEO::InitPrevBuffer();
+                                                VIDEO::gigascreen_enabled = (Config::gigascreen_onoff == 1);
                                                 VIDEO::gigascreen_auto_countdown = 0;
                                             }
                                         } else {
+                                            // Off — release the 52 KB prev framebuffer.
+                                            Config::gigascreen_enabled = false;
                                             VIDEO::gigascreen_enabled = false;
                                             VIDEO::gigascreen_auto_countdown = 0;
+                                            GsSubsys::request(false);
                                         }
                                         Config::save();
-#if !PICO_RP2040
-                                        // Free 52 KB prev framebuffer when disabling.
-                                        GsSubsys::request(Config::gigascreen_enabled);
-#endif
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;

@@ -746,6 +746,15 @@ static const char *MENU_SCANLINES[2] = { "Scanlines\n", "Scanlines\n" };
 static const char *MENU_VSYNC[2] = { "V-Sync\n", "V-Sync\n" };
 
 static const char *MENU_GIGASCREEN[2] = { "Gigascreen\n", "Gigascreen\n" };
+#define MENU_GIGASCREEN_SEL_EN \
+    "Off\t[ ]\n"\
+    "On\t[ ]\n"\
+    "Auto\t[ ]\n"
+#define MENU_GIGASCREEN_SEL_ES \
+    "Off\t[ ]\n"\
+    "On\t[ ]\n"\
+    "Auto\t[ ]\n"
+static const char *MENU_GIGASCREEN_SEL[2] = { MENU_GIGASCREEN_SEL_EN, MENU_GIGASCREEN_SEL_ES };
 
 #if !defined(PICO_RP2040)
 #define MENU_RESET_EN \
