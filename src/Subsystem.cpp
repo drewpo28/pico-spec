@@ -339,14 +339,38 @@ void DivMmcSubsys::syncFromState() {
 // setup() before the loop starts.
 // ----------------------------------------------------------------------------
 void Subsystems::applyPending() {
-    if (TurboSubsys::dirty) TurboSubsys::apply();
-    if (CovoxSubsys::dirty) CovoxSubsys::apply();
-    if (PitSubsys::dirty)   PitSubsys::apply();
+    if (TurboSubsys::dirty) {
+        Debug::log2SD("Subsys: Turbo wanted=%d freeHeap=%u", (int)TurboSubsys::wanted, (unsigned)getFreeHeap());
+        TurboSubsys::apply();
+    }
+    if (CovoxSubsys::dirty) {
+        Debug::log2SD("Subsys: Covox wanted=%d freeHeap=%u", (int)CovoxSubsys::wanted, (unsigned)getFreeHeap());
+        CovoxSubsys::apply();
+    }
+    if (PitSubsys::dirty)   {
+        Debug::log2SD("Subsys: Pit wanted=%d freeHeap=%u", (int)PitSubsys::wanted, (unsigned)getFreeHeap());
+        PitSubsys::apply();
+    }
 #if !PICO_RP2040
-    if (SaaSubsys::dirty)   SaaSubsys::apply();
-    if (MidiSubsys::dirty)  MidiSubsys::apply();
-    if (Mb02Subsys::dirty)  Mb02Subsys::apply();
-    if (DivMmcSubsys::dirty) DivMmcSubsys::apply();
-    if (GsSubsys::dirty)    GsSubsys::apply();
+    if (SaaSubsys::dirty)   {
+        Debug::log2SD("Subsys: Saa wanted=%d freeHeap=%u", (int)SaaSubsys::wanted, (unsigned)getFreeHeap());
+        SaaSubsys::apply();
+    }
+    if (MidiSubsys::dirty)  {
+        Debug::log2SD("Subsys: Midi wanted=%d freeHeap=%u", (int)MidiSubsys::wanted, (unsigned)getFreeHeap());
+        MidiSubsys::apply();
+    }
+    if (Mb02Subsys::dirty)  {
+        Debug::log2SD("Subsys: Mb02 wanted=%d freeHeap=%u", (int)Mb02Subsys::wanted, (unsigned)getFreeHeap());
+        Mb02Subsys::apply();
+    }
+    if (DivMmcSubsys::dirty) {
+        Debug::log2SD("Subsys: DivMmc wanted=%d freeHeap=%u", (int)DivMmcSubsys::wanted, (unsigned)getFreeHeap());
+        DivMmcSubsys::apply();
+    }
+    if (GsSubsys::dirty)    {
+        Debug::log2SD("Subsys: Gs wanted=%d freeHeap=%u", (int)GsSubsys::wanted, (unsigned)getFreeHeap());
+        GsSubsys::apply();
+    }
 #endif
 }

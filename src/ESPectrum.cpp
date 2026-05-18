@@ -914,6 +914,14 @@ void ESPectrum::setup() {
   // MB02 / DivMMC were already initialized above (they need MemESP ready) —
   // sync our subsystem flags to reflect that state.
   // tape_player mode disables AY/SAA emulation regardless of Config (see below).
+  Debug::log2SD("setup: Subsystems::request begin tape_player=%d turbo=%d covox=%d SAA=%d midi=%d freeHeap=%u",
+                (int)Config::tape_player, (int)Config::turbosound, (int)Config::covox,
+#if !PICO_RP2040
+                (int)Config::SAA1099, (int)Config::midi,
+#else
+                0, 0,
+#endif
+                (unsigned)getFreeHeap());
   TurboSubsys::request(!Config::tape_player && Config::turbosound != 0);
   CovoxSubsys::request(Config::covox != 0);
 #if !PICO_RP2040
@@ -923,7 +931,9 @@ void ESPectrum::setup() {
   Mb02Subsys::syncFromState();
   DivMmcSubsys::syncFromState();
 #endif
+  Debug::log2SD("setup: Subsystems::applyPending begin, freeHeap=%u", (unsigned)getFreeHeap());
   Subsystems::applyPending();
+  Debug::log2SD("setup: Subsystems::applyPending done, freeHeap=%u", (unsigned)getFreeHeap());
 
   // Init tape
   Debug::log("setup: Tape init begin");
