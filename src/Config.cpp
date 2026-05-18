@@ -872,22 +872,41 @@ void Config::save() {
             }
         }
         // Make sure /.config/pico-spec/<ver>/<board>/ exists before writing.
-        FileUtils::mkdirParents(CONFIG_DIR_BOARD);
-        // Atomic write: write to .tmp, then rename over the original
-        static const char* nvs_tmp = STORAGE_NVS ".tmp";
-        static const char* nvs_path = STORAGE_NVS;
-        FIL* handle = fopen2(nvs_tmp, FA_WRITE | FA_CREATE_ALWAYS);
-        if (handle) {
-            UINT bw;
-            FRESULT wr = f_write(handle, buf.c_str(), buf.size(), &bw);
-            fclose2(handle);
-            if (wr == FR_OK && bw == buf.size()) {
-                f_unlink(nvs_path);
-                f_rename(nvs_tmp, nvs_path);
+        // If mkdir fails (broken/full SD), refuse to write — otherwise the
+        // following f_open would silently fail and we'd lose original state.
+        if (!FileUtils::mkdirParents(CONFIG_DIR_BOARD)) {
+            Debug::log("Config::save FAILED — cannot create %s", CONFIG_DIR_BOARD);
+        } else {
+            // Atomic write: write to .tmp, then rename over the original
+            static const char* nvs_tmp = STORAGE_NVS ".tmp";
+            static const char* nvs_path = STORAGE_NVS;
+            FIL* handle = fopen2(nvs_tmp, FA_WRITE | FA_CREATE_ALWAYS);
+            if (handle) {
+                UINT bw;
+                FRESULT wr = f_write(handle, buf.c_str(), buf.size(), &bw);
+                // f_sync flushes FAT before close so we don't commit the
+                // rename on top of a half-written file when the card stalls.
+                FRESULT sy = (wr == FR_OK) ? f_sync(handle) : wr;
+                fclose2(handle);
+                if (wr == FR_OK && sy == FR_OK && bw == buf.size()) {
+                    // Try rename first; on FR_EXIST drop the original then
+                    // retry, narrowing the window where neither file exists.
+                    FRESULT rn = f_rename(nvs_tmp, nvs_path);
+                    if (rn == FR_EXIST) {
+                        f_unlink(nvs_path);
+                        rn = f_rename(nvs_tmp, nvs_path);
+                    }
+                    if (rn != FR_OK) {
+                        Debug::log("Config::save FAILED — rename error (rn=%d)", rn);
+                        // Leave .tmp behind for manual recovery if needed.
+                    }
+                } else {
+                    // Write failed — remove incomplete temp, keep original intact
+                    f_unlink(nvs_tmp);
+                    Debug::log("Config::save FAILED — write error (wr=%d, sy=%d, bw=%u/%u)", wr, sy, bw, buf.size());
+                }
             } else {
-                // Write failed — remove incomplete temp, keep original intact
-                f_unlink(nvs_tmp);
-                Debug::log("Config::save FAILED — write error (wr=%d, bw=%u/%u)", wr, bw, buf.size());
+                Debug::log("Config::save FAILED — cannot open %s", nvs_tmp);
             }
         }
     }

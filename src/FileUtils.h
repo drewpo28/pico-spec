@@ -86,7 +86,7 @@ public:
     static void initFileSystem();
     static bool mountSDCard();
     static void unmountSDCard();
-    static void mkdirParents(const char* path);
+    static bool mkdirParents(const char* path);
     static bool checkSDCard();
     static bool remountSD();
     // static String         getAllFilesFrom(const String path);
