@@ -895,31 +895,36 @@ static inline size_t fbPrevBytes(int lines, int stride) {
     return (size_t)lines * (size_t)(stride / 2);  // 4-bit packed: 2 px/byte
 }
 
-// Realloc sharedFB_main to fit lines×stride. Returns true on success.
-// On grow failure the original block (and size) is preserved.
-// Caller must rebuild sharedFB_arr1 afterwards — realloc may move the block.
+extern size_t getContiguousHeap(void);
+
+// Minimum heap headroom before calling FatFS f_open. ff_memalloc reserves
+// (FF_MAX_LFN+1)*2 + MAXDIRB(FF_MAX_LFN) ≈ 1-2 KB for LFN/VFAT scratch. SDK
+// malloc panics on OOM (no NULL return), so we must gate this with sbrk
+// headroom (the only allocator-friendly free-memory measure).
+#define FF_OPEN_HEAP_FLOOR 4096u
+
+// FB allocation happens once at boot via these. Mode-change runtime resize
+// was removed because heap fragmentation made grow impossible — switching
+// video modes now triggers a hard reset (see Config::pending_vga/hdmi mode).
 static bool ensureMainFB(int lines, int stride) {
     size_t want = fbMainBytes(lines, stride);
     if (sharedFB_main && sharedFB_main_size == want) return true;
-    uint8_t *p = (uint8_t*)realloc(sharedFB_main, want);
+    if (sharedFB_main) { free(sharedFB_main); sharedFB_main = nullptr; sharedFB_main_size = 0; }
+    uint8_t *p = (uint8_t*)malloc(want);
     if (!p) return false;
-    if (want > sharedFB_main_size) {
-        memset(p + sharedFB_main_size, 0, want - sharedFB_main_size);
-    }
+    memset(p, 0, want);
     sharedFB_main = p;
     sharedFB_main_size = want;
     return true;
 }
 
-// Same contract for the prev buffer.
 static bool ensurePrevFB(int lines, int stride) {
     size_t want = fbPrevBytes(lines, stride);
     if (sharedFB_prev && sharedFB_prev_size == want) return true;
-    uint8_t *p = (uint8_t*)realloc(sharedFB_prev, want);
+    if (sharedFB_prev) { free(sharedFB_prev); sharedFB_prev = nullptr; sharedFB_prev_size = 0; }
+    uint8_t *p = (uint8_t*)malloc(want);
     if (!p) return false;
-    if (want > sharedFB_prev_size) {
-        memset(p + sharedFB_prev_size, 0, want - sharedFB_prev_size);
-    }
+    memset(p, 0, want);
     sharedFB_prev = p;
     sharedFB_prev_size = want;
     return true;
@@ -1098,25 +1103,13 @@ void VIDEO::changeMode() {
     // resolutions; grows on the way up). Pointer arrays rebuilt afterwards.
     if (sharedFB_main) {
         if (!sameDims) {
-            int lines = fbCalcLines(newH);
-            int stride = (newW + 3) & ~3;
-            // Try to ensure capacity BEFORE touching live state. On failure,
-            // abort the mode change so the driver never indexes past the block.
-            if (!ensureMainFB(lines, stride)) {
-                Debug::log("changeMode: ensureMainFB(%dx%d) OOM, keeping old mode",
-                           newW, newH);
-                return;
-            }
-            if (GsSubsys::enabled) {
-                if (!ensurePrevFB(lines, stride)) {
-                    Debug::log("changeMode: ensurePrevFB OOM, disabling Gigascreen");
-                    GsSubsys::request(false);
-                    GsSubsys::apply();
-                }
-            }
-            vga.frameBuffer = nullptr;  // blank output while reconfiguring
-            SaveRect.clear();
-            setupSharedFBPointers(vga, lines, stride);
+            // Runtime resolution change is not supported — mode-switch callers
+            // savePendingVideoMode() then esp_hard_reset(). If we got here with
+            // a dim change anyway, refuse: heap fragmentation has no in-place
+            // remedy and a NULL frameBuffer would SIGBUS-storm the renderer.
+            Debug::log("changeMode: ignored runtime dim change %dx%d -> %dx%d",
+                       (int)vga.xres, (int)vga.yres, newW, newH);
+            return;
         }
     } else
 #endif
@@ -2515,8 +2508,19 @@ void SaveRectT::save(int16_t x, int16_t y, int16_t w, int16_t h) {
         return;
     }
     if (FileUtils::fsMount) {
+        // FatFS f_open calls ff_memalloc() for LFN/VFAT buffers. SDK malloc
+        // panics on OOM (no NULL return), so reject before opening when the
+        // heap can't satisfy it. Bail to a dummy push — restore will redraw
+        // the underlying screen instead of crashing.
+        if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) {
+            offsets.push_back(off);
+            return;
+        }
         FIL f;
-        f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS);
+        if (f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) {
+            offsets.push_back(off); // open failed — dummy
+            return;
+        }
         f_lseek(&f, off);
         UINT bw;
         f_write(&f, &x, 2, &bw);
@@ -2594,8 +2598,17 @@ void SaveRectT::restore_last() {
         return;
     }
     if (FileUtils::fsMount) {
+        // f_open allocates LFN scratch — gate with heap floor; on shortage the
+        // dialog underneath just redraws on close (no restore happens).
+        if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) {
+            if (offsets.empty()) offsets.push_back(0);
+            return;
+        }
         FIL f;
-        f_open(&f, "/tmp/save_rect.tmp", FA_READ);
+        if (f_open(&f, "/tmp/save_rect.tmp", FA_READ) != FR_OK) {
+            if (offsets.empty()) offsets.push_back(0);
+            return;
+        }
         f_lseek(&f, off);
         UINT br;
         f_read(&f, &x, 2, &br);
@@ -2634,9 +2647,10 @@ void SaveRectT::store_ram(const void* p, size_t sz) {
         offsets.push_back(0);
     }
     size_t off = offsets.back();
+    if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) return; // skip — no LFN scratch room
     UINT bw;
     FIL f;
-    f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS);
+    if (f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) return;
     f_lseek(&f, off);
     f_write(&f, p, sz, &bw);
     f_close(&f);
@@ -2646,9 +2660,16 @@ void SaveRectT::restore_ram(void* p, size_t sz) {
     if (offsets.empty()) return;
     offsets.pop_back();
     size_t off = offsets.back();
+    if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) {
+        if (offsets.empty()) offsets.push_back(0);
+        return;
+    }
     UINT br;
     FIL f;
-    f_open(&f, "/tmp/save_rect.tmp", FA_READ);
+    if (f_open(&f, "/tmp/save_rect.tmp", FA_READ) != FR_OK) {
+        if (offsets.empty()) offsets.push_back(0);
+        return;
+    }
     f_lseek(&f, off);
     f_read(&f, p, sz, &br);
     f_close(&f);

@@ -1600,21 +1600,14 @@ void ESPectrum::loop() {
   {
       uint8_t pend_hdmi = 0, pend_vga = 0;
       if (Config::loadPendingVideoMode(pend_hdmi, pend_vga)) {
-          Debug::log("loop: pending video mode found, showing confirmation");
           sleep_ms(500); // Let HDMI stabilize
           if (!OSD::videoModeConfirm(15)) {
-              Debug::log("loop: reverting video mode");
               Config::hdmi_video_mode = pend_hdmi;
               Config::vga_video_mode = pend_vga;
               Config::save();
               Config::clearPendingVideoMode();
-#ifdef VGA_HDMI
-              VIDEO::changeMode();
-#else
               OSD::esp_hard_reset();
-#endif
           } else {
-              Debug::log("loop: video mode confirmed");
               Config::clearPendingVideoMode();
           }
       }

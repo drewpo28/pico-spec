@@ -108,6 +108,9 @@ public:
   void save(int16_t x, int16_t y, int16_t w, int16_t h);
   void restore_last();
   void clear() { offsets.clear(); offsets.push_back(0); ram_buf.clear(); f_unlink("/tmp/save_rect.tmp"); }
+  // Release ram_buf capacity (clear() leaves the vector's backing alloc in place).
+  // Use before tight-heap operations like framebuffer growth.
+  void dropCapacity() { std::vector<uint8_t>().swap(ram_buf); }
   void store_ram(const void* p, size_t sz);
   void restore_ram(void* p, size_t sz);
 };
