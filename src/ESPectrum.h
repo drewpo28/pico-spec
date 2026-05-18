@@ -113,7 +113,8 @@ public:
     static bool __not_in_flash_func(AY_timer_callback)(repeating_timer_t *rt);
     static uint8_t audioBuffer_L[ESP_AUDIO_SAMPLES_PENTAGON];
     static uint8_t audioBuffer_R[ESP_AUDIO_SAMPLES_PENTAGON];
-    static uint8_t audioBufferCovox[ESP_AUDIO_SAMPLES_PENTAGON];
+    // Dynamically allocated by CovoxSubsys when Config::covox != 0; nullptr otherwise.
+    static uint8_t* audioBufferCovox;
     static uint8_t overSamplebuf[ESP_AUDIO_SAMPLES_PENTAGON];
     static unsigned char audioSampleDivider;
     static unsigned char audioAYDivider;
@@ -135,7 +136,8 @@ public:
 #endif
     static uint32_t faudbufcntCovox;
 #if !PICO_RP2040
-    static uint8_t audioBufferPIT[ESP_AUDIO_SAMPLES_PENTAGON];
+    // Dynamically allocated by PitSubsys when Pentagon Byte arch is active.
+    static uint8_t* audioBufferPIT;
 #endif
     // Compact FDD sound description (~22 bytes instead of 640-byte buffer)
     struct FDDSound {
@@ -167,8 +169,9 @@ public:
         return 0;
     }
 #if !PICO_RP2040
-    static uint8_t audioBufferMIDI_L[ESP_AUDIO_SAMPLES_PENTAGON];
-    static uint8_t audioBufferMIDI_R[ESP_AUDIO_SAMPLES_PENTAGON];
+    // Dynamically allocated by MidiSubsys when Config::midi != 0.
+    static uint8_t* audioBufferMIDI_L;
+    static uint8_t* audioBufferMIDI_R;
     static uint32_t audbufcntPIT;
     static uint32_t faudbufcntPIT;
     static bool SAA_emu;

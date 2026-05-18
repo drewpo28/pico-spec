@@ -41,6 +41,7 @@ visit https://zxespectrum.speccy.org/contacto
 
 #include "OSDMain.h"
 #include "FileUtils.h"
+#include "Subsystem.h"
 #include "CPU.h"
 #include "Video.h"
 #include "ESPectrum.h"
@@ -254,6 +255,7 @@ IRAM_ATTR void OSD::click() {
 }
 void close_all(void);
 void OSD::esp_hard_reset() {
+    Debug::log("esp_hard_reset called from %p", __builtin_return_address(0));
     if (Config::audio_driver == 3) send_to_595(LOW(AY_Enable));
     close_all();
     watchdog_enable(1, true);
@@ -699,31 +701,24 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
     }
 
 #ifdef VGA_HDMI
+    // Mode switches require a hard reset — heap fragmentation breaks runtime
+    // framebuffer grow. Save the *old* vm to pending (loaded after reboot for
+    // the rollback confirmation), write the new vm to main config, then reset.
     if (hkIdx == Config::HK_VIDMODE_60) { // HDMI 60Hz
         uint8_t &vm = SELECT_VGA ? Config::vga_video_mode : Config::hdmi_video_mode;
         if (vm == Config::VM_640x480_60) return;
-        uint8_t saved_vm = vm;
+        Config::savePendingVideoMode(); // captures old vm
         vm = Config::VM_640x480_60;
         Config::save();
-        VIDEO::changeMode();
-        if (!videoModeConfirm(10)) {
-            vm = saved_vm;
-            Config::save();
-            VIDEO::changeMode();
-        }
+        esp_hard_reset();
     } else
     if (hkIdx == Config::HK_VIDMODE_50) { // HDMI 50Hz
         uint8_t &vm = SELECT_VGA ? Config::vga_video_mode : Config::hdmi_video_mode;
         if (vm == Config::VM_640x480_50) return;
-        uint8_t saved_vm = vm;
+        Config::savePendingVideoMode(); // captures old vm
         vm = Config::VM_640x480_50;
         Config::save();
-        VIDEO::changeMode();
-        if (!videoModeConfirm(10)) {
-            vm = saved_vm;
-            Config::save();
-            VIDEO::changeMode();
-        }
+        esp_hard_reset();
     } else
 #endif
     if (hkIdx == Config::HK_HW_INFO) { // Show mem info
@@ -2468,6 +2463,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::turbosound = opt2 - 1;
                                     if (Config::turbosound != prev) {
                                         Config::save();
+                                        TurboSubsys::request(Config::turbosound != 0);
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -2503,6 +2499,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::covox = opt2 - 1;
                                     if (Config::covox != prev) {
                                         Config::save();
+                                        CovoxSubsys::request(Config::covox != 0);
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -2546,6 +2543,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             OSD::osdCenteredMsg("Timex disabled", LEVEL_WARN, 2000);
                                         }
                                         Config::save();
+                                        SaaSubsys::request(Config::SAA1099);
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -2577,6 +2575,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         if (Midi::enabled)
                                             Midi::init();
                                         Config::save();
+                                        MidiSubsys::request(Config::midi != 0);
 #if defined(MIDI_TX_PIN) && defined(LOAD_WAV_PIO) && (LOAD_WAV_PIO == MIDI_TX_PIN)
                                         if ((Config::midi == 1 || Config::midi == 2) && Config::real_player)
                                             osdCenteredMsg(MSG_MIDI_PIN_CONFLICT[Config::lang], LEVEL_WARN, 3000);
@@ -2761,22 +2760,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 if (opt2) {
                                     uint8_t new_vm = opt2 - 1; // opt2 is 1-based, VM_* is 0-based
                                     if (new_vm != curVideoMode) {
-                                        uint8_t saved_vm = curVideoMode;
+                                        // Save old vm as pending for post-reboot rollback confirmation,
+                                        // then commit new vm and hard reset — runtime FB resize is
+                                        // unreliable due to heap fragmentation.
+                                        Config::savePendingVideoMode();
                                         curVideoMode = new_vm;
                                         Config::save();
-#ifdef VGA_HDMI
-                                        VIDEO::changeMode();
-                                        if (!videoModeConfirm(10)) {
-                                            // Rollback
-                                            curVideoMode = saved_vm;
-                                            Config::save();
-                                            VIDEO::changeMode();
-                                        }
-                                        // Exit OSD after mode switch
-                                        return;
-#else
                                         OSD::esp_hard_reset();
-#endif
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -3019,6 +3009,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             VIDEO::gigascreen_auto_countdown = 0;
                                         }
                                         Config::save();
+#if !PICO_RP2040
+                                        // Free 52 KB prev framebuffer when disabling.
+                                        GsSubsys::request(Config::gigascreen_enabled);
+#endif
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
