@@ -1188,6 +1188,7 @@ int main() {
     Debug::log("main: before ESPectrum::setup()");
     ESPectrum::setup();
     Debug::log("main: after ESPectrum::setup()");
+    Debug::log2SD("main: after ESPectrum::setup()");
     #ifdef PICO_DEFAULT_LED_PIN
     for (int i = 0; i < 6; i++) {
         sleep_ms(33);
@@ -1235,12 +1236,15 @@ int main() {
     {
 #if !PICO_RP2040
         // Apply saved vreg voltage (vreg_disable_voltage_limit already called at boot)
+        Debug::log2SD("main: vreg_set_voltage %d", (int)Config::vreq_voltage);
         vreg_set_voltage((enum vreg_voltage)Config::vreq_voltage);
         sleep_ms(10);
 #endif
         uint16_t running_mhz = clock_get_hz(clk_sys) / 1000000;
+        Debug::log2SD("main: cpu_mhz cfg=%d running=%d", (int)Config::cpu_mhz, (int)running_mhz);
         if (Config::cpu_mhz != running_mhz) {
             if (try_set_sys_clock_khz(Config::cpu_mhz * KHZ)) {
+                Debug::log2SD("main: sys_clk -> %d MHz OK", (int)Config::cpu_mhz);
 #ifdef VGA_HDMI
                 graphics_set_pio_clk_div((float)Config::cpu_mhz / 252.0f);
 #endif
@@ -1248,6 +1252,8 @@ int main() {
                 pcm_setup(ESPectrum::Audio_freq);
             } else {
                 // PLL did not lock — restore original PLL
+                Debug::log2SD("main: PLL lock FAILED at %d MHz, restoring %d",
+                              (int)Config::cpu_mhz, (int)running_mhz);
                 set_sys_clock_khz(running_mhz * KHZ, true);
                 //Config::cpu_mhz = running_mhz;
                 //Config::save();

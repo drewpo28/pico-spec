@@ -578,6 +578,7 @@ void ESPectrum::setup() {
   Debug::log("setup: initFileSystem begin");
   FileUtils::initFileSystem();
   Debug::log("setup: initFileSystem done, fsMount=%d", FileUtils::fsMount);
+  Debug::log2SD("setup: initFileSystem done, fsMount=%d", FileUtils::fsMount);
 
   mem_desc_t::reset();
   Ports::portAFF7 = 0;
@@ -589,9 +590,13 @@ void ESPectrum::setup() {
     Config::load();
   VIDEO::loadCustomPalettes();
   Debug::log("setup: Config loaded");
+  Debug::log2SD("setup: Config loaded, arch=%s romSet=%s", Config::arch.c_str(), Config::romSet.c_str());
   bool ext_ram_exist = butter_psram_size() >= (16 << 10) ||
                        psram_size() >= (16 << 10) || FileUtils::fsMount;
   Debug::log("setup: ext_ram_exist=%d, freeHeap=%u", ext_ram_exist, getFreeHeap());
+  Debug::log2SD("setup: ext_ram_exist=%d, butter=%u spi=%u freeHeap=%u",
+                ext_ram_exist, (unsigned)butter_psram_size(),
+                (unsigned)psram_size(), (unsigned)getFreeHeap());
 
   // Set arch if there's no snapshot to load
   if (Config::ram_file == NO_RAM_FILE) {
@@ -669,6 +674,7 @@ void ESPectrum::setup() {
   // MEMORY SETUP
   //=======================================================================================
   Debug::log("setup: MEMORY SETUP begin, freeHeap=%u", getFreeHeap());
+  Debug::log2SD("setup: MEMORY SETUP begin, freeHeap=%u", (unsigned)getFreeHeap());
   if (ext_ram_exist) {
     mem_desc_t *temp = MemESP::ram;
     MemESP::ram = new mem_desc_t[MEM_PG_CNT + 2];
@@ -726,8 +732,11 @@ void ESPectrum::setup() {
   }
   // Load romset
   Debug::log("setup: requestMachine begin, freeHeap=%u", getFreeHeap());
+  Debug::log2SD("setup: requestMachine begin arch=%s romSet=%s freeHeap=%u",
+                Config::arch.c_str(), Config::romSet.c_str(), (unsigned)getFreeHeap());
   Config::requestMachine(Config::arch, Config::romSet);
   Debug::log("setup: requestMachine done, freeHeap=%u", getFreeHeap());
+  Debug::log2SD("setup: requestMachine done, freeHeap=%u", (unsigned)getFreeHeap());
 
   MemESP::page0ram = 0;
   // Pentagon+Gluk: boot with Gluk ROM to install service monitor at 0xDB00
@@ -770,11 +779,17 @@ void ESPectrum::setup() {
 
 #if !PICO_RP2040
   // Always init DivMMC (load ROM) so it's ready if user enables from OSD later
+  Debug::log2SD("setup: DivMMC::init begin, freeHeap=%u", (unsigned)getFreeHeap());
   DivMMC::init();
+  Debug::log2SD("setup: DivMMC::init done, freeHeap=%u", (unsigned)getFreeHeap());
   // MB-02+ disk interface (allocates SRAM in butter PSRAM after DivMMC)
+  Debug::log2SD("setup: MB02::init begin");
   MB02::init();
+  Debug::log2SD("setup: MB02::init done, enabled=%d freeHeap=%u",
+                (int)MB02::enabled, (unsigned)getFreeHeap());
   // Z-Controller raw SD on ports 0x77/0x57 (mutually exclusive with esxDOS)
   if (Config::zcontroller && !Config::esxdos && !Config::mb02) {
+    Debug::log2SD("setup: DivMMC::zc_init");
     DivMMC::zc_init();
   }
 #endif
@@ -783,7 +798,9 @@ void ESPectrum::setup() {
     uint32_t gs_ram = 2u << 20;
     if (Config::gs_ram_size == 0) gs_ram = 512u << 10;
     else if (Config::gs_ram_size == 1) gs_ram = 1u << 20;
+    Debug::log2SD("setup: GS::init ram=%u", (unsigned)gs_ram);
     GS::init(gs_ram);
+    Debug::log2SD("setup: GS::init done, freeHeap=%u", (unsigned)getFreeHeap());
   }
 #endif
 
@@ -818,6 +835,7 @@ void ESPectrum::setup() {
   // if (Config::StartMsg) ShowStartMsg(); // Show welcome message
 
   Debug::log("setup: AUDIO section begin, freeHeap=%u", getFreeHeap());
+  Debug::log2SD("setup: AUDIO section begin, freeHeap=%u", (unsigned)getFreeHeap());
   //=======================================================================================
   // AUDIO
   //=======================================================================================
@@ -826,8 +844,14 @@ void ESPectrum::setup() {
 #if !PICO_RP2040
     SAA_emu = Config::SAA1099;
     Midi::enabled = Config::midi;
-    if (Midi::enabled) Midi::init();
-    if (Config::dma_mode) Z80DMA::reset();
+    if (Midi::enabled) {
+        Debug::log2SD("setup: Midi::init mode=%d", (int)Midi::enabled);
+        Midi::init();
+    }
+    if (Config::dma_mode) {
+        Debug::log2SD("setup: Z80DMA::reset");
+        Z80DMA::reset();
+    }
 #endif
 
   if (Config::arch == "48K") {
@@ -857,9 +881,11 @@ void ESPectrum::setup() {
   audioCOVOXDivider = audioAYDivider;
 
   Debug::log("setup: init_sound begin");
+  Debug::log2SD("setup: init_sound begin arch=%s freq=%d", Config::arch.c_str(), (int)Audio_freq);
   init_sound();
   pcm_setup(Audio_freq);
   Debug::log("setup: audio init done, freeHeap=%u", getFreeHeap());
+  Debug::log2SD("setup: audio init done, freeHeap=%u", (unsigned)getFreeHeap());
 
   if (Config::tape_player) {
     AY_emu = false; // Disable AY emulation if tape player mode is set
@@ -874,6 +900,7 @@ void ESPectrum::setup() {
 
   // AY Sound
   Debug::log("setup: AY init begin");
+  Debug::log2SD("setup: AY init begin");
   chip0.init();
   chip0.set_sound_format(Audio_freq, 1, 8);
   chip0.set_stereo(AYEMU_MONO, NULL);
@@ -883,27 +910,33 @@ void ESPectrum::setup() {
   chip1.set_stereo(AYEMU_MONO, NULL);
   chip1.reset();
   Debug::log("setup: AY init done");
+  Debug::log2SD("setup: AY init done");
 
 #if !PICO_RP2040
   Debug::log("setup: SAA init begin");
+  Debug::log2SD("setup: SAA init begin");
   // SAA1099 Sound
   saaChip.init();
   saaChip.set_sound_format(Audio_freq, 1, 8);
   saaChip.reset();
   Debug::log("setup: SAA init done");
+  Debug::log2SD("setup: SAA init done");
 #endif
 
   // Init tape
   Debug::log("setup: Tape init begin");
+  Debug::log2SD("setup: Tape init begin");
   Tape::Init();
   Tape::tapeFileName = "none";
   Tape::tapeStatus = TAPE_STOPPED;
   Tape::SaveStatus = SAVE_STOPPED;
   Tape::romLoading = false;
   Debug::log("setup: Tape init done");
+  Debug::log2SD("setup: Tape init done");
 
   // Init CPU
   Debug::log("setup: Z80 create begin");
+  Debug::log2SD("setup: Z80 create begin");
   Z80::create();
 
   // Set Ports starting values
@@ -916,11 +949,14 @@ void ESPectrum::setup() {
 
   // Init disk controller
   Debug::log("setup: WD1793 reset begin");
+  Debug::log2SD("setup: WD1793 reset begin");
   rvmWD1793Reset(&fdd);
   Debug::log("setup: WD1793 reset done");
+  Debug::log2SD("setup: WD1793 reset done");
 
   // Reset cpu
   Debug::log("setup: CPU reset begin");
+  Debug::log2SD("setup: CPU reset begin");
   CPU::reset();
   VIDEO::Reset(); // Re-run after CPU::reset() so Z80Ops flags are correct
 
@@ -933,15 +969,19 @@ void ESPectrum::setup() {
 #endif
 
   Debug::log("setup: CPU reset done");
+  Debug::log2SD("setup: CPU reset done");
   Debug::log("setup: Config::loadDiskMounts begin");
+  Debug::log2SD("setup: Config::loadDiskMounts begin, freeHeap=%u", (unsigned)getFreeHeap());
   if (FileUtils::fsMount) {
     Config::loadDiskMounts();
   }
   Debug::log("setup: Config::loadDiskMounts done");
+  Debug::log2SD("setup: Config::loadDiskMounts done, freeHeap=%u", (unsigned)getFreeHeap());
 
 #if !PICO_RP2040
   // Re-reset MB-02 after disk mounts so boot EPROM starts with disks already inserted
   if (MB02::enabled && mb02_fdd.disk[0]) {
+    Debug::log2SD("setup: MB02::reset (post-mount)");
     MB02::reset();
     Z80::reset();
   }
@@ -949,15 +989,20 @@ void ESPectrum::setup() {
 
   // Load snapshot if present in Config::
   Debug::log("setup: ram_file='%s'", Config::ram_file.c_str());
+  Debug::log2SD("setup: ram_file='%s'", Config::ram_file.c_str());
   if (Config::ram_file != NO_RAM_FILE) {
-    if (FileUtils::fsMount)
+    if (FileUtils::fsMount) {
+      Debug::log2SD("setup: LoadSnapshot begin");
       LoadSnapshot(Config::ram_file, "", "");
+      Debug::log2SD("setup: LoadSnapshot done");
+    }
     Config::last_ram_file = Config::ram_file;
     Config::ram_file = NO_RAM_FILE;
     if (FileUtils::fsMount)
       Config::save();
   }
   Debug::log("setup: COMPLETE, freeHeap=%u", getFreeHeap());
+  Debug::log2SD("setup: COMPLETE, freeHeap=%u", (unsigned)getFreeHeap());
 
   // Create loop function as task: it doesn't seem better than calling from
   // main.cpp and increases RAM consumption (4096 bytes for stack).
