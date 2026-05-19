@@ -43,6 +43,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "MemESP.h"
 #include "Config.h"
 #include "OSDMain.h"
+#include "LEDIndicators.h"
 #include "hardconfig.h"
 #include "hardpins.h"
 #include "Z80_JLS/z80.h"
@@ -2231,6 +2232,11 @@ IRAM_ATTR void VIDEO::EndFrame() {
     }
 #endif
 
+    if (Config::ledIndicators) {
+        LED::decay();
+        LED::draw();
+    }
+
     framecnt++;
 }
 
@@ -2457,8 +2463,9 @@ IRAM_ATTR void VIDEO::BottomBorder_OSD() {
         if (brdcol_cnt < brdcol_retrace) {
             if (brdlin_cnt < osd_y_start || brdlin_cnt > osd_y_end) {
                 Update_Border();
-            } else if (brdcol_cnt < osd_x_start || brdcol_cnt >= osd_x_end) {
-                Update_Border();
+            } else {
+                const bool inStats = (brdcol_cnt >= osd_x_start && brdcol_cnt < osd_x_end);
+                if (!inStats) Update_Border();
             }
         } else if (brdcol_retrace < brdcol_end) {
             int lastPair = (brdcol_retrace - 1) & ~1;

@@ -32,6 +32,7 @@ string   Config::last_ram_file = NO_RAM_FILE;
 
 bool     Config::loaded = false;
 bool     Config::slog_on = false;
+bool     Config::ledIndicators = false;
 const bool     Config::aspect_16_9 = false;
 ///uint8_t  Config::esp32rev = 0;
 uint8_t  Config::lang = 0;
@@ -482,6 +483,7 @@ void Config::load() {
         nvs_get_b("flashload", flashload, sts);
         nvs_get_b("rightSpace", rightSpace, sts);
         nvs_get_b("wasd", wasd, sts);
+        nvs_get_b("ledIndicators", ledIndicators, sts);
         // Load typed breakpoints array
         for (int i = 0; i < MAX_BREAKPOINTS; i++) {
             breakPoints[i] = {0xFFFF, BP_NONE};
@@ -758,6 +760,7 @@ void Config::save() {
     nvs_set_str(buf,"Issue2", Issue2 ? "true" : "false");
     nvs_set_str(buf,"debug_log", Debug::log_enabled ? "true" : "false");
     nvs_set_str(buf,"flashload", flashload ? "true" : "false");
+    nvs_set_str(buf,"ledIndicators", ledIndicators ? "true" : "false");
     nvs_set_str(buf,"tape_player", tape_player ? "true" : "false");
     nvs_set_str(buf,"real_player", real_player ? "true" : "false");
     nvs_set_str(buf,"rightSpace", rightSpace ? "true" : "false");
