@@ -3,6 +3,7 @@
 bin
 build
 build-*
+build_*
 firmware
 drew.todo
 debug
