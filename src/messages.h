@@ -656,8 +656,7 @@ static const char *MENU_UPDATE_FW_NO_SD[2] = { MENU_UPDATE_NO_SD_EN, MENU_UPDATE
 		"Timex Gfx Mode\t>\n"\
 		"DMA\t>\n"\
 		"HDMI Dither (ULA+)\t>\n"\
-		"16col (Pentagon)\t>\n"\
-		"Port LED indicators\t>\n"
+		"16col (Pentagon)\t>\n"
 	#define MENU_VIDEO_ES \
 		"Video\n"\
 		"Modo\t>\n"\
@@ -671,8 +670,7 @@ static const char *MENU_UPDATE_FW_NO_SD[2] = { MENU_UPDATE_NO_SD_EN, MENU_UPDATE
 		"Timex Gfx Mode\t>\n"\
 		"DMA\t>\n"\
 		"Tramado HDMI (ULA+)\t>\n"\
-		"16col (Pentagon)\t>\n"\
-		"Indicadores LED\t>\n"
+		"16col (Pentagon)\t>\n"
 #else
 	#define MENU_VIDEO_EN \
 		"Video\n"\
@@ -681,8 +679,7 @@ static const char *MENU_UPDATE_FW_NO_SD[2] = { MENU_UPDATE_NO_SD_EN, MENU_UPDATE
 		"Render type\t>\n"\
 		"Aspect Ratio\t>\n"\
 		"Scanlines\t>\n"\
-		"V-Sync\t>\n"\
-		"Port LED indicators\t>\n"
+		"V-Sync\t>\n"
 	#define MENU_VIDEO_ES \
 		"Video\n"\
 		"Modo\t>\n"\
@@ -690,8 +687,7 @@ static const char *MENU_UPDATE_FW_NO_SD[2] = { MENU_UPDATE_NO_SD_EN, MENU_UPDATE
 		"Tipo render\t>\n"\
 		"Relaci" "\xA2" "n de aspecto\t>\n"\
 		"Scanlines\t>\n"\
-		"V-Sync\t>\n"\
-		"Indicadores LED\t>\n"
+		"V-Sync\t>\n"
 #endif
 static const char *MENU_VIDEO[2] = { MENU_VIDEO_EN, MENU_VIDEO_ES };
 
@@ -856,7 +852,7 @@ static const char *MENU_FLASHLOAD[2] = { "Fast load\n" , "Carga rapida\n"};
 
 static const char *MENU_RGTIMINGS[2] = { "R.G. Timings\n" , "Timings R.G.\n"};
 
-static const char *MENU_LEDINDICATORS[2] = { "Port LED indicators\n" , "Indicadores LED\n"};
+static const char *MENU_LEDINDICATORS[2] = { "LED indicators\n" , "Indicadores LED\n"};
 
 #if PICO_RP2040
 #define MENU_AUDIO_EN "Audio\n"\
@@ -900,7 +896,8 @@ static const char *MENU_GS[2] = { "Turned on?\n", "Turned on?\n" };
     "Second joystick\t>\n"\
     "Kempston joystick port\t>\n"\
     "Throttling\t>\n"\
-    "Hot Keys\t>\n"
+    "Hot Keys\t>\n"\
+    "LED indicators\t>\n"
 #define MENU_OTHER_ES "Otros\n"\
     "Temporizaci" "\xA2" "n ULA\t>\n"\
     "48K Issue 2\t>\n"\
@@ -908,7 +905,8 @@ static const char *MENU_GS[2] = { "Turned on?\n", "Turned on?\n" };
     "Segundo joystick\t>\n"\
     "Puerto Kempston joystick\t>\n"\
     "Aceleraci" "\xA2" "n\t>\n"\
-    "Teclas rapidas\t>\n"
+    "Teclas rapidas\t>\n"\
+    "Indicadores LED\t>\n"
 static const char *MENU_OTHER[2] = { MENU_OTHER_EN, MENU_OTHER_ES };
 
 #ifdef PICO_RP2040
