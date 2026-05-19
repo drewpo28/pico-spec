@@ -2388,10 +2388,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     bool gs_avail = (butter_psram_size() > 0)
                                     || (psram_size() >= (size_t)MEM_PG_CNT * MEM_PG_SZ + (2u << 20));
                     if (gs_avail) {
-                        // Find the last item ("Audio Driver") and insert GS before it
+                        // Insert GS before "Audio Driver" (second-to-last item, before Volume Boost)
                         size_t last_nl = audio_menu.rfind('\n', audio_menu.size() - 2);
-                        if (last_nl != string::npos) {
-                            audio_menu.insert(last_nl + 1, MENU_AUDIO_GS_ITEM[Config::lang]);
+                        if (last_nl != string::npos && last_nl > 0) {
+                            size_t insert_pos = audio_menu.rfind('\n', last_nl - 1);
+                            if (insert_pos != string::npos) {
+                                audio_menu.insert(insert_pos + 1, MENU_AUDIO_GS_ITEM[Config::lang]);
+                            }
                         }
                     }
 #else
