@@ -217,6 +217,7 @@ public:
 #endif
     
     static signed char aud_volume;
+    static uint8_t audio_boost;
 
     // Video mode enum
     enum {

@@ -860,13 +860,15 @@ static const char *MENU_LEDINDICATORS[2] = { "LED indicators\n" , "Indicadores L
     "AY-3-8912 Stereo\t>\n"\
     "TurboSound\t>\n"\
     "Covox\t>\n"\
-    "Audio Driver\t>\n"
+    "Audio Driver\t>\n"\
+    "Volume Boost\t>\n"
 #define MENU_AUDIO_ES "Audio\n"\
     "AY-3-8912 ON/OFF\t>\n"\
     "AY-3-8912 Est" "\x82" "reo\t>\n"\
     "TurboSound\t>\n"\
     "Covox\t>\n"\
-    "Controlador de audio\t>\n"
+    "Controlador de audio\t>\n"\
+    "Aumento de volumen\t>\n"
 #else
 #define MENU_AUDIO_EN "Audio\n"\
     "AY-3-8912 ON/OFF\t>\n"\
@@ -875,7 +877,8 @@ static const char *MENU_LEDINDICATORS[2] = { "LED indicators\n" , "Indicadores L
     "Covox\t>\n"\
     "SAA1099 ON/OFF\t>\n"\
     "MIDI\t>\n"\
-    "Audio Driver\t>\n"
+    "Audio Driver\t>\n"\
+    "Volume Boost\t>\n"
 #define MENU_AUDIO_ES "Audio\n"\
     "AY-3-8912 ON/OFF\t>\n"\
     "AY-3-8912 Est" "\x82" "reo\t>\n"\
@@ -883,7 +886,8 @@ static const char *MENU_LEDINDICATORS[2] = { "LED indicators\n" , "Indicadores L
     "Covox\t>\n"\
     "SAA1099 ON/OFF\t>\n"\
     "MIDI\t>\n"\
-    "Controlador de audio\t>\n"
+    "Controlador de audio\t>\n"\
+    "Aumento de volumen\t>\n"
 #endif
 static const char *MENU_AUDIO[2] = { MENU_AUDIO_EN, MENU_AUDIO_ES };
 static const char *MENU_AUDIO_GS_ITEM[2] = { "General Sound\t>\n", "General Sound\t>\n" };
@@ -1101,6 +1105,25 @@ static const char *MENU_COVOX[2] = { MENU_COVOX_EN, MENU_COVOX_EN };
     "AY-3-8910\t[Y]\n"
 	// \"HDMI     \t[H]\n"
 static const char *MENU_I2S[2] = { MENU_I2S_EN, MENU_I2S_ES };
+
+#define MENU_AUDIO_BOOST_EN "Volume Boost\n"\
+    "+0  \t[A]\n"\
+    "+4  \t[B]\n"\
+    "+8  \t[C]\n"\
+    "+12 \t[D]\n"\
+    "+16 \t[E]\n"\
+    "+32 \t[F]\n"\
+    "+64 \t[G]\n"
+#define MENU_AUDIO_BOOST_ES "Aumento de volumen\n"\
+    "+0  \t[A]\n"\
+    "+4  \t[B]\n"\
+    "+8  \t[C]\n"\
+    "+12 \t[D]\n"\
+    "+16 \t[E]\n"\
+    "+32 \t[F]\n"\
+    "+64 \t[G]\n"
+static const char *MENU_AUDIO_BOOST[2] = { MENU_AUDIO_BOOST_EN, MENU_AUDIO_BOOST_ES };
+static const uint8_t AUDIO_BOOST_VALS[] = { 0, 4, 8, 12, 16, 32, 64 };
 
 #define MENU_ALF_JOY_EN "Source\n"\
     "DPAD #1\t[1]\n"\

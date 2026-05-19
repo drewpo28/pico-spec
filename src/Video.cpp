@@ -177,6 +177,7 @@ static const uint8_t ulaplus_default_palette[64] = {
 uint8_t VIDEO::ulaplus_palette[64];
 bool VIDEO::ulaplus_palette_dirty = false;
 bool VIDEO::ulaplus_alubytes_dirty = false;
+static bool gigascreen_lut_rebuild_deferred = false;
 // AluBytesUlaPlus moved to flash — see roms/AluBytesUlaPlus.c
 
 // 16col mode (Pentagon, Alone Coder)
@@ -643,24 +644,29 @@ static inline uint32_t grb_to_rgb888(uint8_t grb) {
     return (R << 16) | (G << 8) | B;
 }
 
-// Bayer dither neighbour: brighten each channel by ~1 VGA-step (saturating).
-// Used only by HDMI dither path; mimics the visual look of VGA Bayer.
-static inline uint32_t dither_neighbour(uint32_t rgb) {
-    int R = ((rgb >> 16) & 0xFF) + 8; if (R > 255) R = 255;
-    int G = ((rgb >> 8) & 0xFF) + 8; if (G > 255) G = 255;
-    int B = (rgb & 0xFF) + 8; if (B > 255) B = 255;
-    return (R << 16) | (G << 8) | B;
-}
+// VGA Bayer lo/hi for a single channel: snaps to the /21->2bit grid (0,85,170,255).
+// lo = VGA level * 85, hi = (VGA level + 1) * 85, sub = fraction within a VGA level group.
+static inline int vga_lo_chan(int c) { return ((c / 21) >> 2) * 85; }
+static inline int vga_hi_chan(int c) { int hi = ((c / 21) >> 2) + 1; return (hi > 3 ? 3 : hi) * 85; }
+static inline int vga_sub_chan(int c) { return (c / 21) & 3; }
 
 #if !PICO_RP2040
-// Apply ULA+ palette entry i (and Bayer-dither neighbour at i|0x40 for HDMI)
+// Apply ULA+ palette entry i (and Bayer-dither neighbour at i|0x40 for HDMI).
+// Mirrors VGA Bayer: only dither when sub > 0 for at least one channel.
+// When sub=0 for all channels the colour lands exactly on the VGA grid → solid,
+// no checkerboard (same as vga_rgb888_dither which sets all 4 positions to lo).
 static inline void applyUlaPlusPalette(int i) {
-    uint32_t base = paletteTransform(grb_to_rgb888(VIDEO::ulaplus_palette[i]));
-    graphics_set_palette(i, base);
+    uint32_t orig = paletteTransform(grb_to_rgb888(VIDEO::ulaplus_palette[i]));
+    int R = (orig >> 16) & 0xFF, G = (orig >> 8) & 0xFF, B = orig & 0xFF;
+    bool needs = vga_sub_chan(R) || vga_sub_chan(G) || vga_sub_chan(B);
+    uint32_t neigh = needs
+        ? (((uint32_t)vga_hi_chan(R) << 16) | ((uint32_t)vga_hi_chan(G) << 8) | vga_hi_chan(B))
+        : orig;
+    graphics_set_palette(i, orig);
     // Always populate the dither slot so toggling Config::hdmi_dither at runtime
     // does not require a palette rebuild. When dither is off, hdmi.c does not
     // read palette[i|0x40], so the cost is just an extra LUT write per entry.
-    graphics_set_palette(i | 0x40, dither_neighbour(base));
+    graphics_set_palette(i | 0x40, neigh);
 }
 
 void VIDEO::regenerateUlaPlusAluBytes() {
@@ -717,6 +723,14 @@ void VIDEO::ulaPlusDisable() {
         uint32_t color = paletteTransform(spectrum_rgb888[i]);
         graphics_set_palette(i, color);
         vga_set_palette_entry_solid(i, color);
+    }
+    if (Config::gigascreen_enabled) {
+        // ULA+ active phase clobbered Gigascreen blend slots 17..127 via applyUlaPlusPalette.
+        // Signal EndFrame to rebuild them from the safe blanking context.
+        gigascreen_lut_rebuild_deferred = true;
+        // Reseed prevFrameBuffer so the first Gigascreen frame after ULA+ doesn't blend
+        // against stale ULA+ pixel indices (which were never stored as valid 4-bit Gigs data).
+        InitPrevBuffer();
     }
 
     for (int n = 0; n < 16; n++)
@@ -1803,7 +1817,7 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
         }
     } else
 #endif
-    if (VIDEO::gigascreen_enabled) {
+    if (VIDEO::gigascreen_enabled && !VIDEO::ulaplus_enabled) {
         for (; loopCount--; ) {
 #if !PICO_RP2040
             uint8_t att = dma_attr_override ? dma_attr_override[attOffset & 0x1F] : grmem[attOffset];
@@ -2152,6 +2166,14 @@ IRAM_ATTR void VIDEO::EndFrame() {
     if (Config::dma_mode)
         Z80DMA::resetAttrShadow();
     dma_attr_override = nullptr;
+
+    // Rebuild Gigascreen blend palette if a ULA+ session clobbered its slots.
+    // Safe here: EndFrame runs during blanking, HDMI DMA is not reading conv_color.
+    if (gigascreen_lut_rebuild_deferred && Config::gigascreen_enabled) {
+        gigascreen_lut_rebuild_deferred = false;
+        gigsBlendLUTReady = false;
+        initGigascreenBlendLUT();
+    }
 
     // Flush deferred ULA+ palette updates so HDMI DMA sees consistent palette
     // for the entire next frame (prevents top-of-screen palette tearing)

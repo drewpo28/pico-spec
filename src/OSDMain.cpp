@@ -2757,6 +2757,42 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                             }
                         }
+                        else if (options_num ==
+#if !PICO_RP2040
+                            (gs_avail ? 9 : 8)
+#else
+                            6
+#endif
+                        ) { // Volume Boost
+                            menu_level = 2;
+                            menu_curopt = 1;
+                            menu_saverect = true;
+                            while (1) {
+                                string boost_menu = MENU_AUDIO_BOOST[Config::lang];
+                                uint8_t cur = Config::audio_boost;
+                                int cur_idx = 0;
+                                for (int i = 0; i < (int)(sizeof(AUDIO_BOOST_VALS)); i++)
+                                    if (AUDIO_BOOST_VALS[i] == cur) { cur_idx = i; break; }
+                                static const char boost_marks[] = "ABCDEFG";
+                                for (int i = 0; i < (int)(sizeof(AUDIO_BOOST_VALS)); i++) {
+                                    char mark[3] = { '[', boost_marks[i], '\0' };
+                                    auto pos = boost_menu.find(mark, 0);
+                                    if (pos != string::npos)
+                                        boost_menu.replace(pos, 2, cur_idx == i ? "[*" : "[ ");
+                                }
+                                uint8_t opt2 = menuRun(boost_menu);
+                                if (opt2 >= 1 && opt2 <= (uint8_t)(sizeof(AUDIO_BOOST_VALS))) {
+                                    Config::audio_boost = AUDIO_BOOST_VALS[opt2 - 1];
+                                    Config::save();
+                                    menu_curopt = opt2;
+                                    menu_saverect = false;
+                                } else {
+                                    menu_curopt = options_num;
+                                    menu_level = 1;
+                                    break;
+                                }
+                            }
+                        }
                     } else {
                         menu_curopt = 3;
                         break;

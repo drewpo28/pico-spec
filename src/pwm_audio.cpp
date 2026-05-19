@@ -231,10 +231,12 @@ esp_err_t __not_in_flash_func(pwm_audio_write)(
     size_t* bytes_written,
     uint32_t wait_ms
 ) {
-    uint32_t vol8 = (uint32_t)vol << 3;
+    uint32_t vol8 = (uint32_t)(vol + Config::audio_boost) << 3;
     for (size_t i = 0; i < len; ++i) {
-        buff_L[i] = (int16_t)((uint32_t)bufL[i] * vol8);
-        buff_R[i] = (int16_t)((uint32_t)bufR[i] * vol8);
+        int32_t vL = (int32_t)bufL[i] * (int32_t)vol8;
+        int32_t vR = (int32_t)bufR[i] * (int32_t)vol8;
+        buff_L[i] = vL > 32767 ? 32767 : (int16_t)vL;
+        buff_R[i] = vR > 32767 ? 32767 : (int16_t)vR;
     }
     m_off = 0;
     m_size = len;
@@ -401,7 +403,7 @@ static void __not_in_flash_func(pcm_call_inner)() {
     if (GS::enabled) {
         uint8_t gL, gR;
         GS::getLiveLR(gL, gR);
-        uint32_t vol8 = (uint32_t)vol << 3;
+        uint32_t vol8 = (uint32_t)(vol + Config::audio_boost) << 3;
         gs_offL = ((int32_t)gL - 128) * (int32_t)vol8;
         gs_offR = ((int32_t)gR - 128) * (int32_t)vol8;
     }
