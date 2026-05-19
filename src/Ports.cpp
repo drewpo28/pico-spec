@@ -280,12 +280,10 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // Bit 6 = "receiver full" — reflect real UART FIFO state
     // enabled 2=ShamaZX HW, 3=Soft Synth (both use ShamaZX ports)
     if (Midi::enabled >= 2 && address == 0xA1CF) {
-      LED::touchR(LED::MIDI);
       return Midi::busy() ? 0x40 : 0x00;
     }
     // ShamaZX MIDI — read from 0xA0CF (parallel mode handshake)
     if (Midi::enabled >= 2 && address == 0xA0CF) {
-      LED::touchR(LED::MIDI);
       return 0x00;
     }
 #ifdef USE_GS
@@ -326,7 +324,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     if (MB02::enabled) {
       uint8_t lo = address & 0xFF;
       if ((lo & 0x9F) == 0x0F) { // WD2797 registers
-        LED::touchR(LED::MB02);
+        LED::touchR(LED::FDD);
         FDDStep_MB02(true); // force step — WD2797 needs step advancement for Seek/Restore
         ioContentionLate(MemESP::ramContended[rambank]);
         uint8_t r = (lo >> 5) & 3;
@@ -334,7 +332,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         return val;
       }
       if (lo == 0x13) { // Floppy status
-        LED::touchR(LED::MB02);
+        LED::touchR(LED::FDD);
         FDDStep_MB02(true);
         ioContentionLate(MemESP::ramContended[rambank]);
         return MB02::readPort13();
@@ -389,13 +387,13 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       case 0x23:
       case 0x43:
       case 0x63:
-        LED::touchR(LED::BETA);
+        LED::touchR(LED::FDD);
         FDDStep(false);
 
         return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
 
       case 0xe3: {
-        LED::touchR(LED::BETA);
+        LED::touchR(LED::FDD);
         FDDStep(true);
 
         uint8_t v = 0;
@@ -703,7 +701,6 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // 0xA0CF = control port: TX data byte here
     // 0xA1CF = data port: write 0xFF/0x3F for init, read status (bit 6 = receiver full)
     if (Midi::enabled >= 2 && address == 0xA0CF) {
-      LED::touchW(LED::MIDI);
       Midi::send(data);
       return;
     }
@@ -787,7 +784,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     if (MB02::enabled) {
       uint8_t lo = address & 0xFF;
       if ((lo & 0x9F) == 0x0F) { // WD2797 registers
-        LED::touchW(LED::MB02);
+        LED::touchW(LED::FDD);
         FDDStep_MB02(false);
         uint8_t reg = (lo >> 5) & 3;
         rvmWD1793Write(&ESPectrum::mb02_fdd, reg, data);
@@ -801,12 +798,12 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         return;
       }
       if (lo == 0x13) { // Floppy control
-        LED::touchW(LED::MB02);
+        LED::touchW(LED::FDD);
         MB02::writePort13(data);
         return;
       }
       if (lo == 0x17) { // Memory paging
-        LED::touchW(LED::MB02);
+        LED::touchW(LED::FDD);
         MB02::writePort17(data);
         return;
       }
@@ -859,13 +856,13 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       case 0x23:
       case 0x43:
       case 0x63:
-        LED::touchW(LED::BETA);
+        LED::touchW(LED::FDD);
         FDDStep(false);
         rvmWD1793Write(&ESPectrum::fdd, ((address >> 5) & 0x3), data);
         break;
       case 0xe3:
 
-        LED::touchW(LED::BETA);
+        LED::touchW(LED::FDD);
         FDDStep(true);
 
         // Change active disk unit

@@ -9,8 +9,7 @@ namespace LED {
     enum Id : uint8_t {
         SD = 0,        // DivMMC / esxDOS
         ZCTRL,         // Z-Controller
-        BETA,          // Beta-128 / TR-DOS
-        MB02,          // MB-02+
+        FDD,           // Floppy: Beta-128 / TR-DOS or MB-02+ (mutually exclusive)
         TAPE,          // Tape EAR
         AY,            // AY-3-8912
         SAA,           // SAA1099

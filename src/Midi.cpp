@@ -4,6 +4,7 @@
 
 #include "Config.h"
 #include "MidiSynth.h"
+#include "LEDIndicators.h"
 #include <hardware/uart.h>
 #include <hardware/gpio.h>
 
@@ -59,6 +60,7 @@ void Midi::deinit() {
 // Non-blocking send: write to UART TX FIFO if space available, else drop.
 // The ShamaZX driver polls busy() before calling, so drops shouldn't happen.
 void __not_in_flash("midi") Midi::send(uint8_t b) {
+    LED::touchW(LED::MIDI);
     if (enabled == 3) {
         MidiSynth::feedByte(b);
         return;

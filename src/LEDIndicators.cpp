@@ -16,54 +16,162 @@
 
 namespace LED {
 
-static constexpr int CELL_W = 9;   // 8px sprite + 1px gap
-static constexpr int CELL_H = 8;
+static constexpr int CELL_W = 10;  // 8px sprite + 2px gap
+static constexpr int CELL_H = 10;  // 8px sprite + 2px gap
 static constexpr int LEDS_PER_ROW = 9;
 static constexpr int ROWS = 2;
 
 uint8_t rdec[COUNT];
 uint8_t wdec[COUNT];
 
-// Previous render state for draw-on-change: 2 bits per LED (r,w), plus a flag bit for visibility-changed.
-static uint64_t prevStateBits = 0xFFFFFFFFFFFFFFFFULL; // force initial paint
-static uint32_t prevBrd = 0xFFFFFFFFu;
-
-// 8x8 sprite glyphs. Each row is 8 pixels (MSB = leftmost). 1 = LED pixel, 0 = background.
+// 7x7 glyphs in 8x8 grid. Bit 0 (rightmost col) and row 7 are 0 → inter-icon gap.
+// Bit layout per row: b7 = leftmost pixel ... b1 = 7th pixel.
 static const uint8_t SPRITE[COUNT][8] = {
-    /* SD       — card with top-right notch + contact pads */
-                   { 0x3F, 0x7F, 0xFF, 0xC3, 0xDB, 0xDB, 0xC3, 0xFF },
-    /* ZCTRL    — bold Z letter (Z-Controller SD interface) */
-                   { 0xFF, 0xFF, 0x06, 0x0C, 0x30, 0x60, 0xFF, 0xFF },
-    /* BETA     — 3.5" floppy: metal shutter at top + label below */
-                   { 0xFF, 0xBD, 0xBD, 0xBD, 0x81, 0xBD, 0xBD, 0xFF },
-    /* MB02     — 5.25" floppy: rounded corners + central hub slot */
-                   { 0x7E, 0xFF, 0xC3, 0xDB, 0xDB, 0xC3, 0xFF, 0x7E },
-    /* TAPE     — cassette: top edge, two reels, label slot at bottom */
-                   { 0xFF, 0x81, 0xB6, 0xB6, 0x81, 0xFF, 0xBF, 0xFF },
-    /* AY       — music note: note head, stem, flag */
-                   { 0x07, 0x05, 0x05, 0x05, 0xF5, 0xFB, 0xFB, 0x78 },
-    /* SAA      — three vertical bars (PSG channels) */
-                   { 0xDB, 0xDB, 0xDB, 0xDB, 0xDB, 0xDB, 0xDB, 0xDB },
-    /* BEEPER   — speaker: cone facing right */
-                   { 0x07, 0x0F, 0x1F, 0xFF, 0xFF, 0x1F, 0x0F, 0x07 },
-    /* COVOX    — DAC staircase (parallel-port DAC) */
-                   { 0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F, 0xFF },
-    /* GS       — G letter (General Sound) */
-                   { 0x7E, 0xC3, 0xC0, 0xCF, 0xC3, 0xC3, 0xC3, 0x7E },
-    /* MIDI     — DIN-5 connector pinout */
-                   { 0x7E, 0xC3, 0xA5, 0x81, 0xA5, 0x99, 0xC3, 0x7E },
-    /* ULAPLUS  — horizontal palette bands */
-                   { 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0xFF, 0xFF },
-    /* PAGING   — stacked pages (memory banks) */
-                   { 0x7E, 0x81, 0xFF, 0x81, 0xFF, 0x81, 0xFF, 0xFF },
-    /* TIMEX    — T letter (Timex SCLD video) */
-                   { 0xFF, 0xFF, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18 },
-    /* KEMPJOY  — joystick: vertical stick + rectangular base */
-                   { 0x18, 0x18, 0x18, 0x18, 0x7E, 0xFF, 0xFF, 0x7E },
-    /* KEMPMOUSE— mouse: oval body + buttons + tail */
-                   { 0x3C, 0x7E, 0xDB, 0xFF, 0xFF, 0xC3, 0x7E, 0x18 },
-    /* DMA      — diamond / bidirectional double arrow */
-                   { 0x18, 0x3C, 0x7E, 0xFF, 0xFF, 0x7E, 0x3C, 0x18 },
+    /* SD       — SD card silhouette with cut corner
+       .XXXXX.
+       XXXXXX.
+       X.X.X..
+       X.X.X..
+       X.X.X..
+       XXXXXX.
+       XXXXXX. */
+                   { 0x7C, 0xFC, 0xA8, 0xA8, 0xA8, 0xFC, 0xFC, 0x00 },
+    /* ZCTRL    — bold Z with diagonal
+       XXXXXX.
+       ....X..
+       ...X...
+       ..X....
+       .X.....
+       X......
+       XXXXXX. */
+                   { 0xFC, 0x08, 0x10, 0x20, 0x40, 0x80, 0xFC, 0x00 },
+    /* FDD      — diskette (works for both 3.5" Beta-128 and 5.25" MB-02+):
+                   metal shutter at top + central hub slot + label edges
+       .XXXXX.
+       .X.XXX.
+       XXXXXX.
+       X.XX.X.
+       X.XX.X.
+       X....X.
+       XXXXXX. */
+                   { 0x7C, 0x5C, 0xFC, 0xB4, 0xB4, 0x84, 0xFC, 0x00 },
+    /* TAPE     — cassette with two reels
+       XXXXXX.
+       X....X.
+       XXX.XX.
+       X.X.XX.
+       XXX.XX.
+       X....X.
+       XXXXXX. */
+                   { 0xFC, 0x84, 0xEC, 0xAC, 0xEC, 0x84, 0xFC, 0x00 },
+    /* AY       — eighth note with flag
+       ...XXX.
+       ...X.X.
+       ...X...
+       ...X...
+       ..XX...
+       .XXX...
+       .XX.... */
+                   { 0x1C, 0x14, 0x10, 0x10, 0x30, 0x70, 0x60, 0x00 },
+    /* SAA      — three sound waves (sine-like)
+       .X.X.X.
+       X.X.X..
+       .X.X.X.
+       X.X.X..
+       .X.X.X.
+       X.X.X..
+       .X.X.X. */
+                   { 0x54, 0xA8, 0x54, 0xA8, 0x54, 0xA8, 0x54, 0x00 },
+    /* BEEPER   — speaker icon: driver + cone + waves
+       ...X...
+       ..XX.X.
+       .XXX..X
+       .XXX.X.
+       .XXX..X
+       ..XX.X.
+       ...X... */
+                   { 0x10, 0x34, 0x72, 0x74, 0x72, 0x34, 0x10, 0x00 },
+    /* COVOX    — DAC staircase (R-2R ladder)
+       ......X
+       .....XX
+       ....XXX
+       ...XXXX
+       ..XXXXX
+       .XXXXXX
+       XXXXXXX */
+                   { 0x02, 0x06, 0x0E, 0x1E, 0x3E, 0x7E, 0xFE, 0x00 },
+    /* GS       — bold G letter
+       .XXXX..
+       X....X.
+       X......
+       X..XXX.
+       X....X.
+       X....X.
+       .XXXX.. */
+                   { 0x78, 0x84, 0x80, 0x9C, 0x84, 0x84, 0x78, 0x00 },
+    /* MIDI     — piano keyboard: 4 solid keys with black cutouts on top half
+       X.X.X.X
+       X.X.X.X
+       X.X.X.X
+       XXXXXXX
+       XXXXXXX
+       XXXXXXX
+       XXXXXXX */
+                   { 0xAA, 0xAA, 0xAA, 0xFE, 0xFE, 0xFE, 0xFE, 0x00 },
+    /* ULAPLUS  — palette swatches (4 bands)
+       XXXXXX.
+       X.X.X..
+       XXXXXX.
+       X.X.X..
+       XXXXXX.
+       X.X.X..
+       XXXXXX. */
+                   { 0xFC, 0xA8, 0xFC, 0xA8, 0xFC, 0xA8, 0xFC, 0x00 },
+    /* PAGING   — RAM chip (DIP package with legs on top/bottom)
+       .X.X.X.
+       XXXXXXX
+       X.....X
+       X.....X
+       X.....X
+       XXXXXXX
+       .X.X.X. */
+                   { 0x54, 0xFE, 0x82, 0x82, 0x82, 0xFE, 0x54, 0x00 },
+    /* TIMEX    — large T with serifs
+       XXXXXXX
+       ...X...
+       ...X...
+       ...X...
+       ...X...
+       ...X...
+       .XXXXX. */
+                   { 0xFE, 0x10, 0x10, 0x10, 0x10, 0x10, 0x7C, 0x00 },
+    /* KEMPJOY  — joystick: ball top, shaft, wide base
+       ..XXX..
+       ..XXX..
+       ...X...
+       ...X...
+       ...X...
+       .XXXXX.
+       XXXXXXX */
+                   { 0x38, 0x38, 0x10, 0x10, 0x10, 0x7C, 0xFE, 0x00 },
+    /* KEMPMOUSE— mouse: rounded body + scroll wheel
+       ..XXX..
+       .XX.XX.
+       .X.X.X.
+       .XX.XX.
+       .X...X.
+       .X...X.
+       ..XXX.. */
+                   { 0x38, 0x6C, 0x54, 0x6C, 0x44, 0x44, 0x38, 0x00 },
+    /* DMA      — bidirectional double-arrow (up + down)
+       ...X...
+       ..XXX..
+       .XXXXX.
+       ...X...
+       .XXXXX.
+       ..XXX..
+       ...X... */
+                   { 0x10, 0x38, 0x7C, 0x10, 0x7C, 0x38, 0x10, 0x00 },
 };
 
 bool isVisible(Id i) {
@@ -71,7 +179,7 @@ bool isVisible(Id i) {
 #if !PICO_RP2040
         case SD:       return Config::esxdos != 0 || DivMMC::enabled;
         case ZCTRL:    return Config::zcontroller || DivMMC::zc_enabled;
-        case MB02:     return Config::mb02 != 0 || MB02::enabled;
+        case FDD:      return Config::betadisk || Config::mb02 != 0 || MB02::enabled;
         case MIDI:     return Config::midi > 0;
         case SAA:      return Config::SAA1099;
         case TIMEX:    return Config::timex_video;
@@ -83,11 +191,11 @@ bool isVisible(Id i) {
 #endif
         case ULAPLUS:  return Config::ulaplus;
 #else
-        case SD: case ZCTRL: case MB02: case MIDI:
+        case SD: case ZCTRL: case MIDI:
         case SAA: case TIMEX: case DMA: case GS:
         case ULAPLUS:  return false;
+        case FDD:      return Config::betadisk;
 #endif
-        case BETA:     return Config::betadisk;
         case TAPE:     return true;
         case AY:       return Config::AY48 || !Z80Ops::is48;
         case BEEPER:   return true;
@@ -153,23 +261,16 @@ static inline uint8_t fgColor(Id i) {
     return BRI_BLACK; // dim gray (idle)
 }
 
-static void drawSprite(Id i, int xpix, int ypix, uint8_t fg, uint8_t bg) {
+// Draws only the foreground pixels of the glyph; background pixels are left
+// untouched so the border colour underneath shows through (no boxy outline).
+static void drawSprite(Id i, int xpix, int ypix, uint8_t fg) {
     const uint8_t* glyph = SPRITE[i];
     for (int row = 0; row < 8; row++) {
         uint8_t bits = glyph[row];
+        if (!bits) continue;
         uint8_t* line = (uint8_t*)VIDEO::vga.frameBuffer[ypix + row];
         for (int c = 0; c < 8; c++) {
-            uint8_t col = (bits & (0x80 >> c)) ? fg : bg;
-            line[(xpix + c) ^ 2] = col;
-        }
-    }
-}
-
-static void clearCell(int xpix, int ypix, uint8_t bg) {
-    for (int row = 0; row < CELL_H; row++) {
-        uint8_t* line = (uint8_t*)VIDEO::vga.frameBuffer[ypix + row];
-        for (int c = 0; c < CELL_W; c++) {
-            line[(xpix + c) ^ 2] = bg;
+            if (bits & (0x80 >> c)) line[(xpix + c) ^ 2] = fg;
         }
     }
 }
@@ -180,52 +281,19 @@ void draw() {
     int base_x = 0, base_y = 0;
     if (!resolveLayout(base_x, base_y)) return;
 
-    uint8_t bg = (uint8_t)(VIDEO::brd & 0xFF);
-
-    // Build current state bits (2 per LED) + visibility bits (1 per LED).
-    uint64_t cur = 0;
+    // Border is repainted every frame underneath us, so we must redraw every
+    // frame too — otherwise the icons get erased. No draw-on-change here.
     for (uint8_t i = 0; i < COUNT; i++) {
-        uint64_t bits = 0;
-        if (isVisible((Id)i)) {
-            bits |= 0x4; // visible flag
-            if (rdec[i]) bits |= 0x1;
-            if (wdec[i]) bits |= 0x2;
-        }
-        cur |= bits << (i * 3);
-    }
-    // If neither state nor border color changed → nothing to redraw.
-    if (cur == prevStateBits && VIDEO::brd == prevBrd) return;
-    prevStateBits = cur;
-    prevBrd = VIDEO::brd;
-
-    for (uint8_t i = 0; i < COUNT; i++) {
+        if (!isVisible((Id)i)) continue;
         int xpix, ypix;
         cellOrigin((Id)i, base_x, base_y, xpix, ypix);
-        if (!isVisible((Id)i)) {
-            clearCell(xpix, ypix, bg);
-            continue;
-        }
-        uint8_t fg = fgColor((Id)i);
-        // Background of the sprite row: same as border, so unset pixels blend in.
-        drawSprite((Id)i, xpix, ypix, fg, bg);
+        drawSprite((Id)i, xpix, ypix, fgColor((Id)i));
     }
 }
 
 void clear() {
     for (uint8_t i = 0; i < COUNT; i++) { rdec[i] = 0; wdec[i] = 0; }
-    prevStateBits = 0;
-    prevBrd = 0xFFFFFFFFu;
-
-    int base_x = 0, base_y = 0;
-    if (!resolveLayout(base_x, base_y)) return;
-
-    uint8_t bg = (uint8_t)(VIDEO::brd & 0xFF);
-    for (int row = 0; row < ROWS * CELL_H; row++) {
-        uint8_t* line = (uint8_t*)VIDEO::vga.frameBuffer[base_y + row];
-        for (int c = 0; c < LEDS_PER_ROW * CELL_W; c++) {
-            line[(base_x + c) ^ 2] = bg;
-        }
-    }
+    // Border code repaints this region; no manual clear needed.
 }
 
 } // namespace LED
