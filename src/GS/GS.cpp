@@ -2,6 +2,7 @@
 
 #include "GS.h"
 #include "GS_ROM.h"
+#include "../Config.h"
 #include "Debug.h"
 #include "../LEDIndicators.h"
 
@@ -281,9 +282,10 @@ static uint32_t s_drain_frac = 0;
 // RAM caps at ~18 T/µs effective, so 24 MHz target under-delivers (measured
 // ~77% → 29 kHz IRQ, pitch shifted ~25% low). 12 MHz + 320 T is well within
 // capacity and matches native GS firmware timing exactly.
-static constexpr uint32_t GS_CLOCK_HZ    = 20000000;
-static constexpr uint32_t GS_INT_HZ      = 37500;
-static constexpr uint32_t GS_INT_PERIOD  = GS_CLOCK_HZ / GS_INT_HZ;  // 320
+static constexpr uint32_t GS_CLOCK_TABLE[5] = {12000000, 13125000, 14000000, 20000000, 24000000};
+static constexpr uint32_t GS_INT_HZ         = 37500;
+static uint32_t           GS_CLOCK_HZ       = 13125000;  // set in init() from Config::gs_clock
+static uint32_t           GS_INT_PERIOD     = 350;        // set in init()
 
 static inline uint32_t __not_in_flash_func(gs_map_addr)(uint16_t address) {
     return (uint32_t)(GS::reg_page - 1) * 0x8000u + (address - 0x8000u);
@@ -653,6 +655,11 @@ void   __not_in_flash_func(gs_direct_out         )(zuint16 port, zuint8 value) {
 
 bool GS::init(uint32_t ram_size_bytes) {
     if (enabled) return true;
+    {
+        uint8_t ci = Config::gs_clock < 5 ? Config::gs_clock : 1;
+        GS_CLOCK_HZ  = GS_CLOCK_TABLE[ci];
+        GS_INT_PERIOD = GS_CLOCK_HZ / GS_INT_HZ;
+    }
 
     uint32_t rounded = 0x20000;
     while (rounded < ram_size_bytes && rounded < (2u << 20)) rounded <<= 1;

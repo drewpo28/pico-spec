@@ -187,6 +187,7 @@ public:
     static uint8_t  covox;
     static uint8_t  gs_enabled;
     static uint8_t  gs_ram_size;
+    static uint8_t  gs_clock;   // 0=12MHz 1=13MHz 2=14MHz 3=20MHz 4=24MHz
     static uint8_t  joy2cursor;
     static uint8_t  secondJoy;
     static uint8_t  kempstonPort;

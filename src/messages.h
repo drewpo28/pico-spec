@@ -891,7 +891,13 @@ static const char *MENU_LEDINDICATORS[2] = { "LED indicators\n" , "Indicadores L
 #endif
 static const char *MENU_AUDIO[2] = { MENU_AUDIO_EN, MENU_AUDIO_ES };
 static const char *MENU_AUDIO_GS_ITEM[2] = { "General Sound\t>\n", "General Sound\t>\n" };
-static const char *MENU_GS[2] = { "Turned on?\n", "Turned on?\n" };
+static const char *MENU_GS_TITLE[2]      = { "General Sound\n",   "General Sound\n" };
+static const char *MENU_GS_MODE[2]       = { "Mode",  "Modo" };
+static const char *MENU_GS_CLOCK[2]      = { "Clock\n", "Reloj\n" };
+static const char *MENU_GS_CLOCK_SEL[2]  = {
+    "12 MHz\t[ ]\n" "13 MHz\t[ ]\n" "14 MHz\t[ ]\n" "20 MHz\t[ ]\n" "24 MHz\t[ ]\n",
+    "12 MHz\t[ ]\n" "13 MHz\t[ ]\n" "14 MHz\t[ ]\n" "20 MHz\t[ ]\n" "24 MHz\t[ ]\n"
+};
 
 #define MENU_OTHER_EN "Other\n"\
     "ALU Timing\t>\n"\

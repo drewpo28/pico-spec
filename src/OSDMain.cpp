@@ -2658,42 +2658,85 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         }
 #ifdef USE_GS
                         else if (gs_avail && options_num == 7) { // General Sound
+                            static const char* GS_CLOCK_NAMES[5] = {"12 MHz", "13 MHz", "14 MHz", "20 MHz", "24 MHz"};
                             menu_level = 2;
                             menu_curopt = 1;
-                            menu_saverect = true;
+                            bool gsFirstDraw = true;
                             while (1) {
-                                string gs_menu = MENU_GS[Config::lang];
-                                gs_menu += MENU_YESNO[Config::lang];
-                                uint8_t prev_gs = Config::gs_enabled;
-                                if (prev_gs) {
-                                    gs_menu.replace(gs_menu.find("[Y",0),2,"[*");
-                                    gs_menu.replace(gs_menu.find("[N",0),2,"[ ");
-                                } else {
-                                    gs_menu.replace(gs_menu.find("[Y",0),2,"[ ");
-                                    gs_menu.replace(gs_menu.find("[N",0),2,"[*");
-                                }
-                                uint8_t opt2 = menuRun(gs_menu);
-                                if (opt2) {
-                                    Config::gs_enabled = (opt2 == 1) ? 1 : 0;
-                                    if (Config::gs_enabled != prev_gs) {
-                                        // GS conflicts with DivIDE on ports 0xB3/0xBB
+                                string gsmenu = MENU_GS_TITLE[Config::lang];
+                                gsmenu += string(MENU_GS_MODE[Config::lang]) + "\t"
+                                        + (Config::gs_enabled ? "On" : "Off") + "\n";
+                                uint8_t ci = Config::gs_clock < 5 ? Config::gs_clock : 1;
+                                string clockRow = string("Clock") + "\t"
+                                               + GS_CLOCK_NAMES[ci] + " >\n";
+                                if (!Config::gs_enabled) clockRow = "\x01" + clockRow;
+                                gsmenu += clockRow;
+                                menu_saverect = gsFirstDraw;
+                                uint8_t gs_num = menuRun(gsmenu);
+                                gsFirstDraw = false;
+                                if (gs_num == 1) {
+                                    // Mode toggle — requires reboot
+                                    uint8_t prev = Config::gs_enabled;
+                                    Config::gs_enabled = prev ? 0 : 1;
+                                    if (Config::gs_enabled != prev) {
                                         if (Config::gs_enabled && Config::esxdos == 2) {
                                             if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
                                                 Config::esxdos = 0;
                                                 Config::save();
                                                 esp_hard_reset();
                                             } else {
-                                                Config::gs_enabled = prev_gs;
+                                                Config::gs_enabled = prev;
                                             }
                                         } else if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
                                             Config::save();
                                             esp_hard_reset();
                                         } else {
-                                            Config::gs_enabled = prev_gs;
+                                            Config::gs_enabled = prev;
                                         }
                                     }
-                                    menu_curopt = opt2;
-                                    menu_saverect = false;
+                                    menu_curopt = 1;
+                                    continue;
+                                } else if (gs_num == 2 && Config::gs_enabled) {
+                                    // Clock submenu — radio button list
+                                    menu_level = 3;
+                                    menu_curopt = ci + 1;
+                                    menu_saverect = true;
+                                    while (1) {
+                                        string cmenu = MENU_GS_CLOCK[Config::lang];
+                                        cmenu += MENU_GS_CLOCK_SEL[Config::lang];
+                                        int mpos = -1; int idx = 0;
+                                        while ((mpos = cmenu.find("[ ]", mpos + 1)) != (int)string::npos) {
+                                            if (idx == ci) cmenu.replace(mpos, 3, "[*]");
+                                            idx++;
+                                        }
+                                        uint8_t prev_clock = Config::gs_clock;
+                                        uint8_t opt2 = menuRun(cmenu);
+                                        if (opt2) {
+                                            uint8_t newclock = opt2 - 1;
+                                            if (newclock != prev_clock) {
+                                                Config::gs_clock = newclock;
+                                                if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
+                                                    Config::save();
+                                                    esp_hard_reset();
+                                                } else {
+                                                    Config::gs_clock = prev_clock;
+                                                }
+                                            }
+                                            ci = Config::gs_clock < 5 ? Config::gs_clock : 1;
+                                            menu_curopt = ci + 1;
+                                            menu_saverect = false;
+                                        } else {
+                                            menu_curopt = 2;
+                                            menu_level = 2;
+                                            menu_saverect = false;
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                } else if (gs_num == 2 && !Config::gs_enabled) {
+                                    // Disabled row — ignore
+                                    menu_curopt = 2;
+                                    continue;
                                 } else {
                                     menu_curopt = 7;
                                     menu_level = 1;
