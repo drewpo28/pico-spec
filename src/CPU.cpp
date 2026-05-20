@@ -83,18 +83,19 @@ void CPU::updateStatesInFrame() {
     Z80Ops::isALF = (Config::arch == "ALF");
 #endif
     // Early/Late ULA timing: Early=latetiming=0, Late=latetiming=1.
-    // Late shifts the INT window 1T later: IntStart=latetiming, IntEnd=base+latetiming.
-    // isActiveINT checks IntStart <= tstates < IntEnd with no extra offset.
+    // IntEnd += latetiming shifts the INT window 1T later for Late.
+    // isActiveINT adds latetiming to tstates so that Late fires 1T later,
+    // including via end-of-frame straddle (tstates=statesInFrame-1 → tmp=0).
     if (Config::arch == "48K") {
         statesInFrame = TSTATES_PER_FRAME_48;
-        IntStart = INT_START48 + CPU::latetiming;
+        IntStart = INT_START48;
         IntEnd = INT_END48 + CPU::latetiming;
         if (Config::romSet48 == "48Kby") {
             IntEnd = INT_END_BYTE48 + CPU::latetiming;
         }
     } else if (Config::arch == "128K" || Z80Ops::isALF) {
         statesInFrame = TSTATES_PER_FRAME_128;
-        IntStart = INT_START128 + CPU::latetiming;
+        IntStart = INT_START128;
         IntEnd = INT_END128 + CPU::latetiming;
     } else if (Config::arch == "P512") {
         statesInFrame = TSTATES_PER_FRAME_PENTAGON;
@@ -590,7 +591,10 @@ IRAM_ATTR void Z80Ops::addressOnBus(uint16_t address, int32_t wstates) {
 
 /* Callback to know when the INT signal is active */
 IRAM_ATTR bool Z80Ops::isActiveINT(void) {
-    int32_t tmp = (int32_t)CPU::tstates;
+    // Adding latetiming shifts the check 1T later for Late mode.
+    // At end of frame (tstates=statesInFrame-1), tmp wraps to 0, firing
+    // the Late INT via straddle — this is the correct hardware behaviour.
+    int32_t tmp = (int32_t)CPU::tstates + CPU::latetiming;
     if (tmp >= (int32_t)CPU::statesInFrame) tmp -= CPU::statesInFrame;
     return (tmp >= CPU::IntStart) && (tmp < CPU::IntEnd);
 }
