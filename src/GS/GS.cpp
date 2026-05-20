@@ -3,6 +3,7 @@
 #include "GS.h"
 #include "GS_ROM.h"
 #include "Debug.h"
+#include "../LEDIndicators.h"
 
 extern "C" {
 #include "Z80_redcode.h"
@@ -1220,6 +1221,7 @@ void __not_in_flash_func(GS::getLiveLR)(uint8_t& L, uint8_t& R) {
     L = gs_to_u8(sumL / (int32_t)n);
     R = gs_to_u8(sumR / (int32_t)n);
     s_ring_rpos = r + n;
+    if (sumL || sumR) LED::touchR(LED::GS);
 }
 
 // =================================================================

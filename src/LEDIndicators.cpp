@@ -17,9 +17,7 @@
 namespace LED {
 
 static constexpr int CELL_W = 10;  // 8px sprite + 2px gap
-static constexpr int CELL_H = 10;  // 8px sprite + 2px gap
-static constexpr int LEDS_PER_ROW = 9;
-static constexpr int ROWS = 2;
+static constexpr int CELL_H = 10;  // 8px sprite + 2px gap (kept for y-shift)
 
 uint8_t rdec[COUNT];
 uint8_t wdec[COUNT];
@@ -27,6 +25,25 @@ uint8_t wdec[COUNT];
 // 7x7 glyphs in 8x8 grid. Bit 0 (rightmost col) and row 7 are 0 → inter-icon gap.
 // Bit layout per row: b7 = leftmost pixel ... b1 = 7th pixel.
 static const uint8_t SPRITE[COUNT][8] = {
+    // Storage
+    /* TAPE     — cassette: rectangular body, reel centres
+       .......
+       XXXXXXX
+       X.....X
+       X.X.X.X
+       X.....X
+       XXXXXXX
+       ....... */
+                   { 0x00, 0xFE, 0x82, 0xAA, 0x82, 0xFE, 0x00, 0x00 },
+    /* FDD      — diskette: metal shutter + hub slot + label edges
+       .XXXXX.
+       .X.XXX.
+       XXXXXX.
+       X.XX.X.
+       X.XX.X.
+       X....X.
+       XXXXXX. */
+                   { 0x7C, 0x5C, 0xFC, 0xB4, 0xB4, 0x84, 0xFC, 0x00 },
     /* SD       — SD card silhouette with cut corner
        .XXXXX.
        XXXXXX.
@@ -45,43 +62,7 @@ static const uint8_t SPRITE[COUNT][8] = {
        X......
        XXXXXX. */
                    { 0xFC, 0x08, 0x10, 0x20, 0x40, 0x80, 0xFC, 0x00 },
-    /* FDD      — diskette (works for both 3.5" Beta-128 and 5.25" MB-02+):
-                   metal shutter at top + central hub slot + label edges
-       .XXXXX.
-       .X.XXX.
-       XXXXXX.
-       X.XX.X.
-       X.XX.X.
-       X....X.
-       XXXXXX. */
-                   { 0x7C, 0x5C, 0xFC, 0xB4, 0xB4, 0x84, 0xFC, 0x00 },
-    /* TAPE     — cassette with two reels
-       XXXXXX.
-       X....X.
-       XXX.XX.
-       X.X.XX.
-       XXX.XX.
-       X....X.
-       XXXXXX. */
-                   { 0xFC, 0x84, 0xEC, 0xAC, 0xEC, 0x84, 0xFC, 0x00 },
-    /* AY       — eighth note with flag
-       ...XXX.
-       ...X.X.
-       ...X...
-       ...X...
-       ..XX...
-       .XXX...
-       .XX.... */
-                   { 0x1C, 0x14, 0x10, 0x10, 0x30, 0x70, 0x60, 0x00 },
-    /* SAA      — three sound waves (sine-like)
-       .X.X.X.
-       X.X.X..
-       .X.X.X.
-       X.X.X..
-       .X.X.X.
-       X.X.X..
-       .X.X.X. */
-                   { 0x54, 0xA8, 0x54, 0xA8, 0x54, 0xA8, 0x54, 0x00 },
+    // Audio
     /* BEEPER   — speaker icon: driver + cone + waves
        ...X...
        ..XX.X.
@@ -91,24 +72,33 @@ static const uint8_t SPRITE[COUNT][8] = {
        ..XX.X.
        ...X... */
                    { 0x10, 0x34, 0x72, 0x74, 0x72, 0x34, 0x10, 0x00 },
-    /* COVOX    — DAC staircase (R-2R ladder)
-       ......X
-       .....XX
-       ....XXX
-       ...XXXX
-       ..XXXXX
-       .XXXXXX
-       XXXXXXX */
-                   { 0x02, 0x06, 0x0E, 0x1E, 0x3E, 0x7E, 0xFE, 0x00 },
-    /* GS       — bold G letter
-       .XXXX..
-       X....X.
-       X......
-       X..XXX.
-       X....X.
-       X....X.
-       .XXXX.. */
-                   { 0x78, 0x84, 0x80, 0x9C, 0x84, 0x84, 0x78, 0x00 },
+    /* AY       — eighth note with flag
+       ...XXX.
+       ...X.X.
+       ...X...
+       ...X...
+       ..XX...
+       .XXX...
+       .XX.... */
+                   { 0x1C, 0x14, 0x10, 0x10, 0x30, 0x70, 0x60, 0x00 },
+    /* COVOX    — EQ bars (4 columns, heights 3/5/7/4 left→right)
+       ...X...
+       ...X...
+       ..X.X..
+       ..X.X.X
+       X.X.X.X
+       X.X.X.X
+       X.X.X.X */
+                   { 0x10, 0x10, 0x28, 0x2A, 0xAA, 0xAA, 0xAA, 0x00 },
+    /* SAA      — three sound waves (sine-like)
+       .X.X.X.
+       X.X.X..
+       .X.X.X.
+       X.X.X..
+       .X.X.X.
+       X.X.X..
+       .X.X.X. */
+                   { 0x54, 0xA8, 0x54, 0xA8, 0x54, 0xA8, 0x54, 0x00 },
     /* MIDI     — piano keyboard: 4 solid keys with black cutouts on top half
        X.X.X.X
        X.X.X.X
@@ -118,6 +108,16 @@ static const uint8_t SPRITE[COUNT][8] = {
        XXXXXXX
        XXXXXXX */
                    { 0xAA, 0xAA, 0xAA, 0xFE, 0xFE, 0xFE, 0xFE, 0x00 },
+    /* GS       — bold G letter
+       .XXXX..
+       X....X.
+       X......
+       X..XXX.
+       X....X.
+       X....X.
+       .XXXX.. */
+                   { 0x78, 0x84, 0x80, 0x9C, 0x84, 0x84, 0x78, 0x00 },
+    // Video
     /* ULAPLUS  — palette swatches (4 bands)
        XXXXXX.
        X.X.X..
@@ -127,15 +127,6 @@ static const uint8_t SPRITE[COUNT][8] = {
        X.X.X..
        XXXXXX. */
                    { 0xFC, 0xA8, 0xFC, 0xA8, 0xFC, 0xA8, 0xFC, 0x00 },
-    /* PAGING   — RAM chip (DIP package with legs on top/bottom)
-       .X.X.X.
-       XXXXXXX
-       X.....X
-       X.....X
-       X.....X
-       XXXXXXX
-       .X.X.X. */
-                   { 0x54, 0xFE, 0x82, 0x82, 0x82, 0xFE, 0x54, 0x00 },
     /* TIMEX    — large T with serifs
        XXXXXXX
        ...X...
@@ -145,6 +136,25 @@ static const uint8_t SPRITE[COUNT][8] = {
        ...X...
        .XXXXX. */
                    { 0xFE, 0x10, 0x10, 0x10, 0x10, 0x10, 0x7C, 0x00 },
+    // Control
+    /* RAM — RAM chip (DIP package with legs on top/bottom)
+       .X.X.X.
+       XXXXXXX
+       X.....X
+       X.....X
+       X.....X
+       XXXXXXX
+       .X.X.X. */
+                   { 0x54, 0xFE, 0x82, 0x82, 0x82, 0xFE, 0x54, 0x00 },
+    /* DMA      — two RAM blocks with transfer arrow between them
+       .XXX...
+       .X.X...
+       .XXX.X.
+       .....X.
+       .XXX.X.
+       .X.X...
+       .XXX... */
+                   { 0x70, 0x50, 0x74, 0x04, 0x74, 0x50, 0x70, 0x00 },
     /* KEMPJOY  — joystick: ball top, shaft, wide base
        ..XXX..
        ..XXX..
@@ -163,15 +173,6 @@ static const uint8_t SPRITE[COUNT][8] = {
        .X...X.
        ..XXX.. */
                    { 0x38, 0x6C, 0x54, 0x6C, 0x44, 0x44, 0x38, 0x00 },
-    /* DMA      — bidirectional double-arrow (up + down)
-       ...X...
-       ..XXX..
-       .XXXXX.
-       ...X...
-       .XXXXX.
-       ..XXX..
-       ...X... */
-                   { 0x10, 0x38, 0x7C, 0x10, 0x7C, 0x38, 0x10, 0x00 },
 };
 
 bool isVisible(Id i) {
@@ -200,7 +201,7 @@ bool isVisible(Id i) {
         case AY:       return Config::AY48 || !Z80Ops::is48;
         case BEEPER:   return true;
         case COVOX:    return Config::covox != 0;
-        case PAGING:   return !Z80Ops::is48;
+        case RAM:   return !Z80Ops::is48;
         case KEMPJOY:  return Config::joystick == JOY_KEMPSTON;
         case KEMPMOUSE:return true;
         default:       return false;
@@ -214,41 +215,28 @@ void decay() {
     }
 }
 
-// Compute the absolute (xpix, ypix) for a given LED index.
-static inline void cellOrigin(Id i, int base_x, int base_y, int& xpix, int& ypix) {
-    int row = i / LEDS_PER_ROW;
-    int col = i % LEDS_PER_ROW;
-    xpix = base_x + col * CELL_W;
-    ypix = base_y + row * CELL_H;
-}
-
 // Determine where to draw the strip given current video mode.
 // Returns true if drawing surface is available; fills (base_x, base_y).
 static bool resolveLayout(int& base_x, int& base_y) {
 #if !PICO_RP2040
     if (VIDEO::isFullBorder288()) {
         base_x = 4;
-        base_y = 268;
+        base_y = 278;
         return true;
     }
     if (VIDEO::isFullBorder240()) {
         base_x = 4;
-        base_y = 220;
+        base_y = 230;
         return true;
     }
 #endif
     if (Config::aspect_16_9) {
         base_x = 4;
-        base_y = 176;
-        return true;
-    }
-    if (Z80Ops::isPentagon) {
-        base_x = 4;
-        base_y = 220;
+        base_y = 186;
         return true;
     }
     base_x = 4;
-    base_y = 220;
+    base_y = 230;
     return true;
 }
 
@@ -258,7 +246,8 @@ static inline uint8_t fgColor(Id i) {
     if (r && w) return ORANGE;
     if (r)      return BRI_GREEN;
     if (w)      return BRI_RED;
-    return BRI_BLACK; // dim gray (idle)
+    // Idle: complementary ZX color — always contrasts with current border.
+    return VIDEO::borderColor ^ 7;
 }
 
 // Draws only the foreground pixels of the glyph; background pixels are left
@@ -281,13 +270,14 @@ void draw() {
     int base_x = 0, base_y = 0;
     if (!resolveLayout(base_x, base_y)) return;
 
-    // Border is repainted every frame underneath us, so we must redraw every
-    // frame too — otherwise the icons get erased. No draw-on-change here.
+    // Pack visible indicators in a single row, no gaps for disabled ones.
+    // Border repaints underneath every frame so old positions auto-erase.
+    uint8_t slot = 0;
     for (uint8_t i = 0; i < COUNT; i++) {
         if (!isVisible((Id)i)) continue;
-        int xpix, ypix;
-        cellOrigin((Id)i, base_x, base_y, xpix, ypix);
-        drawSprite((Id)i, xpix, ypix, fgColor((Id)i));
+        int xpix = base_x + slot * CELL_W;
+        drawSprite((Id)i, xpix, base_y, fgColor((Id)i));
+        slot++;
     }
 }
 

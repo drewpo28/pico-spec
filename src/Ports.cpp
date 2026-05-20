@@ -203,7 +203,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   }
 
   if (MEM_PG_CNT > 64 && address == 0xAFF7) {
-    LED::touchR(LED::PAGING);
+    LED::touchR(LED::RAM);
     return portAFF7;
   }
   bool ia = Z80Ops::isALF;
@@ -452,7 +452,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     if (!Z80Ops::isPentagon) {
       data = getFloatBusData();
       if ((!Z80Ops::is48) && !Z80Ops::isALF && ((address & 0x8002) == 0)) {
-        LED::touchR(LED::PAGING);
+        LED::touchR(LED::RAM);
         // //  Solo en el modelo 128K, pero no en los +2/+2A/+3, si se lee el
         // puerto
         // //  0x7ffd, el valor leído es reescrito en el puerto 0x7ffd.
@@ -517,7 +517,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   p_states = CPU::tstates;
 
   if (address == 0xAFF7) {
-    LED::touchW(LED::PAGING);
+    LED::touchW(LED::RAM);
     uint8_t prev = portAFF7;
     uint8_t d6 = data & 0b00111111; // limit it for 64 planes
     if (prev != d6) {
@@ -906,7 +906,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   }
   // Pentagon only
   if (Z80Ops::isPentagon && ((address & 0x1008) == 0)) { // 1008 !-> EFF7
-    LED::touchW(LED::PAGING);
+    LED::touchW(LED::RAM);
     if (!MemESP::pagingLock) {
       uint8_t prev = MemESP::page0ram;
       MemESP::notMore128 = bitRead(data, 2);
@@ -921,7 +921,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // for banking, not #7FFD. Letting #7FFD writes through here corrupts
   // videoLatch/pagingLock and produces a black screen on ALF.
   if ((!Z80Ops::is48) && !Z80Ops::isALF && ((address & 0x8002) == 0)) { // 8002 !-> 7FFD
-    LED::touchW(LED::PAGING);
+    LED::touchW(LED::RAM);
     if (!MemESP::pagingLock) {
       uint8_t D5 = bitRead(data, 5);
       if (Z80Ops::is1024) {

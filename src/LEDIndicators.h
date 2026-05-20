@@ -7,22 +7,26 @@
 namespace LED {
 
     enum Id : uint8_t {
-        SD = 0,        // DivMMC / esxDOS
+        // Storage
+        TAPE = 0,      // Tape EAR
+        FDD,           // Floppy: Beta-128 / TR-DOS or MB-02+
+        SD,            // DivMMC / esxDOS
         ZCTRL,         // Z-Controller
-        FDD,           // Floppy: Beta-128 / TR-DOS or MB-02+ (mutually exclusive)
-        TAPE,          // Tape EAR
-        AY,            // AY-3-8912
-        SAA,           // SAA1099
+        // Audio
         BEEPER,        // ULA bit 4 speaker
+        AY,            // AY-3-8912
         COVOX,         // Covox DAC
-        GS,            // General Sound
+        SAA,           // SAA1099
         MIDI,          // MIDI interface
+        GS,            // General Sound
+        // Video
         ULAPLUS,       // ULA+ palette/mode
-        PAGING,        // 128K/+2A/+3/Pentagon paging
         TIMEX,         // Timex SCLD
+        // Control
+        RAM,           // 128K/+2A/+3/Pentagon paging
+        DMA,           // Z80 DMA / zxnDMA
         KEMPJOY,       // Kempston joystick
         KEMPMOUSE,     // Kempston mouse
-        DMA,           // Z80 DMA / zxnDMA
         COUNT
     };
 
