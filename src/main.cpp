@@ -868,8 +868,10 @@ void __scratch_x("render") render_core() {
         refresh_lcd();
 #endif
         pcm_call();
-#ifdef USE_GS
+#if defined(USE_GS) && !defined(SOFTTV)
         // Wall-clock-locked: runs GS-Z80 at exactly 12 MHz off core0.
+        // Under SOFTTV, GS::pump() runs in pcm_call_inner (core0) instead,
+        // because video_timer_callbackTV at 30 kHz would starve it here.
         GS::pump();
 #endif
         tight_loop_contents();

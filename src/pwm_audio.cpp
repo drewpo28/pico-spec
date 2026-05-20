@@ -401,6 +401,11 @@ static void __not_in_flash_func(pcm_call_inner)() {
     int32_t gs_offL = 0, gs_offR = 0;
 #ifdef USE_GS
     if (GS::enabled) {
+#ifdef SOFTTV
+        // Under SOFTTV, core1 is fully occupied by composite video rendering
+        // (video_timer_callbackTV at 30 kHz), so GS::pump() runs here on core0.
+        GS::pump();
+#endif
         uint8_t gL, gR;
         GS::getLiveLR(gL, gR);
         uint32_t vol8 = (uint32_t)(vol + Config::audio_boost) << 3;
