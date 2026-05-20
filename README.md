@@ -39,7 +39,7 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - Border effects emulated (Aquaplane, The Sentinel, Overscan demo).
 - Floating bus effect emulated (Arkanoid, Sidewize).
 - Snow effect accurate emulation (as [described](https://spectrumcomputing.co.uk/forums/viewtopic.php?t=8240) by Weiv and MartianGirl).
-- Gigascreen support (Choose between three modes: On, Off, or Auto) (RP2350 only).
+- Gigascreen support (Choose between three modes: Off, On, or Auto; memory released when Off) (RP2350 only).
 - Selectable color palettes: Pulsar (default), Alone, Grayscale, Mars, Ocean (Unreal Speccy compatible format).
 - Custom palettes support: load user-defined palettes from `/palette.nvs` file on SD card (up to 11 custom palettes, 3x3 RGB color transform matrix).
 - Ula+ support (https://sinclair.wiki.zxnet.co.uk/wiki/ULAplus).
@@ -48,12 +48,13 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - Contended memory and contended I/O emulation.
 - AY-3-8912 / TurboSound emulation.
 - SAA1099 sound chip emulation (https://en.wikipedia.org/wiki/Philips_SAA1099).
-- General Sound (GS) emulation: dedicated Z80 @ 12 MHz on core1 with 2 MB sample RAM, ring-buffered DAC, host→GS FIFO for no-handshake loaders. Auto-enabled on RP2350 boards with butter PSRAM.
+- General Sound (GS) emulation: dedicated Z80 with selectable clock (12/13/14/20/24 MHz) on core1 with 2 MB sample RAM, ring-buffered DAC, host→GS FIFO for no-handshake loaders. Auto-enabled on RP2350 boards with butter PSRAM.
 - MIDI support: external UART output (AY bit-bang, ShamaZX) and built-in software synthesizer (RP2350 only).
 - Beeper & Mic emulation (Cobra’s Arc).
 - Dual keyboard support: you can connect two devices: first using PS/2 protocol and second using USB at the same time.
 - PS/2 Joystick emulation (Cursor, Sinclair, Kempston and Fuller).
 - Two real joysticks support (Up to 8 button joysticks).
+- USB HID gamepad support: XInput (Xbox 360/One), DualShock 4 (PS4), DualSense (PS5), generic HID gamepads with auto-detected report descriptors.
 - Emulation of Betadisk interface with four drives and TRD, SCL, UDI and FDI (read and write) support. Fast and realtime modes. Per-drive Write Protect, inline drive status in the Drives menu, F5 slot-picker popup (F2 toggle WP, F8 eject) when mounting from the file browser.
 - MB-02+ disk interface emulation: WD2797 FDC, Z80-DMA, 512KB SRAM paging, BS-DOS 308, MBD disk images, 4 drives, NMI menu (RP2350 only).
 - esxDOS support (DivMMC, DivIDE, DivSD) — [esxdos.org](https://esxdos.org/index.html).
@@ -73,6 +74,8 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - Overclock menu: CPU frequency (RP2350: 252/378/504 MHz; RP2040: 252/378 MHz), Flash frequency (33–166 MHz), PSRAM frequency (66–166 MHz), VReg voltage (RP2350: 1.15–1.80 V).
 - Complete file navigation system with autoindexing, folder support and search functions.
 - Complete OSD menu in two languages: English & Spanish.
+- On-screen LED indicators: real-time overlay showing FDD activity, MIDI TX, tape, and other port-driven hardware states.
+- Volume boost: configurable audio amplification (0–64) in the Audio menu.
 - BMP screen capture to SD Card (thanks David Crespo 😉).
 
 ## Byte Emulation Details (https://zxbyte.org/)
@@ -115,7 +118,7 @@ Default hotkey bindings (all hotkeys except F1 and ALT+F1 are reconfigurable via
 - ALT+F10 NMI (Pentagon: modal menu with NMI / Magic Button options)
 - ALT+F11 Reset to... (modal menu: Service/Gluk, TR-DOS, 128K, 48K — depends on machine)
 - ALT+F12 USB Boot / Update Firmware
-- ALT+PageUp Switch Gigascreen mode ON/OFF
+- ALT+PageUp Switch Gigascreen mode (Off → On → Auto cycle)
 - ALT+F3 Quick load snapshot
 - ALT+F4 Quick save snapshot
 - ALT+CTRL+Home Switch HDMI video mode (60Hz cycle)
