@@ -53,15 +53,16 @@ static const uint8_t SPRITE[COUNT][8] = {
        XXXXXX.
        XXXXXX. */
                    { 0x7C, 0xFC, 0xA8, 0xA8, 0xA8, 0xFC, 0xFC, 0x00 },
-    /* ZCTRL    — bold Z with diagonal
-       XXXXXX.
-       ....X..
-       ...X...
-       ..X....
-       .X.....
-       X......
-       XXXXXX. */
-                   { 0xFC, 0x08, 0x10, 0x20, 0x40, 0x80, 0xFC, 0x00 },
+    /* ZCTRL    — SD card silhouette with Z inside
+       .XXXXXXX
+       X......X
+       X.XXXX.X
+       X...X..X
+       X..X...X
+       X.XXXX.X
+       X......X
+       XXXXXXXX */
+                   { 0x7F, 0x81, 0xBD, 0x89, 0x91, 0xBD, 0x81, 0xFF },
     // Audio
     /* BEEPER   — speaker icon: driver + cone + waves
        ...X...
@@ -108,15 +109,15 @@ static const uint8_t SPRITE[COUNT][8] = {
        X..X..X.
        X..X..X. */
                    { 0x92, 0xF2, 0x92, 0x92, 0x92, 0x92, 0x92, 0x00 },
-    /* GS       — bold G letter
-       .XXXX..
-       X....X.
-       X......
-       X..XXX.
-       X....X.
-       X....X.
-       .XXXX.. */
-                   { 0x78, 0x84, 0x80, 0x9C, 0x84, 0x84, 0x78, 0x00 },
+    /* GS       — letters G and S (3px + 1px gap + 3px + 1px pad)
+       .XX..XX.
+       X...X...
+       X...XX..
+       X.X...X.
+       X.X...X.
+       X.X.X.X.
+       .XX.XX.. */
+                   { 0x66, 0x88, 0x8C, 0xA2, 0xA2, 0xAA, 0x6C, 0x00 },
     // Video
     /* ULAPLUS  — letters U and + (3px + 1px gap + 3px)
        X.X..X.
@@ -136,6 +137,16 @@ static const uint8_t SPRITE[COUNT][8] = {
        ...X...
        .XXXXX. */
                    { 0xFE, 0x10, 0x10, 0x10, 0x10, 0x10, 0x7C, 0x00 },
+    /* GIGASCREEN — monitor frame with G inside
+       XXXXXXXX
+       X..XX..X
+       X.X....X
+       X.X.XX.X
+       X.X..X.X
+       X..XX..X
+       XXXXXXXX
+       ...XX... */
+                   { 0xFF, 0x99, 0xA1, 0xAD, 0xA5, 0x99, 0xFF, 0x18 },
     // Control
     /* RAM — RAM chip (DIP package with legs on top/bottom)
        .X.X.X.
@@ -190,11 +201,12 @@ bool isVisible(Id i) {
 #else
         case GS:       return false;
 #endif
-        case ULAPLUS:  return Config::ulaplus;
+        case ULAPLUS:    return Config::ulaplus;
+        case GIGASCREEN: return Config::gigascreen_enabled;
 #else
         case SD: case ZCTRL: case MIDI:
         case SAA: case TIMEX: case DMA: case GS:
-        case ULAPLUS:  return false;
+        case ULAPLUS: case GIGASCREEN: return false;
         case FDD:      return Config::betadisk;
 #endif
         case TAPE:     return true;

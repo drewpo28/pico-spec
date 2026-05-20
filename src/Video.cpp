@@ -2259,6 +2259,7 @@ IRAM_ATTR void VIDEO::EndFrame() {
 #endif
 
     if (Config::ledIndicators) {
+        if (gigascreen_enabled) LED::touchR(LED::GIGASCREEN);
         LED::decay();
         LED::draw();
     }

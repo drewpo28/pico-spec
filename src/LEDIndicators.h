@@ -22,6 +22,7 @@ namespace LED {
         // Video
         ULAPLUS,       // ULA+ palette/mode
         TIMEX,         // Timex SCLD
+        GIGASCREEN,    // Gigascreen (interlaced double frame)
         // Control
         RAM,           // 128K/+2A/+3/Pentagon paging
         DMA,           // Z80 DMA / zxnDMA
