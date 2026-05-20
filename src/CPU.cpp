@@ -82,22 +82,20 @@ void CPU::updateStatesInFrame() {
 #if !NO_ALF
     Z80Ops::isALF = (Config::arch == "ALF");
 #endif
-    // Our emulator's baseline ULA timings correspond to the Late variant (Issue 3
-    // and similar — contention start at 14336, INT window [1..32]). Early ULA is
-    // modelled by shifting the INT window backward by 1 T-state (AluTiming=0
-    // means Early => earlyShift=1, AluTiming=1 means Late => earlyShift=0).
-    int earlyShift = Z80Ops::isPentagon ? 0 : (CPU::latetiming ? 0 : 1);
+    // Early/Late ULA timing: Early=latetiming=0, Late=latetiming=1.
+    // Late shifts the INT window 1T later: IntStart=latetiming, IntEnd=base+latetiming.
+    // isActiveINT checks IntStart <= tstates < IntEnd with no extra offset.
     if (Config::arch == "48K") {
         statesInFrame = TSTATES_PER_FRAME_48;
-        IntStart = INT_START48 - earlyShift;
-        IntEnd = INT_END48 - earlyShift;
+        IntStart = INT_START48 + CPU::latetiming;
+        IntEnd = INT_END48 + CPU::latetiming;
         if (Config::romSet48 == "48Kby") {
-            IntEnd = INT_END_BYTE48 - earlyShift;
+            IntEnd = INT_END_BYTE48 + CPU::latetiming;
         }
     } else if (Config::arch == "128K" || Z80Ops::isALF) {
         statesInFrame = TSTATES_PER_FRAME_128;
-        IntStart = INT_START128 - earlyShift;
-        IntEnd = INT_END128 - earlyShift;
+        IntStart = INT_START128 + CPU::latetiming;
+        IntEnd = INT_END128 + CPU::latetiming;
     } else if (Config::arch == "P512") {
         statesInFrame = TSTATES_PER_FRAME_PENTAGON;
         IntStart = INT_START_PENTAGON;
@@ -592,15 +590,8 @@ IRAM_ATTR void Z80Ops::addressOnBus(uint16_t address, int32_t wstates) {
 
 /* Callback to know when the INT signal is active */
 IRAM_ATTR bool Z80Ops::isActiveINT(void) {
-    // IntStart/IntEnd are absolute tstate positions and may be negative in Early
-    // mode (window wraps to the end of the previous frame).
     int32_t tmp = (int32_t)CPU::tstates;
     if (tmp >= (int32_t)CPU::statesInFrame) tmp -= CPU::statesInFrame;
-    if (CPU::IntStart < 0) {
-        // Window straddles frame boundary: active if tmp < IntEnd OR tmp >= IntStart+statesInFrame
-        if (tmp < CPU::IntEnd) return true;
-        return tmp >= CPU::IntStart + (int32_t)CPU::statesInFrame;
-    }
     return (tmp >= CPU::IntStart) && (tmp < CPU::IntEnd);
 }
 
