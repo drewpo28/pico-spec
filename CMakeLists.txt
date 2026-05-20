@@ -391,6 +391,26 @@ if (BUTTER_PSRAM_GPIO AND NOT PICO_PLATFORM STREQUAL "rp2040")
     target_compile_definitions(${PROJECT_NAME} PRIVATE USE_GS=1)
 endif()
 
+# ZiFi (ESP-01S WiFi NIC emulation) — RP2350 only.
+# To enable UART backend, pass -DZIFI_TX_PIN=<gpio> -DZIFI_RX_PIN=<gpio> to cmake.
+# Example (ZERO2, UART1 on GPIO 20/21):
+#   cmake -DZERO2=1 -DZIFI_TX_PIN=20 -DZIFI_RX_PIN=21 ..
+# Error if ZIFI_TX_PIN and MIDI_TX_PIN share the same UART instance.
+if (ZIFI_TX_PIN AND NOT PICO_PLATFORM STREQUAL "rp2040")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_TX_PIN=${ZIFI_TX_PIN})
+    if (ZIFI_RX_PIN)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_RX_PIN=${ZIFI_RX_PIN})
+    endif()
+    # Detect UART conflict with MIDI at configure time
+    if (MIDI_TX_PIN AND ZIFI_TX_PIN)
+        math(EXPR _zifi_uart "(${ZIFI_TX_PIN} / 4) % 2")
+        math(EXPR _midi_uart "(${MIDI_TX_PIN} / 4) % 2")
+        if (_zifi_uart EQUAL _midi_uart)
+            message(FATAL_ERROR "ZIFI_TX_PIN=${ZIFI_TX_PIN} and MIDI_TX_PIN=${MIDI_TX_PIN} share UART${_zifi_uart} — choose different pins or disable one.")
+        endif()
+    endif()
+endif()
+
 # redcode/Z80 build configuration for GS (LGPLv3 library vendored in src/GS/)
 set_source_files_properties(src/GS/Z80_redcode.c PROPERTIES
     COMPILE_FLAGS "-O3 -funroll-loops -DZ80_STATIC -DGS_Z80_INSN_IN_SRAM -DZ80_EXTERNAL_HEADER=\\\"Z80_compat.h\\\"")

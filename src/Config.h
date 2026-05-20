@@ -225,6 +225,11 @@ public:
     static uint8_t ide_scheme;   // IDE/HDD: 0=OFF 1=NEMO 2=PROFI (mutually exclusive with esxDOS DivMMC/DivIDE)
     static string ide_image[2];  // IDE hd0/hd1 image paths ([0]=master, [1]=slave)
     static uint16_t ide_chs[2][3]; // per-slot geometry override [C,H,S]; 0,0,0 = auto-detect
+    static uint8_t zifi_enabled; // 0=Off, 1=ZiFi NIC
+    static string wifi_ssid;
+    static string wifi_pass;
+    static bool wifi_autoconnect;
+    static void loadWifiConfig();
 #endif
     
     static signed char aud_volume;

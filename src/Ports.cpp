@@ -65,6 +65,7 @@ extern "C" const uint32_t profi_default_palette16[16];
 #if !PICO_RP2040
 #include "DivMMC.h"
 #include "IDE.h"
+#include "ZiFi.h"
 #include "MB02.h"
 #include "hardware/gpio.h"
 #include "sdcard.h"
@@ -394,6 +395,15 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     }
   } else {
     ioContentionLate(MemESP::ramContended[rambank]);
+#if !PICO_RP2040
+    // ZiFi NIC port: A0..A7 == 0xEF, A8..A15 selects register (0x00..0xC7)
+    // 0xEFF7 (hi=0xEF > 0xC7) falls through to Pentagon mode16col handler below
+    if (Config::zifi_enabled && p8 == 0xEF) {
+      uint8_t zifi_hi = address >> 8;
+      if (zifi_hi <= 0xC7)
+        return ZiFi::read(zifi_hi);
+    }
+#endif
 #ifndef NO_ALF
     if (ia && bitRead(p8, 7) == 0) {
       if (bitRead(p8, 1) == 0) { // 1D
@@ -929,6 +939,18 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   }
   uint8_t a8 = (address & 0xFF);
   p_states = CPU::tstates;
+
+#if !PICO_RP2040
+  // ZiFi NIC port: A0..A7 == 0xEF, A8..A15 selects register (0x00..0xC7)
+  // 0xEFF7 (hi=0xEF > 0xC7) falls through to Pentagon mode16col handler below
+  if (Config::zifi_enabled && a8 == 0xEF) {
+    uint8_t zifi_hi = address >> 8;
+    if (zifi_hi <= 0xC7) {
+      ZiFi::write(zifi_hi, data);
+      return;
+    }
+  }
+#endif
 
   if (address == 0xAFF7) {
     LED::touchW(LED::RAM);

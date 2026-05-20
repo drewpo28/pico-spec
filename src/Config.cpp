@@ -124,6 +124,10 @@ bool     Config::zcontroller = false;
 uint8_t  Config::ide_scheme = 0;
 string   Config::ide_image[2] = {"", ""};
 uint16_t Config::ide_chs[2][3] = {{0,0,0},{0,0,0}};
+uint8_t  Config::zifi_enabled = 0;
+string   Config::wifi_ssid;
+string   Config::wifi_pass;
+bool     Config::wifi_autoconnect = false;
 #endif
 
 uint8_t Config::scanlines = 0;
@@ -411,6 +415,36 @@ void Config::loadDiskMounts() {
     fclose2(handle);
 }
 
+#if !PICO_RP2040
+void Config::loadWifiConfig() {
+    wifi_ssid.clear();
+    wifi_pass.clear();
+    wifi_autoconnect = false;
+    FIL* f = fopen2("/wifi.cfg", FA_READ);
+    if (!f) return;
+    UINT br;
+    char c;
+    string line;
+    while (!f_eof(f)) {
+        if (f_read(f, &c, 1, &br) != FR_OK) break;
+        if (c == '\n') {
+            auto eq = line.find('=');
+            if (eq != string::npos) {
+                string key = line.substr(0, eq);
+                string val = line.substr(eq + 1);
+                if (key == "ssid")        wifi_ssid = val;
+                else if (key == "pass")   wifi_pass = val;
+                else if (key == "autoconnect") wifi_autoconnect = (val == "1" || val == "true");
+            }
+            line.clear();
+        } else if (c != '\r') {
+            line += c;
+        }
+    }
+    fclose2(f);
+}
+#endif
+
 #if TFT
 extern "C" uint8_t TFT_FLAGS;
 extern "C" uint8_t TFT_INVERSION;
@@ -647,6 +681,7 @@ void Config::load() {
             mb02SoundLed = old ? 3 : 0;
         }
         nvs_get_b("zcontroller", zcontroller, sts);
+        nvs_get_u8("zifi_enabled", zifi_enabled, sts);
 #endif
         nvs_get_str("SNA_Path", FileUtils::SNA_Path, sts);
         nvs_get_str("TAP_Path", FileUtils::TAP_Path, sts);
@@ -740,6 +775,10 @@ void Config::load() {
         else MEM_PG_CNT = mem_pg_cnt;
     }
     loaded = true;
+#if !PICO_RP2040
+    if (FileUtils::fsMount)
+        loadWifiConfig();
+#endif
 }
 
 // Streams key=value lines straight to the SD file when one is open;
@@ -870,6 +909,7 @@ void Config::save() {
     nvs_set_str(buf,"SAA1099", SAA1099 ? "true" : "false");
     nvs_set_u8(buf,"midi", midi);
     nvs_set_u8(buf,"midipreset", midi_synth_preset);
+    nvs_set_u8(buf,"zifi_enabled", zifi_enabled);
 #endif
     nvs_set_u8(buf,"ayConfig", Config::ayConfig);
     nvs_set_u8(buf,"turbosound", Config::turbosound);

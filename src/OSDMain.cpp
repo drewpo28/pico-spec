@@ -66,6 +66,8 @@ visit https://zxespectrum.speccy.org/contacto
 #include "AySound.h"
 #include "Midi.h"
 #include "MidiSynth.h"
+#include "ZiFi.h"
+#include "ZiFiAT.h"
 #include "kbd_img.h"
 extern "C" void graphics_set_scanlines(uint8_t level);
 extern "C" void graphics_set_dither(bool enabled);
@@ -5548,7 +5550,68 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     }
                 }
             }
+#if !PICO_RP2040
+            else if (opt == 10) { // Network
+                menu_saverect = true;
+                menu_curopt = 1;
+                while (1) {
+                    menu_level = 1;
+                    uint8_t net_opt = menuRun(MENU_NETWORK[Config::lang]);
+                    if (net_opt == 0) break;
+
+                    if (net_opt == 1) { // Status
+                        string ssid, ip;
+                        bool ok = ZiFiAT::getStatus(ssid, ip);
+                        string msg;
+                        if (ok)
+                            msg = string("SSID: ") + ssid + "\nIP:   " + ip;
+                        else
+                            msg = MSG_WIFI_DISCONNECTED[Config::lang];
+                        OSD::osdCenteredMsg(msg, LEVEL_INFO, 3000);
+                    }
+                    else if (net_opt == 2) { // Connect
+                        if (Config::wifi_ssid.empty()) {
+                            OSD::osdCenteredMsg(MSG_WIFI_NO_CFG[Config::lang], LEVEL_WARN, 3000);
+                        } else {
+                            OSD::osdCenteredMsg(MSG_WIFI_CONNECTING[Config::lang], LEVEL_INFO, 0);
+                            ZiFiAT::Status s = ZiFiAT::connect(Config::wifi_ssid, Config::wifi_pass);
+                            if (s == ZiFiAT::OK)
+                                OSD::osdCenteredMsg(string(MSG_WIFI_CONNECTED[Config::lang]) + "\n" + ZiFiAT::current_ip, LEVEL_INFO, 3000);
+                            else
+                                OSD::osdCenteredMsg(MSG_WIFI_CONNECT_ERR[Config::lang], LEVEL_WARN, 3000);
+                        }
+                    }
+                    else if (net_opt == 3) { // Disconnect
+                        ZiFiAT::disconnect();
+                        OSD::osdCenteredMsg(MSG_WIFI_DISCONNECTED[Config::lang], LEVEL_INFO, 2000);
+                    }
+                    else if (net_opt == 4) { // Reload wifi.cfg
+                        Config::loadWifiConfig();
+                        OSD::osdCenteredMsg(MSG_WIFI_CFG_RELOADED[Config::lang], LEVEL_INFO, 2000);
+                    }
+                    else if (net_opt == 5) { // ZiFi NIC toggle
+                        menu_saverect = true;
+                        menu_curopt = Config::zifi_enabled + 1;
+                        uint8_t zn = menuRun(MENU_ZIFI_NIC[Config::lang]);
+                        if (zn > 0) {
+                            Config::zifi_enabled = zn - 1;
+                            if (Config::zifi_enabled)
+                                ZiFi::init();
+                            else
+                                ZiFi::deinit();
+                            Config::save();
+                        }
+                    }
+                    menu_curopt = net_opt;
+                }
+                menu_curopt = 10;
+            }
+#endif
+#if !PICO_RP2040
+            else if (opt == 11) { // ZX Keyboard — bitmap overlay
+#else
             else if (opt == 10) { // ZX Keyboard — bitmap overlay
+#endif
                 // Protect OSD area from Z80 video renderer overwrite
                 bool kbd_osd_enabled = (VIDEO::OSD != 0);
                 if (!kbd_osd_enabled) {
@@ -5600,7 +5663,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 if (VIDEO::OSD) OSD::drawStats();
                 return;
             }
+#if !PICO_RP2040
+            else if (opt == 12) { // Help — dynamic from hotkeys
+#else
             else if (opt == 11) { // Help — dynamic from hotkeys
+#endif
                 // Build index of visible hotkeys (no large buffer needed)
                 auto descs = Config::lang ? hkDescES : hkDescEN;
                 const int maxCols = osdMaxCols();
@@ -5693,7 +5760,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 if (VIDEO::OSD) OSD::drawStats();
                 return;
             }
+#if !PICO_RP2040
+            else if (opt == 13) { // About
+#else
             else if (opt == 12) { // About
+#endif
                 // About
                 // Protect OSD area from Z80 video renderer overwrite
                 bool about_osd_enabled = (VIDEO::OSD != 0);

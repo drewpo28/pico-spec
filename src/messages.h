@@ -522,6 +522,13 @@ static const char *MENU_ESX_INSERT[2]    = { "Insert disk\t>\n", "Insertar disco
 static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco\n" };
 #endif
 
+// Network menu item — present on RP2350 only; empty string on RP2040
+#if !PICO_RP2040
+#define MENU_MAIN_NETWORK_ITEM "Network\t>\n"
+#else
+#define MENU_MAIN_NETWORK_ITEM ""
+#endif
+
 #if TFT
 #define MENU_MAIN_EN \
 	"Volume\n"\
@@ -562,6 +569,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Options\t>\n"\
     "Debug\t>\n"\
     "Hardware\t>\n"\
+    MENU_MAIN_NETWORK_ITEM \
     "ZX Keyboard\n"\
     "Help\n"\
     "About\n"
@@ -575,6 +583,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Opciones\t>\n"\
 	"Depurar\t>\n"\
     "Hardware\t>\n"\
+    MENU_MAIN_NETWORK_ITEM \
     "Teclado ZX\n"\
     "Ayuda\n"\
     "Acerca de\n"
@@ -591,6 +600,7 @@ static const char *MENU_MAIN[2] = { MENU_MAIN_EN, MENU_MAIN_ES };
     "Options\t>\n"\
     "Debug\t>\n"\
     "Hardware\t>\n"\
+    MENU_MAIN_NETWORK_ITEM \
     "ZX Keyboard\n"\
     "Help\n"\
     "About\n"
@@ -604,6 +614,7 @@ static const char *MENU_MAIN[2] = { MENU_MAIN_EN, MENU_MAIN_ES };
     "Opciones\t>\n"\
     "Depurar\t>\n"\
     "Hardware\t>\n"\
+    MENU_MAIN_NETWORK_ITEM \
     "Teclado ZX\n"\
     "Ayuda\n"\
     "Acerca de\n"
@@ -2224,5 +2235,42 @@ const uint8_t ESPectrum_logo[] = {
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00,
 };
+
+
+// ─── ZiFi / Network menu strings ─────────────────────────────────────────────
+#if !PICO_RP2040
+
+#define MENU_NETWORK_EN \
+    "Network\n"\
+    "Status\n"\
+    "Connect\n"\
+    "Disconnect\n"\
+    "Reload wifi.cfg\n"\
+    "ZiFi NIC\t>\n"
+#define MENU_NETWORK_ES \
+    "Red\n"\
+    "Estado\n"\
+    "Conectar\n"\
+    "Desconectar\n"\
+    "Recargar wifi.cfg\n"\
+    "ZiFi NIC\t>\n"
+static const char *MENU_NETWORK[2] = { MENU_NETWORK_EN, MENU_NETWORK_ES };
+
+#define MENU_ZIFI_NIC_EN "ZiFi NIC\n"\
+    "Off\n"\
+    "On\n"
+#define MENU_ZIFI_NIC_ES "ZiFi NIC\n"\
+    "Apagado\n"\
+    "Encendido\n"
+static const char *MENU_ZIFI_NIC[2] = { MENU_ZIFI_NIC_EN, MENU_ZIFI_NIC_ES };
+
+static const char *MSG_WIFI_CONNECTING[2]    = { "Connecting...",     "Conectando..."      };
+static const char *MSG_WIFI_CONNECTED[2]     = { "Connected",         "Conectado"          };
+static const char *MSG_WIFI_DISCONNECTED[2]  = { "Disconnected",      "Desconectado"       };
+static const char *MSG_WIFI_CONNECT_ERR[2]   = { "Connect failed",    "Error al conectar"  };
+static const char *MSG_WIFI_NO_CFG[2]        = { "No /wifi.cfg found","Sin /wifi.cfg"      };
+static const char *MSG_WIFI_CFG_RELOADED[2]  = { "wifi.cfg reloaded", "wifi.cfg recargado" };
+
+#endif // !PICO_RP2040
 
 #endif // ESPECTRUM_MESSAGES_h

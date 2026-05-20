@@ -71,6 +71,7 @@ visit https://zxespectrum.speccy.org/contacto
 #endif
 #include "Midi.h"
 #include "MidiSynth.h"
+#include "ZiFi.h"
 #include "Z80DMA.h"
 #ifdef USE_GS
 #include "GS/GS.h"
@@ -981,6 +982,9 @@ void ESPectrum::setup() {
         Debug::log2SD("setup: Z80DMA::reset");
         Z80DMA::reset();
     }
+    ZiFi::enabled = Config::zifi_enabled;
+    if (ZiFi::enabled)
+        ZiFi::init();
 #endif
 
   if (Config::arch == "48K" || Config::arch == "Profi") {
@@ -2181,6 +2185,8 @@ void ESPectrum::loop() {
       }
       prev_ds80_active = profi_ds80_active;
     }
+
+    if (ZiFi::enabled) ZiFi::tick();
 #endif
 
     // GS-Z80 runs on core1 alongside pcm_call(); core0 only reads the ring.
