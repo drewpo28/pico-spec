@@ -267,7 +267,7 @@ static volatile uint32_t s_cmd_fifo_r = 0;
 // GS-time — absorbs typical 10-25 ms core1 slowdowns (heavy core0 PSRAM use,
 // sustained OSD activity) without draining. Single-writer (core1 main) /
 // single-reader (core1 IRQ preempts main) — volatile wpos/rpos atomic on ARM.
-#define GS_RING_SIZE 1024
+#define GS_RING_SIZE 4096
 #define GS_RING_MASK (GS_RING_SIZE - 1)
 static int16_t* s_ring_L = nullptr;
 static int16_t* s_ring_R = nullptr;
@@ -280,7 +280,7 @@ static uint32_t s_drain_frac = 0;
 // RAM caps at ~18 T/µs effective, so 24 MHz target under-delivers (measured
 // ~77% → 29 kHz IRQ, pitch shifted ~25% low). 12 MHz + 320 T is well within
 // capacity and matches native GS firmware timing exactly.
-static constexpr uint32_t GS_CLOCK_HZ    = 13125000;
+static constexpr uint32_t GS_CLOCK_HZ    = 20000000;
 static constexpr uint32_t GS_INT_HZ      = 37500;
 static constexpr uint32_t GS_INT_PERIOD  = GS_CLOCK_HZ / GS_INT_HZ;  // 320
 
@@ -984,7 +984,8 @@ void __not_in_flash_func(GS::pump)() {
     uint32_t dt_us = now - s_pump_last_us;
     if (dt_us == 0) return;
     if (dt_us > 1000) dt_us = 1000;          // clamp: max 1 ms per pump
-    int budget_t = (int)(dt_us * 12);         // 12 T-states per µs at 12 MHz
+    // Budget matches GS_CLOCK_HZ exactly: 13125 T/ms → INT every 350T = 37500Hz
+    int budget_t = (int)((uint32_t)dt_us * (GS_CLOCK_HZ / 1000u) / 1000u);
     s_pump_last_us = now;
 
     // Ring-fill safety: if consumer fell badly behind (shouldn't happen
