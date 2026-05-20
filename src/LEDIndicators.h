@@ -46,6 +46,7 @@ namespace LED {
     void decay();
     void draw();
     void clear();
+    void drawGlyph(Id i, int xpix, int ypix, uint8_t fg, uint8_t bg);
 }
 
 #endif

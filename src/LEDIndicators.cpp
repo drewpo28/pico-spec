@@ -16,14 +16,14 @@
 
 namespace LED {
 
-static constexpr int CELL_W = 10;  // 8px sprite + 2px gap
+static constexpr int CELL_W = 9;   // 8px sprite + 1px gap
 static constexpr int CELL_H = 10;  // 8px sprite + 2px gap (kept for y-shift)
 
 uint8_t rdec[COUNT];
 uint8_t wdec[COUNT];
 
-// 7x7 glyphs in 8x8 grid. Bit 0 (rightmost col) and row 7 are 0 → inter-icon gap.
-// Bit layout per row: b7 = leftmost pixel ... b1 = 7th pixel.
+// 8x8 glyphs. All 8 bits per row and all 8 rows are active.
+// Bit layout per row: b7 = leftmost pixel ... b0 = rightmost pixel.
 static const uint8_t SPRITE[COUNT][8] = {
     // Storage
     /* TAPE     — cassette: rectangular body, reel centres
@@ -81,33 +81,33 @@ static const uint8_t SPRITE[COUNT][8] = {
        .XXX...
        .XX.... */
                    { 0x1C, 0x14, 0x10, 0x10, 0x30, 0x70, 0x60, 0x00 },
-    /* COVOX    — EQ bars (4 columns, heights 3/5/7/4 left→right)
-       ...X...
-       ...X...
-       ..X.X..
+    /* COVOX    — diamond / speaker cone
+       ...XX..
+       ..X..X.
+       .X.....
+       X......
+       .X.....
+       ..X..X.
+       ...XX.. */
+                   { 0x18, 0x24, 0x40, 0x80, 0x40, 0x24, 0x18, 0x00 },
+    /* SAA      — letters S and A (3px + 1px gap + 3px)
+       .XX..X.
+       X...X.X
+       X...X.X
+       .X..XXX
        ..X.X.X
-       X.X.X.X
-       X.X.X.X
-       X.X.X.X */
-                   { 0x10, 0x10, 0x28, 0x2A, 0xAA, 0xAA, 0xAA, 0x00 },
-    /* SAA      — three sound waves (sine-like)
-       .X.X.X.
-       X.X.X..
-       .X.X.X.
-       X.X.X..
-       .X.X.X.
-       X.X.X..
-       .X.X.X. */
-                   { 0x54, 0xA8, 0x54, 0xA8, 0x54, 0xA8, 0x54, 0x00 },
-    /* MIDI     — piano keyboard: 4 solid keys with black cutouts on top half
-       X.X.X.X
-       X.X.X.X
-       X.X.X.X
-       XXXXXXX
-       XXXXXXX
-       XXXXXXX
-       XXXXXXX */
-                   { 0xAA, 0xAA, 0xAA, 0xFE, 0xFE, 0xFE, 0xFE, 0x00 },
+       ..X.X.X
+       XX..X.X */
+                   { 0x64, 0x8A, 0x8A, 0x4E, 0x2A, 0x2A, 0xCA, 0x00 },
+    /* MIDI     — letters M and I (4px + 1px gap + 2px)
+       X..X..X.
+       XXXX..X.
+       X..X..X.
+       X..X..X.
+       X..X..X.
+       X..X..X.
+       X..X..X. */
+                   { 0x92, 0xF2, 0x92, 0x92, 0x92, 0x92, 0x92, 0x00 },
     /* GS       — bold G letter
        .XXXX..
        X....X.
@@ -118,15 +118,15 @@ static const uint8_t SPRITE[COUNT][8] = {
        .XXXX.. */
                    { 0x78, 0x84, 0x80, 0x9C, 0x84, 0x84, 0x78, 0x00 },
     // Video
-    /* ULAPLUS  — palette swatches (4 bands)
-       XXXXXX.
-       X.X.X..
-       XXXXXX.
-       X.X.X..
-       XXXXXX.
-       X.X.X..
-       XXXXXX. */
-                   { 0xFC, 0xA8, 0xFC, 0xA8, 0xFC, 0xA8, 0xFC, 0x00 },
+    /* ULAPLUS  — letters U and + (3px + 1px gap + 3px)
+       X.X..X.
+       X.X..X.
+       X.X.XXX
+       X.X..X.
+       X.X..X.
+       X.X....
+       XXX.... */
+                   { 0xA4, 0xA4, 0xAE, 0xA4, 0xA4, 0xA0, 0xE0, 0x00 },
     /* TIMEX    — large T with serifs
        XXXXXXX
        ...X...
@@ -261,6 +261,15 @@ static void drawSprite(Id i, int xpix, int ypix, uint8_t fg) {
         for (int c = 0; c < 8; c++) {
             if (bits & (0x80 >> c)) line[(xpix + c) ^ 2] = fg;
         }
+    }
+}
+
+void drawGlyph(Id i, int xpix, int ypix, uint8_t fg, uint8_t bg) {
+    const uint8_t* glyph = SPRITE[i];
+    for (int row = 0; row < 8; row++) {
+        uint8_t bits = glyph[row];
+        for (int c = 0; c < 8; c++)
+            VIDEO::vga.dotFast(xpix + c, ypix + row, (bits & (0x80 >> c)) ? fg : bg);
     }
 }
 

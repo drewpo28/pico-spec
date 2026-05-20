@@ -101,6 +101,7 @@ public:
     static void errorHalt(const string& errormsg);
     static void osdCenteredMsg(const string& msg, uint8_t warn_level);
     static void osdCenteredMsg(const string& msg, uint8_t warn_level, uint16_t millispause);
+    static void showLedLegend();
 
     static void osdDump();
     static void osdDebug(uint16_t gotoAddr = 0xFFFF);

@@ -4561,13 +4561,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     menu_saverect = false;
                                 }
                                 else if (options_num == 8) {
-                                    // LED indicators ON/OFF
+                                    // LED indicators ON/OFF + Legend
                                     menu_level = 3;
                                     menu_curopt = 1;
                                     menu_saverect = true;
                                     while (1) {
                                         string opt_menu = MENU_LEDINDICATORS[Config::lang];
                                         opt_menu += MENU_YESNO[Config::lang];
+                                        opt_menu += Config::lang ? "Leyenda\t>\n" : "Legend\t>\n";
                                         bool prev_opt = Config::ledIndicators;
                                         if (prev_opt) {
                                             opt_menu.replace(opt_menu.find("[Y",0),2,"[*");
@@ -4577,7 +4578,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             opt_menu.replace(opt_menu.find("[N",0),2,"[*");
                                         }
                                         uint8_t opt2 = menuRun(opt_menu);
-                                        if (opt2) {
+                                        if (opt2 == 1 || opt2 == 2) {
                                             Config::ledIndicators = (opt2 == 1);
                                             if (Config::ledIndicators != prev_opt) {
                                                 if (!Config::ledIndicators) LED::clear();
@@ -4585,6 +4586,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             }
                                             menu_curopt = opt2;
                                             menu_saverect = false;
+                                        } else if (opt2 == 3) {
+                                            showLedLegend();
+                                            menu_curopt = 3;
+                                            menu_saverect = true;
                                         } else {
                                             menu_curopt = 8;
                                             menu_level = 2;
@@ -5301,6 +5306,78 @@ void OSD::errorHalt(const string& errormsg) {
 // W/A
 extern "C" void osd_printf(const char* msg, ...) {
     OSD::osdCenteredMsg(msg, LEVEL_WARN, 1000);
+}
+
+// LED indicators legend panel: draws all glyphs with labels in a single column
+void OSD::showLedLegend() {
+    struct Entry { LED::Id id; const char* label; };
+    static const Entry entries[] = {
+        { LED::TAPE,      "Tape (EAR)"      },
+        { LED::FDD,       "Floppy/TR-DOS"   },
+        { LED::SD,        "DivMMC/esxDOS"   },
+        { LED::ZCTRL,     "Z-Controller"    },
+        { LED::BEEPER,    "Beeper"          },
+        { LED::AY,        "AY-3-8912"       },
+        { LED::COVOX,     "Covox DAC"       },
+        { LED::SAA,       "SAA1099"         },
+        { LED::MIDI,      "MIDI"            },
+        { LED::GS,        "General Sound"   },
+        { LED::ULAPLUS,   "ULA+"            },
+        { LED::TIMEX,     "Timex SCLD"      },
+        { LED::RAM,       "RAM paging"      },
+        { LED::DMA,       "Z80 DMA"         },
+        { LED::KEMPJOY,   "Kempston joy"    },
+        { LED::KEMPMOUSE, "Kempston mouse"  },
+    };
+    static constexpr int N = sizeof(entries) / sizeof(entries[0]);
+
+    static constexpr int row_h = 11;  // 8px sprite + 3px gap
+    static constexpr int W = 160;
+    static constexpr int H = 2 + OSD_FONT_H + 4 + N * row_h + 4;  // title + rows + padding
+
+    unsigned short ox = scrAlignCenterX(W);
+    unsigned short oy = scrAlignCenterY(H);
+    uint8_t paper      = zxColor(1, 0);
+    uint8_t ink        = zxColor(7, 1);
+    uint8_t title_paper = zxColor(5, 1);
+    uint8_t title_ink   = zxColor(0, 0);
+
+    VIDEO::SaveRect.save(ox, oy, W, H);
+    VIDEO::vga.fillRect(ox, oy, W, H, paper);
+    VIDEO::vga.rect(ox, oy, W, H, zxColor(0, 0));
+    VIDEO::vga.rect(ox + 1, oy + 1, W - 2, H - 2, zxColor(7, 0));
+
+    // Title bar
+    VIDEO::vga.fillRect(ox + 2, oy + 2, W - 4, OSD_FONT_H, title_paper);
+    VIDEO::vga.setTextColor(title_ink, title_paper);
+    VIDEO::vga.setFont(Font6x8);
+    VIDEO::vga.setCursor(ox + OSD_FONT_W, oy + 2);
+    VIDEO::vga.print(Config::lang ? "Leyenda" : "LED legend");
+
+    VIDEO::vga.setTextColor(ink, paper);
+
+    int top_y = oy + 2 + OSD_FONT_H + 4;
+
+    for (int i = 0; i < N; i++) {
+        int gx = ox + 6;
+        int gy = top_y + i * row_h;
+        LED::drawGlyph(entries[i].id, gx, gy + 1, ink - 1, paper);
+        VIDEO::vga.setCursor(gx + 10, gy + 1);
+        VIDEO::vga.print(entries[i].label);
+    }
+
+    // Drain any pending keys (e.g. Enter from menu selection), then wait for new keypress
+    auto Kbd = ESPectrum::PS2Controller.keyboard();
+    fabgl::VirtualKeyItem item;
+    while (Kbd->virtualKeyAvailable()) Kbd->getNextVirtualKey(&item);
+    while (1) {
+        if (Kbd->virtualKeyAvailable()) {
+            Kbd->getNextVirtualKey(&item);
+            if (item.down) break;
+        }
+    }
+
+    VIDEO::SaveRect.restore_last();
 }
 
 // Centered message
