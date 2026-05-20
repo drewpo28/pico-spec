@@ -1817,7 +1817,11 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
         }
     } else
 #endif
-    if (VIDEO::gigascreen_enabled && !VIDEO::ulaplus_enabled) {
+    if (VIDEO::gigascreen_enabled
+#if !PICO_RP2040
+        && !VIDEO::ulaplus_enabled
+#endif
+    ) {
         for (; loopCount--; ) {
 #if !PICO_RP2040
             uint8_t att = dma_attr_override ? dma_attr_override[attOffset & 0x1F] : grmem[attOffset];
