@@ -66,15 +66,15 @@ visit https://zxespectrum.speccy.org/contacto
 #define TS_BORDER_360x200_PENTAGON 17075  // START OF BORDER PENTAGON
 #define TS_BORDER_360x200_BYTE 13428
 
-#define TS_BORDER_360x288 3563          // START OF BORDER 48 FULL (formula 3559 + 4)
-#define TS_BORDER_360x288_128 3397      // START OF BORDER 128 FULL (formula 3393 + 4)
+#define TS_BORDER_360x288 3564          // START OF BORDER 48 FULL (formula 3559 + 5)
+#define TS_BORDER_360x288_128 3398      // START OF BORDER 128 FULL (formula 3393 + 5)
 #define TS_BORDER_360x288_PENTAGON 7209 // START OF BORDER PENTAGON FULL (formula 7205 + 4)
-#define TS_BORDER_360x288_BYTE 3563
+#define TS_BORDER_360x288_BYTE 3564
 
-#define TS_BORDER_360x240 8939          // START OF BORDER 48 HALF (formula 8935 + 4)
-#define TS_BORDER_360x240_128 8869      // START OF BORDER 128 HALF (formula 8865 + 4)
+#define TS_BORDER_360x240 8940          // START OF BORDER 48 HALF (formula 8935 + 5)
+#define TS_BORDER_360x240_128 8870      // START OF BORDER 128 HALF (formula 8865 + 5)
 #define TS_BORDER_360x240_PENTAGON 12585 // START OF BORDER PENTAGON HALF (formula 12581 + 4)
-#define TS_BORDER_360x240_BYTE 8939
+#define TS_BORDER_360x240_BYTE 8940
 
 // Colors as 8-bit palette indices (VGA8 mode)
 // Standard Spectrum color order: 0-7 normal, 8-15 bright, 16 orange
