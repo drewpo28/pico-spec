@@ -162,6 +162,7 @@ IRAM_ATTR static void FDDStep_MB02(bool force) {
 
 uint8_t nes_pad2_for_alf(void);
 static uint8_t newAlfBit = 0;
+static uint8_t profi_fdc_busy = 0;
 
 extern int ram_pages, butter_pages, psram_pages, swap_pages;
 
@@ -428,6 +429,18 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       }
     }
 
+    // Profi FDC stub: return WD1793 "no disk" sequence so boot ROM's FDC
+    // detection fails cleanly instead of hanging in its wait-for-BUSY loop.
+    // Stateful: returns 0x81 (BUSY|NOT_READY) once after an OUT command, then
+    // 0x90 (SEEK_ERROR|NOT_READY) — ROM sees error at 0x073D → gives up on FDC.
+    if (Config::arch == "Profi" && !ESPectrum::trdos && (address & 0xE3) == 0x03) {
+      if (profi_fdc_busy) {
+        profi_fdc_busy = 0;
+        return 0x81; // BUSY|NOT_READY — exits ROM wait-for-busy at 0x0710
+      }
+      return 0x90; // SEEK_ERROR|NOT_READY — fails FDC presence check at 0x073D
+    }
+
     // Kempston Joystick
     // Standard Kempston decodes A5=0 — always honored so games like Dizzy
     // that read port 0x1F keep working even when an alternate kempstonPort
@@ -497,7 +510,11 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
           }
           MemESP::romLatch = bitRead(data, 4);
           if (!ESPectrum::trdos) {
-            MemESP::romInUse = MemESP::romLatch;
+            // Profi: 7FFD bit4 selects bank 2 (128K compat) vs bank 3 (SOS)
+            // — banks 0 (SYS) and 1 (TR-DOS) are reserved for SYSEN/DOSEN.
+            MemESP::romInUse = (Config::arch == "Profi")
+                ? (MemESP::romLatch ? 3 : 2)
+                : MemESP::romLatch;
             MemESP::recoverPage0();
           }
         }
@@ -556,6 +573,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // bit [7]: hires video mode — screen at RAM page 4/6 instead of 5/7
   if (Config::arch == "Profi" && address == 0xDFFD) {
     LED::touchW(LED::RAM);
+    Debug::log("[DFFD] data=0x%02X bl=%u lock=%d trdos=%d", data, MemESP::bankLatch, (int)MemESP::pagingLock, (int)ESPectrum::trdos);
     if (!MemESP::pagingLock) {
       uint8_t prev_page0ram = MemESP::page0ram;
       portDFFD = data;
@@ -586,6 +604,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         uint32_t clrPage = MemESP::videoLatch ? 58 : 56;
         uint32_t totPages = ram_pages + butter_pages + psram_pages + swap_pages;
         VIDEO::profi_clrmem = (clrPage < totPages) ? MemESP::ram[clrPage].direct() : nullptr;
+        Debug::log("[DFFD] DS80 on: clrPage=%u tot=%u clrmem=%p grmem=%p", clrPage, totPages, VIDEO::profi_clrmem, VIDEO::grmem);
       } else {
         VIDEO::grmem        = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
         VIDEO::profi_clrmem = nullptr;
@@ -904,6 +923,13 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     }
 #endif
 
+    // Profi FDC stub: command write to WD1793 reg0 → arm the one-shot busy flag
+    if (Config::arch == "Profi" && !ESPectrum::trdos && (address & 0xE3) == 0x03) {
+      profi_fdc_busy = 1;
+      ioContentionLate(MemESP::ramContended[rambank]);
+      return;
+    }
+
     // Check if TRDOS Rom is mapped.
     if (ESPectrum::trdos) {
 
@@ -1010,6 +1036,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       if (Config::arch == "Profi") {
         uint32_t profi_page = (page & 0x7) + ((portDFFD & 0x7) << 3);
         uint32_t profi_pages = ram_pages + butter_pages + psram_pages + swap_pages;
+        Debug::log("[7FFD] data=0x%02X base=%u pp=%u/%u bl=%u", data, page, profi_page, profi_pages, MemESP::bankLatch);
         if (profi_page < profi_pages) page = profi_page;
       }
       if (MemESP::bankLatch != page) {

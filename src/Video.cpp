@@ -49,9 +49,9 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Z80_JLS/z80.h"
 #include "Z80_JLS/z80operations.h"
 #include "psram_spi.h"
+#include "Ports.h"
 #if !PICO_RP2040
 #include "Z80DMA.h"
-#include "Ports.h"
 #endif
 extern "C" void graphics_set_palette(uint8_t i, uint32_t color888);
 extern "C" void vga_set_palette_entry_solid(uint8_t i, uint32_t color888);
@@ -1328,6 +1328,17 @@ void VIDEO::Reset() {
         Draw_OSD169 = MainScreen;
         Draw_OSD43 = BottomBorder;
         DrawBorder = TopBorder_Blank;
+    } else if (Config::arch == "Profi") {
+        tStatesPerLine = TSTATES_PER_LINE_PROFI;
+        tStatesScreen = TS_SCREEN_PROFI;
+        tStatesBorder = isFullBorder ? (isFullBorder240 ? TS_BORDER_360x240_PROFI : TS_BORDER_360x288_PROFI)
+                      : is169 ? TS_BORDER_360x200_PROFI : TS_BORDER_320x240_PROFI;
+        VsyncFinetune[0] = 0;
+        VsyncFinetune[1] = 0;
+
+        Draw_OSD169 = MainScreen;
+        Draw_OSD43 = BottomBorder;
+        DrawBorder = TopBorder_Blank;
     }
 
     // Border column layout (unified for all models):
@@ -1376,7 +1387,9 @@ void VIDEO::Reset() {
         grmem = MemESP::videoLatch ? MemESP::ram[6].direct() : MemESP::ram[4].direct();
         uint32_t clrPage = MemESP::videoLatch ? 58 : 56;
         extern int ram_pages, butter_pages, psram_pages, swap_pages;
-        profi_clrmem = ((int)clrPage < ram_pages + butter_pages + psram_pages + swap_pages) ? MemESP::ram[clrPage].direct() : nullptr;
+        int totPg = ram_pages + butter_pages + psram_pages + swap_pages;
+        profi_clrmem = ((int)clrPage < totPg) ? MemESP::ram[clrPage].direct() : nullptr;
+        Debug::log("[VID] DS80 Reset: clrPage=%u totPg=%d clrmem=%p grmem=%p", clrPage, totPg, profi_clrmem, grmem);
     } else {
         grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
         profi_clrmem = nullptr;
@@ -1855,27 +1868,27 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             *lineptr32++ = mix2;
         }
     } else if (Config::arch == "Profi" && (Ports::portDFFD & 0x80)) {
-        // Profi hires (DS80) 512x192/240. Per ZXMAK2 ProfiRenderer:
-        //   pixCoff = 2048*(line>>6) + 256*(line&7) + ((line&0x38)<<2)
-        //   Each 16-pixel cell: 1 byte from LEFT half (pixCoff+i+8192) → pixels 0..7,
-        //                       1 byte from RIGHT half (pixCoff+i)    → pixels 8..15.
-        //   Color attr is at SAME offset in profi_clrmem (1 attr per byte).
-        //   Profi attr encoding (ZXMAK2 OnPaletteChanged):
-        //     ink   = (attr & 7) | ((attr >> 3) & 8)   — bits 0..2 + bit 6 → 4-bit
-        //     paper = ((attr >> 3) & 7) | ((attr >> 4) & 8) — bits 3..5 + bit 7 → 4-bit
-        // Our framebuffer is 256px wide → render the first 256 hires pixels.
+        // Profi DS80 512x192 hires: OR-merge both halves → 256px output (2:1 downsample).
+        // Left half (offset +8192) = x=0..255; right half (offset +0) = x=256..511.
+        // Each column i (0..31): OR-merge 8 left bits → nibL (4px), 8 right bits → nibR (4px).
+        // coldraw_cnt tracks position within line (reset to 0 at line start, +loopCount each call).
         uint32_t line = curline;
         uint32_t pixCoff = 2048 * (line >> 6) + 256 * (line & 7) + ((line & 0x38) << 2);
-        const uint8_t att = 0x07; // TODO: wire profi_clrmem when color page available
-        for (unsigned int i = 0; i < 16 && loopCount; i++) {
-            uint32_t offL = pixCoff + i + 8192;
-            uint32_t offR = pixCoff + i;
-            uint8_t bmpL = grmem[offL];
-            uint8_t bmpR = grmem[offR];
-            if (loopCount) { *lineptr32++ = AluByte[bmpL >> 4][att]; loopCount--; }
-            if (loopCount) { *lineptr32++ = AluByte[bmpL & 0xF][att]; loopCount--; }
-            if (loopCount) { *lineptr32++ = AluByte[bmpR >> 4][att]; loopCount--; }
-            if (loopCount) { *lineptr32++ = AluByte[bmpR & 0xF][att]; loopCount--; }
+        unsigned int end_col = coldraw_cnt < 32u ? coldraw_cnt : 32u;
+        unsigned int start_col = end_col - loopCount;
+        for (unsigned int i = start_col; i < end_col; i++) {
+            uint8_t bmpL = grmem[pixCoff + i + 8192];
+            uint8_t bmpR = grmem[pixCoff + i];
+            uint8_t rawL = profi_clrmem ? profi_clrmem[pixCoff + i + 8192] : 0x07;
+            uint8_t rawR = profi_clrmem ? profi_clrmem[pixCoff + i]        : 0x07;
+            uint8_t attL = (rawL & 0x3F) | ((rawL | (rawL >> 1)) & 0x40);
+            uint8_t attR = (rawR & 0x3F) | ((rawR | (rawR >> 1)) & 0x40);
+            uint8_t oL = (bmpL | (bmpL >> 1)) & 0x55;
+            uint8_t oR = (bmpR | (bmpR >> 1)) & 0x55;
+            uint8_t nibL = ((oL>>3)&8)|((oL>>2)&4)|((oL>>1)&2)|(oL&1);
+            uint8_t nibR = ((oR>>3)&8)|((oR>>2)&4)|((oR>>1)&2)|(oR&1);
+            *lineptr32++ = AluByte[nibL][attL];
+            *lineptr32++ = AluByte[nibR][attR];
         }
     } else {
         for (; loopCount--; ) {
