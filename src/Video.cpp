@@ -51,6 +51,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "psram_spi.h"
 #if !PICO_RP2040
 #include "Z80DMA.h"
+#include "Ports.h"
 #endif
 extern "C" void graphics_set_palette(uint8_t i, uint32_t color888);
 extern "C" void vga_set_palette_entry_solid(uint8_t i, uint32_t color888);
@@ -113,6 +114,7 @@ uint8_t VIDEO::tStatesPerLine;
 int VIDEO::tStatesScreen;
 int VIDEO::tStatesBorder;
 uint8_t* VIDEO::grmem;
+uint8_t* VIDEO::profi_clrmem = nullptr;
 uint16_t VIDEO::offBmp[SPEC_H];
 uint16_t VIDEO::offAtt[SPEC_H];
 SaveRectT VIDEO::SaveRect;
@@ -1370,14 +1372,22 @@ void VIDEO::Reset() {
         lineptr_offset = 8;  // 32 bytes = (320-256)/2 pixels
     }
 
-    grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
+    if (Config::arch == "Profi" && (Ports::portDFFD & 0x80)) {
+        grmem = MemESP::videoLatch ? MemESP::ram[6].direct() : MemESP::ram[4].direct();
+        uint32_t clrPage = MemESP::videoLatch ? 58 : 56;
+        extern int ram_pages, butter_pages, psram_pages, swap_pages;
+        profi_clrmem = ((int)clrPage < ram_pages + butter_pages + psram_pages + swap_pages) ? MemESP::ram[clrPage].direct() : nullptr;
+    } else {
+        grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
+        profi_clrmem = nullptr;
+    }
 
     #ifdef DIRTY_LINES
     // for (int i=0; i < SPEC_H; i++) VIDEO::dirty_lines[i] = 0x01;
     memset((uint8_t *)VIDEO::dirty_lines,0x01,SPEC_H);
     #endif // DIRTY_LINES
 
-    VIDEO::snow_toggle = Config::arch != "P1024" && Config::arch != "P512" && Config::arch != "Pentagon" ? Config::render : false;
+    VIDEO::snow_toggle = (Config::arch != "P1024" && Config::arch != "P512" && Config::arch != "Pentagon" && Config::arch != "Profi") ? Config::render : false;
 
     if (VIDEO::snow_toggle) {
         Draw = &Blank_Snow;
@@ -1599,8 +1609,11 @@ IRAM_ATTR void VIDEO::MainScreen_Blank_Snow(unsigned int statestoadd, bool conte
             attOffset = offAtt[curline];
         }
 
-        snowpage = MemESP::videoLatch ? 7 : 5;
-        
+        if (Config::arch == "Profi" && (Ports::portDFFD & 0x80))
+            snowpage = MemESP::videoLatch ? 6 : 4;
+        else
+            snowpage = MemESP::videoLatch ? 7 : 5;
+
         dispUpdCycle = 0; // For ULA cycle perfect emulation
 
         #ifdef DIRTY_LINES
@@ -1841,6 +1854,29 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             *lineptr32++ = mix1;
             *lineptr32++ = mix2;
         }
+    } else if (Config::arch == "Profi" && (Ports::portDFFD & 0x80)) {
+        // Profi hires (DS80) 512x192/240. Per ZXMAK2 ProfiRenderer:
+        //   pixCoff = 2048*(line>>6) + 256*(line&7) + ((line&0x38)<<2)
+        //   Each 16-pixel cell: 1 byte from LEFT half (pixCoff+i+8192) → pixels 0..7,
+        //                       1 byte from RIGHT half (pixCoff+i)    → pixels 8..15.
+        //   Color attr is at SAME offset in profi_clrmem (1 attr per byte).
+        //   Profi attr encoding (ZXMAK2 OnPaletteChanged):
+        //     ink   = (attr & 7) | ((attr >> 3) & 8)   — bits 0..2 + bit 6 → 4-bit
+        //     paper = ((attr >> 3) & 7) | ((attr >> 4) & 8) — bits 3..5 + bit 7 → 4-bit
+        // Our framebuffer is 256px wide → render the first 256 hires pixels.
+        uint32_t line = curline;
+        uint32_t pixCoff = 2048 * (line >> 6) + 256 * (line & 7) + ((line & 0x38) << 2);
+        const uint8_t att = 0x07; // TODO: wire profi_clrmem when color page available
+        for (unsigned int i = 0; i < 16 && loopCount; i++) {
+            uint32_t offL = pixCoff + i + 8192;
+            uint32_t offR = pixCoff + i;
+            uint8_t bmpL = grmem[offL];
+            uint8_t bmpR = grmem[offR];
+            if (loopCount) { *lineptr32++ = AluByte[bmpL >> 4][att]; loopCount--; }
+            if (loopCount) { *lineptr32++ = AluByte[bmpL & 0xF][att]; loopCount--; }
+            if (loopCount) { *lineptr32++ = AluByte[bmpR >> 4][att]; loopCount--; }
+            if (loopCount) { *lineptr32++ = AluByte[bmpR & 0xF][att]; loopCount--; }
+        }
     } else {
         for (; loopCount--; ) {
 #if !PICO_RP2040
@@ -2020,11 +2056,16 @@ IRAM_ATTR void VIDEO::MainScreen_Snow_Opcode(bool contended) {
     uint8_t page = Z80::getRegI() & 0xc0;
     if (page == 0x40) { // Snow 48K, 128K
         snow_effect = 1;
-        snowpage = MemESP::videoLatch ? 7 : 5;
+        if (Config::arch == "Profi" && (Ports::portDFFD & 0x80))
+            snowpage = MemESP::videoLatch ? 6 : 4;
+        else
+            snowpage = MemESP::videoLatch ? 7 : 5;
     } else if (Z80Ops::is128 && (MemESP::bankLatch & 0x01) && page == 0xc0) {  // Snow 128K
         snow_effect = 1;
         if (MemESP::bankLatch == 1 || MemESP::bankLatch == 3)
             snowpage = MemESP::videoLatch ? 3 : 1;
+        else if (Config::arch == "Profi" && (Ports::portDFFD & 0x80))
+            snowpage = MemESP::videoLatch ? 6 : 4;
         else
             snowpage = MemESP::videoLatch ? 7 : 5;
     }

@@ -832,7 +832,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             } else {
                 // Build machine-dependent menu
                 string reset_menu;
-                if (Z80Ops::isPentagon) {
+                if (Config::arch == "Profi") {
+                    reset_menu = MENU_RESETTO_PROFI[Config::lang];
+                } else if (Z80Ops::isPentagon) {
                     if (Config::romSet == "128Kpg")
                         reset_menu = MENU_RESETTO_PENTGLUK[Config::lang];
                     else
@@ -855,7 +857,23 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     if (Config::ram_file != NO_RAM_FILE) Config::ram_file = NO_RAM_FILE;
                     Config::last_ram_file = NO_RAM_FILE;
 
-                    if (Z80Ops::isPentagon && Config::romSet == "128Kpg") {
+                    if (Config::arch == "Profi") {
+                        // Service ROM=1, TR-DOS=2, 128K=3, 48K=4
+                        if (opt == 1) {
+                            // Service ROM: boot SYS ROM (bank0), SYSEN=true (set by reset(0) for Profi).
+                            ESPectrum::reset(0);
+                        } else if (opt == 2) {
+                            // TR-DOS: boot SYS ROM first — user selects TR-DOS from service menu.
+                            ESPectrum::reset(0);
+                        } else if (opt == 3) {
+                            // 128K ROM: trdos=false, romLatch=0 → bank2
+                            ESPectrum::reset(2);
+                        } else if (opt == 4) {
+                            // 48K/SOS ROM: trdos=false, romLatch=1 → bank3
+                            ESPectrum::reset(3);
+                            MemESP::romLatch = 1;
+                        }
+                    } else if (Z80Ops::isPentagon && Config::romSet == "128Kpg") {
                         // Service (Gluk)=1, TR-DOS=2, 128K=3, 48K=4
                         if (opt == 1) {
                             ESPectrum::reset(3); // Gluk ROM
@@ -3621,9 +3639,23 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     break;
                                 }
                             }
+                        } else if (ext_ram && arch_num == 8) { // Profi
+                            menu_level = 2;
+                            menu_curopt = 1;
+                            menu_saverect = true;
+                            opt2 = menuRun(MENU_ROMS_PROFI[Config::lang]);
+                            if (opt2) {
+                                arch = "Profi";
+                                romset = "Profi";
+                                menu_curopt = opt2;
+                                menu_saverect = false;
+                            } else {
+                                menu_curopt = 1;
+                                menu_level = 2;
+                            }
                         }
 #if !NO_ALF
-                        else if (arch_num == 8 || !ext_ram) { // ALF TV GAME
+                        else if (arch_num == 9 || !ext_ram) { // ALF TV GAME
                             arch = "ALF";
                             romset = "ALF1";
                             menu_curopt = opt2;
@@ -3667,6 +3699,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             Config::romSet = romset;
                                             Config::romSetP1M = romset;
                                         }
+                                    } else if (arch == "Profi") {
+                                        if (Config::pref_romSetProfi == "Last") {
+                                            Config::romSet = romset;
+                                            Config::romSetProfi = romset;
+                                        }
                                     } else {
                                         Config::romSet = romset;
                                     }
@@ -3680,7 +3717,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if !PICO_RP2040
                                 bool isByte = (romset == "48Kby" || romset == "128Kby");
                                 if (Config::mb02 && (arch == "Pentagon" || arch == "P512" || arch == "P1024" ||
-                                    isByte)) {
+                                    arch == "Profi" || isByte)) {
                                     Config::mb02 = 0;
                                     MB02::init();
                                     OSD::osdCenteredMsg("MB-02+ disabled", LEVEL_WARN, 2000);
@@ -3692,8 +3729,8 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     OSD::osdCenteredMsg("Timex disabled", LEVEL_WARN, 2000);
                                 }
 #endif
-                                // TR-DOS is mandatory on Pentagon
-                                if ((arch == "Pentagon" || arch == "P512" || arch == "P1024") && !Config::betadisk) {
+                                // TR-DOS is mandatory on Pentagon / Profi
+                                if ((arch == "Pentagon" || arch == "P512" || arch == "P1024" || arch == "Profi") && !Config::betadisk) {
                                     Config::betadisk = true;
                                     OSD::osdCenteredMsg("Betadisk enabled", LEVEL_INFO, 1500);
                                 }

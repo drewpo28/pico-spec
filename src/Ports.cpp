@@ -85,6 +85,7 @@ uint8_t Ports::speaker_values[8] = {0, 19, 34, 53, 97, 101, 130, 134};
 uint8_t Ports::port[128];
 uint8_t Ports::port254 = 0;
 uint8_t Ports::portAFF7 = 0;
+uint8_t Ports::portDFFD = 0;
 #if !PICO_RP2040
 Ports::PIT8253Channel Ports::pitChannels[3] = {};
 #endif
@@ -205,6 +206,10 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   if (MEM_PG_CNT > 64 && address == 0xAFF7) {
     LED::touchR(LED::RAM);
     return portAFF7;
+  }
+  if (Config::arch == "Profi" && address == 0xDFFD) {
+    LED::touchR(LED::RAM);
+    return portDFFD;
   }
   bool ia = Z80Ops::isALF;
   uint8_t p8 = address & 0xFF;
@@ -476,8 +481,15 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
           }
           if (MemESP::videoLatch != bitRead(data, 3)) {
             MemESP::videoLatch = bitRead(data, 3);
-            VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[7].direct()
-                                              : MemESP::ram[5].direct();
+            if (Config::arch == "Profi" && (portDFFD & 0x80)) {
+              VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[6].direct() : MemESP::ram[4].direct();
+              uint32_t clrPage = MemESP::videoLatch ? 58 : 56;
+              uint32_t totPages = ram_pages + butter_pages + psram_pages + swap_pages;
+              VIDEO::profi_clrmem = (clrPage < totPages) ? MemESP::ram[clrPage].direct() : nullptr;
+            } else {
+              VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
+              if (Config::arch == "Profi") VIDEO::profi_clrmem = nullptr;
+            }
             if (Config::gigascreen_onoff == 2) VIDEO::gigascreen_auto_countdown = 3;
 #if !PICO_RP2040
             if (VIDEO::mode16col_enabled) VIDEO::mode16colUpdatePlanes();
@@ -532,6 +544,51 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
           MemESP::ramContended[3] =
               Z80Ops::isPentagon ? false : (page & 0x01 ? true : false);
         }
+      }
+    }
+  }
+
+  // Profi extended paging port 0xDFFD
+  // bits [2:0]: upper RAM page group (combined with 0x7FFD bits[2:0] → 8 groups × 8 pages)
+  // bit [4]: map bank0 to RAM page 0 (else ROM)
+  // bit [5]: DOS ports / TR-DOS enable (handled by existing TR-DOS mechanism)
+  // bit [6]: map bank2 to page 6
+  // bit [7]: hires video mode — screen at RAM page 4/6 instead of 5/7
+  if (Config::arch == "Profi" && address == 0xDFFD) {
+    LED::touchW(LED::RAM);
+    if (!MemESP::pagingLock) {
+      uint8_t prev_page0ram = MemESP::page0ram;
+      portDFFD = data;
+      MemESP::page0ram = bitRead(data, 4);
+      if (MemESP::page0ram != prev_page0ram)
+        MemESP::recoverPage0();
+      // SCR (bit6): bank2 → page6 (else page2)
+      uint8_t bank2_page = bitRead(data, 6) ? 6 : 2;
+      MemESP::ramCurrent[2] = MemESP::ram[bank2_page].sync(2);
+      // Re-apply bankLatch with new extended group offset
+      uint32_t page = (MemESP::bankLatch & 0x7) + ((data & 0x7) << 3);
+      uint32_t pages = ram_pages + butter_pages + psram_pages + swap_pages;
+      if (page < pages) {
+        MemESP::bankLatch = page;
+        MemESP::ramContended[3] = false;
+      }
+      // SCO (bit3): 0=normal (bank1=page5, bank3=ramPage), 1=swap (bank1=ramPage, bank3=page7)
+      if (bitRead(data, 3)) {
+        MemESP::ramCurrent[1] = MemESP::ram[MemESP::bankLatch & 0x7].sync(1);
+        MemESP::ramCurrent[3] = MemESP::ram[7].sync(3);
+      } else {
+        MemESP::ramCurrent[1] = MemESP::ram[5].direct();
+        MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(3);
+      }
+      // bit7: hires mode switches screen pages 5/7 → 4/6; color attrs from pages 58/56
+      if (data & 0x80) {
+        VIDEO::grmem     = MemESP::videoLatch ? MemESP::ram[6].direct()  : MemESP::ram[4].direct();
+        uint32_t clrPage = MemESP::videoLatch ? 58 : 56;
+        uint32_t totPages = ram_pages + butter_pages + psram_pages + swap_pages;
+        VIDEO::profi_clrmem = (clrPage < totPages) ? MemESP::ram[clrPage].direct() : nullptr;
+      } else {
+        VIDEO::grmem        = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
+        VIDEO::profi_clrmem = nullptr;
       }
     }
   }
@@ -949,21 +1006,43 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
           page = pPlus;
         }
       }
+      // For Profi: combine 0x7FFD bits[2:0] with 0xDFFD group (bits[2:0]<<3)
+      if (Config::arch == "Profi") {
+        uint32_t profi_page = (page & 0x7) + ((portDFFD & 0x7) << 3);
+        uint32_t profi_pages = ram_pages + butter_pages + psram_pages + swap_pages;
+        if (profi_page < profi_pages) page = profi_page;
+      }
       if (MemESP::bankLatch != page) {
         MemESP::bankLatch = page;
-        MemESP::ramCurrent[3] = MemESP::ram[page].sync(3);
         MemESP::ramContended[3] =
             Z80Ops::isPentagon ? false : (page & 0x01 ? true : false);
       }
-      MemESP::romLatch = bitRead(data, 4);
-      if (!ia && !ESPectrum::trdos) {
-        MemESP::romInUse = MemESP::romLatch;
+      // Profi SCO (DFFD bit3): bank1=ramPage, bank3=page7; else bank3=ramPage
+      if (Config::arch == "Profi" && (portDFFD & 0x08)) {
+        MemESP::ramCurrent[1] = MemESP::ram[MemESP::bankLatch & 0x7].sync(1);
+        MemESP::ramCurrent[3] = MemESP::ram[7].sync(3);
+      } else {
+        MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(3);
+      }
+      { uint8_t prevLatch = MemESP::romLatch;
+        MemESP::romLatch = bitRead(data, 4);
+        if (!ia && !ESPectrum::trdos) {
+          // Profi: bit4=0→bank2(128K), bit4=1→bank3(SOS/48K); trdos path handled in check_trdos
+          MemESP::romInUse = (Config::arch == "Profi") ? (MemESP::romLatch ? 3 : 2) : MemESP::romLatch;
+        }
       }
       if (!ESPectrum::trdos) MemESP::recoverPage0();
       if (MemESP::videoLatch != bitRead(data, 3)) {
         MemESP::videoLatch = bitRead(data, 3);
-        VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[7].direct()
-                                          : MemESP::ram[5].direct();
+        if (Config::arch == "Profi" && (portDFFD & 0x80)) {
+          VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[6].direct() : MemESP::ram[4].direct();
+          uint32_t clrPage = MemESP::videoLatch ? 58 : 56;
+          uint32_t totPages = ram_pages + butter_pages + psram_pages + swap_pages;
+          VIDEO::profi_clrmem = (clrPage < totPages) ? MemESP::ram[clrPage].direct() : nullptr;
+        } else {
+          VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
+          if (Config::arch == "Profi") VIDEO::profi_clrmem = nullptr;
+        }
         if (Config::gigascreen_onoff == 2) VIDEO::gigascreen_auto_countdown = 3;
 #if !PICO_RP2040
         if (VIDEO::mode16col_enabled) VIDEO::mode16colUpdatePlanes();

@@ -21,12 +21,14 @@ string   Config::romSet128 = "128K";
 string   Config::romSetPent = "128Kp";
 string   Config::romSetP512 = "128Kp";
 string   Config::romSetP1M = "128Kp";
+string   Config::romSetProfi = "Profi";
 string   Config::pref_arch = "Last";
 string   Config::pref_romSet_48 = "Last";
 string   Config::pref_romSet_128 = "Last";
 string   Config::pref_romSetPent = "Last";
 string   Config::pref_romSetP512 = "Last";
 string   Config::pref_romSetP1M = "Last";
+string   Config::pref_romSetProfi = "Last";
 string   Config::ram_file = NO_RAM_FILE;
 string   Config::last_ram_file = NO_RAM_FILE;
 
@@ -246,6 +248,13 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
             MemESP::rom[0].assign_rom(gb_rom_0_sinclair_128k);
             MemESP::rom[1].assign_rom(gb_rom_1_sinclair_128k);
         }
+    } else if (arch == "Profi") {
+        if (newRomSet=="") romSet = "Profi"; else romSet = newRomSet;
+        if (newRomSet=="") romSetProfi = "Profi"; else romSetProfi = newRomSet;
+        MemESP::rom[0].assign_rom(gb_rom_profi);
+        MemESP::rom[1].assign_rom(gb_rom_profi + (16 << 10));
+        MemESP::rom[2].assign_rom(gb_rom_profi + (32 << 10));
+        MemESP::rom[3].assign_rom(gb_rom_profi + (48 << 10));
     } else { // Pentagon by default
         if (newRomSet=="") romSet = "128Kp"; else romSet = newRomSet;
         if (romSetPent=="") romSetPent = "128Kp"; else romSetPent = newRomSet;
@@ -441,12 +450,14 @@ void Config::load() {
         nvs_get_str("romSetPent", romSetPent, sts);
         nvs_get_str("romSetP512", romSetP512, sts);
         nvs_get_str("romSetP1M", romSetP1M, sts);
+        nvs_get_str("romSetProfi", romSetProfi, sts);
         nvs_get_str("pref_arch", pref_arch, sts);
         nvs_get_str("pref_romSet_48", pref_romSet_48, sts);
         nvs_get_str("pref_romSet_128", pref_romSet_128, sts);
         nvs_get_str("pref_romSetPent", pref_romSetPent, sts);
         nvs_get_str("pref_romSetP512", pref_romSetP512, sts);
         nvs_get_str("pref_romSetP1M", pref_romSetP1M, sts);
+        nvs_get_str("pref_romSetProfi", pref_romSetProfi, sts);
         nvs_get_str("ram", ram_file, sts);
         nvs_get_b("AY48", AY48, sts);
 #if !PICO_RP2040
@@ -739,12 +750,14 @@ void Config::save() {
     nvs_set_str(buf,"romSetPent",romSetPent.c_str());
     nvs_set_str(buf,"romSetP512",romSetP512.c_str());
     nvs_set_str(buf,"romSetP1M",romSetP1M.c_str());
+    nvs_set_str(buf,"romSetProfi",romSetProfi.c_str());
     nvs_set_str(buf,"pref_arch",pref_arch.c_str());
     nvs_set_str(buf,"pref_romSet_48",pref_romSet_48.c_str());
     nvs_set_str(buf,"pref_romSet_128",pref_romSet_128.c_str());
     nvs_set_str(buf,"pref_romSetPent",pref_romSetPent.c_str());
     nvs_set_str(buf,"pref_romSetP512",pref_romSetP512.c_str());
     nvs_set_str(buf,"pref_romSetP1M",pref_romSetP1M.c_str());
+    nvs_set_str(buf,"pref_romSetProfi",pref_romSetProfi.c_str());
     nvs_set_str(buf,"ram",ram_file.c_str());
     nvs_set_str(buf,"slog",slog_on ? "true" : "false");
 ///        nvs_set_str(buf,"sdstorage", FileUtils::MountPoint);

@@ -176,6 +176,7 @@ public:
   static void vgataskinit(void *unused);
 
   static uint8_t* grmem;
+  static uint8_t* profi_clrmem; // Profi hires color attr page (56 or 58)
 
   static uint16_t spectrum_colors[NUM_SPECTRUM_COLORS];
 

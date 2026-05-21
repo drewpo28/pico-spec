@@ -583,6 +583,7 @@ void ESPectrum::setup() {
 
   mem_desc_t::reset();
   Ports::portAFF7 = 0;
+  Ports::portDFFD = 0;
   //=======================================================================================
   // LOAD CONFIG
   //=======================================================================================
@@ -752,15 +753,19 @@ void ESPectrum::setup() {
   Debug::log2SD("setup: requestMachine done, freeHeap=%u", (unsigned)getFreeHeap());
 
   MemESP::page0ram = 0;
+  ESPectrum::trdos = false;
   // Pentagon+Gluk: boot with Gluk ROM to install service monitor at 0xDB00
+  // Profi: boot with SYS ROM (bank0), SYSEN=true — per ZXMAK2 BusReset() spec
   if (Config::romSet == "128Kpg" || Config::romSet == "128Kbg")
       MemESP::romInUse = 3;
   else
       MemESP::romInUse = 0;
+  if (Config::arch == "Profi") ESPectrum::trdos = true; // SYSEN
   MemESP::bankLatch = 0;
   MemESP::videoLatch = 0;
   MemESP::romLatch = 0;
   MemESP::newSRAM = false;
+  Debug::log("[setup] arch=%s romInUse=%d", Config::arch.c_str(), MemESP::romInUse);
 
   MemESP::ramCurrent[0] = MemESP::rom[MemESP::romInUse].direct();
   MemESP::ramCurrent[1] = MemESP::ram[5].direct();
@@ -778,7 +783,7 @@ void ESPectrum::setup() {
 
   MemESP::ramContended[0] = false;
   MemESP::ramContended[1] = Config::arch == "P1024" || Config::arch == "P512" ||
-                                    Config::arch == "Pentagon"
+                                    Config::arch == "Pentagon" || Config::arch == "Profi"
                                 ? false
                                 : true;
   MemESP::ramContended[2] = false;
@@ -1055,7 +1060,11 @@ void ESPectrum::reset(uint8_t romInUse) {
   else if (Config::joystick == JOY_FULLER)
     Ports::port[0x7f] = 0xff; // Fuller
   Ports::portAFF7 = 0;
+  Ports::portDFFD = 0;
+  // Profi SYSEN: boot into SYS ROM (bank0) with trdos=true to protect page0
+  ESPectrum::trdos = (Config::arch == "Profi" && romInUse == 0);
 
+  Debug::log("[reset] arch=%s romInUse=%d trdos=%d", Config::arch.c_str(), romInUse, (int)ESPectrum::trdos);
   // Memory
   MemESP::page0ram = 0;
   MemESP::romInUse = romInUse;
@@ -1077,7 +1086,7 @@ void ESPectrum::reset(uint8_t romInUse) {
 
   MemESP::ramContended[0] = false;
   MemESP::ramContended[1] = Config::arch == "P1024" || Config::arch == "P512" ||
-                                    Config::arch == "Pentagon"
+                                    Config::arch == "Pentagon" || Config::arch == "Profi"
                                 ? false
                                 : true;
   MemESP::ramContended[2] = false;

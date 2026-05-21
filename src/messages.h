@@ -454,6 +454,11 @@ static const char *MENU_RESETTO_PENT[2] = { MENU_RESETTO_PENT_EN, MENU_RESETTO_P
 #define MENU_RESETTO_PENTGLUK_ES "Resetear a\n" "Mr Gluk Reset Srvs\n" "TR-DOS\n" "128K\n" "48K\n"
 static const char *MENU_RESETTO_PENTGLUK[2] = { MENU_RESETTO_PENTGLUK_EN, MENU_RESETTO_PENTGLUK_ES };
 
+// Profi reset menu: Service ROM=1, TR-DOS=2, 128K=3, 48K=4
+#define MENU_RESETTO_PROFI_EN "Reset to\n" "Service ROM\n" "TR-DOS\n" "128K\n" "48K\n"
+#define MENU_RESETTO_PROFI_ES "Resetear a\n" "Service ROM\n" "TR-DOS\n" "128K\n" "48K\n"
+static const char *MENU_RESETTO_PROFI[2] = { MENU_RESETTO_PROFI_EN, MENU_RESETTO_PROFI_ES };
+
 static const char *MENU_TRDOS_ROM_TITLE[2] = { "TR-DOS ROM\n", "TR-DOS ROM\n" };
 #define MENU_TRDOS_ROM_SEL_EN \
     "5.03\t[ ]\n"\
@@ -1174,7 +1179,8 @@ static const char *MENU_ISSUE2[2] = { "48K Issue 2\n", "48K Issue 2\n"};
 	"Pentagon 512K\t>\n"\
 	"Pentagon 1024K\t>\n"\
 	"Byte\t>\n"\
-	"Murmuzavr mode\t>\n"
+	"Murmuzavr mode\t>\n"\
+	"Profi\t>\n"
 #else
 #define MENU_ARCHS \
     "Spectrum 48K\t>\n"\
@@ -1184,6 +1190,7 @@ static const char *MENU_ISSUE2[2] = { "48K Issue 2\n", "48K Issue 2\n"};
 	"Pentagon 1024K\t>\n"\
 	"Byte\t>\n"\
 	"Murmuzavr mode\t>\n"\
+	"Profi\t>\n"\
 	"ALF TV GAME\n"
 #endif
 static const char *MENU_ARCH[2] = { MENU_ARCH_EN MENU_ARCHS, MENU_ARCH_ES MENU_ARCHS };
@@ -1274,6 +1281,12 @@ static const char *MENU_ROMS128[2] = { MENU_ROMS128_EN, MENU_ROMS128_ES };
 	"128Kp + Mr Gluk Reset Srvs\n"\
     "Custom\n"
 static const char *MENU_ROMS_PENT[2] = { MENU_ROMS_PENT_EN, MENU_ROMS_PENT_ES };
+
+#define MENU_ROMS_PROFI_EN "Select ROM\n"\
+	"Profi ROM\n"
+#define MENU_ROMS_PROFI_ES "Elija ROM\n"\
+	"Profi ROM\n"
+static const char *MENU_ROMS_PROFI[2] = { MENU_ROMS_PROFI_EN, MENU_ROMS_PROFI_ES };
 
 #if PICO_RP2350
 #define MENU_MURMUZAVR_EN "Murmuzavr mode\n"\

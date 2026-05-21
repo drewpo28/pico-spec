@@ -976,21 +976,37 @@ IRAM_ATTR void Z80::check_trdos() {
             if (REG_PCh == 0x3D) {
 
                 // TR-DOS Rom can be accessed from 48K machines and from Spectrum 128/+2 and Pentagon if the currently mapped ROM is bank 1.
+                // For Profi: TR-DOS is accessed from bank 0 (SYS ROM), bank 2 (128K compat ROM), or bank 3 (SOS ROM) via 0x3Dxx.
                 // newSRAM=true means slot 0 is a RAM page (Pentagon Hidden RAM), not the stock 48K ROM — skip TR-DOS automap.
-                if ((Z80Ops::is48 && MemESP::romInUse == 0) || (!Z80Ops::is48 && MemESP::romInUse == 1 && !MemESP::newSRAM)) {
-                    MemESP::romInUse = 4;
-                    MemESP::ramCurrent[0] = MemESP::rom[4].direct();
+                // For Profi: ZXMAK2 MemoryProfi1024.BusReadMem3D00_M1 triggers DOSEN only when IsRom48 — i.e. SOS bank3 (Sinclair OS). Not from SYS (0), TR-DOS (1), or 128K (2).
+                if ((Z80Ops::is48 && MemESP::romInUse == 0) ||
+                    (Config::arch == "Profi" && MemESP::romInUse == 3 && !MemESP::newSRAM) ||
+                    (!Z80Ops::is48 && Config::arch != "Profi" && MemESP::romInUse == 1 && !MemESP::newSRAM)) {
+                    // Profi uses its own TR-DOS in ROM bank 1; others use the external TR-DOS ROM (bank 4)
+                    uint8_t dosBank = (Config::arch == "Profi") ? 1 : 4;
+                    MemESP::romInUse = dosBank;
+                    MemESP::ramCurrent[0] = MemESP::rom[dosBank].direct();
                     ESPectrum::trdos = true;
+                } else if (Config::arch == "Profi") {
                 }
 
             }
 
         } else {
 
-            if (REG_PCh >= 0x40) {
+            // Exit trdos/SYSEN when PC leaves ROM space (0x0000-0x3FFF).
+            // Profi special: only exit when in TR-DOS bank (bank1) or SYS ROM (bank0).
+            // SYS ROM (bank0) SYSEN clears when execution reaches RAM — selects 128K/SOS ROM.
+            bool doExit = REG_PCh >= 0x40;
+            if (Config::arch == "Profi" && MemESP::romInUse != 1 && MemESP::romInUse != 0) doExit = false;
+
+            if (doExit) {
 
                 if (Z80Ops::is48)
                     MemESP::romInUse = 0;
+                else if (Config::arch == "Profi")
+                    // trdos=false: bit4=0→bank2(128K), bit4=1→bank3(SOS/48K)
+                    MemESP::romInUse = MemESP::romLatch ? 3 : 2;
                 else
                     MemESP::romInUse = MemESP::romLatch;
 

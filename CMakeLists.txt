@@ -465,7 +465,7 @@ ELSEIF(PICO_PC)
 ELSEIF(PICO_DV)
     # Optional UART for Debug Probe. Set DBG_UART_PINS=ON to enable UART1 on GP20/GP21.
     # Note: GP20 is also LOAD_WAV_PIO default — auto-remapped to GP3 when UART enabled.
-    set(PICO_DV_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
+    set(PICO_DV_DBG_UART ON CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
     if(PICO_DV_DBG_UART)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
         set(PICO_DV_LOAD_WAV_PIO 3)  # GP20 taken by UART → use FREE pin

@@ -105,6 +105,10 @@ void CPU::updateStatesInFrame() {
         statesInFrame = TSTATES_PER_FRAME_PENTAGON;
         IntStart = INT_START_PENTAGON;
         IntEnd = INT_END_PENTAGON;
+    } else if (Config::arch == "Profi") {
+        statesInFrame = TSTATES_PER_FRAME_PENTAGON;
+        IntStart = INT_START_PENTAGON;
+        IntEnd = INT_END_PENTAGON;
     } else { // if (Config::arch == "Pentagon") - by default
         statesInFrame = TSTATES_PER_FRAME_PENTAGON;
         IntStart = INT_START_PENTAGON;
@@ -164,6 +168,15 @@ void CPU::reset() {
         Z80Ops::isPentagon = true;
         Z80Ops::is512 = false;
         Z80Ops::is1024 = true;
+        // Set emulation loop sync target
+        ESPectrum::target = MICROS_PER_FRAME_PENTAGON;
+    } else if (Config::arch == "Profi") {
+        Z80Ops::isByte = false;
+        Z80Ops::is48 = false;
+        Z80Ops::is128 = false;
+        Z80Ops::isPentagon = true;
+        Z80Ops::is512 = false;
+        Z80Ops::is1024 = false;
         // Set emulation loop sync target
         ESPectrum::target = MICROS_PER_FRAME_PENTAGON;
     } else { // if (Config::arch == "Pentagon") - by default

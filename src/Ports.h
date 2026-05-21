@@ -56,6 +56,7 @@ public:
     static uint8_t dmaInput(uint16_t address);
 
     static uint8_t portAFF7;
+    static uint8_t portDFFD;
 
 #if !PICO_RP2040
     // KR580VI53 (Intel 8253 PIT) — Byte computer sound synthesizer

@@ -63,4 +63,5 @@ extern "C" const unsigned char gb_rom_pentagon_128k[];
 extern "C" unsigned char gb_rom_esxdos[];
 extern "C" unsigned char gb_rom_esxide[];
 #endif
+#include "roms/romProfi.h"
 #endif
