@@ -68,6 +68,11 @@ visit https://zxespectrum.speccy.org/contacto
 extern "C" void graphics_set_scanlines(bool enabled);
 extern "C" void graphics_set_dither(bool enabled);
 #if !PICO_RP2040
+extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
+extern "C" volatile bool hdmi_profi_ds80_active;
+extern "C" const uint32_t profi_default_palette16[16];
+#endif
+#if !PICO_RP2040
 #include "DivMMC.h"
 #include "MB02.h"
 #endif
@@ -685,6 +690,21 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
         AYGuard()  { if (Config::audio_driver == 3) send_to_595(LOW(AY_Enable)); }
         ~AYGuard() { if (Config::audio_driver == 3) send_to_595(HIGH(AY_Enable)); }
     } ayGuard;
+
+#if !PICO_RP2040
+    // Suspend DS80 packed-pair palette while OSD is visible so OSD bytes (standard
+    // ZX color indices 0-15) are rendered normally. Restored on scope exit.
+    struct DS80Guard {
+        bool was_active;
+        DS80Guard() : was_active(hdmi_profi_ds80_active) {
+            if (was_active) hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
+        }
+        ~DS80Guard() {
+            if (was_active) hdmi_set_profi_ds80_mode(true, profi_default_palette16,
+                                                      &VIDEO::profi_pair_lookup[0][0]);
+        }
+    } ds80Guard;
+#endif
 
     static uint8_t last_sna_row = 0;
     fabgl::VirtualKeyItem Nextkey;

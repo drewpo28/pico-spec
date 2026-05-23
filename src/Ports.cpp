@@ -52,6 +52,11 @@ visit https://zxespectrum.speccy.org/contacto
 
 #include "OSDMain.h"
 
+#if !PICO_RP2040
+#include "../drivers/graphics/graphics.h"
+extern "C" const uint32_t profi_default_palette16[16];
+#endif
+
 #include "Midi.h"
 #include "Z80DMA.h"
 #ifdef USE_GS
@@ -573,7 +578,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // bit [7]: hires video mode — screen at RAM page 4/6 instead of 5/7
   if (Config::arch == "Profi" && address == 0xDFFD) {
     LED::touchW(LED::RAM);
-    Debug::log("[DFFD] data=0x%02X bl=%u lock=%d trdos=%d", data, MemESP::bankLatch, (int)MemESP::pagingLock, (int)ESPectrum::trdos);
+    // Debug::log("[DFFD] data=0x%02X bl=%u lock=%d trdos=%d", data, MemESP::bankLatch, (int)MemESP::pagingLock, (int)ESPectrum::trdos);
     if (!MemESP::pagingLock) {
       uint8_t prev_page0ram = MemESP::page0ram;
       portDFFD = data;
@@ -604,10 +609,20 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         uint32_t clrPage = MemESP::videoLatch ? 58 : 56;
         uint32_t totPages = ram_pages + butter_pages + psram_pages + swap_pages;
         VIDEO::profi_clrmem = (clrPage < totPages) ? MemESP::ram[clrPage].direct() : nullptr;
-        Debug::log("[DFFD] DS80 on: clrPage=%u tot=%u clrmem=%p grmem=%p", clrPage, totPages, VIDEO::profi_clrmem, VIDEO::grmem);
+        // Debug::log("[DFFD] DS80 on: clrPage=%u tot=%u clrmem=%p grmem=%p", clrPage, totPages, VIDEO::profi_clrmem, VIDEO::grmem);
+#if !PICO_RP2040
+        // Switch HDMI conv_color to packed-nibble mode: 1 fb byte = 2 HDMI pixels
+        // (high nibble = left, low = right) → true native 512 from 256 packed bytes.
+        hdmi_set_profi_ds80_mode(true, profi_default_palette16, &VIDEO::profi_pair_lookup[0][0]);
+        VIDEO::updateBorderBrd();
+#endif
       } else {
         VIDEO::grmem        = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
         VIDEO::profi_clrmem = nullptr;
+#if !PICO_RP2040
+        hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
+        VIDEO::updateBorderBrd();
+#endif
       }
     }
   }
@@ -668,7 +683,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         VIDEO::ulaPlusUpdateBorder();
       else
 #endif
-        VIDEO::brd = VIDEO::border32[VIDEO::borderColor];
+        VIDEO::updateBorderBrd();
     }
     if (Config::tape_player)
       Audiobit = Tape::tapeEarBit ? 255 : 0; // For tape player mode
@@ -1036,7 +1051,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       if (Config::arch == "Profi") {
         uint32_t profi_page = (page & 0x7) + ((portDFFD & 0x7) << 3);
         uint32_t profi_pages = ram_pages + butter_pages + psram_pages + swap_pages;
-        Debug::log("[7FFD] data=0x%02X base=%u pp=%u/%u bl=%u", data, page, profi_page, profi_pages, MemESP::bankLatch);
+        // Debug::log("[7FFD] data=0x%02X base=%u pp=%u/%u bl=%u", data, page, profi_page, profi_pages, MemESP::bankLatch);
         if (profi_page < profi_pages) page = profi_page;
       }
       if (MemESP::bankLatch != page) {
@@ -1149,7 +1164,7 @@ IRAM_ATTR void Ports::dmaOutput(uint16_t address, uint8_t data) {
                 VIDEO::ulaPlusUpdateBorder();
             else
 #endif
-                VIDEO::brd = VIDEO::border32[VIDEO::borderColor];
+                VIDEO::updateBorderBrd();
         }
         int Audiobit;
         Audiobit = speaker_values[((data >> 2) & 0x04) | (Tape::tapeEarBit << 1) |

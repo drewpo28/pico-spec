@@ -183,6 +183,18 @@ public:
 
   static uint8_t* grmem;
   static uint8_t* profi_clrmem; // Profi hires color attr page (56 or 58)
+#if !PICO_RP2040
+  // Profi DS80 native 512×240 framebuffer in butter PSRAM.
+  // 1 byte = packed pair of 4-bit palette indices: high nibble = left pixel, low = right.
+  // Allocated once at Profi machine boot.
+  static uint8_t* profi_fb_psram;
+  // pair_lookup[ink][paper] → safe HDMI palette index (avoids sync range 220-244, border 255).
+  // Built by init_profi_pair_lookup() in Reset(). Used by rasterizer and passed to HDMI driver.
+  static uint8_t profi_pair_lookup[16][16];
+#endif
+
+  static bool isProfiDS80();
+  static void updateBorderBrd(); // set VIDEO::brd correctly for current mode (DS80 or normal)
 
   static uint16_t spectrum_colors[NUM_SPECTRUM_COLORS];
 

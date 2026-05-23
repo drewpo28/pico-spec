@@ -115,6 +115,68 @@ int VIDEO::tStatesScreen;
 int VIDEO::tStatesBorder;
 uint8_t* VIDEO::grmem;
 uint8_t* VIDEO::profi_clrmem = nullptr;
+
+#if !PICO_RP2040
+// Profi DS80 packed-pair framebuffer in butter PSRAM.
+// 1 byte = pair of 4-bit palette indices via profi_pair_lookup[ink][paper].
+// HDMI driver expands each fb byte to 2 different HDMI pixels → 512 native pixels.
+#define PROFI_FB_W 256
+#define PROFI_FB_H 240
+uint8_t* VIDEO::profi_fb_psram = nullptr;
+uint8_t  VIDEO::profi_pair_lookup[16][16];
+
+// Profi 16-color default palette (classic EGA-like).
+// Index 0 = black; index 8 = bright-black (same RGB, treated as 0 in pair_lookup).
+extern "C" const uint32_t profi_default_palette16[16] = {
+    0x000000, // 0  black
+    0x0000AA, // 1  dark blue
+    0x00AA00, // 2  dark green
+    0x00AAAA, // 3  dark cyan
+    0xAA0000, // 4  dark red
+    0xAA00AA, // 5  dark magenta
+    0xAA5500, // 6  brown
+    0xAAAAAA, // 7  light gray
+    0x000000, // 8  bright-black = same as index 0
+    0x5555FF, // 9  bright blue
+    0x55FF55, // 10 bright green
+    0x55FFFF, // 11 bright cyan
+    0xFF5555, // 12 bright red
+    0xFF55FF, // 13 bright magenta
+    0xFFFF55, // 14 yellow
+    0xFFFFFF, // 15 white
+};
+
+// Build profi_pair_lookup[ink][paper] → safe HDMI palette index.
+// Safe = not in HDMI sync/audio range 220-244, not border fill 255.
+// Index 8 (bright-black) normalised to 0 → 15×15 = 225 unique pairs, fits in 230 safe slots.
+static void init_profi_pair_lookup() {
+    int safe[256], ns = 0;
+    for (int i = 0; i < 256; i++) {
+        if (i >= 220 && i <= 244) continue;
+        if (i == 255) continue;
+        safe[ns++] = i;  // ns == 230
+    }
+    bool assigned[16][16] = {};
+    int slot = 0;
+    for (int ink = 0; ink < 16; ink++) {
+        int ci = (ink == 8) ? 0 : ink;
+        for (int paper = 0; paper < 16; paper++) {
+            int cp = (paper == 8) ? 0 : paper;
+            if (!assigned[ci][cp]) {
+                assigned[ci][cp] = true;
+                VIDEO::profi_pair_lookup[ink][paper] = (uint8_t)safe[slot++];
+            } else {
+                VIDEO::profi_pair_lookup[ink][paper] = VIDEO::profi_pair_lookup[ci][cp];
+            }
+        }
+    }
+    // slot == 225 here; remaining safe slots are unused (no conflict possible)
+}
+
+bool VIDEO::isProfiDS80() {
+    return Config::arch == "Profi" && (Ports::portDFFD & 0x80);
+}
+#endif
 uint16_t VIDEO::offBmp[SPEC_H];
 uint16_t VIDEO::offAtt[SPEC_H];
 SaveRectT VIDEO::SaveRect;
@@ -370,6 +432,18 @@ void precalcborder32()
         uint8_t border = zxColor(i,0);
         VIDEO::border32[i] = border | (border << 8) | (border << 16) | (border << 24);
     }
+}
+
+void VIDEO::updateBorderBrd() {
+#if !PICO_RP2040
+    if (isProfiDS80()) {
+        // DS80 has no border — use black for all surrounding areas
+        uint8_t b = profi_pair_lookup[0][0];
+        brd = (uint32_t)b * 0x01010101u;
+        return;
+    }
+#endif
+    brd = border32[borderColor];
 }
 
 // Palette definitions (Unreal Speccy format)
@@ -737,7 +811,7 @@ void VIDEO::ulaPlusDisable() {
 
     for (int n = 0; n < 16; n++)
         AluByte[n] = (unsigned int*)AluBytesStd_flash[n];
-    brd = border32[borderColor];
+    updateBorderBrd();
     brdChange = true;
 }
 
@@ -1220,7 +1294,7 @@ void VIDEO::changeMode() {
     uint8_t savedBorderColor = borderColor;
     VIDEO::Reset();
     borderColor = savedBorderColor;
-    brd = border32[borderColor];
+    updateBorderBrd();
     precalcborder32();
 
     // 6. Repaint framebuffer with current border color
@@ -1394,6 +1468,28 @@ void VIDEO::Reset() {
         grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
         profi_clrmem = nullptr;
     }
+
+#if !PICO_RP2040
+    if (Config::arch == "Profi") {
+        // Build pair_lookup every reset (palette may change). Cheap — 16×16 = 256 iters.
+        init_profi_pair_lookup();
+
+        // Allocate 256×240 packed-pair fb in butter PSRAM (once, on first Profi reset).
+        // Placed at END of butter PSRAM to avoid collision with the Z80 RAM page allocator.
+        if (!profi_fb_psram) {
+            constexpr int total = PROFI_FB_W * PROFI_FB_H;  // 256×240 = 61440 B
+            uint32_t butter_sz = butter_psram_size();
+            if (butter_sz >= (uint32_t)total) {
+                profi_fb_psram = (uint8_t*)PSRAM_DATA + (butter_sz - total);
+                memset(profi_fb_psram, 0, total);
+                Debug::log("[VID] Profi 256×240 packed-pair fb @%p (%d B)", profi_fb_psram, total);
+            } else {
+                Debug::log("[VID] Profi fb needs %d B PSRAM, have %u — not allocated",
+                           total, (unsigned)butter_sz);
+            }
+        }
+    }
+#endif
 
     #ifdef DIRTY_LINES
     // for (int i=0; i < SPEC_H; i++) VIDEO::dirty_lines[i] = 0x01;
@@ -1868,27 +1964,51 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             *lineptr32++ = mix2;
         }
     } else if (Config::arch == "Profi" && (Ports::portDFFD & 0x80)) {
-        // Profi DS80 512x192 hires: OR-merge both halves → 256px output (2:1 downsample).
-        // Left half (offset +8192) = x=0..255; right half (offset +0) = x=256..511.
-        // Each column i (0..31): OR-merge 8 left bits → nibL (4px), 8 right bits → nibR (4px).
-        // coldraw_cnt tracks position within line (reset to 0 at line start, +loopCount each call).
+        // Profi DS80 native rendering — writes 256-byte-wide packed pairs into
+        // profi_fb_psram (1 byte = pair of 4-bit palette indices: high nibble =
+        // left source pixel, low nibble = right). HDMI ISR is configured (via
+        // hdmi_set_profi_ds80_mode) so each fb byte expands to 2 *different*
+        // HDMI pixels — native 512 horizontal resolution.
+        //
+        // Per ZXMAK2 ProfiRenderer (byte-column interleaved): for col j (0..31)
+        //   even src byte-col 2j in second half (+0x2000), odd 2j+1 in first half (+0).
+        // Attr (4-bit): ink = bits 2..0 | (bit6 << 3); paper = bits 5..3 | (bit7 << 3).
         uint32_t line = curline;
         uint32_t pixCoff = 2048 * (line >> 6) + 256 * (line & 7) + ((line & 0x38) << 2);
         unsigned int end_col = coldraw_cnt < 32u ? coldraw_cnt : 32u;
         unsigned int start_col = end_col - loopCount;
-        for (unsigned int i = start_col; i < end_col; i++) {
-            uint8_t bmpL = grmem[pixCoff + i + 8192];
-            uint8_t bmpR = grmem[pixCoff + i];
-            uint8_t rawL = profi_clrmem ? profi_clrmem[pixCoff + i + 8192] : 0x07;
-            uint8_t rawR = profi_clrmem ? profi_clrmem[pixCoff + i]        : 0x07;
-            uint8_t attL = (rawL & 0x3F) | ((rawL | (rawL >> 1)) & 0x40);
-            uint8_t attR = (rawR & 0x3F) | ((rawR | (rawR >> 1)) & 0x40);
-            uint8_t oL = (bmpL | (bmpL >> 1)) & 0x55;
-            uint8_t oR = (bmpR | (bmpR >> 1)) & 0x55;
-            uint8_t nibL = ((oL>>3)&8)|((oL>>2)&4)|((oL>>1)&2)|(oL&1);
-            uint8_t nibR = ((oR>>3)&8)|((oR>>2)&4)|((oR>>1)&2)|(oR&1);
-            *lineptr32++ = AluByte[nibL][attL];
-            *lineptr32++ = AluByte[nibR][attR];
+        // PSRAM row is 256 bytes wide (one packed-pair byte per 2 source pixels).
+        uint8_t* psram_row = profi_fb_psram ? (profi_fb_psram + (size_t)line * 256) : nullptr;
+        for (unsigned int j = start_col; j < end_col; j++) {
+            uint8_t bmpEven = grmem[pixCoff + j + 8192];
+            uint8_t bmpOdd  = grmem[pixCoff + j];
+            uint8_t rawE = profi_clrmem ? profi_clrmem[pixCoff + j + 8192] : 0x07;
+            uint8_t rawO = profi_clrmem ? profi_clrmem[pixCoff + j]        : 0x07;
+            uint8_t inkE = (rawE & 0x07) | ((rawE & 0x40) >> 3);
+            uint8_t papE = ((rawE & 0x38) >> 3) | ((rawE & 0x80) >> 4);
+            uint8_t inkO = (rawO & 0x07) | ((rawO & 0x40) >> 3);
+            uint8_t papO = ((rawO & 0x38) >> 3) | ((rawO & 0x80) >> 4);
+            if (psram_row) {
+                // 16 source pixels per col → 8 packed bytes. Each pack: 2 adj src pixels.
+                size_t pbase = (size_t)j * 8;
+                // Even src byte (8 px): pairs (bit7,bit6), (bit5,bit4), (bit3,bit2), (bit1,bit0)
+                for (int k = 0; k < 4; k++) {
+                    int sh = 6 - k * 2;
+                    uint8_t p0 = ((bmpEven >> (sh + 1)) & 1) ? inkE : papE;
+                    uint8_t p1 = ((bmpEven >> sh) & 1) ? inkE : papE;
+                    psram_row[pbase + k] = profi_pair_lookup[p0][p1];
+                }
+                // Odd src byte (8 px), packed in next 4 bytes.
+                for (int k = 0; k < 4; k++) {
+                    int sh = 6 - k * 2;
+                    uint8_t p0 = ((bmpOdd >> (sh + 1)) & 1) ? inkO : papO;
+                    uint8_t p1 = ((bmpOdd >> sh) & 1) ? inkO : papO;
+                    psram_row[pbase + 4 + k] = profi_pair_lookup[p0][p1];
+                }
+            }
+            // Advance lineptr32 by 2 uint32 (= 8 bytes per col) to keep std fb cursor in sync
+            // with the standard renderer's stride. Std fb content is overwritten by EndFrame.
+            lineptr32 += 2;
         }
     } else {
         for (; loopCount--; ) {
@@ -2220,6 +2340,64 @@ IRAM_ATTR void VIDEO::EndFrame() {
     tstateDraw = tStatesScreen;
 
 #if !PICO_RP2040
+    // Profi DS80 frame finalization: copy 256 packed-pair bytes per ZX line from
+    // profi_fb_psram into std fb, centered (offset 32 = 64 HDMI pixel left pad).
+    // Bytes left/right of content (positions 0..31 and 288..319) must be black —
+    // i.e. packed pair (0,0) → byte 0x00 (palette index 0 in BOTH high and low
+    // nibble = black). zxColor(0,0) is BLACK by convention so we can memset 0.
+    // Halfword swap applied to match ISR's (x^2) read pattern for AluByte order.
+    if (isProfiDS80() && vga.frameBuffer && grmem) {
+        // Profi DS80 is native 512×240 (no border) — render all 240 source rows
+        // directly into framebuffer here. Source layout: 4 quarters (64+64+64+48 rows),
+        // ZX-style interleaving within each quarter, 32 byte-cols per half-screen,
+        // two halves (even cols at +8192 offset, odd cols at +0).
+        const int xres = (int)vga.xres;
+        const int yres = (int)vga.yres;
+        const int pad_l = (xres - 256) / 2;
+        const int pad_r = xres - 256 - pad_l;
+        const uint8_t brd_byte = profi_pair_lookup[0][0]; // black for any extra rows
+        const int rows = (yres < 240) ? yres : 240;
+        for (int line = 0; line < rows; line++) {
+            uint32_t pixCoff = 2048u * (line >> 6) + 256u * (line & 7) + ((line & 0x38u) << 2);
+            uint8_t* dst = vga.frameBuffer[line];
+            if (!dst) continue;
+            if (pad_l > 0) memset(dst, brd_byte, pad_l);
+            uint32_t* mid = (uint32_t*)(dst + pad_l);
+            for (int j = 0; j < 32; j++) {
+                uint8_t bmpEven = grmem[pixCoff + j + 8192];
+                uint8_t bmpOdd  = grmem[pixCoff + j];
+                uint8_t rawE = profi_clrmem ? profi_clrmem[pixCoff + j + 8192] : 0x07;
+                uint8_t rawO = profi_clrmem ? profi_clrmem[pixCoff + j]        : 0x07;
+                uint8_t inkE = (rawE & 0x07) | ((rawE & 0x40) >> 3);
+                uint8_t papE = ((rawE & 0x38) >> 3) | ((rawE & 0x80) >> 4);
+                uint8_t inkO = (rawO & 0x07) | ((rawO & 0x40) >> 3);
+                uint8_t papO = ((rawO & 0x38) >> 3) | ((rawO & 0x80) >> 4);
+                uint8_t tmp[8];
+                for (int k = 0; k < 4; k++) {
+                    int sh = 6 - k * 2;
+                    uint8_t p0 = ((bmpEven >> (sh + 1)) & 1) ? inkE : papE;
+                    uint8_t p1 = ((bmpEven >> sh) & 1) ? inkE : papE;
+                    tmp[k] = profi_pair_lookup[p0][p1];
+                }
+                for (int k = 0; k < 4; k++) {
+                    int sh = 6 - k * 2;
+                    uint8_t p0 = ((bmpOdd >> (sh + 1)) & 1) ? inkO : papO;
+                    uint8_t p1 = ((bmpOdd >> sh) & 1) ? inkO : papO;
+                    tmp[4 + k] = profi_pair_lookup[p0][p1];
+                }
+                // Write with halfword swap to compensate ISR's (x^2) read pattern.
+                uint32_t v0, v1;
+                memcpy(&v0, tmp,     4);
+                memcpy(&v1, tmp + 4, 4);
+                mid[j*2 + 0] = (v0 >> 16) | (v0 << 16);
+                mid[j*2 + 1] = (v1 >> 16) | (v1 << 16);
+            }
+            if (pad_r > 0) memset(dst + pad_l + 256, brd_byte, pad_r);
+        }
+        // Modes with yres > 240 (e.g. 288): extra rows beyond DS80 buffer = black
+        for (int row = rows; row < yres; row++)
+            if (vga.frameBuffer[row]) memset(vga.frameBuffer[row], brd_byte, xres);
+    }
     // Clear DMA attr shadow and charrow write counters for next frame
     if (Config::dma_mode)
         Z80DMA::resetAttrShadow();
