@@ -34,6 +34,10 @@
 #include "Debug.h"
 #include "ESPectrum.h"
 #include "wd1793.h"
+
+#if !PICO_RP2040
+extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
+#endif
 #if !PICO_RP2040
 #include "DivMMC.h"
 #include "MB02.h"

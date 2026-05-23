@@ -60,6 +60,9 @@ extern "C" void graphics_set_scanlines(bool enabled);
 extern "C" void graphics_set_dither(bool enabled);
 extern "C" void hdmi_reinit(void);
 extern "C" void vga_reinit(void);
+#if !PICO_RP2040
+extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
+#endif
 // Place hot video functions in SRAM instead of XIP flash
 #undef IRAM_ATTR
 #define IRAM_ATTR __not_in_flash("video")
@@ -2497,6 +2500,20 @@ IRAM_ATTR void VIDEO::EndFrame() {
     }
 
     framecnt++;
+
+#if !PICO_RP2040
+    // Profi DS80 force-cleanup: when 128K/SOS/TR-DOS ROM is active (not SYS),
+    // BIOS or guest may have forgotten to clear DFFD bit7 → HDMI keeps
+    // interpreting standard 256-pixel framebuffer as packed pairs → garbage.
+    if (Config::arch == "Profi" && MemESP::romInUse != 0 && (Ports::portDFFD & 0x80)) {
+        Ports::portDFFD &= ~0x80;
+        grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
+        profi_clrmem = nullptr;
+        hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
+        borderColor = 7; // reset to white (standard ZX boot default)
+        updateBorderBrd();
+    }
+#endif
 }
 
 //----------------------------------------------------------------------------------------------------------------

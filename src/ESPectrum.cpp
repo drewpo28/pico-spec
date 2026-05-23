@@ -78,6 +78,10 @@ using namespace std;
 
 extern size_t getFreeHeap(void);
 
+#if !PICO_RP2040
+extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
+#endif
+
 //=======================================================================================
 // KEYBOARD
 //=======================================================================================
@@ -1060,6 +1064,13 @@ void ESPectrum::reset(uint8_t romInUse) {
   else if (Config::joystick == JOY_FULLER)
     Ports::port[0x7f] = 0xff; // Fuller
   Ports::portAFF7 = 0;
+#if !PICO_RP2040
+  // If DS80 packed-pair HDMI mode was active before reset, disable it before
+  // clearing DFFD — otherwise HDMI ISR keeps expanding bytes as pairs and the
+  // normal-mode framebuffer renders as vertical scanline garbage.
+  if (Ports::portDFFD & 0x80)
+    hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
+#endif
   Ports::portDFFD = 0;
   // Profi SYSEN: boot into SYS ROM (bank0) with trdos=true to protect page0
   ESPectrum::trdos = (Config::arch == "Profi" && romInUse == 0);

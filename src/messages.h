@@ -1283,9 +1283,9 @@ static const char *MENU_ROMS128[2] = { MENU_ROMS128_EN, MENU_ROMS128_ES };
 static const char *MENU_ROMS_PENT[2] = { MENU_ROMS_PENT_EN, MENU_ROMS_PENT_ES };
 
 #define MENU_ROMS_PROFI_EN "Select ROM\n"\
-	"Profi ROM\n"
+	"1024K\n"
 #define MENU_ROMS_PROFI_ES "Elija ROM\n"\
-	"Profi ROM\n"
+	"1024K\n"
 static const char *MENU_ROMS_PROFI[2] = { MENU_ROMS_PROFI_EN, MENU_ROMS_PROFI_ES };
 
 #if PICO_RP2350

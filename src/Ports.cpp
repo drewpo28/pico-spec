@@ -628,8 +628,20 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         VIDEO::grmem        = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
         VIDEO::profi_clrmem = nullptr;
 #if !PICO_RP2040
+        extern volatile bool hdmi_profi_ds80_active;
+        bool exiting_ds80 = hdmi_profi_ds80_active;
         hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
+        // Reset border to white (standard ZX boot default) when leaving DS80
+        if (exiting_ds80) VIDEO::borderColor = 7;
         VIDEO::updateBorderBrd();
+        // Fill framebuffer with white (palette index 7 = WHITE) when leaving DS80:
+        // leftover packed-pair byte values (range 0..254) would render as random
+        // colors with the now-standard 16-color palette. White is the standard
+        // ZX boot border, gives clean look until guest ROM does its own CLS.
+        if (exiting_ds80 && VIDEO::vga.frameBuffer) {
+          for (int y = 0; y < (int)VIDEO::vga.yres; y++)
+            if (VIDEO::vga.frameBuffer[y]) memset(VIDEO::vga.frameBuffer[y], WHITE, VIDEO::vga.xres);
+        }
 #endif
       }
     }
