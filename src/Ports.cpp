@@ -384,12 +384,15 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // Beta-128 ports: accessible when TR-DOS ROM is paged in,
     // or when a raw-format disk (UDI/FDI) is inserted (copy-protected loaders
     // access WD1793 ports from RAM with TR-DOS ROM paged out)
-    if (ESPectrum::trdos
+    // Profi SYS ROM (romInUse=0) probes FDC during boot — use the stub below
+    // (no real disk attached) so the BIOS boot menu can proceed.
+    bool skip_real_fdc = (Config::arch == "Profi" && MemESP::romInUse == 0);
+    if (!skip_real_fdc && (ESPectrum::trdos
 #if !PICO_RP2040
         || (ESPectrum::fdd.disk[ESPectrum::fdd.diskS] &&
             (ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsUDIFile || ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsFDIFile))
 #endif
-    ) {
+    )) {
 
       uint8_t dat;
 
@@ -438,7 +441,8 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // detection fails cleanly instead of hanging in its wait-for-BUSY loop.
     // Stateful: returns 0x81 (BUSY|NOT_READY) once after an OUT command, then
     // 0x90 (SEEK_ERROR|NOT_READY) — ROM sees error at 0x073D → gives up on FDC.
-    if (Config::arch == "Profi" && !ESPectrum::trdos && (address & 0xE3) == 0x03) {
+    // Applies when SYS ROM is active (Profi BIOS probes FDC even with SYSEN).
+    if (Config::arch == "Profi" && MemESP::romInUse == 0 && (address & 0xE3) == 0x03) {
       if (profi_fdc_busy) {
         profi_fdc_busy = 0;
         return 0x81; // BUSY|NOT_READY — exits ROM wait-for-busy at 0x0710
@@ -943,7 +947,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
 #endif
 
     // Profi FDC stub: command write to WD1793 reg0 → arm the one-shot busy flag
-    if (Config::arch == "Profi" && !ESPectrum::trdos && (address & 0xE3) == 0x03) {
+    if (Config::arch == "Profi" && MemESP::romInUse == 0 && (address & 0xE3) == 0x03) {
       profi_fdc_busy = 1;
       ioContentionLate(MemESP::ramContended[rambank]);
       return;
@@ -1055,7 +1059,6 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       if (Config::arch == "Profi") {
         uint32_t profi_page = (page & 0x7) + ((portDFFD & 0x7) << 3);
         uint32_t profi_pages = ram_pages + butter_pages + psram_pages + swap_pages;
-        // Debug::log("[7FFD] data=0x%02X base=%u pp=%u/%u bl=%u", data, page, profi_page, profi_pages, MemESP::bankLatch);
         if (profi_page < profi_pages) page = profi_page;
       }
       if (MemESP::bankLatch != page) {
