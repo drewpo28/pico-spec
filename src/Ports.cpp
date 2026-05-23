@@ -181,7 +181,7 @@ inline static size_t extendedZxRamPages() {
     return 64;
   if (Z80Ops::is512)
     return 32;
-  if (Z80Ops::is128 || Z80Ops::isPentagon)
+  if (Z80Ops::is128 || (Z80Ops::isPentagon || Z80Ops::isProfi))
     return 8;
   return 4;
 }
@@ -201,7 +201,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   } else {
     // // ULA ports (A0=0): ULA always applies contention during display area
     // // Non-ULA ports (A0=1): contention only if port address maps to contended memory
-    // bool earlyContend = ((address & 0x0001) == 0) ? !Z80Ops::isPentagon : MemESP::ramContended[rambank];
+    // bool earlyContend = ((address & 0x0001) == 0) ? !(Z80Ops::isPentagon || Z80Ops::isProfi) : MemESP::ramContended[rambank];
     // VIDEO::Draw(1, earlyContend); // I/O Contention (Early)
     // Early contention depends on ADDRESS (contended memory?), not port type
     // Wiki: ULA port non-contended addr = N:1,C:3; contended addr = C:1,C:3
@@ -219,7 +219,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   }
   bool ia = Z80Ops::isALF;
   uint8_t p8 = address & 0xFF;
-  if (Z80Ops::isPentagon) { // Hidden RAM (Pentagon 512/1024 only)
+  if ((Z80Ops::isPentagon || Z80Ops::isProfi)) { // Hidden RAM (Pentagon 512/1024 only)
     if (p8 == 0xFB) { // Hidden RAM on
       MemESP::newSRAM = true;
       MemESP::recoverPage0();
@@ -233,7 +233,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   }
   // ULA PORT
   if ((address & 0x0001) == 0) {
-    VIDEO::Draw(3, !Z80Ops::isPentagon); // I/O Contention (Late)
+    VIDEO::Draw(3, !(Z80Ops::isPentagon || Z80Ops::isProfi)); // I/O Contention (Late)
     if (ia && p8 == 0xFE) {
       data = nes_pad2_for_alf(); // default port value is 0xFF.
     } else {
@@ -472,7 +472,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         return chips[AySound::selected_chip]->getRegisterData();
       }
     }
-    if (!Z80Ops::isPentagon) {
+    if (!(Z80Ops::isPentagon || Z80Ops::isProfi)) {
       data = getFloatBusData();
       if ((!Z80Ops::is48) && !Z80Ops::isALF && ((address & 0x8002) == 0)) {
         LED::touchR(LED::RAM);
@@ -564,7 +564,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
           MemESP::bankLatch = page;
           MemESP::ramCurrent[3] = MemESP::ram[page].sync(3);
           MemESP::ramContended[3] =
-              Z80Ops::isPentagon ? false : (page & 0x01 ? true : false);
+              (Z80Ops::isPentagon || Z80Ops::isProfi) ? false : (page & 0x01 ? true : false);
         }
       }
     }
@@ -578,11 +578,13 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // bit [7]: hires video mode — screen at RAM page 4/6 instead of 5/7
   if (Config::arch == "Profi" && address == 0xDFFD) {
     LED::touchW(LED::RAM);
-    // Debug::log("[DFFD] data=0x%02X bl=%u lock=%d trdos=%d", data, MemESP::bankLatch, (int)MemESP::pagingLock, (int)ESPectrum::trdos);
-    if (!MemESP::pagingLock) {
+    // Per ZXMAK2 MemoryProfi1024: DFFD writes are NOT gated by paging lock.
+    // norom (bit 4) clears lock unconditionally.
+    {
       uint8_t prev_page0ram = MemESP::page0ram;
       portDFFD = data;
       MemESP::page0ram = bitRead(data, 4);
+      if (MemESP::page0ram) MemESP::pagingLock = false; // norom → unlock
       if (MemESP::page0ram != prev_page0ram)
         MemESP::recoverPage0();
       // SCR (bit6): bank2 → page6 (else page2)
@@ -595,9 +597,11 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         MemESP::bankLatch = page;
         MemESP::ramContended[3] = false;
       }
-      // SCO (bit3): 0=normal (bank1=page5, bank3=ramPage), 1=swap (bank1=ramPage, bank3=page7)
+      // SCO (bit3): per ZXMAK2 UpdateMapping —
+      //   sco=0: MapRead4000 = RAM[5];      MapReadC000 = RAM[ramPage]
+      //   sco=1: MapRead4000 = RAM[ramPage]; MapReadC000 = RAM[7]
       if (bitRead(data, 3)) {
-        MemESP::ramCurrent[1] = MemESP::ram[MemESP::bankLatch & 0x7].sync(1);
+        MemESP::ramCurrent[1] = MemESP::ram[MemESP::bankLatch].sync(1);
         MemESP::ramCurrent[3] = MemESP::ram[7].sync(3);
       } else {
         MemESP::ramCurrent[1] = MemESP::ram[5].direct();
@@ -630,7 +634,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
 #if !PICO_RP2040
   // Port #EFF7 D0 enables Pentagon 16col video mode (Alone Coder).
   // Other bits historically reserved (D1=hardware multicolor stub, etc.) — ignored.
-  if (Z80Ops::isPentagon && Config::mode16col_onoff && address == 0xEFF7) {
+  if ((Z80Ops::isPentagon || Z80Ops::isProfi) && Config::mode16col_onoff && address == 0xEFF7) {
     bool want = (data & 0x01) != 0;
     if (want != VIDEO::mode16col_enabled) {
       VIDEO::mode16col_enabled = want;
@@ -673,7 +677,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // Border color
     if (VIDEO::borderColor != data) {
       VIDEO::brdChange = true;
-      if (!Z80Ops::isPentagon)
+      if (!(Z80Ops::isPentagon || Z80Ops::isProfi))
         // VIDEO::Draw(0, false); // Flush video rendering without adding contention
         VIDEO::Draw(0, true); // Apply contention to align border change with ULA character cell
       VIDEO::DrawBorder();
@@ -706,7 +710,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         if (Tape::tapeStatus != TAPE_LOADING) ESPectrum::AYGetSample();
         chips[AySound::selected_chip]->setRegisterData(data);
       }
-      VIDEO::Draw(3, !Z80Ops::isPentagon); // I/O Contention (Late)
+      VIDEO::Draw(3, !(Z80Ops::isPentagon || Z80Ops::isProfi)); // I/O Contention (Late)
       return;
     }
 #if !PICO_RP2040
@@ -740,7 +744,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       }
     }
 #endif
-    VIDEO::Draw(3, !Z80Ops::isPentagon); // I/O Contention (Late)
+    VIDEO::Draw(3, !(Z80Ops::isPentagon || Z80Ops::isProfi)); // I/O Contention (Late)
   } else {
 #if !PICO_RP2040
     // ULA+ ports (odd addresses: 0xBF3B register select, 0xFF3B data)
@@ -1003,7 +1007,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     ioContentionLate(MemESP::ramContended[rambank]);
   }
   // Pentagon only
-  if (Z80Ops::isPentagon && ((address & 0x1008) == 0)) { // 1008 !-> EFF7
+  if ((Z80Ops::isPentagon || Z80Ops::isProfi) && ((address & 0x1008) == 0)) { // 1008 !-> EFF7
     LED::touchW(LED::RAM);
     if (!MemESP::pagingLock) {
       uint8_t prev = MemESP::page0ram;
@@ -1057,11 +1061,11 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       if (MemESP::bankLatch != page) {
         MemESP::bankLatch = page;
         MemESP::ramContended[3] =
-            Z80Ops::isPentagon ? false : (page & 0x01 ? true : false);
+            (Z80Ops::isPentagon || Z80Ops::isProfi) ? false : (page & 0x01 ? true : false);
       }
-      // Profi SCO (DFFD bit3): bank1=ramPage, bank3=page7; else bank3=ramPage
+      // Profi SCO (DFFD bit3): bank1=ramPage (full 0..63), bank3=page7; else bank3=ramPage
       if (Config::arch == "Profi" && (portDFFD & 0x08)) {
-        MemESP::ramCurrent[1] = MemESP::ram[MemESP::bankLatch & 0x7].sync(1);
+        MemESP::ramCurrent[1] = MemESP::ram[MemESP::bankLatch].sync(1);
         MemESP::ramCurrent[3] = MemESP::ram[7].sync(3);
       } else {
         MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(3);

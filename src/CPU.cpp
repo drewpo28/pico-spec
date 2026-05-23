@@ -77,6 +77,7 @@ bool Z80Ops::is128;
 bool Z80Ops::isPentagon;
 bool Z80Ops::is512 = false;
 bool Z80Ops::is1024 = false;
+bool Z80Ops::isProfi = false;
 
 void CPU::updateStatesInFrame() {
 #if !NO_ALF
@@ -142,6 +143,7 @@ void CPU::reset() {
         Z80Ops::isPentagon = false;
         Z80Ops::is512 = false;
         Z80Ops::is1024 = false;
+        Z80Ops::isProfi = false;
         // Set emulation loop sync target
         ESPectrum::target = !Z80Ops::isByte ? MICROS_PER_FRAME_48 : MICROS_PER_FRAME_BYTE;
     } else if (Config::arch == "128K" || Z80Ops::isALF) {
@@ -152,6 +154,7 @@ void CPU::reset() {
         Z80Ops::isPentagon = false;
         Z80Ops::is512 = false;
         Z80Ops::is1024 = false;
+        Z80Ops::isProfi = false;
         // Set emulation loop sync target
         ESPectrum::target = !Z80Ops::isByte ? MICROS_PER_FRAME_128 : MICROS_PER_FRAME_BYTE;
     } else if (Config::arch == "P512") {
@@ -161,6 +164,7 @@ void CPU::reset() {
         Z80Ops::isPentagon = true;
         Z80Ops::is512 = true;
         Z80Ops::is1024 = false;
+        Z80Ops::isProfi = false;
         // Set emulation loop sync target
         ESPectrum::target = MICROS_PER_FRAME_PENTAGON;
     } else if (Config::arch == "P1024") {
@@ -170,15 +174,17 @@ void CPU::reset() {
         Z80Ops::isPentagon = true;
         Z80Ops::is512 = false;
         Z80Ops::is1024 = true;
+        Z80Ops::isProfi = false;
         // Set emulation loop sync target
         ESPectrum::target = MICROS_PER_FRAME_PENTAGON;
     } else if (Config::arch == "Profi") {
         Z80Ops::isByte = false;
         Z80Ops::is48 = false;
         Z80Ops::is128 = false;
-        Z80Ops::isPentagon = true;
+        Z80Ops::isPentagon = false;
         Z80Ops::is512 = false;
         Z80Ops::is1024 = false;
+        Z80Ops::isProfi = true;
         // Set emulation loop sync target
         ESPectrum::target = MICROS_PER_FRAME_PENTAGON;
     } else { // if (Config::arch == "Pentagon") - by default
@@ -188,13 +194,14 @@ void CPU::reset() {
         Z80Ops::isPentagon = true;
         Z80Ops::is512 = false;
         Z80Ops::is1024 = false;
+        Z80Ops::isProfi = false;
         // Set emulation loop sync target
         ESPectrum::target = MICROS_PER_FRAME_PENTAGON;
     }
 
 #if !PICO_RP2040
     // 16col is Pentagon-only — auto-disable when switching to non-Pentagon arch.
-    if (!Z80Ops::isPentagon) {
+    if (!(Z80Ops::isPentagon || Z80Ops::isProfi)) {
         if (Config::mode16col_onoff) {
             Config::mode16col_onoff = false;
             Config::save();
@@ -204,7 +211,7 @@ void CPU::reset() {
 #endif
 
     // TR-DOS (betadisk) is mandatory on Pentagon — force on without saving.
-    if (Z80Ops::isPentagon && !Config::betadisk) Config::betadisk = true;
+    if ((Z80Ops::isPentagon || Z80Ops::isProfi) && !Config::betadisk) Config::betadisk = true;
 
     // Timex video is incompatible with Byte ROM sets — auto-disable.
 #if !PICO_RP2040

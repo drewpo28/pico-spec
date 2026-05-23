@@ -43,6 +43,7 @@ public:
     static bool isPentagon;
     static bool is512;
     static bool is1024;
+    static bool isProfi;
 };
 
 #endif // Z80OPERATIONS_H

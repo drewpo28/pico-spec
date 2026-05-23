@@ -125,24 +125,24 @@ uint8_t* VIDEO::profi_clrmem = nullptr;
 uint8_t* VIDEO::profi_fb_psram = nullptr;
 uint8_t  VIDEO::profi_pair_lookup[16][16];
 
-// Profi 16-color default palette (classic EGA-like).
-// Index 0 = black; index 8 = bright-black (same RGB, treated as 0 in pair_lookup).
+// Profi 16-color default palette in ZX Spectrum order: bit0=Blue, bit1=Red, bit2=Green.
+// Bit 3 = bright. Index 8 = bright-black (same RGB, treated as 0 in pair_lookup).
 extern "C" const uint32_t profi_default_palette16[16] = {
-    0x000000, // 0  black
-    0x0000AA, // 1  dark blue
-    0x00AA00, // 2  dark green
-    0x00AAAA, // 3  dark cyan
-    0xAA0000, // 4  dark red
-    0xAA00AA, // 5  dark magenta
-    0xAA5500, // 6  brown
-    0xAAAAAA, // 7  light gray
+    0x000000, // 0  000 black
+    0x0000AA, // 1  001 dark blue
+    0xAA0000, // 2  010 dark red
+    0xAA00AA, // 3  011 dark magenta
+    0x00AA00, // 4  100 dark green
+    0x00AAAA, // 5  101 dark cyan
+    0xAAAA00, // 6  110 dark yellow
+    0xAAAAAA, // 7  111 light gray
     0x000000, // 8  bright-black = same as index 0
     0x5555FF, // 9  bright blue
-    0x55FF55, // 10 bright green
-    0x55FFFF, // 11 bright cyan
-    0xFF5555, // 12 bright red
-    0xFF55FF, // 13 bright magenta
-    0xFFFF55, // 14 yellow
+    0xFF5555, // 10 bright red
+    0xFF55FF, // 11 bright magenta
+    0x55FF55, // 12 bright green
+    0x55FFFF, // 13 bright cyan
+    0xFFFF55, // 14 bright yellow
     0xFFFFFF, // 15 white
 };
 
@@ -1420,7 +1420,7 @@ void VIDEO::Reset() {
     // 48K/128K: step=4 (8px per column), brdPairWrite=true
     // Pentagon:  step=1 (2px per column), brdPairWrite=false (XOR)
     brdcol_end = isFullBorder ? 180 : 160;  // vga.xres / 2 (T-states = half pixel count)
-    if (Z80Ops::isPentagon) {
+    if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
         brdcol_step = 1;
         brdPairWrite = false;
         brdcol_start = is169 ? 10 : 0;
@@ -1442,11 +1442,11 @@ void VIDEO::Reset() {
     if (isFullBorder && !isFullBorder240) {
         lin_end = 48;
         lin_end2 = 240;
-        lineptr_offset = (Z80Ops::isPentagon ? 26 : 24) / 2;
+        lineptr_offset = ((Z80Ops::isPentagon || Z80Ops::isProfi) ? 26 : 24) / 2;
     } else if (isFullBorder && isFullBorder240) {
         lin_end = 24;
         lin_end2 = 216;
-        lineptr_offset = (Z80Ops::isPentagon ? 26 : 24) / 2;
+        lineptr_offset = ((Z80Ops::isPentagon || Z80Ops::isProfi) ? 26 : 24) / 2;
     } else if (is169) {
         lin_end = 4;
         lin_end2 = 196;

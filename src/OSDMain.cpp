@@ -389,7 +389,7 @@ void OSD::clearStats() {
                 ptr[col * 2 + 1] = brdColor;
             }
         }
-    } else if (Z80Ops::isPentagon) {
+    } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
         for (int line = 220; line < 236; line++) {
             uint16_t *ptr = (uint16_t *)(VIDEO::vga.frameBuffer[line]);
             for (int col = 84; col < 156; col++)
@@ -796,7 +796,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     MemESP::recoverPage0();
                     osdCenteredMsg(Config::byte_cobmect_mode ? OSD_COBMECT_ON[Config::lang] : OSD_COBMECT_OFF[Config::lang], LEVEL_INFO, 500);
                 }
-            } else if (Z80Ops::isPentagon) {
+            } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
                 menu_level = 0;
                 menu_curopt = 1;
                 menu_saverect = true;
@@ -854,7 +854,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 string reset_menu;
                 if (Config::arch == "Profi") {
                     reset_menu = MENU_RESETTO_PROFI[Config::lang];
-                } else if (Z80Ops::isPentagon) {
+                } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
                     if (Config::romSet == "128Kpg")
                         reset_menu = MENU_RESETTO_PENTGLUK[Config::lang];
                     else
@@ -893,7 +893,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             ESPectrum::reset(3);
                             MemESP::romLatch = 1;
                         }
-                    } else if (Z80Ops::isPentagon && Config::romSet == "128Kpg") {
+                    } else if ((Z80Ops::isPentagon || Z80Ops::isProfi) && Config::romSet == "128Kpg") {
                         // Service (Gluk)=1, TR-DOS=2, 128K=3, 48K=4
                         if (opt == 1) {
                             ESPectrum::reset(3); // Gluk ROM
@@ -907,7 +907,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             ESPectrum::reset(1); // 48K BASIC ROM
                             MemESP::pagingLock = 1;
                         }
-                    } else if (Z80Ops::isPentagon) {
+                    } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
                         // TR-DOS=1, 128K=2, 48K=3
                         if (opt == 1) {
                             ESPectrum::reset(4); // TR-DOS ROM
@@ -1348,7 +1348,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             // Show / hide OnScreen Stats
             {
                 uint8_t mode = VIDEO::OSD & 0x03;
-                bool hasFdd = (Z80Ops::isPentagon || (Z80Ops::is128 && Z80Ops::isByte)
+                bool hasFdd = ((Z80Ops::isPentagon || Z80Ops::isProfi) || (Z80Ops::is128 && Z80Ops::isByte)
 #if !PICO_RP2040
                                 || ((Z80Ops::is48 || Z80Ops::is128) && MB02::enabled))
                         && Tape::tapeStatus != TAPE_LOADING
@@ -3345,7 +3345,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 uint8_t opt2 = menuRun(mc_menu);
                                 if (opt2) {
                                     bool want = (opt2 == 1);
-                                    if (want && !Z80Ops::isPentagon) {
+                                    if (want && !(Z80Ops::isPentagon || Z80Ops::isProfi)) {
                                         OSD::osdCenteredMsg(OSD_16COL_NEEDS_PENTAGON[Config::lang], LEVEL_WARN, 1500);
                                     } else {
                                         Config::mode16col_onoff = want;
@@ -8285,7 +8285,7 @@ void OSD::EmulatorInfo() {
 
         // TR-DOS — available for Pentagon or Byte 128K
         {
-            bool trdos_available = Z80Ops::isPentagon || (Z80Ops::is128 && Z80Ops::isByte);
+            bool trdos_available = (Z80Ops::isPentagon || Z80Ops::isProfi) || (Z80Ops::is128 && Z80Ops::isByte);
             if (trdos_available) {
                 pos += snprintf(buf + pos, sizeof(buf) - pos, " TR-DOS         : On");
                 if (Config::trdosFastMode) {

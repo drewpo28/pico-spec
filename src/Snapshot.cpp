@@ -220,11 +220,11 @@ bool FileSNA::load(const string& sna_fn, const string& force_arch, const string&
 
         MemESP::recoverPage0();
         MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(3);
-        MemESP::ramContended[3] = Z80Ops::isPentagon ? false : (MemESP::bankLatch & 0x01 ? true: false);
+        MemESP::ramContended[3] = (Z80Ops::isPentagon || Z80Ops::isProfi) ? false : (MemESP::bankLatch & 0x01 ? true: false);
 
         VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
 
-        if (Z80Ops::isPentagon) CPU::tstates = 22; // Pentagon SNA load fix... still dunno why this works but it works
+        if ((Z80Ops::isPentagon || Z80Ops::isProfi)) CPU::tstates = 22; // Pentagon SNA load fix... still dunno why this works but it works
 
     }
     fclose2(file);
@@ -759,7 +759,7 @@ bool FileZ80::load(const string& z80_fn) {
 
             MemESP::recoverPage0();
             MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(3);
-            MemESP::ramContended[3] = Z80Ops::isPentagon ? false : (MemESP::bankLatch & 0x01 ? true: false);
+            MemESP::ramContended[3] = (Z80Ops::isPentagon || Z80Ops::isProfi) ? false : (MemESP::bankLatch & 0x01 ? true: false);
 
             VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
         }
@@ -1105,7 +1105,7 @@ void FileZ80::loader128() {
     
     MemESP::recoverPage0();
     MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(3);
-    MemESP::ramContended[3] = Z80Ops::isPentagon ? false : (MemESP::bankLatch & 0x01 ? true: false);
+    MemESP::ramContended[3] = (Z80Ops::isPentagon || Z80Ops::isProfi) ? false : (MemESP::bankLatch & 0x01 ? true: false);
 
     VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
 
