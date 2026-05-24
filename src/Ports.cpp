@@ -91,6 +91,7 @@ uint8_t Ports::port[128];
 uint8_t Ports::port254 = 0;
 uint8_t Ports::portAFF7 = 0;
 uint8_t Ports::portDFFD = 0;
+uint8_t Ports::portEFF7 = 0;
 #if !PICO_RP2040
 Ports::PIT8253Channel Ports::pitChannels[3] = {};
 #endif
@@ -382,17 +383,21 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
 #endif
 
     // Beta-128 ports: accessible when TR-DOS ROM is paged in,
-    // or when a raw-format disk (UDI/FDI) is inserted (copy-protected loaders
-    // access WD1793 ports from RAM with TR-DOS ROM paged out)
+    // or when a raw-format disk (UDI/FDI/MBD/PRO) is inserted (copy-protected
+    // loaders + Profi CP/M access WD1793 ports from RAM with TR-DOS ROM paged out)
     // Profi SYS ROM (romInUse=0) probes FDC during boot — use the stub below
-    // (no real disk attached) so the BIOS boot menu can proceed.
-    bool skip_real_fdc = (Config::arch == "Profi" && MemESP::romInUse == 0);
-    if (!skip_real_fdc && (ESPectrum::trdos
+    // (no real disk attached) so the BIOS boot menu can proceed. But if a .pro
+    // (or other raw) disk is mounted, route to real FDC so CP/M boot can work.
 #if !PICO_RP2040
-        || (ESPectrum::fdd.disk[ESPectrum::fdd.diskS] &&
-            (ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsUDIFile || ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsFDIFile))
+    bool has_raw_disk = ESPectrum::fdd.disk[ESPectrum::fdd.diskS] &&
+        (ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsUDIFile ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsFDIFile ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsMBDFile);
+#else
+    bool has_raw_disk = false;
 #endif
-    )) {
+    bool skip_real_fdc = (Config::arch == "Profi" && MemESP::romInUse == 0 && !has_raw_disk);
+    if (!skip_real_fdc && (ESPectrum::trdos || has_raw_disk)) {
 
       uint8_t dat;
 
@@ -406,6 +411,12 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
 
         return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
 
+      case 0xa3:
+        // Profi CP/M mode (DFFD bit5=1): FDC SYS/status port shifts to 0xBF
+        // (address & 0xe3 == 0xa3). In normal mode, ignore this address.
+        if (!(Config::arch == "Profi" && (portDFFD & 0x20)))
+          break;
+        [[fallthrough]];
       case 0xe3: {
         LED::touchR(LED::FDD);
         FDDStep(true);
@@ -538,6 +549,18 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   if (Config::numPortWriteBP > 0 && Config::hasBreakPoint(address, Config::BP_PORT_WRITE))
     CPU::portBasedBP = true;
   uint8_t rambank = address >> 14;
+#if !PICO_RP2040
+  // Profi dynamic palette: per ZXMAK2 UlaProfi5XX.WritePortFE,
+  // any OUT with (address & 0x0081) == 0 (port low byte even AND bit 7 = 0)
+  // and DS80 active (CMR1/DFFD bit 7) triggers palette write:
+  //   index = (port254 XOR 0x0F) & 0x0F
+  //   color = ~(address >> 8), decoded as Gg0Rr0Bb (2-2-2 with gaps).
+  if (Config::arch == "Profi" && (address & 0x0081) == 0 && (portDFFD & 0x80)) {
+    uint8_t index = (port254 ^ 0x0F) & 0x0F;
+    uint8_t color = ~(uint8_t)(address >> 8);
+    VIDEO::profiPaletteWrite(index, color);
+  }
+#endif
 
   if (Z80Ops::isByte && address >= 0xC000) {
     // вместо VIDEO::Draw(1, MemESP::ramContended[rambank]);
@@ -619,9 +642,14 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         VIDEO::profi_clrmem = (clrPage < totPages) ? MemESP::ram[clrPage].direct() : nullptr;
         // Debug::log("[DFFD] DS80 on: clrPage=%u tot=%u clrmem=%p grmem=%p", clrPage, totPages, VIDEO::profi_clrmem, VIDEO::grmem);
 #if !PICO_RP2040
-        // Switch HDMI conv_color to packed-nibble mode: 1 fb byte = 2 HDMI pixels
-        // (high nibble = left, low = right) → true native 512 from 256 packed bytes.
-        hdmi_set_profi_ds80_mode(true, profi_default_palette16, &VIDEO::profi_pair_lookup[0][0]);
+        // Switch HDMI conv_color to packed-nibble mode only on off→on transition.
+        // Subsequent DFFD writes that re-affirm DS80 must NOT trigger a full
+        // 225-slot TMDS refresh during active display — that causes tearing /
+        // black flashes. Palette updates go via deferred refresh in EndFrame.
+        extern volatile bool hdmi_profi_ds80_active;
+        if (!hdmi_profi_ds80_active) {
+            hdmi_set_profi_ds80_mode(true, VIDEO::profi_palette_live, &VIDEO::profi_pair_lookup[0][0]);
+        }
         VIDEO::updateBorderBrd();
 #endif
       } else {
@@ -648,13 +676,28 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   }
 
 #if !PICO_RP2040
-  // Port #EFF7 D0 enables Pentagon 16col video mode (Alone Coder).
-  // Other bits historically reserved (D1=hardware multicolor stub, etc.) — ignored.
-  if ((Z80Ops::isPentagon || Z80Ops::isProfi) && Config::mode16col_onoff && address == 0xEFF7) {
-    bool want = (data & 0x01) != 0;
-    if (want != VIDEO::mode16col_enabled) {
-      VIDEO::mode16col_enabled = want;
-      if (want) VIDEO::mode16colUpdatePlanes();
+  // Port #EFF7 — extended-feature register (per UnrealSpeccy emul.h):
+  //   D0 (0x01) = EFF7_4BPP      — 4-bit-per-pixel mode
+  //   D1 (0x02) = EFF7_512       — 512-pixel hires mode (Profi CP/M)
+  //   D2 (0x04) = EFF7_LOCKMEM
+  //   D3 (0x08) = EFF7_ROCACHE
+  //   D4 (0x10) = EFF7_GIGASCREEN
+  //   D5 (0x20) = EFF7_HWMC      — hardware multicolor
+  //   D6 (0x40) = EFF7_384       — 384-line video
+  //   D7 (0x80) = EFF7_CMOS      — CMOS RTC enable
+  if ((Z80Ops::isPentagon || Z80Ops::isProfi) && address == 0xEFF7) {
+    Debug::log("[EFF7] pc=0x%04X data=0x%02X (4BPP=%d 512=%d LOCK=%d GIGA=%d HWMC=%d CMOS=%d)",
+               Z80::getRegPC(), data,
+               !!(data & 0x01), !!(data & 0x02), !!(data & 0x04),
+               !!(data & 0x10), !!(data & 0x20), !!(data & 0x80));
+    portEFF7 = data;
+    // Pentagon 16col — keep existing bit 0 behaviour (legacy mode_16col_onoff)
+    if (Config::mode16col_onoff) {
+      bool want = (data & 0x01) != 0;
+      if (want != VIDEO::mode16col_enabled) {
+        VIDEO::mode16col_enabled = want;
+        if (want) VIDEO::mode16colUpdatePlanes();
+      }
     }
   }
 #endif
@@ -959,14 +1002,24 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
 #endif
 
     // Profi FDC stub: command write to WD1793 reg0 → arm the one-shot busy flag
-    if (Config::arch == "Profi" && MemESP::romInUse == 0 && (address & 0xE3) == 0x03) {
+    // (only when no real raw-format disk is mounted — otherwise we want real FDC).
+#if !PICO_RP2040
+    bool out_has_raw_disk = ESPectrum::fdd.disk[ESPectrum::fdd.diskS] &&
+        (ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsUDIFile ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsFDIFile ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsMBDFile);
+#else
+    bool out_has_raw_disk = false;
+#endif
+    if (Config::arch == "Profi" && MemESP::romInUse == 0 && !out_has_raw_disk
+        && (address & 0xE3) == 0x03) {
       profi_fdc_busy = 1;
       ioContentionLate(MemESP::ramContended[rambank]);
       return;
     }
 
-    // Check if TRDOS Rom is mapped.
-    if (ESPectrum::trdos) {
+    // Check if TRDOS Rom is mapped, or a raw disk is loaded.
+    if (ESPectrum::trdos || out_has_raw_disk) {
 
       switch (address & 0xe3) {
 
@@ -978,8 +1031,13 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         FDDStep(false);
         rvmWD1793Write(&ESPectrum::fdd, ((address >> 5) & 0x3), data);
         break;
+      case 0xa3:
+        // Profi CP/M mode (DFFD bit5=1): FDC SYS register shifts to 0xBF
+        // (address & 0xe3 == 0xa3). In normal mode, ignore this address.
+        if (!(Config::arch == "Profi" && (portDFFD & 0x20)))
+          break;
+        [[fallthrough]];
       case 0xe3:
-
         LED::touchW(LED::FDD);
         FDDStep(true);
 
