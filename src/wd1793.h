@@ -310,6 +310,12 @@ typedef struct
     // This one-shot flag forces BUSY=1 in the first status read after a Type I
     // command that completed synchronously, then auto-clears.
     bool typeI_busy_oneshot;
+    // Profi CP/M WAIT-line simulation: hold BUSY=1 persistently in the STATUS
+    // REGISTER (not just the oneshot) until a status read occurs.  Used for
+    // no-disk commands so the DSKKE9A CALL 0x40EA re-issue loop sees BUSY=1
+    // and re-issues are rejected, preventing infinite recursion + stack growth.
+    // Cleared on the first status register read (port 0x1F reg 0).
+    bool profi_busy_hold;
 
     bool sclConverted;
 

@@ -32,6 +32,7 @@ THE SOFTWARE.
 #include "Debug.h"
 #include "Config.h"
 #include "CPU.h"
+#include "Ports.h"
 #include "OSDMain.h"
 #include "messages.h"
 #include "Z80_JLS/z80.h"
@@ -1414,7 +1415,10 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
             // below (e.g. Seek with verify to the already-current track), BUSY
             // would drop to 0 before BIOS reads the status, causing an infinite
             // poll loop. Arm a one-shot BUSY=1 to guarantee BIOS sees it once.
-            wd->typeI_busy_oneshot = true;
+            // NOTE: Profi CP/M only (DFFD bit5=1). TR-DOS relies on BUSY=0
+            // after instant completion, so the oneshot must NOT be armed there.
+            if (Config::arch == "Profi" && (Ports::portDFFD & 0x20))
+              wd->typeI_busy_oneshot = true;
 
             _do(wd);
 
@@ -1423,7 +1427,14 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
             // WD2797 (MB-02) Seek (0x10-0x1F): don't complete instantly — BS-DOS
             // calibration checks Busy flag timing to determine step rate.
             // Restore (0x00-0x0F) still completes instantly (255 steps would hang).
-            if (!(wd->command & kRVMWD177XTypeI)) {
+            //
+            // Profi CP/M exception: do NOT complete instantly. The DSKKE9A driver
+            // uses CALL 0x40EA which re-issues Type I commands in a loop while BUSY=1.
+            // Instant completion means every re-issue is accepted (BUSY→0 before next
+            // OUT), causing infinite stack growth. Keep BUSY=1 for multiple FDDStep
+            // calls (like real hardware / UnrealSpeccy) so re-issues are rejected.
+            bool profi_cpm = (Config::arch == "Profi" && (Ports::portDFFD & 0x20));
+            if (!(wd->command & kRVMWD177XTypeI) && !profi_cpm) {
               while (wd->stepState == kRVMWD177XStepWaiting) {
                 _do(wd);
               }
@@ -1446,8 +1457,23 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
 
         } else {
 
-          wd->status=kRVMWD177XStatusNotReady;
-          wd->control|=kRVMWD177XINTRQ;
+          // No disk or no power: command rejected.
+          // Real WD1793 sets BUSY=1, then completes with NOT_READY + INTRQ.
+          // We simulate this: set BUSY|NOT_READY, enter TypeIEnd state with a
+          // brief step counter (50) so BUSY stays high for a few FDDStep calls
+          // before completing — matching real hardware timing.
+          // This keeps BUSY=1 long enough for Profi CP/M DSKKE9A's CALL 0x40EA
+          // re-issue loop to reject further OUTs while BUSY, preventing infinite
+          // stack growth from looping at CPU speed without the Z80 WAIT line.
+          // FINTRQ: survives status register reads (unlike XINTRQ) so the SYS
+          // port INTRQ bit remains set for the data-transfer loop at 0x418C.
+          wd->status = kRVMWD177XStatusNotReady | kRVMWD177XStatusBusy;
+          wd->control |= kRVMWD177XINTRQ;
+          wd->state = kRVMWD177XTypeIEnd;
+          wd->stepState = kRVMWD177XStepWaiting;
+          wd->c = 50;
+          wd->command = 0x00;
+          wd->control |= kRVMWD177XFINTRQ;
 #if !PICO_RP2040
           if (Config::arch == "Profi")
             Debug::log("[FDC!] CMD=0x%02X NOT_READY: disk=%p power=0x%X diskS=%d",
@@ -1613,6 +1639,7 @@ void rvmWD1793Reset(rvmWD1793 *wd) {
   wd->stepState = kRVMWD177XStepIdle;
   wd->next = kRVMWD177XNone;
   wd->typeI_busy_oneshot = false;
+  wd->profi_busy_hold = false;
 
   wd->c = 0;
   wd->control &= 0xf000;
