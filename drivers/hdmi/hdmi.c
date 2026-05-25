@@ -386,8 +386,10 @@ ex:
 
 
 #if !PICO_RP2040
-            if (hdmi_audio_enabled) {
-                // DI packets on specific vblank lines (ISR fires on odd lines only)
+            if (hdmi_audio_enabled && !hdmi_profi_ds80_active) {
+                // DI packets on specific vblank lines (ISR fires on odd lines only).
+                // In DS80 mode audio writes are suppressed: slots 220-244 hold DS80
+                // pair TMDS data and must not be overwritten by audio TERC4 packets.
                 uint32_t vbl_line = line - mode.v_active;  // offset from start of vblank
                 uint64_t *src = NULL;
                 if (vbl_line == 3) {
@@ -787,23 +789,31 @@ void hdmi_set_profi_ds80_mode(bool active,
                 tmds_encoder((c >>  8) & 0xff),
                 tmds_encoder( c        & 0xff));
         }
-        // Write only the 225 unique safe slots referenced by pair_lut.
+        // Write all 240 unique slots referenced by pair_lut (slots 0..239).
         // pixel-0 = ink  (first  HDMI pixel clock of the pair)
         // pixel-1 = paper (second HDMI pixel clock of the pair)
         //
-        // DC balance: in standard doubled-pixel mode graphics_set_palette() always
-        // writes pixel-1 as  pixel-0 ^ 0x0003ffffffffffff  (XOR complement of the
-        // differential pairs).  The monitor decodes the complement to the same colour
-        // (both codewords of the TMDS running-disparity pair encode the same byte),
-        // but alternating polarity keeps the physical lines DC-balanced.
+        // DC balance: pixel-1 is the XOR complement of pixel-0's TMDS differential
+        // pairs.  The monitor decodes both codewords to the same colour, but
+        // alternating polarity keeps the physical lines DC-balanced.
         // Without this complement DS80 mode accumulated DC offset → signal ringing
         // → blue fringe right of bright pixels and intermittent sync loss.
+        //
+        // pair_lut normalises paper=8 → paper=0 (bright-black bg = black bg), so
+        // (ink, paper=8) shares the slot of (ink, paper=0).  The written[] guard
+        // ensures the canonical paper=0 TMDS value is NOT overwritten by paper=8.
+        // ink=8 has independent slots (different from ink=0) so palette[8] renders
+        // independently; changing palette[8] cannot corrupt black-ink pixels.
+        bool written[256] = {};
         for (int ink = 0; ink < 16; ink++) {
             for (int paper = 0; paper < 16; paper++) {
                 uint8_t slot = pair_lut[ink * 16 + paper];
-                // pair_lut guarantees slot ∉ [220..244] ∪ {255}
-                cc64[slot * 2 + 0] = tmds16[ink];
-                cc64[slot * 2 + 1] = tmds16[paper] ^ 0x0003ffffffffffffl;
+                // pair_lut guarantees slot ∈ 0..239 (never in sync/border range)
+                if (!written[slot]) {
+                    written[slot] = true;
+                    cc64[slot * 2 + 0] = tmds16[ink];
+                    cc64[slot * 2 + 1] = tmds16[paper] ^ 0x0003ffffffffffffl;
+                }
             }
         }
         // Slot 255: border fill byte — must be (black, black).

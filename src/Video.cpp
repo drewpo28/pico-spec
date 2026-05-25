@@ -132,44 +132,48 @@ uint8_t* VIDEO::profi_clrmem = nullptr;
 uint8_t* VIDEO::profi_fb_psram = nullptr;
 uint8_t  VIDEO::profi_pair_lookup[16][16];
 
-// Profi 16-color default palette in ZX Spectrum order: bit0=Blue, bit1=Red, bit2=Green.
-// Bit 3 = bright. Index 8 = bright-black (same RGB, treated as 0 in pair_lookup).
+// Profi DS80 default palette — GGGRRRBb format (3-3-2 bits).
+// Raw startup bytes: {0x00,0x02,0x10,0x12,0x80,0x82,0x90,0x92,
+//                     0x00,0x03,0x18,0x1B,0xC0,0xC3,0xD8,0xDB}
+// Standard bytes have bit5=bit2=0 → G/R use only their 2 MSBs → dim=170(0xAA), bright=255.
 extern "C" const uint32_t profi_default_palette16[16] = {
-    0x000000, // 0  000 black
-    0x0000AA, // 1  001 dark blue
-    0xAA0000, // 2  010 dark red
-    0xAA00AA, // 3  011 dark magenta
-    0x00AA00, // 4  100 dark green
-    0x00AAAA, // 5  101 dark cyan
-    0xAAAA00, // 6  110 dark yellow
-    0xAAAAAA, // 7  111 light gray
-    0x000000, // 8  bright-black = same as index 0
-    0x5555FF, // 9  bright blue
-    0xFF5555, // 10 bright red
-    0xFF55FF, // 11 bright magenta
-    0x55FF55, // 12 bright green
-    0x55FFFF, // 13 bright cyan
-    0xFFFF55, // 14 bright yellow
-    0xFFFFFF, // 15 white
+    0x000000, // 0  0x00 black
+    0x0000AA, // 1  0x02 dark blue
+    0xAA0000, // 2  0x10 dark red
+    0xAA00AA, // 3  0x12 dark magenta
+    0x00AA00, // 4  0x80 dark green
+    0x00AAAA, // 5  0x82 dark cyan
+    0xAAAA00, // 6  0x90 dark yellow
+    0xAAAAAA, // 7  0x92 light gray
+    0x000000, // 8  0x00 bright-black = same as index 0
+    0x0000FF, // 9  0x03 bright blue
+    0xFF0000, // 10 0x18 bright red
+    0xFF00FF, // 11 0x1B bright magenta
+    0x00FF00, // 12 0xC0 bright green
+    0x00FFFF, // 13 0xC3 bright cyan
+    0xFFFF00, // 14 0xD8 bright yellow
+    0xFFFFFF, // 15 0xDB white
 };
 
 // Live Profi palette: modifiable at runtime via OUT (port_low=0x7E).
 // Initialized to defaults at boot; refresh-applied to HDMI on each write.
 uint32_t VIDEO::profi_palette_live[16] = {
     0x000000, 0x0000AA, 0xAA0000, 0xAA00AA, 0x00AA00, 0x00AAAA, 0xAAAA00, 0xAAAAAA,
-    0x000000, 0x5555FF, 0xFF5555, 0xFF55FF, 0x55FF55, 0x55FFFF, 0xFFFF55, 0xFFFFFF
+    0x000000, 0x0000FF, 0xFF0000, 0xFF00FF, 0x00FF00, 0x00FFFF, 0xFFFF00, 0xFFFFFF
 };
 
-// Convert Profi palette byte to RGB888 per ZXMAK2 UlaProfi5XX format "Gg0Rr0Bb":
-//   bits [7:6] = G, bits [4:3] = R, bits [1:0] = B. Each 2-bit channel × 85.
-//   Bits 5 and 2 are unused. Result: 64 distinct colors (4 levels per channel).
+// Convert Profi palette byte to RGB888.
+// Format: GGGRRRBb — bits[7:5]=G (3-bit), bits[4:2]=R (3-bit), bits[1:0]=B (2-bit).
+// 256 distinct colors (8×8×4). Confirmed by ZX-Profi hardware docs (habr.com/ru/articles/836836/).
+// G/R: 3-bit scale — levels 0..6 map to 0,43,85,128,170,213,255; level 7 clamps to 255.
+// B:   2-bit scale — level × 85 (blue "has implicit LSB=0", equivalent to 3-bit value×2).
+// Standard palette bytes (bit5=bit2=0) decode identically to ZXMAK2: dim=170 (0xAA), bright=255.
 static inline uint32_t profi_color_to_rgb888(uint8_t c) {
-    uint8_t g2 = (c >> 6) & 0x03;
-    uint8_t r2 = (c >> 3) & 0x03;
-    uint8_t b2 = c & 0x03;
-    uint8_t R = r2 * 85; // 0, 85, 170, 255
-    uint8_t G = g2 * 85;
-    uint8_t B = b2 * 85;
+    static const uint8_t gr[8] = {0, 43, 85, 128, 170, 213, 255, 255};
+    static const uint8_t bl[4] = {0, 85, 170, 255};
+    uint8_t R = gr[(c >> 2) & 0x07];   // bits[4:2]
+    uint8_t G = gr[(c >> 5) & 0x07];   // bits[7:5]
+    uint8_t B = bl[c & 0x03];           // bits[1:0]
     return ((uint32_t)R << 16) | ((uint32_t)G << 8) | B;
 }
 
@@ -188,37 +192,52 @@ void VIDEO::profiPaletteWrite(uint8_t index, uint8_t profi_color) {
     // defaults from incidental port-0x7E writes during BIOS startup setup.
     extern volatile bool hdmi_profi_ds80_active;
     if (!hdmi_profi_ds80_active) return;
-    profi_palette_live[index & 0x0F] = profi_color_to_rgb888(profi_color);
+    uint8_t idx = index & 0x0F;
+    uint32_t newRgb = profi_color_to_rgb888(profi_color);
+    profi_palette_live[idx] = newRgb;
     // Defer HDMI refresh to HDMI ISR vblank (set dirty flag, applied in EndFrame).
     profi_palette_dirty = true;
 #endif
 }
 
-// Build profi_pair_lookup[ink][paper] → safe HDMI palette index.
-// Safe = not in HDMI sync/audio range 220-244, not border fill 255.
-// Index 8 (bright-black) normalised to 0 → 15×15 = 225 unique pairs, fits in 230 safe slots.
+// Build profi_pair_lookup[ink][paper] → HDMI conv_color slot index.
+//
+// Slot budget (250 available):
+//   0..239:   free pair data slots (220..237 = audio range, suppressed in DS80 by DMA handler)
+//   240..244: BASE_HDMI_CTRL_INX + IDX_SCANLINE — NEVER pair data (sync/porch)
+//   245..254: free pair data slots
+//   255:      border fill — NEVER pair data
+//
+// We need 250 unique pairs (256 total − 6 merges).
+// Merges: ink=0..5, paper=8 → paper=0  (bright-black bg = black bg for these inks).
+//   ink=6..15 (INCLUDING ink=8): NO normalization.
+//   → (8,8) gets its OWN slot → both pixels render as palette[8] → solid color, no stripes.
+//   → ink=8 is fully independent from ink=0 → changing palette[8] can't corrupt black pixels.
+// written[] guard in hdmi_set_profi_ds80_mode() ensures paper=0 TMDS wins for merged slots.
 static void init_profi_pair_lookup() {
+    // safe[]: all slots except 240..244 (sync/scanline) and 255 (border) → 250 slots
     int safe[256], ns = 0;
     for (int i = 0; i < 256; i++) {
-        if (i >= 220 && i <= 244) continue;
+        if (i >= 240 && i <= 244) continue;
         if (i == 255) continue;
-        safe[ns++] = i;  // ns == 230
+        safe[ns++] = i;  // ns == 250
     }
     bool assigned[16][16] = {};
-    int slot = 0;
+    int slot_idx = 0;
     for (int ink = 0; ink < 16; ink++) {
-        int ci = (ink == 8) ? 0 : ink;
         for (int paper = 0; paper < 16; paper++) {
-            int cp = (paper == 8) ? 0 : paper;
-            if (!assigned[ci][cp]) {
-                assigned[ci][cp] = true;
-                VIDEO::profi_pair_lookup[ink][paper] = (uint8_t)safe[slot++];
+            // For inks 0..5 only: paper=8 → paper=0 (6 merges to fit in 250 slots).
+            // For inks 6..15 (including ink=8): full independence — paper=8 is own slot.
+            int cp = (paper == 8 && ink <= 5) ? 0 : paper;
+            if (!assigned[ink][cp]) {
+                assigned[ink][cp] = true;
+                VIDEO::profi_pair_lookup[ink][paper] = (uint8_t)safe[slot_idx++];
             } else {
-                VIDEO::profi_pair_lookup[ink][paper] = VIDEO::profi_pair_lookup[ci][cp];
+                VIDEO::profi_pair_lookup[ink][paper] = VIDEO::profi_pair_lookup[ink][cp];
             }
         }
     }
-    // slot == 225 here; remaining safe slots are unused (no conflict possible)
+    // slot_idx == 250 here
 }
 
 bool VIDEO::isProfiDS80() {
