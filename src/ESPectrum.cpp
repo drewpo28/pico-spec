@@ -1068,8 +1068,20 @@ void ESPectrum::reset(uint8_t romInUse) {
   // If DS80 packed-pair HDMI mode was active before reset, disable it before
   // clearing DFFD — otherwise HDMI ISR keeps expanding bytes as pairs and the
   // normal-mode framebuffer renders as vertical scanline garbage.
-  if (Ports::portDFFD & 0x80)
+  if (Ports::portDFFD & 0x80) {
     hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
+    // Clear framebuffer immediately after switching HDMI back to standard mode.
+    // DS80 packed-pair slot values (0..254) in the framebuffer look like garbage
+    // when re-read through the restored standard conv_color table.
+    // VIDEO::Reset() won't clear it (hdmi_profi_ds80_active is now false), so we
+    // must do it here.  Fill with 0 = palette index BLACK in both standard and
+    // DS80 modes.
+    if (VIDEO::vga.frameBuffer) {
+      for (int _y = 0; _y < (int)VIDEO::vga.yres; _y++)
+        if (VIDEO::vga.frameBuffer[_y]) memset(VIDEO::vga.frameBuffer[_y], 0, VIDEO::vga.xres);
+    }
+    Debug::log("[RESET] DS80 off + FB cleared");
+  }
 #endif
   Ports::portDFFD = 0;
   // Profi SYSEN: boot into SYS ROM (bank0) with trdos=true to protect page0

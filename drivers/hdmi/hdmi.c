@@ -252,6 +252,9 @@ static inline void* __not_in_flash_func(nf_memset)(void* ptr, int value, size_t 
     return ptr;
 }
 
+// Current HDMI scanline counter (exposed for Profi palette refresh sync).
+volatile uint hdmi_current_line = 0;
+
 static void __scratch_x("hdmi_driver") dma_handler_HDMI() {
     static uint32_t inx_buf_dma;
     static uint line = 0;
@@ -279,6 +282,7 @@ static void __scratch_x("hdmi_driver") dma_handler_HDMI() {
     } else {
         ++line;
     }
+    hdmi_current_line = line; // expose to main context for palette refresh sync
 
     // Сигнализируем vsync в начале blanking-периода (после последней видимой строки),
     // чтобы эмулятор рендерил следующий кадр во время blanking,
@@ -761,12 +765,19 @@ volatile bool hdmi_profi_ds80_active = false;
 void hdmi_set_profi_ds80_mode(bool active,
                                const uint32_t *palette16_rgb888,
                                const uint8_t  *pair_lut) {
-    if (active == hdmi_profi_ds80_active) return;
+    // active=true with palette args: activate OR refresh palette (no early-return)
+    // active=true without args: skip
+    // active=false: deactivate (skip if already inactive)
+    if (active && (!palette16_rgb888 || !pair_lut)) return;
+    if (!active && !hdmi_profi_ds80_active) return;
 
     uint64_t *cc64 = (uint64_t *)conv_color;
-    if (active && palette16_rgb888 && pair_lut) {
-        for (int i = 0; i < 1240; i++) conv_color_std_snapshot[i] = conv_color[i];
-        conv_color_std_snapshot_valid = true;
+    if (active) {
+        // Snapshot only on first activation, not on refresh
+        if (!hdmi_profi_ds80_active) {
+            for (int i = 0; i < 1240; i++) conv_color_std_snapshot[i] = conv_color[i];
+            conv_color_std_snapshot_valid = true;
+        }
 
         uint64_t tmds16[16];
         for (int p = 0; p < 16; p++) {
@@ -777,17 +788,27 @@ void hdmi_set_profi_ds80_mode(bool active,
                 tmds_encoder( c        & 0xff));
         }
         // Write only the 225 unique safe slots referenced by pair_lut.
+        // pixel-0 = ink  (first  HDMI pixel clock of the pair)
+        // pixel-1 = paper (second HDMI pixel clock of the pair)
+        //
+        // DC balance: in standard doubled-pixel mode graphics_set_palette() always
+        // writes pixel-1 as  pixel-0 ^ 0x0003ffffffffffff  (XOR complement of the
+        // differential pairs).  The monitor decodes the complement to the same colour
+        // (both codewords of the TMDS running-disparity pair encode the same byte),
+        // but alternating polarity keeps the physical lines DC-balanced.
+        // Without this complement DS80 mode accumulated DC offset → signal ringing
+        // → blue fringe right of bright pixels and intermittent sync loss.
         for (int ink = 0; ink < 16; ink++) {
             for (int paper = 0; paper < 16; paper++) {
                 uint8_t slot = pair_lut[ink * 16 + paper];
                 // pair_lut guarantees slot ∉ [220..244] ∪ {255}
                 cc64[slot * 2 + 0] = tmds16[ink];
-                cc64[slot * 2 + 1] = tmds16[paper];
+                cc64[slot * 2 + 1] = tmds16[paper] ^ 0x0003ffffffffffffl;
             }
         }
         // Slot 255: border fill byte — must be (black, black).
         cc64[255 * 2 + 0] = tmds16[0];
-        cc64[255 * 2 + 1] = tmds16[0];
+        cc64[255 * 2 + 1] = tmds16[0] ^ 0x0003ffffffffffffl;
 
         hdmi_profi_ds80_active = true;
     } else {

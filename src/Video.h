@@ -191,6 +191,14 @@ public:
   // pair_lookup[ink][paper] → safe HDMI palette index (avoids sync range 220-244, border 255).
   // Built by init_profi_pair_lookup() in Reset(). Used by rasterizer and passed to HDMI driver.
   static uint8_t profi_pair_lookup[16][16];
+  // Live 16-color palette in RGB888 — modifiable by guest via OUT (port_low=0x7E).
+  static uint32_t profi_palette_live[16];
+  static volatile bool profi_palette_dirty;      // pending HDMI palette refresh — applied in EndFrame
+  static volatile bool profi_ds80_activate_pending;   // deferred off→on mode switch (set in Ports, applied in EndFrame)
+  static volatile bool profi_ds80_deactivate_pending; // deferred on→off mode switch (set in Ports, applied in EndFrame)
+  static void profiPaletteReset();
+  // Update palette[index] from a Profi RRRGGGBB color byte; sets dirty flag.
+  static void profiPaletteWrite(uint8_t index, uint8_t profi_color);
 #endif
 
   static bool isProfiDS80();

@@ -401,6 +401,17 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
 
       uint8_t dat;
 
+      // Profi CP/M mode: FDC data registers shift to 0x83/0xA3/0xC3/0xE3
+      // UnrealSpeccy decode: (addr & 0x9F) == 0x83 → reg index = (addr >> 5) & 3
+      //   0x83 → reg0 (CMD/STATUS), 0xA3 → reg1 (TRACK),
+      //   0xC3 → reg2 (SECTOR),     0xE3 → reg3 (DATA)
+      // 0xBF & 0x9F == 0x9F ≠ 0x83, so SYS port 0xBF falls through to switch below.
+      if (Config::arch == "Profi" && (portDFFD & 0x20) && ((address & 0x9F) == 0x83)) {
+        LED::touchR(LED::FDD);
+        FDDStep(false);
+        return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
+      }
+
       switch (address & 0xe3) {
       case 0x03:
       case 0x23:
@@ -414,6 +425,8 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       case 0xa3:
         // Profi CP/M mode (DFFD bit5=1): FDC SYS/status port shifts to 0xBF
         // (address & 0xe3 == 0xa3). In normal mode, ignore this address.
+        // Note: 0xA3/0xE3 in CP/M mode are caught by the pre-check above;
+        // this case now handles 0xBF (bits[4:2]=111) which falls through here.
         if (!(Config::arch == "Profi" && (portDFFD & 0x20)))
           break;
         [[fallthrough]];
@@ -642,13 +655,15 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         VIDEO::profi_clrmem = (clrPage < totPages) ? MemESP::ram[clrPage].direct() : nullptr;
         // Debug::log("[DFFD] DS80 on: clrPage=%u tot=%u clrmem=%p grmem=%p", clrPage, totPages, VIDEO::profi_clrmem, VIDEO::grmem);
 #if !PICO_RP2040
-        // Switch HDMI conv_color to packed-nibble mode only on off→on transition.
-        // Subsequent DFFD writes that re-affirm DS80 must NOT trigger a full
-        // 225-slot TMDS refresh during active display — that causes tearing /
-        // black flashes. Palette updates go via deferred refresh in EndFrame.
+        // DEFERRED: hdmi_set_profi_ds80_mode() writes conv_color[] which the HDMI
+        // DMA reads in real time.  Calling it here (Z80 loop, core0, active scan)
+        // races the DMA on core1 → TMDS corruption → picture disappears.
+        // Set a flag; EndFrame() (always at vblank) will apply it safely.
+        // Guard: only set pending if neither mode is already active/pending.
         extern volatile bool hdmi_profi_ds80_active;
-        if (!hdmi_profi_ds80_active) {
-            hdmi_set_profi_ds80_mode(true, VIDEO::profi_palette_live, &VIDEO::profi_pair_lookup[0][0]);
+        if (!hdmi_profi_ds80_active && !VIDEO::profi_ds80_activate_pending) {
+            VIDEO::profi_ds80_deactivate_pending = false; // cancel any pending off
+            VIDEO::profi_ds80_activate_pending   = true;
         }
         VIDEO::updateBorderBrd();
 #endif
@@ -656,19 +671,34 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         VIDEO::grmem        = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
         VIDEO::profi_clrmem = nullptr;
 #if !PICO_RP2040
+        // DEFERRED: same race condition — defer deactivation to EndFrame vblank.
         extern volatile bool hdmi_profi_ds80_active;
-        bool exiting_ds80 = hdmi_profi_ds80_active;
-        hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
-        // Reset border to white (standard ZX boot default) when leaving DS80
-        if (exiting_ds80) VIDEO::borderColor = 7;
+        bool exiting_ds80 = hdmi_profi_ds80_active || VIDEO::profi_ds80_activate_pending;
+        if (exiting_ds80) {
+            VIDEO::profi_ds80_activate_pending   = false; // cancel any pending on
+            VIDEO::profi_ds80_deactivate_pending = true;
+            // Reset border to white (standard ZX boot default) when leaving DS80
+            VIDEO::borderColor = 7;
+            Debug::log("[DFFD] DS80 off: hdmi_act=%d act_pend was set → deact_pend=1", (int)hdmi_profi_ds80_active);
+        }
         VIDEO::updateBorderBrd();
-        // Fill framebuffer with white (palette index 7 = WHITE) when leaving DS80:
-        // leftover packed-pair byte values (range 0..254) would render as random
-        // colors with the now-standard 16-color palette. White is the standard
-        // ZX boot border, gives clean look until guest ROM does its own CLS.
+        // Fill framebuffer with BLACK (0) when leaving DS80.
+        //
+        // Why not WHITE (7)?  The deferred deactivation flag (profi_ds80_deactivate_pending)
+        // means HDMI ISR is STILL in DS80 mode when this fill runs — EndFrame hasn't
+        // processed the flag yet.  In DS80 mode, byte 7 = slot profi_pair_lookup[0][7]
+        // = pair(black, white) → alternating pixels → fine vertical gray stripes on the
+        // border areas (bytes 0..pad_l-1 and pad_l+256..xres-1 are NOT overwritten by the
+        // DS80 scan-time renderer, so they stay at 7 until EndFrame clears them).
+        //
+        // Byte 0 is safe in both modes:
+        //   DS80:     slot 0 = pair(0,0) = black/black → solid black ✓
+        //   Standard: palette index 0 = BLACK ✓
+        // The border scanner fires after EndFrame deactivates DS80 and writes the correct
+        // border color (white/default), so the first full standard frame looks correct.
         if (exiting_ds80 && VIDEO::vga.frameBuffer) {
           for (int y = 0; y < (int)VIDEO::vga.yres; y++)
-            if (VIDEO::vga.frameBuffer[y]) memset(VIDEO::vga.frameBuffer[y], WHITE, VIDEO::vga.xres);
+            if (VIDEO::vga.frameBuffer[y]) memset(VIDEO::vga.frameBuffer[y], 0, VIDEO::vga.xres);
         }
 #endif
       }
@@ -1021,7 +1051,16 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // Check if TRDOS Rom is mapped, or a raw disk is loaded.
     if (ESPectrum::trdos || out_has_raw_disk) {
 
-      switch (address & 0xe3) {
+      // Profi CP/M mode: FDC data registers shift to 0x83/0xA3/0xC3/0xE3
+      // UnrealSpeccy decode: (addr & 0x9F) == 0x83 → reg index = (addr >> 5) & 3
+      //   0x83 → reg0 (CMD/STATUS), 0xA3 → reg1 (TRACK),
+      //   0xC3 → reg2 (SECTOR),     0xE3 → reg3 (DATA)
+      // 0xBF & 0x9F == 0x9F ≠ 0x83, so SYS port 0xBF falls through to switch below.
+      if (Config::arch == "Profi" && (portDFFD & 0x20) && ((address & 0x9F) == 0x83)) {
+        LED::touchW(LED::FDD);
+        FDDStep(false);
+        rvmWD1793Write(&ESPectrum::fdd, ((address >> 5) & 0x3), data);
+      } else switch (address & 0xe3) {
 
       case 0x03:
       case 0x23:
@@ -1034,6 +1073,8 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       case 0xa3:
         // Profi CP/M mode (DFFD bit5=1): FDC SYS register shifts to 0xBF
         // (address & 0xe3 == 0xa3). In normal mode, ignore this address.
+        // Note: 0xA3/0xE3 in CP/M mode are caught by the pre-check above;
+        // this case now handles 0xBF (bits[4:2]=111) which falls through here.
         if (!(Config::arch == "Profi" && (portDFFD & 0x20)))
           break;
         [[fallthrough]];
@@ -1069,6 +1110,17 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
           else
             ESPectrum::fdd.side = 1;
         }
+
+#if !PICO_RP2040
+        if (Config::arch == "Profi" && ESPectrum::fdd.track >= 10) {
+          uint16_t pc = Z80::getRegPC();
+          Debug::log("[SYS] OUT 0xBF=0x%02X pc=0x%04X → drv=%d side=%d rst=%d t=%d s=%d",
+                     data, pc,
+                     ESPectrum::fdd.diskS, ESPectrum::fdd.side,
+                     (data & 0x4) ? 0 : 1,
+                     ESPectrum::fdd.track, ESPectrum::fdd.sector);
+        }
+#endif
 
         if (data & 0x40)
           ESPectrum::fdd.control |= kRVMWD177XDDEN;

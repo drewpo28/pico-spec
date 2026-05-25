@@ -68,7 +68,6 @@ visit https://zxespectrum.speccy.org/contacto
 extern "C" void graphics_set_scanlines(bool enabled);
 extern "C" void graphics_set_dither(bool enabled);
 #if !PICO_RP2040
-extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
 extern "C" volatile bool hdmi_profi_ds80_active;
 extern "C" const uint32_t profi_default_palette16[16];
 #endif
@@ -694,14 +693,30 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if !PICO_RP2040
     // Suspend DS80 packed-pair palette while OSD is visible so OSD bytes (standard
     // ZX color indices 0-15) are rendered normally. Restored on scope exit.
+    // Uses deferred flags (applied at vblank in EndFrame) to avoid racing with the
+    // HDMI ISR on core1 which reads conv_color[] concurrently.
     struct DS80Guard {
         bool was_active;
         DS80Guard() : was_active(hdmi_profi_ds80_active) {
-            if (was_active) hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
+            // Cancel any pending activation that arrived just before OSD opened.
+            VIDEO::profi_ds80_activate_pending = false;
+            // Schedule deactivation at next vblank (EndFrame will call hdmi_set_profi_ds80_mode safely).
+            if (was_active) {
+                VIDEO::profi_ds80_deactivate_pending = true;
+            }
         }
         ~DS80Guard() {
-            if (was_active) hdmi_set_profi_ds80_mode(true, profi_default_palette16,
-                                                      &VIDEO::profi_pair_lookup[0][0]);
+            // Cancel any stray deactivate pending.
+            VIDEO::profi_ds80_deactivate_pending = false;
+            // Re-schedule DS80 activation ONLY if the machine is still supposed to
+            // run in DS80 mode (portDFFD bit7 still set).
+            // Guard: if ESPectrum::reset() was called during OSD it sets portDFFD=0,
+            // so isProfiDS80()=false → we must NOT set activate_pending here, otherwise
+            // EndFrame immediately re-enables DS80 on a machine that was just reset to a
+            // non-DS80 ROM (48K/128K/SOS) causing "DS80 activates on 48K ROM" bug.
+            if (was_active && VIDEO::isProfiDS80()) {
+                VIDEO::profi_ds80_activate_pending = true;
+            }
         }
     } ds80Guard;
 #endif

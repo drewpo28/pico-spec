@@ -57,6 +57,7 @@ public:
 
     static uint8_t portAFF7;
     static uint8_t portDFFD;
+    static uint8_t portEFF7; // Extended feature register (Profi CP/M uses bit 1=EFF7_512)
 
 #if !PICO_RP2040
     // KR580VI53 (Intel 8253 PIT) — Byte computer sound synthesizer

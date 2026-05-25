@@ -34,6 +34,7 @@ THE SOFTWARE.
 #include "CPU.h"
 #include "OSDMain.h"
 #include "messages.h"
+#include "Z80_JLS/z80.h"
 
 static bool sclConvertToTRD(rvmWD1793 *wd);
 
@@ -87,6 +88,16 @@ static uint16_t vgCrc(uint16_t crc, uint8_t byte);
 #endif
 
 IRAM_ATTR static void _end(rvmWD1793 *wd) {
+#if !PICO_RP2040
+  if (Config::arch == "Profi" && wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsProFile
+      && wd->track >= 12) {
+    Debug::log("[FDCe] END t=%d s=%d side=%d st=0x%02X (crc=%d lost=%d notready=%d)",
+               wd->track, wd->sector, wd->side, wd->status,
+               (wd->status & kRVMWD177XStatusCRC) ? 1 : 0,
+               (wd->status & kRVMWD177XStatusLostData) ? 1 : 0,
+               (wd->status & kRVMWD177XStatusNotReady) ? 1 : 0);
+  }
+#endif
   wd->status &= ~kRVMWD177XStatusBusy;
   wd->state = kRVMWD177XNone;
   wd->stepState = kRVMWD177XStepIdle;
@@ -989,6 +1000,15 @@ case kRVMWD177XWriteTrack: {
   }
 }
 
+#if !PICO_RP2040
+// File-scope counters for Profi diagnostics (used in rvmWD1793Step and rvmWD1793Write/Read)
+static int s_profi_wb_cnt = 0;   // wait_busy (0x40EC) reads per CMD
+static int s_profi_rd_cnt = 0;   // general BIOS reads per CMD
+static int s_profi_data_cnt = 0; // DATA reg reads (any PC) per CMD
+static int s_ff_wrap_cnt = 0;    // fast-find wrap events per CMD
+static int s_ff_hit_cnt = 0;     // fast-find hit events per CMD
+#endif
+
 IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
   
   for (;steps > 0; steps--) {
@@ -1077,6 +1097,12 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
             && wd->state == kRVMWD177XReadHeaderBytes
             && wd->fdiSectorCount == 0)
         {
+#if !PICO_RP2040
+            if (wd->disk[wd->diskS]->IsProFile)
+                Debug::log("[FDC!] EmptyTrack dt=%d t=%d s=%d side=%d lc=%d ls=%d",
+                           (int)wd->disk[wd->diskS]->t, wd->track, wd->sector, wd->side,
+                           wd->diskLoadedCyl, wd->diskLoadedSide);
+#endif
             wd->status |= kRVMWD177XStatusSeek; // bit 4 = Record Not Found (Type II)
             _end(wd);
             break;
@@ -1127,6 +1153,15 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
                 // rvmwdDiskStep generates an index pulse (indexDelay), which will
                 // naturally decrement retry via _checkIndex on the next step.
                 if (idPos < curPos) {
+#if !PICO_RP2040
+                    if (wd->disk[wd->diskS]->IsProFile && wd->track >= 12) {
+                        if (s_ff_wrap_cnt < 30) {
+                            s_ff_wrap_cnt++;
+                            Debug::log("[FFwr] WRAP sec=%d idPos=%u curPos=%u retry=%d want t=%d s=%d side=%d",
+                                       bestSec, idPos, curPos, wd->retry, wd->track, wd->sector, wd->side);
+                        }
+                    }
+#endif
                     fdisk->indx = trkLen; // trigger index pulse via rvmwdDiskStep
                     break; // exit — let normal stepping handle the revolution
                 }
@@ -1138,6 +1173,17 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
                 wd->fdiDataCrcError = (wd->fdiSectorFlags[bestSec] & 1);
 
                 if (wd->state == kRVMWD177XReadHeaderBytes) {
+#if !PICO_RP2040
+                    if (wd->disk[wd->diskS]->IsProFile && wd->track >= 12) {
+                        if (s_ff_hit_cnt < 80) {
+                            s_ff_hit_cnt++;
+                            Debug::log("[FFnd] sec=%d hdr=[%02X %d %d %d] want t=%d s=%d side=%d",
+                                       bestSec,
+                                       wd->header[0], wd->header[1], wd->header[2], wd->header[3],
+                                       wd->track, wd->sector, wd->side);
+                        }
+                    }
+#endif
                     wd->state = wd->next; // → kRVMWD177XReadSectorHeader
                     _do(wd);
                 } else {
@@ -1233,6 +1279,21 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
 }
 
 IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
+#if !PICO_RP2040
+  // Minimal: log only Command writes (one per FDC operation) for Profi/PRO
+  if (Config::arch == "Profi" && wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsProFile
+      && (a & 0x3) == 0) {
+    int diskt = wd->disk[wd->diskS] ? (int)wd->disk[wd->diskS]->t : -1;
+    uint16_t pc = Z80::getRegPC();
+    Debug::log("[FDCw] CMD=0x%02X pc=0x%04X t=%d s=%d side=%d dt=%d busy=%d oneshot=%d fsc=%d hld=%d",
+               value, pc,
+               wd->track, wd->sector, wd->side, diskt,
+               (wd->status & kRVMWD177XStatusBusy) ? 1 : 0,
+               wd->typeI_busy_oneshot ? 1 : 0,
+               wd->fdiSectorCount,
+               (wd->control & kRVMWD177XHLD) ? 1 : 0);
+  }
+#endif
   switch(a & 0x3) {
 
     case 0: //Command
@@ -1348,6 +1409,12 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
             wd->control &= ~kRVMWD177XDRQ;
             wd->status = kRVMWD177XStatusSetIndex | kRVMWD177XStatusSetTrack0 | kRVMWD177XStatusSetWP | kRVMWD177XStatusBusy;
             wd->state = kRVMWD177XTypeI0;
+            // Profi CP/M boot fix: BIOS polls "wait for BUSY=1" right after every
+            // Type I command. If the command completes fully inside the _do() chain
+            // below (e.g. Seek with verify to the already-current track), BUSY
+            // would drop to 0 before BIOS reads the status, causing an infinite
+            // poll loop. Arm a one-shot BUSY=1 to guarantee BIOS sees it once.
+            wd->typeI_busy_oneshot = true;
 
             _do(wd);
 
@@ -1381,11 +1448,39 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
 
           wd->status=kRVMWD177XStatusNotReady;
           wd->control|=kRVMWD177XINTRQ;
-
+#if !PICO_RP2040
+          if (Config::arch == "Profi")
+            Debug::log("[FDC!] CMD=0x%02X NOT_READY: disk=%p power=0x%X diskS=%d",
+                       wd->command, wd->disk[wd->diskS],
+                       wd->control & 0xf000, wd->diskS);
+#endif
         }
 
-      } // else printf("BUSY!!!\n");
+      } else {
+#if !PICO_RP2040
+        if (Config::arch == "Profi" && wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsProFile) {
+          Debug::log("[FDCw!] CMD=0x%02X REJECTED (BUSY) t=%d s=%d prev_cmd=0x%02X st=%d ss=%d",
+                     value, wd->track, wd->sector, wd->command, wd->state, wd->stepState);
+        }
+#endif
+      }
 
+#if !PICO_RP2040
+      // Log resulting status after CMD write (confirm BUSY was set or rejected)
+      if (Config::arch == "Profi" && wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsProFile) {
+        bool accepted = (wd->command == value); // command was updated → accepted
+        if (accepted) {
+          s_profi_wb_cnt = 0;  // reset per-CMD wait_busy counter
+          s_profi_rd_cnt = 0;
+          s_profi_data_cnt = 0;
+          s_ff_wrap_cnt = 0;
+          s_ff_hit_cnt = 0;
+        }
+        Debug::log("[FDCa] after CMD=0x%02X(%s): status=0x%02X state=%d stepState=%d hld=%d",
+                   wd->command, accepted ? "OK" : "REJ", wd->status, wd->state, wd->stepState,
+                   (wd->control & kRVMWD177XHLD) ? 1 : 0);
+      }
+#endif
       break;
 
     case 1: //Track
@@ -1411,9 +1506,36 @@ IRAM_ATTR uint8_t rvmWD1793Read(rvmWD1793 *wd,uint8_t a) {
 
   switch(a & 0x3) {
     case 0: //Status
+    {
       wd->control&=~kRVMWD177XINTRQ;
 
       r=wd->status & 0xff;
+      // One-shot BUSY for instant-complete Type I (Profi CP/M boot fix).
+      if (wd->typeI_busy_oneshot) {
+        r |= kRVMWD177XStatusBusy;
+        wd->typeI_busy_oneshot = false;
+      }
+
+#if !PICO_RP2040
+      if (Config::arch == "Profi" && wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsProFile
+          && wd->track >= 10) {
+        uint16_t pc = Z80::getRegPC();
+        if (pc >= 0x4000 && pc < 0x4200) {
+          bool at_waitbusy = (pc == 0x40EC);
+          if (at_waitbusy) {
+            if (s_profi_wb_cnt < 50) {
+              s_profi_wb_cnt++;
+              Debug::log("[FDCr] status=0x%02X pc=0x%04X st=%d ss=%d t=%d s=%d side=%d",
+                         r, pc, wd->state, wd->stepState, wd->track, wd->sector, wd->side);
+            }
+          } else if (s_profi_rd_cnt < 200) {
+            s_profi_rd_cnt++;
+            Debug::log("[FDCr] status=0x%02X pc=0x%04X st=%d ss=%d t=%d s=%d side=%d",
+                       r, pc, wd->state, wd->stepState, wd->track, wd->sector, wd->side);
+          }
+        }
+      }
+#endif
 
       if(wd->disk[wd->diskS]) {
         if(wd->status & kRVMWD177XStatusSetWP)  {
@@ -1448,13 +1570,25 @@ IRAM_ATTR uint8_t rvmWD1793Read(rvmWD1793 *wd,uint8_t a) {
       } else {
         r|=kRVMWD177XStatusNotReady;
       }
-
       return r;
+    }
     case 1: //Track
       return wd->track;
     case 2: //Sector
       return wd->sector;
     case 3: //Data
+#if !PICO_RP2040
+      // Log data bytes only for high tracks (near GRF location) to reduce volume
+      if (Config::arch == "Profi" && wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsProFile
+          && wd->track >= 13) {
+        if (s_profi_data_cnt < 16) {
+          s_profi_data_cnt++;
+          uint16_t pc = Z80::getRegPC();
+          Debug::log("[FDCd] DATA=0x%02X pc=0x%04X drq=%d st=%d side=%d",
+                     wd->data, pc, (wd->control & kRVMWD177XDRQ) ? 1 : 0, wd->state, wd->side);
+        }
+      }
+#endif
 
       // if(!(wd->control&kRVMWD177XDRQ)) {
       //   printf("Read data register overrunning\n");
@@ -1478,6 +1612,7 @@ void rvmWD1793Reset(rvmWD1793 *wd) {
   wd->state = kRVMWD177XNone;
   wd->stepState = kRVMWD177XStepIdle;
   wd->next = kRVMWD177XNone;
+  wd->typeI_busy_oneshot = false;
 
   wd->c = 0;
   wd->control &= 0xf000;
@@ -1566,6 +1701,8 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
 #if !PICO_RP2040
         wd->disk[UnitNum]->IsUDIFile = false;
         wd->disk[UnitNum]->IsFDIFile = false;
+        wd->disk[UnitNum]->IsMBDFile = false;
+        wd->disk[UnitNum]->IsProFile = false;
 #endif
         wd->disk[UnitNum]->fname = Filename;
         // writeprotect is seeded by the caller from the per-slot Config array.
@@ -1580,6 +1717,8 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         wd->disk[UnitNum]->IsSCLFile = false;
         wd->disk[UnitNum]->IsUDIFile = true;
         wd->disk[UnitNum]->IsFDIFile = false;
+        wd->disk[UnitNum]->IsMBDFile = false;
+        wd->disk[UnitNum]->IsProFile = false;
         // writeprotect is seeded by the caller from the per-slot Config array.
         wd->disk[UnitNum]->writeprotect = 0;
         wd->disk[UnitNum]->sclDataOffset = 0;
@@ -1632,6 +1771,8 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         wd->disk[UnitNum]->IsSCLFile = false;
         wd->disk[UnitNum]->IsUDIFile = false;
         wd->disk[UnitNum]->IsFDIFile = true;
+        wd->disk[UnitNum]->IsMBDFile = false;
+        wd->disk[UnitNum]->IsProFile = false;
         wd->disk[UnitNum]->sclDataOffset = 0;
 
         // Read FDI header (14 bytes)
@@ -1685,6 +1826,7 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         wd->disk[UnitNum]->IsUDIFile = false;
         wd->disk[UnitNum]->IsFDIFile = false;
         wd->disk[UnitNum]->IsMBDFile = true;
+        wd->disk[UnitNum]->IsProFile = false;
         wd->disk[UnitNum]->sclDataOffset = 0;
 
         // Read MBD header to determine geometry
@@ -1727,6 +1869,52 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         printf("MBD: %d tracks, %d sides, %d sec/trk, %d bytes/sec\n",
                tracks, sides, spt, wd->disk[UnitNum]->mbdSectorSize);
         return true;
+
+    } else if (Filename.length() >= 4 &&
+               (Filename.substr(Filename.length() - 4) == ".pro" ||
+                Filename.substr(Filename.length() - 4) == ".PRO" ||
+                Filename.substr(Filename.length() - 4) == ".Pro")) {
+        // PRO file — Profi CP/M raw disk image, no header.
+        // Layout per UnrealSpeccy wldr_pro.cpp: 80 cyl × 2 sides × 5 sec × 1024 bytes = 800 KB.
+        // First track (cyl 0 side 0) uses special sector IDs {1,2,3,4,9}; other
+        // tracks use {1,2,3,4,5}. Reuses MBD reader; PRO-specific ID array applied
+        // inside mbdLoadTrack when IsProFile is set.
+        wd->disk[UnitNum]->IsSCLFile = false;
+        wd->disk[UnitNum]->IsUDIFile = false;
+        wd->disk[UnitNum]->IsFDIFile = false;
+        wd->disk[UnitNum]->IsMBDFile = true;
+        wd->disk[UnitNum]->IsProFile = true;
+        wd->disk[UnitNum]->sclDataOffset = 0;
+
+        FSIZE_t fsize = f_size(wd->disk[UnitNum]->Diskfile);
+        uint8_t tracks, sides, spt;
+        uint16_t secSize;
+        if (fsize == 819200) {            // 800 KB standard Profi CP/M layout
+            tracks = 80; sides = 2; spt = 5; secSize = 1024;
+        } else if (fsize == 409600) {     // 400 KB single-sided
+            tracks = 80; sides = 1; spt = 5; secSize = 1024;
+        } else {
+            // Fallback: assume standard 800K geometry
+            tracks = 80; sides = 2; spt = 5; secSize = 1024;
+        }
+
+        wd->disk[UnitNum]->tracks = tracks - 1;
+        wd->disk[UnitNum]->sides = sides;
+        wd->disk[UnitNum]->mbdSectorsPerTrack = spt;
+        wd->disk[UnitNum]->mbdSectorSize = secSize;
+        wd->disk[UnitNum]->writeprotect = 0;
+
+        wd->disk[UnitNum]->t0s1_info = 0;
+        wd->disk[UnitNum]->cursectbufpos = 0xff;
+        wd->control |= kRVMWD177XPower0 << UnitNum;
+        wd->disk[UnitNum]->fname = Filename;
+        wd->diskLoadedCyl = -1;
+        wd->diskLoadedSide = -1;
+        wd->fastmode = false;
+
+        printf("PRO (Profi CP/M): %d tracks, %d sides, %d sec/trk, %d bytes/sec\n",
+               tracks, sides, spt, secSize);
+        return true;
 #endif
 
     } else {
@@ -1735,6 +1923,7 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         wd->disk[UnitNum]->IsUDIFile = false;
         wd->disk[UnitNum]->IsFDIFile = false;
         wd->disk[UnitNum]->IsMBDFile = false;
+        wd->disk[UnitNum]->IsProFile = false;
 #endif
         // writeprotect is seeded by the caller from the per-slot Config array.
         wd->disk[UnitNum]->writeprotect = 0;
@@ -2143,7 +2332,17 @@ void mbdLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
         if (pos + 4 <= imageSize) {
             buf[pos++] = (uint8_t)cyl;
             buf[pos++] = side;
-            buf[pos++] = (uint8_t)(sec + 1); // sectors numbered from 1
+            // PRO (Profi CP/M) special: first track (cyl 0 side 0) uses sector
+            // IDs {1,2,3,4,9} per UnrealSpeccy wldr_pro.cpp. All other tracks
+            // use standard {1,2,3,4,5}.
+            uint8_t sec_id;
+            if (disk->IsProFile && cyl == 0 && side == 0) {
+                static const uint8_t sn0[5] = {1, 2, 3, 4, 9};
+                sec_id = (sec < 5) ? sn0[sec] : (uint8_t)(sec + 1);
+            } else {
+                sec_id = (uint8_t)(sec + 1); // sectors numbered from 1
+            }
+            buf[pos++] = sec_id;
             buf[pos++] = secN;
         }
         // ID CRC

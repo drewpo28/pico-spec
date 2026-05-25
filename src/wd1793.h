@@ -164,6 +164,10 @@ typedef struct
     bool IsMBDFile;
     uint8_t mbdSectorsPerTrack;       // sectors per track (typically 11)
     uint16_t mbdSectorSize;           // bytes per sector (typically 1024)
+    // PRO format flag: Profi CP/M raw disk. Uses MBD-style track builder but
+    // with special sector ID layout — first track (cyl 0 side 0) uses IDs
+    // {1,2,3,4,9} (5th sector has ID=9 for CP/M boot), other tracks {1,2,3,4,5}.
+    bool IsProFile;
 #endif
 } rvmwdDisk;
 
@@ -300,6 +304,12 @@ typedef struct
 
     bool fastmode;
     bool wd2797_mode;
+    // Profi CP/M boot polls "wait for BUSY=1" right after each Type I command.
+    // If our state machine completes the Type I instantly (e.g., Seek to the
+    // already-current track), BUSY=0 immediately → BIOS loop hangs forever.
+    // This one-shot flag forces BUSY=1 in the first status read after a Type I
+    // command that completed synchronously, then auto-clears.
+    bool typeI_busy_oneshot;
 
     bool sclConverted;
 

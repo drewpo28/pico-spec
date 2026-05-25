@@ -81,10 +81,10 @@ DISK_FTYPE FileUtils::fileTypes[6] = {
 #else
     {".sna,.SNA,.z80,.Z80,.p,.P,.zip,.ZIP",2,2,0,""},
     {".tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.zip,.ZIP",2,2,0,""},
-    {".trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.mbd,.MBD,.zip,.ZIP",2,2,0,""},
+    {".trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.mbd,.MBD,.pro,.PRO,.zip,.ZIP",2,2,0,""},
     {".rom,.ROM,.bin,.BIN",2,2,0,""},
     {".mmc,.MMC,.hdf,.HDF,.zip,.ZIP",2,2,0,""},
-    {".sna,.SNA,.z80,.Z80,.p,.P,.tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.mbd,.MBD,.mmc,.MMC,.hdf,.HDF,.zip,.ZIP",2,2,0,""}
+    {".sna,.SNA,.z80,.Z80,.p,.P,.tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.mbd,.MBD,.pro,.PRO,.mmc,.MMC,.hdf,.HDF,.zip,.ZIP",2,2,0,""}
 #endif
 };
 
@@ -106,7 +106,8 @@ string FileUtils::getLCaseExt(const string& filename) {
 }
 
 DiskIface FileUtils::ifaceForExt(const string& lcExt) {
-    if (lcExt == "trd" || lcExt == "scl" || lcExt == "fdi" || lcExt == "udi") return IFACE_BETA;
+    if (lcExt == "trd" || lcExt == "scl" || lcExt == "fdi" || lcExt == "udi"
+     || lcExt == "pro") return IFACE_BETA;
     if (lcExt == "mbd") return IFACE_MB02;
     if (lcExt == "mmc" || lcExt == "hdf") return IFACE_ESX;
     return IFACE_NONE;
