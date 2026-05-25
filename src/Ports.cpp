@@ -579,7 +579,6 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // ULA =======================================================================
   if ((address & 0x0001) == 0) {
     port254 = data;
-    LED::touchW(LED::BEEPER);
     // Border color
     if (VIDEO::borderColor != data) {
       VIDEO::brdChange = true;
@@ -604,6 +603,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     if (Audiobit != ESPectrum::lastaudioBit) {
       ESPectrum::BeeperGetSample();
       ESPectrum::lastaudioBit = Audiobit;
+      LED::touchW(LED::BEEPER);
     }
     // AY
     // ========================================================================
