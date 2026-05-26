@@ -2680,31 +2680,10 @@ IRAM_ATTR void VIDEO::EndFrame() {
     framecnt++;
 
 #if !PICO_RP2040
-    // Minimal Profi heartbeat — once per 2 sec, won't flood UART.
-    if (Config::arch == "Profi" && (framecnt % 100) == 0) {
-        Debug::log("[HB] f=%u pc=0x%04X bc=0x%04X hl=0x%04X iff=%u rom=%u dffd=0x%02X eff7=0x%02X bl=%u vidlatch=%u",
-            framecnt, Z80::getRegPC(), Z80::getRegBC(), Z80::getRegHL(),
-            (unsigned)(Z80::isIFF1()?1:0),
-            MemESP::romInUse, Ports::portDFFD, Ports::portEFF7,
-            MemESP::bankLatch, MemESP::videoLatch);
-    }
-    // Profi DS80 force-cleanup: when 128K/SOS/TR-DOS ROM is active (not SYS),
-    // BIOS or guest may have forgotten to clear DFFD bit7 → HDMI keeps
-    // interpreting standard 256-pixel framebuffer as packed pairs → garbage.
-    // EXCEPT when CPM bit (DFFD bit 5) is also set — CP/M needs DS80 hires for
-    // its 64x30 text display, so we must NOT clear DS80 in CP/M mode.
-    // This runs during vblank (EndFrame context) so hdmi_set call is safe.
-    if (Config::arch == "Profi" && MemESP::romInUse != 0 && (Ports::portDFFD & 0x80)
-        && !(Ports::portDFFD & 0x20)) {
-        Ports::portDFFD &= ~0x80;
-        grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
-        profi_clrmem = nullptr;
-        profi_ds80_activate_pending   = false;
-        profi_ds80_deactivate_pending = false;
-        hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
-        borderColor = 7; // reset to white (standard ZX boot default)
-        updateBorderBrd();
-    }
+    // Debug::log("[HB] f=%u pc=0x%04X bc=0x%04X hl=0x%04X iff=%u rom=%u dffd=0x%02X eff7=0x%02X bl=%u vidlatch=%u",
+    //     framecnt, Z80::getRegPC(), Z80::getRegBC(), Z80::getRegHL(),
+    //     (unsigned)(Z80::isIFF1()?1:0), MemESP::romInUse, Ports::portDFFD, Ports::portEFF7,
+    //     MemESP::bankLatch, MemESP::videoLatch);
 #endif
 }
 

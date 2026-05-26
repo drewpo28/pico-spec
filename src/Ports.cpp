@@ -638,8 +638,8 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       uint8_t R = ((color >> 3) & 3) * 85;
       uint8_t G = ((color >> 6) & 3) * 85;
       uint8_t B = (color & 3) * 85;
-      Debug::log("[PAL] idx=%2d byte=0x%02X RGB=#%02X%02X%02X (addr=0x%04X port254=0x%02X pc=0x%04X)",
-                 index, color, R, G, B, address, port254, Z80::getRegPC());
+      // Debug::log("[PAL] idx=%2d byte=0x%02X RGB=#%02X%02X%02X (addr=0x%04X port254=0x%02X pc=0x%04X)",
+      //            index, color, R, G, B, address, port254, Z80::getRegPC());
     }
     VIDEO::profiPaletteWrite(index, color);
   }
@@ -695,11 +695,9 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       // Log only when DS80 bit transitions (bit 7), or any change in low-volume bits.
       static uint8_t prev_dffd = 0xFE;
       if ((prev_dffd & 0x80) != (data & 0x80) || prev_dffd == 0xFE) {
-        Debug::log("[DFFD] new=0x%02X DS80=%d CPM=%d NOROM=%d SCO=%d SCR=%d page2..0=%d pc=0x%04X",
-                   data,
-                   (data >> 7) & 1, (data >> 5) & 1, (data >> 4) & 1,
-                   (data >> 3) & 1, (data >> 6) & 1, data & 7,
-                   Z80::getRegPC());
+        // Debug::log("[DFFD] new=0x%02X DS80=%d CPM=%d NOROM=%d SCO=%d SCR=%d page2..0=%d pc=0x%04X",
+        //            data, (data >> 7) & 1, (data >> 5) & 1, (data >> 4) & 1,
+        //            (data >> 3) & 1, (data >> 6) & 1, data & 7, Z80::getRegPC());
         prev_dffd = data;
       }
       portDFFD = data;
@@ -744,6 +742,16 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         if (!hdmi_profi_ds80_active && !VIDEO::profi_ds80_activate_pending) {
             VIDEO::profi_ds80_deactivate_pending = false; // cancel any pending off
             VIDEO::profi_ds80_activate_pending   = true;
+        } else if (hdmi_profi_ds80_active) {
+            // DS80 already active — cancel any spurious deactivation queued by a
+            // preceding bit7=0 write in the same Z80 frame (e.g. sea-viewer does
+            // OUT (#FD),0x00  ; "reset" portDFFD before reprogramming banks
+            // OUT (#FD),0x80  ; re-enable DS80
+            // Without this cancel, EndFrame would see deactivate_pending=true and
+            // tear down DS80 for one frame → black flash / flicker.
+            if (VIDEO::profi_ds80_deactivate_pending) {
+                VIDEO::profi_ds80_deactivate_pending = false;
+            }
         }
         VIDEO::updateBorderBrd();
 #endif
@@ -795,10 +803,9 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   //   D6 (0x40) = EFF7_384       — 384-line video
   //   D7 (0x80) = EFF7_CMOS      — CMOS RTC enable
   if ((Z80Ops::isPentagon || Z80Ops::isProfi) && address == 0xEFF7) {
-    Debug::log("[EFF7] pc=0x%04X data=0x%02X (4BPP=%d 512=%d LOCK=%d GIGA=%d HWMC=%d CMOS=%d)",
-               Z80::getRegPC(), data,
-               !!(data & 0x01), !!(data & 0x02), !!(data & 0x04),
-               !!(data & 0x10), !!(data & 0x20), !!(data & 0x80));
+    // Debug::log("[EFF7] pc=0x%04X data=0x%02X (4BPP=%d 512=%d LOCK=%d GIGA=%d HWMC=%d CMOS=%d)",
+    //            Z80::getRegPC(), data, !!(data & 0x01), !!(data & 0x02), !!(data & 0x04),
+    //            !!(data & 0x10), !!(data & 0x20), !!(data & 0x80));
     portEFF7 = data;
     // Pentagon 16col — keep existing bit 0 behaviour (legacy mode_16col_onoff)
     if (Config::mode16col_onoff) {
