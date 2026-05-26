@@ -2210,6 +2210,15 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
         const uint32_t frow = line + (uint32_t)ds80_voff;   // framebuffer row for this content line
         uint8_t* fb_row = (vga.frameBuffer && frow < (uint32_t)vga.yres)
                           ? (uint8_t*)vga.frameBuffer[frow] : nullptr;
+        // F8 stats overlay (DS80 640×480 only): drawStats writes the cached lines into
+        // fb rows 220..235 every frame (in vblank).  The content renderer + side-border
+        // fill would overwrite them during the next active scan → 1-frame content /
+        // 1-frame stats → flicker.  The stats rectangle (fb bytes 168..311) straddles
+        // the content area AND the right border pad (288..319), so BOTH the content
+        // write and the right-pad fill must carve it out, leaving it for drawStats.
+        // (720×576 keeps stats in the bottom border band, carved out in EndFrame.)
+        bool skip_stats_row = (ds80_voff == 0) && (VIDEO::OSD & 0x03) && !(VIDEO::OSD & 0x04)
+                              && frow >= 220 && frow < 236;
         // Per-line side borders: fill left/right pads with the CURRENT border colour
         // (mapped to its solid DS80 pair slot) once, on the first column batch of the
         // line.  Done per-scanline so raster border effects (OUT 0xFE bursts) show.
@@ -2221,7 +2230,16 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             uint8_t bidx = (uint8_t)(~VIDEO::borderColor) & 0x07;
             uint8_t bbyte = profi_pair_lookup[bidx][bidx];
             memset(fb_row, bbyte, pad_l);
-            memset(fb_row + pad_l + 256, bbyte, (int)vga.xres - (pad_l + 256));
+            const int rpad_start = pad_l + 256;
+            const int xres = (int)vga.xres;
+            if (skip_stats_row && 312 > rpad_start && 312 < xres) {
+                // Right pad overlaps the stats box (168..311): fill only 312..xres-1,
+                // leaving 288..311 for drawStats.  (Left of 312 in the right pad is the
+                // stats box itself.)
+                memset(fb_row + 312, bbyte, xres - 312);
+            } else {
+                memset(fb_row + rpad_start, bbyte, xres - rpad_start);
+            }
         }
         for (unsigned int j = start_col; j < end_col; j++) {
             uint8_t bmpEven = grmem[pixCoff + j + 8192];
@@ -2232,10 +2250,13 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             uint8_t papE = ((rawE & 0x38) >> 3) | ((rawE & 0x80) >> 4);
             uint8_t inkO = (rawO & 0x07) | ((rawO & 0x40) >> 3);
             uint8_t papO = ((rawO & 0x38) >> 3) | ((rawO & 0x80) >> 4);
-            if (fb_row) {
+            // Stats overlay carve-out: skip the 8-byte column block if it overlaps the
+            // stats rectangle (fb bytes 168..311) on a stats row — drawStats owns it.
+            size_t pbase = (size_t)pad_l + (size_t)j * 8;
+            bool in_stats = skip_stats_row && (pbase + 8 > 168) && (pbase < 312);
+            if (fb_row && !in_stats) {
                 // 16 source pixels per col → 8 packed bytes at content offset pad_l + j*8.
                 // Pre-apply (k^2) swap so ISR reads in correct order: store v[k] at pbase+(k^2).
-                size_t pbase = (size_t)pad_l + (size_t)j * 8;
                 // Even src byte (8 px): pairs (bit7,bit6), (bit5,bit4), (bit3,bit2), (bit1,bit0)
                 for (int k = 0; k < 4; k++) {
                     int sh = 6 - k * 2;
@@ -2689,10 +2710,27 @@ IRAM_ATTR void VIDEO::EndFrame() {
             uint8_t bidx = (uint8_t)(~VIDEO::borderColor) & 0x07;
             uint8_t bbyte = profi_pair_lookup[bidx][bidx];
             const int botStart = DS80_BORDER_TOP + 240;
+            // Top band: never overlaps the stats overlay → plain full-width fill.
             for (int y = 0; y < DS80_BORDER_TOP; y++)
                 if (vga.frameBuffer[y]) memset(vga.frameBuffer[y], bbyte, vga.xres);
-            for (int y = botStart; y < (int)vga.yres; y++)
-                if (vga.frameBuffer[y]) memset(vga.frameBuffer[y], bbyte, vga.xres);
+            // Bottom band: the F8 stats overlay (isFullBorder288: x=188, y=268, 144×16)
+            // lives here.  If we fill those rows full-width every frame, the per-frame
+            // drawStats() repaint races the fill → flicker when stats text updates.
+            // Carve the stats rectangle out of the fill and let drawStats own it.
+            bool statsHere = (VIDEO::OSD & 0x03) && !(VIDEO::OSD & 0x04);
+            const int sx = 188, sw = 144, sy = 268, sh = 16;   // matches OSD::drawStats 288-mode
+            for (int y = botStart; y < (int)vga.yres; y++) {
+                if (!vga.frameBuffer[y]) continue;
+                uint8_t* row = (uint8_t*)vga.frameBuffer[y];
+                if (statsHere && y >= sy && y < sy + sh) {
+                    // Fill only the border segments left/right of the stats box.
+                    if (sx > 0) memset(row, bbyte, sx);
+                    int rstart = sx + sw;
+                    if (rstart < (int)vga.xres) memset(row + rstart, bbyte, (int)vga.xres - rstart);
+                } else {
+                    memset(row, bbyte, vga.xres);
+                }
+            }
         }
     }
 
