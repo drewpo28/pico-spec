@@ -2064,6 +2064,15 @@ void ESPectrum::loop() {
         VIDEO::framecnt = 0;
       }
     }
+#if !PICO_RP2040
+    // DS80: the stats overlay (F8) is only refreshed every 10 frames above, but the
+    // DS80 scan-time renderer + per-frame border fill repaint the whole framebuffer
+    // every frame — so the stats text would show for 1 frame then vanish for 9
+    // (flicker).  Re-draw the cached stats lines every frame while DS80 is active so
+    // they persist.  (Normal modes draw into the static border area, no flicker.)
+    if (hdmi_profi_ds80_active && (VIDEO::OSD & 0x03) && (VIDEO::OSD & 0x04) == 0 && !CPU::paused)
+      OSD::drawStats();
+#endif
     // Flashing flag change (disabled when ULA+ palette is active)
 #if !PICO_RP2040
     if (!(VIDEO::flash_ctr++ & 0x0f) && !VIDEO::ulaplus_enabled)
