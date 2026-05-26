@@ -129,6 +129,10 @@ uint8_t* VIDEO::profi_clrmem = nullptr;
 // HDMI driver expands each fb byte to 2 different HDMI pixels → 512 native pixels.
 #define PROFI_FB_W 320   // 32 left-pad + 256 content + 32 right-pad
 #define PROFI_FB_H 240
+// DS80 vertical border for the 720×576 (yres=288) full-border mode: the 240 content
+// lines are centred, leaving 48 fb rows split symmetrically (24 top + 24 bottom).
+// In 640×480 (yres=240) there is no vertical border (content fills the height).
+#define DS80_BORDER_TOP 24
 uint8_t* VIDEO::profi_fb_psram = nullptr;
 uint8_t  VIDEO::profi_pair_lookup[16][16];
 
@@ -2185,12 +2189,25 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
         // into the SRAM framebuffer, we get the same tear-free guarantee as standard modes:
         // by the time HDMI scans line N, the Z80 has already rendered it.
         //
-        // Row layout: pad_l bytes of black (zeroed at DS80 activation and never overwritten),
-        // then 256 content bytes with (k^2) pre-swap for ISR's x^2 read pattern,
-        // then pad_r bytes of black.  Padding stays black for the entire DS80 session.
+        // Row layout: pad_l bytes of border, then 256 content bytes (with (k^2) pre-swap
+        // for the ISR's x^2 read pattern), then pad_r bytes of border.
+        // Vertical: 640×480 (yres=240) shows content full-height (voff=0, no top/bottom
+        // border). 720×576 (yres=288) centres the 240 content lines with a symmetric
+        // 24-row top/bottom border band (voff=DS80_BORDER_TOP) — top/bottom rows are
+        // filled in EndFrame; here we offset content + paint the per-line side borders.
         const int pad_l = vga.frameBuffer ? ((int)vga.xres - 256) / 2 : 32;
-        uint8_t* fb_row = (vga.frameBuffer && line < (uint32_t)vga.yres)
-                          ? (uint8_t*)vga.frameBuffer[line] : nullptr;
+        const int ds80_voff = (vga.yres >= 288) ? DS80_BORDER_TOP : 0;
+        const uint32_t frow = line + (uint32_t)ds80_voff;   // framebuffer row for this content line
+        uint8_t* fb_row = (vga.frameBuffer && frow < (uint32_t)vga.yres)
+                          ? (uint8_t*)vga.frameBuffer[frow] : nullptr;
+        // Per-line side borders: fill left/right pads with the CURRENT border colour
+        // (mapped to its solid DS80 pair slot) once, on the first column batch of the
+        // line.  Done per-scanline so raster border effects (OUT 0xFE bursts) show.
+        if (fb_row && start_col == 0) {
+            uint8_t bbyte = profi_pair_lookup[VIDEO::borderColor & 0x0F][VIDEO::borderColor & 0x0F];
+            memset(fb_row, bbyte, pad_l);
+            memset(fb_row + pad_l + 256, bbyte, (int)vga.xres - (pad_l + 256));
+        }
         for (unsigned int j = start_col; j < end_col; j++) {
             uint8_t bmpEven = grmem[pixCoff + j + 8192];
             uint8_t bmpOdd  = grmem[pixCoff + j];
@@ -2578,6 +2595,10 @@ IRAM_ATTR void VIDEO::EndFrame() {
             // dotFast), so it is unaffected by the remap.
             rebuildDS80ColorLut();
             Graphics8BitPalette::ds80_active = true;
+            // DS80 border defaults to BLACK (not the ZX white-7 set by Reset()): the
+            // Profi screen has no meaningful border at activation, and white side/top
+            // bands look wrong.  Guest OUT 0xFE writes still update it normally afterwards.
+            borderColor = 0;
             // Apply DS80 geometry: full 240-line screen, no border.
             // (Mirrors Reset() DS80 branch; skips palette/pair-lookup re-init.)
             grmem = MemESP::videoLatch ? MemESP::ram[6].direct() : MemESP::ram[4].direct();
@@ -2638,6 +2659,23 @@ IRAM_ATTR void VIDEO::EndFrame() {
             && !profi_ds80_activate_pending && !profi_ds80_deactivate_pending) {
             hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
             profi_palette_dirty = false;
+        }
+    }
+
+    // DS80 720×576 top/bottom border bands: the scan-time renderer only writes the
+    // 240 content lines (fb rows DS80_BORDER_TOP..+239), so the top rows 0..TOP-1 and
+    // the bottom rows TOP+240..yres-1 are never touched by it.  Fill them with the
+    // current border colour each frame (frame-accurate; side borders are per-line).
+    // 640×480 (yres=240) has no vertical border band → nothing to do.
+    {
+        extern volatile bool hdmi_profi_ds80_active;
+        if (hdmi_profi_ds80_active && vga.frameBuffer && (int)vga.yres >= 288) {
+            uint8_t bbyte = profi_pair_lookup[VIDEO::borderColor & 0x0F][VIDEO::borderColor & 0x0F];
+            const int botStart = DS80_BORDER_TOP + 240;
+            for (int y = 0; y < DS80_BORDER_TOP; y++)
+                if (vga.frameBuffer[y]) memset(vga.frameBuffer[y], bbyte, vga.xres);
+            for (int y = botStart; y < (int)vga.yres; y++)
+                if (vga.frameBuffer[y]) memset(vga.frameBuffer[y], bbyte, vga.xres);
         }
     }
 

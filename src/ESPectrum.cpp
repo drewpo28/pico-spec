@@ -2083,7 +2083,6 @@ void ESPectrum::loop() {
     // current border colour (which would otherwise leave a permanently visible square).
     uint8_t led_off_col = zxColor(VIDEO::borderColor, 0);
 #if !PICO_RP2040
-    if (hdmi_profi_ds80_active) led_off_col = zxColor(0, 0);
     if (MB02::enabled && (Config::mb02SoundLed & 1)) {
         // MB-02+ I/O skips the WD1793 command-dispatch paths that drive
         // rvmWD1793::led, so mirror the panel LED off the port-0x13 motor state.
