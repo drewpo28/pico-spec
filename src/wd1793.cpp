@@ -33,6 +33,7 @@ THE SOFTWARE.
 #include "Config.h"
 #include "CPU.h"
 #include "Ports.h"
+#include "MemESP.h"
 #include "OSDMain.h"
 #include "messages.h"
 #include "Z80_JLS/z80.h"
@@ -89,16 +90,6 @@ static uint16_t vgCrc(uint16_t crc, uint8_t byte);
 #endif
 
 IRAM_ATTR static void _end(rvmWD1793 *wd) {
-#if !PICO_RP2040
-  if (Config::arch == "Profi" && wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsProFile
-      && wd->track >= 12) {
-    Debug::log("[FDCe] END t=%d s=%d side=%d st=0x%02X (crc=%d lost=%d notready=%d)",
-               wd->track, wd->sector, wd->side, wd->status,
-               (wd->status & kRVMWD177XStatusCRC) ? 1 : 0,
-               (wd->status & kRVMWD177XStatusLostData) ? 1 : 0,
-               (wd->status & kRVMWD177XStatusNotReady) ? 1 : 0);
-  }
-#endif
   wd->status &= ~kRVMWD177XStatusBusy;
   wd->state = kRVMWD177XNone;
   wd->stepState = kRVMWD177XStepIdle;
@@ -1001,15 +992,6 @@ case kRVMWD177XWriteTrack: {
   }
 }
 
-#if !PICO_RP2040
-// File-scope counters for Profi diagnostics (used in rvmWD1793Step and rvmWD1793Write/Read)
-static int s_profi_wb_cnt = 0;   // wait_busy (0x40EC) reads per CMD
-static int s_profi_rd_cnt = 0;   // general BIOS reads per CMD
-static int s_profi_data_cnt = 0; // DATA reg reads (any PC) per CMD
-static int s_ff_wrap_cnt = 0;    // fast-find wrap events per CMD
-static int s_ff_hit_cnt = 0;     // fast-find hit events per CMD
-#endif
-
 IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
   
   for (;steps > 0; steps--) {
@@ -1071,7 +1053,17 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
           wd->fdd_clicks = 0;
         }
 
-        if (wd->fastmode) {
+        // Profi CP/M: PRO file uses fastmode=false (real MFM emulation needed
+        // for Read Sector), but Type I Seek step-delay accumulator never fills
+        // when CP/M poll loop spins ~30 T-states/iter, blocking Type I forever.
+        // Treat Type I steps as fastmode in this case.
+        bool profi_cpm_typeI =
+            (Config::arch == "Profi" && (Ports::portDFFD & 0x20)
+             && wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsProFile
+             && (wd->command & kRVMWD177XTypeI) == 0
+             && wd->state == kRVMWD177XTypeICheck);
+
+        if (wd->fastmode || profi_cpm_typeI) {
           wd->c = 0;
           _do(wd);
         } else if(!(--wd->c)) {
@@ -1154,15 +1146,6 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
                 // rvmwdDiskStep generates an index pulse (indexDelay), which will
                 // naturally decrement retry via _checkIndex on the next step.
                 if (idPos < curPos) {
-#if !PICO_RP2040
-                    if (wd->disk[wd->diskS]->IsProFile && wd->track >= 12) {
-                        if (s_ff_wrap_cnt < 30) {
-                            s_ff_wrap_cnt++;
-                            Debug::log("[FFwr] WRAP sec=%d idPos=%u curPos=%u retry=%d want t=%d s=%d side=%d",
-                                       bestSec, idPos, curPos, wd->retry, wd->track, wd->sector, wd->side);
-                        }
-                    }
-#endif
                     fdisk->indx = trkLen; // trigger index pulse via rvmwdDiskStep
                     break; // exit — let normal stepping handle the revolution
                 }
@@ -1174,17 +1157,6 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
                 wd->fdiDataCrcError = (wd->fdiSectorFlags[bestSec] & 1);
 
                 if (wd->state == kRVMWD177XReadHeaderBytes) {
-#if !PICO_RP2040
-                    if (wd->disk[wd->diskS]->IsProFile && wd->track >= 12) {
-                        if (s_ff_hit_cnt < 80) {
-                            s_ff_hit_cnt++;
-                            Debug::log("[FFnd] sec=%d hdr=[%02X %d %d %d] want t=%d s=%d side=%d",
-                                       bestSec,
-                                       wd->header[0], wd->header[1], wd->header[2], wd->header[3],
-                                       wd->track, wd->sector, wd->side);
-                        }
-                    }
-#endif
                     wd->state = wd->next; // → kRVMWD177XReadSectorHeader
                     _do(wd);
                 } else {
@@ -1280,21 +1252,6 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
 }
 
 IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
-#if !PICO_RP2040
-  // Minimal: log only Command writes (one per FDC operation) for Profi/PRO
-  if (Config::arch == "Profi" && wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsProFile
-      && (a & 0x3) == 0) {
-    int diskt = wd->disk[wd->diskS] ? (int)wd->disk[wd->diskS]->t : -1;
-    uint16_t pc = Z80::getRegPC();
-    Debug::log("[FDCw] CMD=0x%02X pc=0x%04X t=%d s=%d side=%d dt=%d busy=%d oneshot=%d fsc=%d hld=%d",
-               value, pc,
-               wd->track, wd->sector, wd->side, diskt,
-               (wd->status & kRVMWD177XStatusBusy) ? 1 : 0,
-               wd->typeI_busy_oneshot ? 1 : 0,
-               wd->fdiSectorCount,
-               (wd->control & kRVMWD177XHLD) ? 1 : 0);
-  }
-#endif
   switch(a & 0x3) {
 
     case 0: //Command
@@ -1410,14 +1367,20 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
             wd->control &= ~kRVMWD177XDRQ;
             wd->status = kRVMWD177XStatusSetIndex | kRVMWD177XStatusSetTrack0 | kRVMWD177XStatusSetWP | kRVMWD177XStatusBusy;
             wd->state = kRVMWD177XTypeI0;
-            // Profi CP/M boot fix: BIOS polls "wait for BUSY=1" right after every
-            // Type I command. If the command completes fully inside the _do() chain
-            // below (e.g. Seek with verify to the already-current track), BUSY
-            // would drop to 0 before BIOS reads the status, causing an infinite
-            // poll loop. Arm a one-shot BUSY=1 to guarantee BIOS sees it once.
-            // NOTE: Profi CP/M only (DFFD bit5=1). TR-DOS relies on BUSY=0
-            // after instant completion, so the oneshot must NOT be armed there.
-            if (Config::arch == "Profi" && (Ports::portDFFD & 0x20))
+            // Profi boot fix: SYS-ROM probe at 0x0710 and CP/M DSKKE9A at 0x40EC
+            // both poll "wait for BUSY=1" right after every Type I command.
+            // If the command completes fully inside the _do() chain below
+            // (e.g. Seek with verify to the already-current track), BUSY would
+            // drop to 0 before BIOS reads the status, causing an infinite poll.
+            // Arm a one-shot BUSY=1 to guarantee the poll sees it once.
+            //
+            // Armed for Profi when EITHER:
+            //   - CP/M mode (DFFD bit5=1) — DSKKE9A driver, OR
+            //   - SYS ROM active (romInUse==0) — boot ROM FDC probe at 0x0710.
+            // TR-DOS (romInUse=1, CP/M off) relies on BUSY=0 after instant
+            // completion, so the oneshot stays OFF there.
+            if (Config::arch == "Profi" &&
+                ((Ports::portDFFD & 0x20) || MemESP::romInUse == 0))
               wd->typeI_busy_oneshot = true;
 
             _do(wd);
@@ -1491,22 +1454,6 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
 #endif
       }
 
-#if !PICO_RP2040
-      // Log resulting status after CMD write (confirm BUSY was set or rejected)
-      if (Config::arch == "Profi" && wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsProFile) {
-        bool accepted = (wd->command == value); // command was updated → accepted
-        if (accepted) {
-          s_profi_wb_cnt = 0;  // reset per-CMD wait_busy counter
-          s_profi_rd_cnt = 0;
-          s_profi_data_cnt = 0;
-          s_ff_wrap_cnt = 0;
-          s_ff_hit_cnt = 0;
-        }
-        Debug::log("[FDCa] after CMD=0x%02X(%s): status=0x%02X state=%d stepState=%d hld=%d",
-                   wd->command, accepted ? "OK" : "REJ", wd->status, wd->state, wd->stepState,
-                   (wd->control & kRVMWD177XHLD) ? 1 : 0);
-      }
-#endif
       break;
 
     case 1: //Track
@@ -1542,26 +1489,6 @@ IRAM_ATTR uint8_t rvmWD1793Read(rvmWD1793 *wd,uint8_t a) {
         wd->typeI_busy_oneshot = false;
       }
 
-#if !PICO_RP2040
-      if (Config::arch == "Profi" && wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsProFile
-          && wd->track >= 10) {
-        uint16_t pc = Z80::getRegPC();
-        if (pc >= 0x4000 && pc < 0x4200) {
-          bool at_waitbusy = (pc == 0x40EC);
-          if (at_waitbusy) {
-            if (s_profi_wb_cnt < 50) {
-              s_profi_wb_cnt++;
-              Debug::log("[FDCr] status=0x%02X pc=0x%04X st=%d ss=%d t=%d s=%d side=%d",
-                         r, pc, wd->state, wd->stepState, wd->track, wd->sector, wd->side);
-            }
-          } else if (s_profi_rd_cnt < 200) {
-            s_profi_rd_cnt++;
-            Debug::log("[FDCr] status=0x%02X pc=0x%04X st=%d ss=%d t=%d s=%d side=%d",
-                       r, pc, wd->state, wd->stepState, wd->track, wd->sector, wd->side);
-          }
-        }
-      }
-#endif
 
       if(wd->disk[wd->diskS]) {
         if(wd->status & kRVMWD177XStatusSetWP)  {
@@ -1603,19 +1530,6 @@ IRAM_ATTR uint8_t rvmWD1793Read(rvmWD1793 *wd,uint8_t a) {
     case 2: //Sector
       return wd->sector;
     case 3: //Data
-#if !PICO_RP2040
-      // Log data bytes only for high tracks (near GRF location) to reduce volume
-      if (Config::arch == "Profi" && wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsProFile
-          && wd->track >= 13) {
-        if (s_profi_data_cnt < 16) {
-          s_profi_data_cnt++;
-          uint16_t pc = Z80::getRegPC();
-          Debug::log("[FDCd] DATA=0x%02X pc=0x%04X drq=%d st=%d side=%d",
-                     wd->data, pc, (wd->control & kRVMWD177XDRQ) ? 1 : 0, wd->state, wd->side);
-        }
-      }
-#endif
-
       // if(!(wd->control&kRVMWD177XDRQ)) {
       //   printf("Read data register overrunning\n");
       // }

@@ -456,7 +456,6 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       case 0x63:
         LED::touchR(LED::FDD);
         FDDStep(false);
-
         return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
 
       case 0xa3:
@@ -477,14 +476,17 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         FDDStep(true);
 
         uint8_t v = 0;
+        // Profi 5.06 SYS-ROM uses Beta-128 bit ordering (bit 7 = INTRQ,
+        // bit 6 = DRQ) — verified empirically: ROM at 0x07A4 does `JP M`
+        // (sign flag set) to exit Read Sector loop, expecting bit 7 to be
+        // INTRQ (command-done), not DRQ. The Karabas-Pro dev manual v1.01
+        // p.23 swaps these — that's the Karabas FPGA wiring, not Profi 5.06.
+        // Treat all Profi variants as Beta-128 ordering for now.
         if (Config::arch == "Profi") {
-          // Profi / Karabas-Pro RQ93 register (per dev manual v1.01, p.23):
-          //   bit 7 = DRQ state
-          //   bit 6 = INTRQ state
           if (ESPectrum::fdd.control & kRVMWD177XDRQ)
-            v |= 0x80;
-          if (ESPectrum::fdd.control & (kRVMWD177XINTRQ | kRVMWD177XFINTRQ))
             v |= 0x40;
+          if (ESPectrum::fdd.control & (kRVMWD177XINTRQ | kRVMWD177XFINTRQ))
+            v |= 0x80;
         } else {
           // Beta-128 / TR-DOS: bit 6 = DRQ, bit 7 = INTRQ
           if (ESPectrum::fdd.control & kRVMWD177XDRQ)
@@ -629,6 +631,16 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   if (Config::arch == "Profi" && (address & 0x0081) == 0 && (portDFFD & 0x80)) {
     uint8_t index = (port254 ^ 0x0F) & 0x0F;
     uint8_t color = ~(uint8_t)(address >> 8);
+    static int s_pal_log_cnt = 0;
+    if (s_pal_log_cnt < 48) {
+      s_pal_log_cnt++;
+      // Decode same way as profi_color_to_rgb888 (2:2:2 GG_RR_BB layout).
+      uint8_t R = ((color >> 3) & 3) * 85;
+      uint8_t G = ((color >> 6) & 3) * 85;
+      uint8_t B = (color & 3) * 85;
+      Debug::log("[PAL] idx=%2d byte=0x%02X RGB=#%02X%02X%02X (addr=0x%04X port254=0x%02X pc=0x%04X)",
+                 index, color, R, G, B, address, port254, Z80::getRegPC());
+    }
     VIDEO::profiPaletteWrite(index, color);
   }
 #endif
@@ -680,6 +692,16 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // norom (bit 4) clears lock unconditionally.
     {
       uint8_t prev_page0ram = MemESP::page0ram;
+      // Log only when DS80 bit transitions (bit 7), or any change in low-volume bits.
+      static uint8_t prev_dffd = 0xFE;
+      if ((prev_dffd & 0x80) != (data & 0x80) || prev_dffd == 0xFE) {
+        Debug::log("[DFFD] new=0x%02X DS80=%d CPM=%d NOROM=%d SCO=%d SCR=%d page2..0=%d pc=0x%04X",
+                   data,
+                   (data >> 7) & 1, (data >> 5) & 1, (data >> 4) & 1,
+                   (data >> 3) & 1, (data >> 6) & 1, data & 7,
+                   Z80::getRegPC());
+        prev_dffd = data;
+      }
       portDFFD = data;
       MemESP::page0ram = bitRead(data, 4);
       if (MemESP::page0ram) MemESP::pagingLock = false; // norom → unlock
@@ -737,7 +759,6 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
             VIDEO::profi_ds80_deactivate_pending = true;
             // Reset border to white (standard ZX boot default) when leaving DS80
             VIDEO::borderColor = 7;
-            Debug::log("[DFFD] DS80 off: hdmi_act=%d act_pend was set → deact_pend=1", (int)hdmi_profi_ds80_active);
         }
         VIDEO::updateBorderBrd();
         // Fill framebuffer with BLACK (0) when leaving DS80.
@@ -1269,9 +1290,16 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         LED::touchW(LED::FDD);
         FDDStep(true);
 
-        // Change active disk unit
-        if (ESPectrum::fdd.diskS != (data & 0x3)) {
-          ESPectrum::fdd.diskS = data & 0x3;
+        // Change active disk unit.
+        // Profi 5.06 hardware has only 2 physical drives (A:/B:), so the WD1793
+        // SYS register drive bits wrap modulo 2 (ZXMAK2 WD1793.cs:227 —
+        // `drive = (value & 3) % fdd.Length` where fdd.Length=2 for Profi).
+        // Without this wrap, CP/M `sea` issuing OUT(#BF),#4E (drv-bits=2) lands
+        // on empty slot 2 and the FDC hangs waiting for BUSY=1 from no disk.
+        uint8_t new_drive = data & 0x3;
+        if (Config::arch == "Profi") new_drive &= 0x1;
+        if (ESPectrum::fdd.diskS != new_drive) {
+          ESPectrum::fdd.diskS = new_drive;
           if (ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != NULL &&
               ESPectrum::fdd.side &&
               ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->sides == 1)
@@ -1299,20 +1327,6 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
             ESPectrum::fdd.side = 1;
         }
 
-#if !PICO_RP2040
-        if (Config::arch == "Profi" && ESPectrum::fdd.track >= 10) {
-          uint16_t pc = Z80::getRegPC();
-          uint16_t iy = Z80::getRegIY();
-          uint8_t iy4 = (iy >= 0xC000) ? MemESP::ramCurrent[3][iy + 4 - 0xC000] : 0;
-          uint8_t iy5 = (iy >= 0xC000) ? MemESP::ramCurrent[3][iy + 5 - 0xC000] : 0;
-          Debug::log("[SYS] OUT 0xBF=0x%02X pc=0x%04X → drv=%d side=%d rst=%d t=%d s=%d IY=0x%04X IY4=%d IY5=%d",
-                     data, pc,
-                     ESPectrum::fdd.diskS, ESPectrum::fdd.side,
-                     (data & 0x4) ? 0 : 1,
-                     ESPectrum::fdd.track, ESPectrum::fdd.sector,
-                     iy, iy4, iy5);
-        }
-#endif
 
         // RQ93 bit 5: ~DDEN (0=MFM double density, 1=FM single density)
         if (data & 0x20)
