@@ -204,6 +204,7 @@ public:
   static void rebuildDS80ColorLut();     // rebuild Graphics8BitPalette::ds80_color_lut from profi_pair_lookup
   static void applyProfiOSDPalette();    // enable Graphics-layer DS80 colour remap (OSD draws correct colours)
   static void restoreProfiLivePalette(); // disable Graphics-layer DS80 colour remap
+  static void discardProfiOSDPaletteSnapshot(); // drop saved palette without re-enabling DS80
   static void clearDS80Padding();        // re-blacken DS80 side-padding columns after OSD close
   static void profiPaletteReset();
   // Update palette[index] from a Profi RRRGGGBB color byte; sets dirty flag.

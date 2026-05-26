@@ -251,6 +251,16 @@ void VIDEO::restoreProfiLivePalette() {
 #endif
 }
 
+// Drop the saved app-palette snapshot WITHOUT touching HDMI or re-enabling DS80.
+// Used when DS80 was switched off (machine reset) while the OSD STD-palette override
+// was active: the saved palette is no longer meaningful and must not trigger a
+// hdmi_set_profi_ds80_mode(true,…) re-activation.
+void VIDEO::discardProfiOSDPaletteSnapshot() {
+#if !PICO_RP2040
+    profi_palette_saved_valid = false;
+#endif
+}
+
 // Re-blacken the DS80 side-padding columns (left 0..pad_l-1 and right pad_l+256..xres-1)
 // across all framebuffer rows.  The DS80 renderer only ever rewrites the 256 content
 // bytes per row, so padding that an OSD dialog drew over is otherwise left dirty after
@@ -2204,7 +2214,12 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
         // (mapped to its solid DS80 pair slot) once, on the first column batch of the
         // line.  Done per-scanline so raster border effects (OUT 0xFE bursts) show.
         if (fb_row && start_col == 0) {
-            uint8_t bbyte = profi_pair_lookup[VIDEO::borderColor & 0x0F][VIDEO::borderColor & 0x0F];
+            // Border colour = Palette[(~borderIndex) & 7] (per ZXMAK2 ProfiRenderer
+            // UlaAction.Profi32_0 → m_borderColorPaper).  Note the INVERSE index: the
+            // Profi ULA derives the solid-border colour from the complement of the
+            // port-0xFE value, then maps it through the live palette.
+            uint8_t bidx = (uint8_t)(~VIDEO::borderColor) & 0x07;
+            uint8_t bbyte = profi_pair_lookup[bidx][bidx];
             memset(fb_row, bbyte, pad_l);
             memset(fb_row + pad_l + 256, bbyte, (int)vga.xres - (pad_l + 256));
         }
@@ -2595,10 +2610,10 @@ IRAM_ATTR void VIDEO::EndFrame() {
             // dotFast), so it is unaffected by the remap.
             rebuildDS80ColorLut();
             Graphics8BitPalette::ds80_active = true;
-            // DS80 border defaults to BLACK (not the ZX white-7 set by Reset()): the
-            // Profi screen has no meaningful border at activation, and white side/top
-            // bands look wrong.  Guest OUT 0xFE writes still update it normally afterwards.
-            borderColor = 0;
+            // DS80 border colour = Palette[(~borderColor) & 7] (inverse index, per
+            // ZXMAK2).  Reset() sets borderColor=7 → (~7)&7 = 0 → Palette[0] = BLACK,
+            // which is the desired default until a guest OUT 0xFE changes it.  (Do NOT
+            // force borderColor=0 here: that would invert to Palette[7] = light grey.)
             // Apply DS80 geometry: full 240-line screen, no border.
             // (Mirrors Reset() DS80 branch; skips palette/pair-lookup re-init.)
             grmem = MemESP::videoLatch ? MemESP::ram[6].direct() : MemESP::ram[4].direct();
@@ -2670,7 +2685,9 @@ IRAM_ATTR void VIDEO::EndFrame() {
     {
         extern volatile bool hdmi_profi_ds80_active;
         if (hdmi_profi_ds80_active && vga.frameBuffer && (int)vga.yres >= 288) {
-            uint8_t bbyte = profi_pair_lookup[VIDEO::borderColor & 0x0F][VIDEO::borderColor & 0x0F];
+            // Border colour = Palette[(~borderIndex) & 7] (inverse index — see renderer).
+            uint8_t bidx = (uint8_t)(~VIDEO::borderColor) & 0x07;
+            uint8_t bbyte = profi_pair_lookup[bidx][bidx];
             const int botStart = DS80_BORDER_TOP + 240;
             for (int y = 0; y < DS80_BORDER_TOP; y++)
                 if (vga.frameBuffer[y]) memset(vga.frameBuffer[y], bbyte, vga.xres);

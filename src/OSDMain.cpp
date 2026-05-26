@@ -728,10 +728,22 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
         ~DS80Guard() {
             if (VIDEO::profi_ds80_osd_active) {
                 VIDEO::profi_ds80_osd_active = false;
-                VIDEO::restoreProfiLivePalette(); // back to live DS80 pair palette
-                // DS80 renderer only rewrites the 256 content bytes per row, so any
-                // side-padding the dialog drew over stays dirty — re-blacken it.
-                VIDEO::clearDS80Padding();
+                // CRITICAL: only restore the DS80 palette if HDMI is STILL in DS80 mode.
+                // If a machine reset fired during OSD (e.g. switching to 48K/128K from a
+                // menu), ESPectrum::reset() already called hdmi_set_profi_ds80_mode(false).
+                // restoreProfiLivePalette() would call hdmi_set_profi_ds80_mode(true,…),
+                // RE-ENABLING DS80 packed-pair scanout over a non-DS80 framebuffer →
+                // shifted/garbled screen.  Skip it when we've left DS80.
+                if (hdmi_profi_ds80_active) {
+                    VIDEO::restoreProfiLivePalette(); // back to live DS80 pair palette
+                    // DS80 renderer only rewrites the 256 content bytes per row, so any
+                    // side-padding the dialog drew over stays dirty — re-blacken it.
+                    VIDEO::clearDS80Padding();
+                } else {
+                    // Left DS80 during OSD: drop the saved-palette flag without re-arming
+                    // DS80, so a later DS80 session starts clean.
+                    VIDEO::discardProfiOSDPaletteSnapshot();
+                }
             }
             // Cancel any stray deferred flags from transitions during OSD.
             VIDEO::profi_ds80_activate_pending   = false;

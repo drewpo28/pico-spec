@@ -2078,11 +2078,15 @@ void ESPectrum::loop() {
         && !DivMMC::enabled
 #endif
         ;
-    // Indicator sits at x=312 — inside the DS80 right-padding band (content is 32..287).
-    // In DS80 there is no border there, so the "off" state must erase to BLACK, not the
-    // current border colour (which would otherwise leave a permanently visible square).
+    // Indicator sits at x=312 — inside the DS80 right border band.  The "off" state
+    // erases it to the surrounding border colour so no square remains.
+    //   Normal mode: border byte = zxColor(borderColor, 0).
+    //   DS80 mode:   the band is filled with Palette[(~borderColor)&7] (inverse index,
+    //     per ProfiRenderer).  The Graphics remap maps a ZX index i → Palette[i&0xF],
+    //     so pass (~borderColor)&7 to land on the same byte and blend cleanly.
     uint8_t led_off_col = zxColor(VIDEO::borderColor, 0);
 #if !PICO_RP2040
+    if (hdmi_profi_ds80_active) led_off_col = (uint8_t)(~VIDEO::borderColor) & 0x07;
     if (MB02::enabled && (Config::mb02SoundLed & 1)) {
         // MB-02+ I/O skips the WD1793 command-dispatch paths that drive
         // rvmWD1793::led, so mirror the panel LED off the port-0x13 motor state.
