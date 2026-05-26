@@ -46,6 +46,10 @@ public:
     static uint8_t input(uint16_t address);
     static void output(uint16_t address, uint8_t data);
     static uint8_t port[128];
+    // Profi extended keyboard: bit 5 of each standard row (row 0-7).
+    // 0xFF = key not pressed; bit 5 cleared = key pressed.
+    // Used only when Config::arch=="Profi" && Config::profi_ext_keys.
+    static uint8_t extPort[8];
 
     static uint8_t (*getFloatBusData)();
     static uint8_t getFloatBusData48();

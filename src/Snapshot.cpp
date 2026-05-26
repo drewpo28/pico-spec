@@ -962,8 +962,10 @@ void FileZ80::loader48() {
 }
 
 void FileZ80::loader128() {
-    unsigned char *z80_array;
-    uint32_t dataLen;
+    unsigned char *z80_array = nullptr;
+    uint32_t dataLen = 0;
+    // When true, ROM page blocks from the snapshot are skipped (ROM pre-loaded by assign_rom).
+    bool skip_rom_pages = false;
     if (Config::arch == "128K") {
         z80_array = (unsigned char *) load128;
         dataLen = sizeof(load128);
@@ -991,9 +993,32 @@ void FileZ80::loader128() {
     } else if (Config::arch == "Pentagon" || Config::arch == "P512"  || Config::arch == "P1024") {
         z80_array = (unsigned char *) loadpentagon;
         dataLen = sizeof(loadpentagon);
+    } else if (Config::arch == "Profi") {
+        // Profi tape loading: boot into SOS ROM (bank 2) and reuse the Pentagon
+        // loader Z80 state — both use the identical 128K SOS ROM tape routine.
+        // ROM page blocks from loadpentagon must NOT be written into Profi ROM
+        // slots (rom[0]=SYS ROM would be corrupted; rom[1]=TR-DOS likewise).
+        z80_array = (unsigned char *) loadpentagon;
+        dataLen = sizeof(loadpentagon);
+        skip_rom_pages = true;
     }
+
+    if (!z80_array) {
+        // No loader snapshot available for this architecture — just reset.
+        ESPectrum::reset();
+        return;
+    }
+
     uint32_t dataOffset = 86;
-    ESPectrum::reset();
+
+    // Profi: boot into SOS ROM (romInUse=2, trdos=false) so the tape loading
+    // routine at the standard 128K ROM address is accessible from bank 0.
+    // ESPectrum::reset() no-arg always calls reset(0) for Profi → SYS ROM +
+    // trdos=true, which is wrong for tape loading.
+    if (Config::arch == "Profi")
+        ESPectrum::reset(2);
+    else
+        ESPectrum::reset();
 
     // begin loading registers
     Z80::setRegA  (z80_array[0]);
@@ -1037,6 +1062,14 @@ void FileZ80::loader128() {
     MemESP::bankLatch = z80_array[35] & 0x07;
     MemESP::romInUse = MemESP::romLatch;
 
+    // Profi: the loadpentagon paging byte sets romLatch=0 → romInUse=0 (Pentagon
+    // ROM 0).  Override to romInUse=2 (Profi SOS ROM) so tape loading uses the
+    // correct ROM after recoverPage0() at the end of this function.
+    if (Config::arch == "Profi") {
+        MemESP::romInUse = 2;
+        MemESP::ramCurrent[0] = MemESP::rom[2].direct();
+    }
+
     z80_array += dataOffset;
 
     mem_desc_t* pages[12] = {
@@ -1052,6 +1085,23 @@ void FileZ80::loader128() {
         uint8_t hdr2 = z80_array[2]; dataOffset ++;
         z80_array += 3;
         uint16_t compDataLen = mkword(hdr0, hdr1);
+
+        // Bounds check: guard against malformed snapshots with invalid page index.
+        if (hdr2 >= 12) {
+            z80_array += compDataLen;
+            dataOffset += compDataLen;
+            continue;
+        }
+
+        // For Profi: skip ROM page blocks (pages[0..2] = rom[0..2]; pages[11] = rom[3]).
+        // Writing Pentagon ROM content into Profi's ROM slots would corrupt the SYS ROM,
+        // TR-DOS, and 48K SOS ROM banks that are pre-loaded by assign_rom().
+        if (skip_rom_pages && (hdr2 < 3 || hdr2 == 11)) {
+            z80_array += compDataLen;
+            dataOffset += compDataLen;
+            continue;
+        }
+
         uint8_t* sp = pages[hdr2]->sync(4);
         {
             uint16_t dataOff = 0;

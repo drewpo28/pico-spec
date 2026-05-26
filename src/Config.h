@@ -106,6 +106,7 @@ public:
     static bool     flashload;    
     static bool     tape_player;
     static volatile bool real_player;
+    static bool     profi_ext_keys;  // Profi extended keyboard mode (default false)
     static bool     tape_timing_rg;
     static bool     rightSpace;
     static bool     wasd;

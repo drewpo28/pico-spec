@@ -1308,20 +1308,39 @@ IRAM_ATTR void ESPectrum::processKeyboard() {
             KeytoESP == fabgl::VK_VOLUMEUP || KeytoESP == fabgl::VK_VOLUMEDOWN ||
             KeytoESP == fabgl::VK_VOLUMEMUTE ||
             KeytoESP == fabgl::VK_DELETE)) {
-        int64_t osd_start = esp_timer_get_time();
-        OSD::do_OSD(
-            KeytoESP,
-            Kbd->isVKDown(fabgl::VK_LALT) || Kbd->isVKDown(fabgl::VK_RALT),
-            Kbd->isVKDown(fabgl::VK_LCTRL) || Kbd->isVKDown(fabgl::VK_RCTRL));
-        Kbd->emptyVirtualKeyQueue();
+        // In Profi extended keyboard mode, F-keys and nav-keys pass to Z80 matrix
+        // instead of opening OSD. PAUSE always opens OSD (escape hatch).
+        // GRAVEACCENT/TILDE still go to OSD (for Alt+` toggle and max-speed hotkey).
+#if !PICO_RP2040
+        bool passToZ80 = Z80Ops::isProfi && Config::profi_ext_keys
+            && KeytoESP != fabgl::VK_PAUSE
+            && KeytoESP != fabgl::VK_TILDE
+            && KeytoESP != fabgl::VK_GRAVEACCENT
+            && KeytoESP != fabgl::VK_PRINTSCREEN
+            && KeytoESP != fabgl::VK_SCROLLLOCK
+            && KeytoESP != fabgl::VK_NUMLOCK
+            && KeytoESP != fabgl::VK_VOLUMEUP
+            && KeytoESP != fabgl::VK_VOLUMEDOWN
+            && KeytoESP != fabgl::VK_VOLUMEMUTE;
+        if (!passToZ80)
+#endif
+        {
+          int64_t osd_start = esp_timer_get_time();
+          OSD::do_OSD(
+              KeytoESP,
+              Kbd->isVKDown(fabgl::VK_LALT) || Kbd->isVKDown(fabgl::VK_RALT),
+              Kbd->isVKDown(fabgl::VK_LCTRL) || Kbd->isVKDown(fabgl::VK_RCTRL));
+          Kbd->emptyVirtualKeyQueue();
 #ifdef DIRTY_LINES
-        for (int i = 0; i < SPEC_H; i++)
-          VIDEO::dirty_lines[i] |= 0x01;
+          for (int i = 0; i < SPEC_H; i++)
+            VIDEO::dirty_lines[i] |= 0x01;
 #endif // DIRTY_LINES
-       // Refresh border
-        VIDEO::brdnextframe = true;
-        ESPectrum::ts_start += esp_timer_get_time() - osd_start;
-        return;
+          // Refresh border
+          VIDEO::brdnextframe = true;
+          ESPectrum::ts_start += esp_timer_get_time() - osd_start;
+          return;
+        }
+        // else: key falls through to extended keyboard polling below
       }
       // Reset keys
       if (Kdown && NextKey.LALT) {
@@ -1524,6 +1543,62 @@ IRAM_ATTR void ESPectrum::processKeyboard() {
       );
       bitWrite(PS2cols[7], 4,
                (!Kbd->isVKDown(fabgl::VK_B)) & (!Kbd->isVKDown(fabgl::VK_b)));
+
+#if !PICO_RP2040
+      // ── Profi extended keyboard matrix ──────────────────────────────────
+      // Only active when arch=Profi and extended keyboard mode is on.
+      // Bit 5 of rows 0-7 via extPort[]; additional rows via port[8..10].
+      if (Z80Ops::isProfi && Config::profi_ext_keys) {
+        // Row 0: Ctrl → bit 5
+        bitWrite(Ports::extPort[0], 5,
+                 (!Kbd->isVKDown(fabgl::VK_LCTRL)) & (!Kbd->isVKDown(fabgl::VK_RCTRL)));
+        // Row 1: Alt → bit 5
+        bitWrite(Ports::extPort[1], 5,
+                 (!Kbd->isVKDown(fabgl::VK_LALT)) & (!Kbd->isVKDown(fabgl::VK_RALT)));
+        // Row 2: F1 → bit 5
+        bitWrite(Ports::extPort[2], 5, !Kbd->isVKDown(fabgl::VK_F1));
+        // Row 3: F2 → bit 5
+        bitWrite(Ports::extPort[3], 5, !Kbd->isVKDown(fabgl::VK_F2));
+        // Row 4: F3 → bit 5
+        bitWrite(Ports::extPort[4], 5, !Kbd->isVKDown(fabgl::VK_F3));
+        // Row 5: F4 → bit 5
+        bitWrite(Ports::extPort[5], 5, !Kbd->isVKDown(fabgl::VK_F4));
+        // Row 6: F5 → bit 5
+        bitWrite(Ports::extPort[6], 5, !Kbd->isVKDown(fabgl::VK_F5));
+        // Row 7: CapsLock → bit 5
+        bitWrite(Ports::extPort[7], 5, !Kbd->isVKDown(fabgl::VK_CAPSLOCK));
+        // Row 8: F6-F12 (bits 0-6). Address scheme TBD from CP/M ROM analysis.
+        Ports::port[8] = 0xFF;
+        bitWrite(Ports::port[8], 0, !Kbd->isVKDown(fabgl::VK_F6));
+        bitWrite(Ports::port[8], 1, !Kbd->isVKDown(fabgl::VK_F7));
+        bitWrite(Ports::port[8], 2, !Kbd->isVKDown(fabgl::VK_F8));
+        bitWrite(Ports::port[8], 3, !Kbd->isVKDown(fabgl::VK_F9));
+        bitWrite(Ports::port[8], 4, !Kbd->isVKDown(fabgl::VK_F10));
+        bitWrite(Ports::port[8], 5, !Kbd->isVKDown(fabgl::VK_F11));
+        bitWrite(Ports::port[8], 6, !Kbd->isVKDown(fabgl::VK_F12));
+        // Row 9: arrows + INS/DEL/HOME/END (bits 0-7). Address scheme TBD.
+        Ports::port[9] = 0xFF;
+        bitWrite(Ports::port[9], 0, !Kbd->isVKDown(fabgl::VK_UP));
+        bitWrite(Ports::port[9], 1, !Kbd->isVKDown(fabgl::VK_DOWN));
+        bitWrite(Ports::port[9], 2, !Kbd->isVKDown(fabgl::VK_LEFT));
+        bitWrite(Ports::port[9], 3, !Kbd->isVKDown(fabgl::VK_RIGHT));
+        bitWrite(Ports::port[9], 4, !Kbd->isVKDown(fabgl::VK_INSERT));
+        bitWrite(Ports::port[9], 5, !Kbd->isVKDown(fabgl::VK_DELETE));
+        bitWrite(Ports::port[9], 6, !Kbd->isVKDown(fabgl::VK_HOME));
+        bitWrite(Ports::port[9], 7, !Kbd->isVKDown(fabgl::VK_END));
+        // Row 10: PGUP/PGDN/BS/ESC/TAB (bits 0-4). Address scheme TBD.
+        Ports::port[10] = 0xFF;
+        bitWrite(Ports::port[10], 0, !Kbd->isVKDown(fabgl::VK_PAGEUP));
+        bitWrite(Ports::port[10], 1, !Kbd->isVKDown(fabgl::VK_PAGEDOWN));
+        bitWrite(Ports::port[10], 2, !Kbd->isVKDown(fabgl::VK_BACKSPACE));
+        bitWrite(Ports::port[10], 3, !Kbd->isVKDown(fabgl::VK_ESCAPE));
+        bitWrite(Ports::port[10], 4, !Kbd->isVKDown(fabgl::VK_TAB));
+      } else {
+        // Not in extended mode — clear extended state (all keys released)
+        for (int i = 0; i < 8; i++) Ports::extPort[i] = 0xFF;
+        Ports::port[8] = Ports::port[9] = Ports::port[10] = 0xFF;
+      }
+#endif
     }
   }
   if (r) {

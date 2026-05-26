@@ -88,6 +88,7 @@ extern "C" const uint32_t profi_default_palette16[16];
 // and adjusted for BEEPER_MAX_VOLUME = 97
 uint8_t Ports::speaker_values[8] = {0, 19, 34, 53, 97, 101, 130, 134};
 uint8_t Ports::port[128];
+uint8_t Ports::extPort[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 uint8_t Ports::port254 = 0;
 uint8_t Ports::portAFF7 = 0;
 uint8_t Ports::portDFFD = 0;
@@ -250,6 +251,19 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         if ((portHigh & mask) != 0)
           data &= port[row];
       }
+#if !PICO_RP2040
+      // Profi extended keyboard: bit 5 of each standard row.
+      // portHigh bit i set → row i is selected → AND extPort[i] with bit 5 only.
+      // (other bits of extPort are kept 1 so they don't affect bits 0-4 of data)
+      if (Z80Ops::isProfi && Config::profi_ext_keys) {
+        for (int row = 0, mask = 0x01; row < 8; row++, mask <<= 1) {
+          if ((portHigh & mask) != 0)
+            data &= (extPort[row] | 0xDF); // mask: only bit 5 can be cleared
+        }
+        // TODO: additional extended rows (F6-F12, arrows, nav keys) via port[8..10].
+        // Address scheme TBD — run keyboard test with port-read logging to find exact addresses.
+      }
+#endif
     }
     if (Tape::tapeStatus == TAPE_LOADING) LED::touchR(LED::TAPE);
     if (Tape::TapePortRead()) return data;

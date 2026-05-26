@@ -736,6 +736,17 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
         }
     }
 
+#if !PICO_RP2040
+    // Alt+` (grave/tilde) — toggle Profi extended keyboard mode (only in Profi arch)
+    if (Config::arch == "Profi" && ALT && !CTRL &&
+        (KeytoESP == fabgl::VK_GRAVEACCENT || KeytoESP == fabgl::VK_TILDE)) {
+        Config::profi_ext_keys = !Config::profi_ext_keys;
+        Config::save();
+        osdCenteredMsg(Config::profi_ext_keys ? " Ext kbd ON  " : " Ext kbd OFF ", LEVEL_INFO, 500);
+        return;
+    }
+#endif
+
 #ifdef VGA_HDMI
     // Mode switches require a hard reset — heap fragmentation breaks runtime
     // framebuffer grow. Save the *old* vm to pending (loaded after reboot for
@@ -3678,15 +3689,55 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             menu_level = 2;
                             menu_curopt = 1;
                             menu_saverect = true;
-                            opt2 = menuRun(MENU_ROMS_PROFI[Config::lang]);
-                            if (opt2) {
-                                arch = "Profi";
-                                romset = "Profi";
-                                menu_curopt = opt2;
-                                menu_saverect = false;
-                            } else {
-                                menu_curopt = 1;
-                                menu_level = 2;
+                            opt2 = 0;
+                            while (1) {
+                                // Profi submenu: ROM selection + Ext keyboard toggle
+                                string profi_sub =
+                                    string(Config::lang ? "Profi\n" : "Profi\n") +
+                                    "1024K\n" +
+                                    string("Ext keyboard [") +
+                                    (Config::profi_ext_keys ? "ON" : "OFF") + "]\n";
+                                uint8_t opt_p = menuRun(profi_sub);
+                                if (opt_p == 1) {
+                                    // ROM selected
+                                    arch = "Profi";
+                                    romset = "Profi";
+                                    opt2 = 1; // signal machine switch
+                                    menu_curopt = 1;
+                                    menu_saverect = false;
+                                    break;
+                                } else if (opt_p == 2) {
+                                    // Ext keyboard toggle (Yes/No submenu)
+                                    while (1) {
+                                        string ext_menu = string(Config::lang ? "Teclado ext.\n" : "Ext keyboard\n");
+                                        ext_menu += MENU_YESNO[Config::lang];
+                                        bool prev_ext = Config::profi_ext_keys;
+                                        if (prev_ext) {
+                                            ext_menu.replace(ext_menu.find("[Y",0), 2, "[*");
+                                            ext_menu.replace(ext_menu.find("[N",0), 2, "[ ");
+                                        } else {
+                                            ext_menu.replace(ext_menu.find("[Y",0), 2, "[ ");
+                                            ext_menu.replace(ext_menu.find("[N",0), 2, "[*");
+                                        }
+                                        uint8_t opt3 = menuRun(ext_menu);
+                                        if (opt3) {
+                                            Config::profi_ext_keys = (opt3 == 1);
+                                            if (Config::profi_ext_keys != prev_ext) Config::save();
+                                            menu_curopt = opt3;
+                                            menu_saverect = false;
+                                        } else {
+                                            menu_curopt = 2;
+                                            menu_level = 2;
+                                            break; // back to Profi submenu
+                                        }
+                                    }
+                                } else {
+                                    // ESC — exit Profi submenu
+                                    opt2 = 0;
+                                    menu_curopt = 1;
+                                    menu_level = 2;
+                                    break;
+                                }
                             }
                         }
 #if !NO_ALF

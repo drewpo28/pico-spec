@@ -55,6 +55,7 @@ bool     Config::Issue2 = true;
 bool     Config::flashload = true;
 bool     Config::tape_player = false; // Tape player mode
 volatile bool Config::real_player = false;
+bool     Config::profi_ext_keys = false; // Profi extended keyboard mode
 bool     Config::tape_timing_rg = false; // Rodolfo Guerra ROMs tape timings
 bool     Config::rightSpace = true;
 bool     Config::wasd = true;
@@ -535,6 +536,7 @@ void Config::load() {
         }
         recountBP();
         nvs_get_b("tape_player", tape_player, sts);
+        nvs_get_b("profi_ext_keys", profi_ext_keys, sts);
         bool b; nvs_get_b("real_player", b, sts);
 #if LOAD_WAV_PIO
         if (real_player && !b) {
@@ -780,6 +782,7 @@ void Config::save() {
     nvs_set_str(buf,"flashload", flashload ? "true" : "false");
     nvs_set_str(buf,"ledIndicators", ledIndicators ? "true" : "false");
     nvs_set_str(buf,"tape_player", tape_player ? "true" : "false");
+    nvs_set_str(buf,"profi_ext_keys", profi_ext_keys ? "true" : "false");
     nvs_set_str(buf,"real_player", real_player ? "true" : "false");
     nvs_set_str(buf,"rightSpace", rightSpace ? "true" : "false");
     nvs_set_str(buf,"wasd", wasd ? "true" : "false");
