@@ -196,6 +196,15 @@ public:
   static volatile bool profi_palette_dirty;      // pending HDMI palette refresh — applied in EndFrame
   static volatile bool profi_ds80_activate_pending;   // deferred off→on mode switch (set in Ports, applied in EndFrame)
   static volatile bool profi_ds80_deactivate_pending; // deferred on→off mode switch (set in Ports, applied in EndFrame)
+  // OSD palette override: while OSD is open over a DS80 screen, conv_color is
+  // temporarily switched to the standard ZX palette so OSD colour bytes (0..16)
+  // render correctly.  HDMI stays in DS80 mode; the frozen Profi background is
+  // re-interpreted through the standard palette (accepted tradeoff — OSD always ZX).
+  static bool profi_ds80_osd_active;     // true while OSD standard-palette override is in effect
+  static void rebuildDS80ColorLut();     // rebuild Graphics8BitPalette::ds80_color_lut from profi_pair_lookup
+  static void applyProfiOSDPalette();    // enable Graphics-layer DS80 colour remap (OSD draws correct colours)
+  static void restoreProfiLivePalette(); // disable Graphics-layer DS80 colour remap
+  static void clearDS80Padding();        // re-blacken DS80 side-padding columns after OSD close
   static void profiPaletteReset();
   // Update palette[index] from a Profi RRRGGGBB color byte; sets dirty flag.
   static void profiPaletteWrite(uint8_t index, uint8_t profi_color);

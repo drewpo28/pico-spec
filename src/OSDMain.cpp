@@ -691,30 +691,54 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
     } ayGuard;
 
 #if !PICO_RP2040
-    // Suspend DS80 packed-pair palette while OSD is visible so OSD bytes (standard
-    // ZX color indices 0-15) are rendered normally. Restored on scope exit.
-    // Uses deferred flags (applied at vblank in EndFrame) to avoid racing with the
-    // HDMI ISR on core1 which reads conv_color[] concurrently.
+    // DS80 OSD palette guard.
+    //
+    // While OSD is open, the Z80/main loop is paused (suspended inside do_OSD()),
+    // so EndFrame() never fires — the deferred profi_ds80_*_pending flags cannot
+    // be applied here.  The HDMI ISR on core1 keeps scanning the (now frozen) DS80
+    // framebuffer, so the Profi screen stays visible behind the dialog.
+    //
+    // Problem: OSD draws standard ZX colour bytes (indices 0..16) into the
+    // framebuffer, but in DS80 mode a framebuffer byte indexes the DS80 packed-pair
+    // conv_color table, not the standard ZX palette — so OSD bytes render as garbled
+    // striped colours (the reported bug).
+    //
+    // Fix: applyProfiOSDPalette() makes the OSD render correctly, in one of two modes
+    // chosen by the "OSD palette" menu toggle (applied live, no reboot):
+    //   STD : restore the standard ZX conv_color snapshot → menu in TRUE ZX colours,
+    //         Profi background re-interpreted through std palette (sacrificed).
+    //   DS80: enable the Graphics-layer remap (Graphics8BitPalette::ds80_active +
+    //         ds80_color_lut[]) so each ZX index → profi_pair_lookup[c][c] (solid Profi
+    //         colour) → menu in Profi-palette colours, background fully correct.
+    // Either way HDMI stays in DS80 mode and the change reverts on OSD close.
+    //
+    // Edge case: if a machine reset fires during OSD, ESPectrum::reset() clears DS80
+    // state directly.  The dtor re-arms activation only if the machine is still DS80.
     struct DS80Guard {
         bool was_active;
         DS80Guard() : was_active(hdmi_profi_ds80_active) {
-            // Cancel any pending activation that arrived just before OSD opened.
+            // Cancel any pending activation that arrived just before OSD opened
+            // (avoids a spurious framebuffer-zeroing + geometry reset under the dialog).
             VIDEO::profi_ds80_activate_pending = false;
-            // Schedule deactivation at next vblank (EndFrame will call hdmi_set_profi_ds80_mode safely).
             if (was_active) {
-                VIDEO::profi_ds80_deactivate_pending = true;
+                VIDEO::profi_ds80_osd_active = true;
+                VIDEO::applyProfiOSDPalette();   // STD swap or DS80 remap (per toggle)
             }
         }
         ~DS80Guard() {
-            // Cancel any stray deactivate pending.
+            if (VIDEO::profi_ds80_osd_active) {
+                VIDEO::profi_ds80_osd_active = false;
+                VIDEO::restoreProfiLivePalette(); // back to live DS80 pair palette
+                // DS80 renderer only rewrites the 256 content bytes per row, so any
+                // side-padding the dialog drew over stays dirty — re-blacken it.
+                VIDEO::clearDS80Padding();
+            }
+            // Cancel any stray deferred flags from transitions during OSD.
+            VIDEO::profi_ds80_activate_pending   = false;
             VIDEO::profi_ds80_deactivate_pending = false;
-            // Re-schedule DS80 activation ONLY if the machine is still supposed to
-            // run in DS80 mode (portDFFD bit7 still set).
-            // Guard: if ESPectrum::reset() was called during OSD it sets portDFFD=0,
-            // so isProfiDS80()=false → we must NOT set activate_pending here, otherwise
-            // EndFrame immediately re-enables DS80 on a machine that was just reset to a
-            // non-DS80 ROM (48K/128K/SOS) causing "DS80 activates on 48K ROM" bug.
-            if (was_active && VIDEO::isProfiDS80()) {
+            // Reset-during-OSD: hdmi_profi_ds80_active was cleared by ESPectrum::reset()
+            // directly.  Re-arm activation only if the machine is still DS80.
+            if (was_active && !hdmi_profi_ds80_active && VIDEO::isProfiDS80()) {
                 VIDEO::profi_ds80_activate_pending = true;
             }
         }
@@ -3686,17 +3710,22 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                             }
                         } else if (ext_ram && arch_num == 8) { // Profi
-                            menu_level = 2;
                             menu_curopt = 1;
                             menu_saverect = true;
                             opt2 = 0;
                             while (1) {
-                                // Profi submenu: ROM selection + Ext keyboard toggle
+                                // menu_level set INSIDE the loop (canonical pattern) so the
+                                // outer Profi submenu level stays stable across iterations,
+                                // even after an inner submenu (level 3) returns.
+                                menu_level = 2;
+                                // Profi submenu: ROM selection + Ext keyboard + OSD palette
                                 string profi_sub =
                                     string(Config::lang ? "Profi\n" : "Profi\n") +
                                     "1024K\n" +
                                     string("Ext keyboard [") +
-                                    (Config::profi_ext_keys ? "ON" : "OFF") + "]\n";
+                                    (Config::profi_ext_keys ? "ON" : "OFF") + "]\n" +
+                                    string("OSD palette [") +
+                                    (Config::profi_ds80_std_palette_osd ? "STD" : "DS80") + "]\n";
                                 uint8_t opt_p = menuRun(profi_sub);
                                 if (opt_p == 1) {
                                     // ROM selected
@@ -3707,7 +3736,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     menu_saverect = false;
                                     break;
                                 } else if (opt_p == 2) {
-                                    // Ext keyboard toggle (Yes/No submenu)
+                                    // Ext keyboard toggle (Yes/No submenu) — level 3
+                                    menu_level = 3;
+                                    menu_curopt = 1;
+                                    menu_saverect = true;
                                     while (1) {
                                         string ext_menu = string(Config::lang ? "Teclado ext.\n" : "Ext keyboard\n");
                                         ext_menu += MENU_YESNO[Config::lang];
@@ -3727,6 +3759,41 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             menu_saverect = false;
                                         } else {
                                             menu_curopt = 2;
+                                            menu_level = 2;
+                                            break; // back to Profi submenu
+                                        }
+                                    }
+                                } else if (opt_p == 3) {
+                                    // OSD palette toggle (STD / DS80) submenu — level 3
+                                    menu_level = 3;
+                                    menu_curopt = 1;
+                                    menu_saverect = true;
+                                    while (1) {
+                                        // Two explicit options: STD (standard ZX palette) / DS80
+                                        // (live Profi palette).  Active one marked with [*].
+                                        string osd_pal_menu = string(Config::lang ? "Paleta OSD\n" : "OSD palette\n");
+                                        bool prev_pal = Config::profi_ds80_std_palette_osd;
+                                        osd_pal_menu += string("STD\t[")  + (prev_pal  ? "*" : " ") + "]\n";
+                                        osd_pal_menu += string("DS80\t[") + (!prev_pal ? "*" : " ") + "]\n";
+                                        uint8_t opt3 = menuRun(osd_pal_menu);
+                                        if (opt3) {
+                                            Config::profi_ds80_std_palette_osd = (opt3 == 1); // 1=STD, 2=DS80
+                                            if (Config::profi_ds80_std_palette_osd != prev_pal) {
+                                                Config::save();
+                                                // Re-apply immediately — OSD blocks the main loop
+                                                // so EndFrame won't fire to do it for us.
+                                                // applyProfiOSDPalette() reads the new flag and
+                                                // picks STD (conv_color swap) or DS80 (Graphics remap).
+                                                if (hdmi_profi_ds80_active) {
+                                                    VIDEO::restoreProfiLivePalette(); // clean slate
+                                                    VIDEO::profi_ds80_osd_active = true;
+                                                    VIDEO::applyProfiOSDPalette();
+                                                }
+                                            }
+                                            menu_curopt = opt3;
+                                            menu_saverect = false;
+                                        } else {
+                                            menu_curopt = 3;
                                             menu_level = 2;
                                             break; // back to Profi submenu
                                         }
@@ -3985,10 +4052,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         }
                     }
                     else if (options_num == 2) {
-                        menu_level = 2;
                         menu_curopt = 1;
                         menu_saverect = true;
                         while (1) {
+                            // menu_level set INSIDE the loop (canonical pattern): inner
+                            // ROM-pref submenus run at level 3 and restore 2 on Esc, but
+                            // setting it here keeps the outer level stable across iterations.
+                            menu_level = 2;
                             uint8_t opt2 = menuRun(MENU_ROM_PREF[Config::lang]);
                             if (opt2) {
                                 if (opt2 == 1) {
@@ -4710,9 +4780,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             menu_curopt = opt2;
                                             menu_saverect = false;
                                         } else if (opt2 == 3) {
+                                            // showLedLegend() does its own SaveRect save/restore,
+                                            // so the LED menu background is already intact on return.
+                                            // menu_saverect MUST be false here: a true would re-save
+                                            // and recalculate y (shifts the menu) and imbalance the
+                                            // SaveRect stack → SIGBUS.
                                             showLedLegend();
                                             menu_curopt = 3;
-                                            menu_saverect = true;
+                                            menu_saverect = false;
                                         } else {
                                             menu_curopt = 8;
                                             menu_level = 2;

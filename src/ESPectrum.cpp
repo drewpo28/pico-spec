@@ -80,6 +80,7 @@ extern size_t getFreeHeap(void);
 
 #if !PICO_RP2040
 extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
+extern "C" volatile bool hdmi_profi_ds80_active;
 #endif
 
 //=======================================================================================
@@ -1070,6 +1071,7 @@ void ESPectrum::reset(uint8_t romInUse) {
   // normal-mode framebuffer renders as vertical scanline garbage.
   if (Ports::portDFFD & 0x80) {
     hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
+    Graphics8BitPalette::ds80_active = false; // leaving DS80 → raw ZX indices again
     // Clear framebuffer immediately after switching HDMI back to standard mode.
     // DS80 packed-pair slot values (0..254) in the framebuffer look like garbage
     // when re-read through the restored standard conv_color table.
@@ -2076,7 +2078,12 @@ void ESPectrum::loop() {
         && !DivMMC::enabled
 #endif
         ;
+    // Indicator sits at x=312 — inside the DS80 right-padding band (content is 32..287).
+    // In DS80 there is no border there, so the "off" state must erase to BLACK, not the
+    // current border colour (which would otherwise leave a permanently visible square).
+    uint8_t led_off_col = zxColor(VIDEO::borderColor, 0);
 #if !PICO_RP2040
+    if (hdmi_profi_ds80_active) led_off_col = zxColor(0, 0);
     if (MB02::enabled && (Config::mb02SoundLed & 1)) {
         // MB-02+ I/O skips the WD1793 command-dispatch paths that drive
         // rvmWD1793::led, so mirror the panel LED off the port-0x13 motor state.
@@ -2085,7 +2092,7 @@ void ESPectrum::loop() {
         if (mb02_led) {
             VIDEO::vga.fillRect(312, 3, 4, 4, zxColor(mb02_led == 2 ? 2 : 1, 1));
         } else {
-            VIDEO::vga.fillRect(312, 3, 4, 4, zxColor(VIDEO::borderColor, 0));
+            VIDEO::vga.fillRect(312, 3, 4, 4, led_off_col);
         }
     } else
 #endif
@@ -2093,7 +2100,7 @@ void ESPectrum::loop() {
         if (ESPectrum::fdd.led) {
             VIDEO::vga.fillRect(312, 3, 4, 4, zxColor(fdd.led == 2 ? 2 : 1, 1));
         } else {
-            VIDEO::vga.fillRect(312, 3, 4, 4, zxColor(VIDEO::borderColor, 0));
+            VIDEO::vga.fillRect(312, 3, 4, 4, led_off_col);
         }
     }
 

@@ -180,6 +180,92 @@ static inline uint32_t profi_color_to_rgb888(uint8_t c) {
 volatile bool VIDEO::profi_palette_dirty = false;
 volatile bool VIDEO::profi_ds80_activate_pending   = false;
 volatile bool VIDEO::profi_ds80_deactivate_pending = false;
+bool VIDEO::profi_ds80_osd_active = false;
+
+// Graphics-layer DS80 colour remap (see Graphics8BitPalette).  When DS80 is active,
+// dotFast()/dot()/fillRect() pass standard ZX colour indices (0..16) through
+// Graphics8BitPalette::ds80_color_lut[] so OSD/LED/menu drawing renders in the
+// intended colour while the framebuffer byte still indexes the DS80 packed-pair
+// conv_color table.  The lut maps ZX index → profi_pair_lookup[c][c] (a SOLID pair
+// slot: both half-pixels = palette[c]).  ORANGE (16) has no DS80 slot → BRI_YELLOW.
+bool    Graphics8BitPalette::ds80_active = false;
+uint8_t Graphics8BitPalette::ds80_color_lut[17] = {0};
+
+void VIDEO::rebuildDS80ColorLut() {
+#if !PICO_RP2040
+    for (int c = 0; c < 16; c++)
+        Graphics8BitPalette::ds80_color_lut[c] = profi_pair_lookup[c][c];
+    // ORANGE (16): no DS80 palette entry — fall back to BRI_YELLOW (14).
+    Graphics8BitPalette::ds80_color_lut[16] = profi_pair_lookup[14][14];
+#endif
+}
+
+// Saved copy of the running app's live Profi palette while the OSD "STD" override is
+// active (so it can be restored verbatim on close).
+#if !PICO_RP2040
+static uint32_t profi_palette_saved[16];
+static bool     profi_palette_saved_valid = false;
+#endif
+
+// OSD palette override for DS80.  The Graphics-layer ZX→DS80 colour remap
+// (Graphics8BitPalette::ds80_active) is already ON for the whole DS80 session — these
+// functions only choose WHICH palette the solid pair slots resolve to, per the
+// "OSD palette" menu toggle (Config::profi_ds80_std_palette_osd):
+//
+//   DS80: keep the running app's live palette unchanged → menu in app colours,
+//         Profi background stays fully correct.  (apply = no-op)
+//
+//   STD : temporarily load the standard ZX palette into profi_palette_live and refresh
+//         the DS80 pair slots (hdmi_set_profi_ds80_mode only rewrites palette slots
+//         0..255 — it never touches the sync/audio/DMA region, so HDMI sync is safe).
+//         → menu in TRUE ZX colours; the Profi background also shifts to ZX colours
+//         (the accepted "OSD in ZX, background sacrificed" tradeoff).  The app palette
+//         is saved here and restored by restoreProfiLivePalette().
+void VIDEO::applyProfiOSDPalette() {
+#if !PICO_RP2040
+    if (Config::profi_ds80_std_palette_osd && !profi_palette_saved_valid) {
+        // Save the app palette, load standard ZX defaults, refresh the pair slots + lut.
+        for (int i = 0; i < 16; i++) profi_palette_saved[i] = profi_palette_live[i];
+        profi_palette_saved_valid = true;
+        for (int i = 0; i < 16; i++) profi_palette_live[i] = profi_default_palette16[i];
+        hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+        rebuildDS80ColorLut();
+    }
+#endif
+}
+
+// Undo applyProfiOSDPalette()'s STD palette swap (restore the running app's palette).
+// Does NOT touch ds80_active — the remap stays ON while DS80 is active.
+void VIDEO::restoreProfiLivePalette() {
+#if !PICO_RP2040
+    if (profi_palette_saved_valid) {
+        for (int i = 0; i < 16; i++) profi_palette_live[i] = profi_palette_saved[i];
+        profi_palette_saved_valid = false;
+        hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+        rebuildDS80ColorLut();
+    }
+#endif
+}
+
+// Re-blacken the DS80 side-padding columns (left 0..pad_l-1 and right pad_l+256..xres-1)
+// across all framebuffer rows.  The DS80 renderer only ever rewrites the 256 content
+// bytes per row, so padding that an OSD dialog drew over is otherwise left dirty after
+// the menu closes (visible artefacts in the side border).  Call after OSD close.
+void VIDEO::clearDS80Padding() {
+#if !PICO_RP2040
+    if (!vga.frameBuffer) return;
+    const int pad_l = ((int)vga.xres - 256) / 2;
+    if (pad_l <= 0) return;
+    const int right_off = pad_l + 256;
+    const int pad_r = (int)vga.xres - right_off;
+    for (int y = 0; y < (int)vga.yres; y++) {
+        uint8_t* row = (uint8_t*)vga.frameBuffer[y];
+        if (!row) continue;
+        memset(row, 0, pad_l);
+        if (pad_r > 0) memset(row + right_off, 0, pad_r);
+    }
+#endif
+}
 
 void VIDEO::profiPaletteReset() {
     for (int i = 0; i < 16; i++) profi_palette_live[i] = profi_default_palette16[i];
@@ -2485,6 +2571,13 @@ IRAM_ATTR void VIDEO::EndFrame() {
             profi_ds80_activate_pending   = false;
             profi_palette_dirty           = false; // palette included in activate
             hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+            // Enable the Graphics-layer ZX→DS80 colour remap for the whole DS80 session
+            // (not just OSD): any vga.* draw with a standard ZX index (FDD indicator,
+            // LED legend, OSD, …) is then mapped to the correct solid DS80 pair slot.
+            // The DS80 scan-time renderer writes pair slots into the fb directly (not via
+            // dotFast), so it is unaffected by the remap.
+            rebuildDS80ColorLut();
+            Graphics8BitPalette::ds80_active = true;
             // Apply DS80 geometry: full 240-line screen, no border.
             // (Mirrors Reset() DS80 branch; skips palette/pair-lookup re-init.)
             grmem = MemESP::videoLatch ? MemESP::ram[6].direct() : MemESP::ram[4].direct();
@@ -2511,6 +2604,7 @@ IRAM_ATTR void VIDEO::EndFrame() {
             profi_ds80_deactivate_pending = false;
             Debug::log("[EF] DS80 deactivate: grmem=%p clrmem=%p", grmem, profi_clrmem);
             hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
+            Graphics8BitPalette::ds80_active = false; // leave DS80 → raw ZX indices again
             // Clear framebuffer: DS80 packed-pair slot values look like garbage
             // when re-interpreted through the standard HDMI conv_color table.
             if (vga.frameBuffer) {
