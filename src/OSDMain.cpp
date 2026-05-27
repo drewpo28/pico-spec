@@ -778,7 +778,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
         (KeytoESP == fabgl::VK_GRAVEACCENT || KeytoESP == fabgl::VK_TILDE)) {
         Config::profi_ext_keys = !Config::profi_ext_keys;
         Config::save();
-        osdCenteredMsg(Config::profi_ext_keys ? " Ext kbd ON  " : " Ext kbd OFF ", LEVEL_INFO, 500);
+        osdCenteredMsg(Config::profi_ext_keys ? " XT keyboard ON  " : " XT keyboard OFF ", LEVEL_INFO, 500);
         return;
     }
 #endif
@@ -3730,11 +3730,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 // outer Profi submenu level stays stable across iterations,
                                 // even after an inner submenu (level 3) returns.
                                 menu_level = 2;
-                                // Profi submenu: ROM selection + Ext keyboard + OSD palette
+                                // Profi submenu: ROM selection + XT keyboard + OSD palette
                                 string profi_sub =
                                     string(Config::lang ? "Profi\n" : "Profi\n") +
                                     "1024K\n" +
-                                    string("Ext keyboard [") +
+                                    string("XT keyboard [") +
                                     (Config::profi_ext_keys ? "ON" : "OFF") + "]\n" +
                                     string("OSD palette [") +
                                     (Config::profi_ds80_std_palette_osd ? "STD" : "DS80") + "]\n";
@@ -3748,12 +3748,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     menu_saverect = false;
                                     break;
                                 } else if (opt_p == 2) {
-                                    // Ext keyboard toggle (Yes/No submenu) — level 3
+                                    // XT keyboard toggle (Yes/No submenu) — level 3
                                     menu_level = 3;
                                     menu_curopt = 1;
                                     menu_saverect = true;
                                     while (1) {
-                                        string ext_menu = string(Config::lang ? "Teclado ext.\n" : "Ext keyboard\n");
+                                        string ext_menu = string(Config::lang ? "Teclado XT\n" : "XT keyboard\n");
                                         ext_menu += MENU_YESNO[Config::lang];
                                         bool prev_ext = Config::profi_ext_keys;
                                         if (prev_ext) {

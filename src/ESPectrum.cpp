@@ -1547,58 +1547,197 @@ IRAM_ATTR void ESPectrum::processKeyboard() {
                (!Kbd->isVKDown(fabgl::VK_B)) & (!Kbd->isVKDown(fabgl::VK_b)));
 
 #if !PICO_RP2040
-      // ── Profi extended keyboard matrix ──────────────────────────────────
-      // Only active when arch=Profi and extended keyboard mode is on.
-      // Bit 5 of rows 0-7 via extPort[]; additional rows via port[8..10].
+      // ── Profi extended keyboard ─────────────────────────────────────────
+      // Active when arch=Profi and extended keyboard mode is on.
+      //
+      // Mechanism (verified from profi_v10.rom bank 0 disasm):
+      //  - The ROM scanner (0x03A9) reads bit5 of each port 0xFE half-row into
+      //    RAM 0x99DA. Bit5 of row 6 (0xBFFE) is the "ALT" modifier (BIT 6,A at
+      //    0x1303). Held bit5 is asserted via extPort[6].
+      //  - When ALT is set, the decoded ZX key is remapped via the table at
+      //    ROM 0x365B: ALT + bare letter A..P → codes 0x75..0x84.
+      //
+      //  Matrix coords: rows are the 8 port-0xFE half-rows 0..7
+      //  (0xFEFE,0xFDFE,0xFBFE,0xF7FE,0xEFFE,0xDFFE,0xBFFE,0x7FFE);
+      //  CapsShift=(0,0), SymbolShift=(7,1).
+      //
+      //  TWO produce paths (verified via test cell-table 0x3427 + decode tables
+      //  0x0450/0x0478/0x04A0 + ALT-remap 0x365B):
+      //   (A) ALT held → bare letter remapped: A..J→F1-F10, K..P→nav (0x7F-0x84)
+      //   (B) NO ALT → CapsShift/SymShift combo decoded directly:
+      //         F11=Caps+Q(0x67) F12=Caps+W(0x68) ESC=Sym+1(0x1B) TAB=Sym+I(0x09)
+      //  Path-B keys MUST NOT assert ALT, or 0x365B would remap them.
       if (Z80Ops::isProfi && Config::profi_ext_keys) {
-        // Row 0: Ctrl → bit 5
-        bitWrite(Ports::extPort[0], 5,
-                 (!Kbd->isVKDown(fabgl::VK_LCTRL)) & (!Kbd->isVKDown(fabgl::VK_RCTRL)));
-        // Row 1: Alt → bit 5
-        bitWrite(Ports::extPort[1], 5,
-                 (!Kbd->isVKDown(fabgl::VK_LALT)) & (!Kbd->isVKDown(fabgl::VK_RALT)));
-        // Row 2: F1 → bit 5
-        bitWrite(Ports::extPort[2], 5, !Kbd->isVKDown(fabgl::VK_F1));
-        // Row 3: F2 → bit 5
-        bitWrite(Ports::extPort[3], 5, !Kbd->isVKDown(fabgl::VK_F2));
-        // Row 4: F3 → bit 5
-        bitWrite(Ports::extPort[4], 5, !Kbd->isVKDown(fabgl::VK_F3));
-        // Row 5: F4 → bit 5
-        bitWrite(Ports::extPort[5], 5, !Kbd->isVKDown(fabgl::VK_F4));
-        // Row 6: F5 → bit 5
-        bitWrite(Ports::extPort[6], 5, !Kbd->isVKDown(fabgl::VK_F5));
-        // Row 7: CapsLock → bit 5
-        bitWrite(Ports::extPort[7], 5, !Kbd->isVKDown(fabgl::VK_CAPSLOCK));
-        // Row 8: F6-F12 (bits 0-6). Address scheme TBD from CP/M ROM analysis.
-        Ports::port[8] = 0xFF;
-        bitWrite(Ports::port[8], 0, !Kbd->isVKDown(fabgl::VK_F6));
-        bitWrite(Ports::port[8], 1, !Kbd->isVKDown(fabgl::VK_F7));
-        bitWrite(Ports::port[8], 2, !Kbd->isVKDown(fabgl::VK_F8));
-        bitWrite(Ports::port[8], 3, !Kbd->isVKDown(fabgl::VK_F9));
-        bitWrite(Ports::port[8], 4, !Kbd->isVKDown(fabgl::VK_F10));
-        bitWrite(Ports::port[8], 5, !Kbd->isVKDown(fabgl::VK_F11));
-        bitWrite(Ports::port[8], 6, !Kbd->isVKDown(fabgl::VK_F12));
-        // Row 9: arrows + INS/DEL/HOME/END (bits 0-7). Address scheme TBD.
-        Ports::port[9] = 0xFF;
-        bitWrite(Ports::port[9], 0, !Kbd->isVKDown(fabgl::VK_UP));
-        bitWrite(Ports::port[9], 1, !Kbd->isVKDown(fabgl::VK_DOWN));
-        bitWrite(Ports::port[9], 2, !Kbd->isVKDown(fabgl::VK_LEFT));
-        bitWrite(Ports::port[9], 3, !Kbd->isVKDown(fabgl::VK_RIGHT));
-        bitWrite(Ports::port[9], 4, !Kbd->isVKDown(fabgl::VK_INSERT));
-        bitWrite(Ports::port[9], 5, !Kbd->isVKDown(fabgl::VK_DELETE));
-        bitWrite(Ports::port[9], 6, !Kbd->isVKDown(fabgl::VK_HOME));
-        bitWrite(Ports::port[9], 7, !Kbd->isVKDown(fabgl::VK_END));
-        // Row 10: PGUP/PGDN/BS/ESC/TAB (bits 0-4). Address scheme TBD.
-        Ports::port[10] = 0xFF;
-        bitWrite(Ports::port[10], 0, !Kbd->isVKDown(fabgl::VK_PAGEUP));
-        bitWrite(Ports::port[10], 1, !Kbd->isVKDown(fabgl::VK_PAGEDOWN));
-        bitWrite(Ports::port[10], 2, !Kbd->isVKDown(fabgl::VK_BACKSPACE));
-        bitWrite(Ports::port[10], 3, !Kbd->isVKDown(fabgl::VK_ESCAPE));
-        bitWrite(Ports::port[10], 4, !Kbd->isVKDown(fabgl::VK_TAB));
+        // Path A — bare letter
+        bool f1  = Kbd->isVKDown(fabgl::VK_F1);
+        bool f2  = Kbd->isVKDown(fabgl::VK_F2);
+        bool f3  = Kbd->isVKDown(fabgl::VK_F3);
+        bool f4  = Kbd->isVKDown(fabgl::VK_F4);
+        bool f5  = Kbd->isVKDown(fabgl::VK_F5);
+        bool f6  = Kbd->isVKDown(fabgl::VK_F6);
+        bool f7  = Kbd->isVKDown(fabgl::VK_F7);
+        bool f8  = Kbd->isVKDown(fabgl::VK_F8);
+        bool f9  = Kbd->isVKDown(fabgl::VK_F9);
+        bool f10 = Kbd->isVKDown(fabgl::VK_F10);
+        bool kHome = Kbd->isVKDown(fabgl::VK_HOME);
+        bool kEnd  = Kbd->isVKDown(fabgl::VK_END);
+        bool kPgUp = Kbd->isVKDown(fabgl::VK_PAGEUP);
+        bool kPgDn = Kbd->isVKDown(fabgl::VK_PAGEDOWN);
+        bool kIns  = Kbd->isVKDown(fabgl::VK_INSERT);
+        bool kDel  = Kbd->isVKDown(fabgl::VK_DELETE);
+        // Arrows = CapsShift + 5/6/7/8 (ZX cursor keys; CAPS decode layer, no ALT)
+        bool kUp    = Kbd->isVKDown(fabgl::VK_UP);
+        bool kDown  = Kbd->isVKDown(fabgl::VK_DOWN);
+        bool kLeft  = Kbd->isVKDown(fabgl::VK_LEFT);
+        bool kRight = Kbd->isVKDown(fabgl::VK_RIGHT);
+        // SymShift symbol keys not in the base ZX matrix (Profi sym layer 0x3B97)
+        bool sMinus  = Kbd->isVKDown(fabgl::VK_MINUS);
+        bool sEqual  = Kbd->isVKDown(fabgl::VK_EQUALS);
+        bool sLBrk   = Kbd->isVKDown(fabgl::VK_LEFTBRACKET);
+        bool sRBrk   = Kbd->isVKDown(fabgl::VK_RIGHTBRACKET);
+        bool sBSlash = Kbd->isVKDown(fabgl::VK_BACKSLASH);
+        bool sSlash  = Kbd->isVKDown(fabgl::VK_SLASH);
+        bool sColon  = Kbd->isVKDown(fabgl::VK_COLON);
+        bool sQuote  = Kbd->isVKDown(fabgl::VK_QUOTE);
+        bool sSemi   = Kbd->isVKDown(fabgl::VK_SEMICOLON);
+        bool sComma  = Kbd->isVKDown(fabgl::VK_COMMA);   // Sym+N → ','
+        bool sPeriod = Kbd->isVKDown(fabgl::VK_PERIOD);  // Sym+M → '.'
+        bool kBS     = Kbd->isVKDown(fabgl::VK_BACKSPACE); // Caps+0 → BS
+
+        // Path B — Caps/Sym combo
+        bool f11  = Kbd->isVKDown(fabgl::VK_F11);
+        bool f12  = Kbd->isVKDown(fabgl::VK_F12);
+        bool kEsc = Kbd->isVKDown(fabgl::VK_ESCAPE);
+        bool kTab = Kbd->isVKDown(fabgl::VK_TAB);
+        bool kCaps = Kbd->isVKDown(fabgl::VK_CAPSLOCK);
+        bool lAlt = Kbd->isVKDown(fabgl::VK_LALT);   // left Alt  → Sym+Enter (0x69)
+        bool rAlt = Kbd->isVKDown(fabgl::VK_RALT);   // right Alt → Sym+Space (0x71)
+        bool altDown = lAlt || rAlt;
+
+        // extPort bit5 = Profi ext column. Bit5-of-row6 (0xBFFE) is the "ALT"
+        // modifier (ROM BIT 6,(0x99DA) at 0x114E). ALT makes the ROM remap a
+        // bare letter via table 0x3571: A..J → F1-F10 (0x75-0x7E),
+        // K..P → nav (0x7F-0x84). Without ALT the letters stay as A..P.
+        for (int i = 0; i < 8; i++) Ports::extPort[i] |= 0x20;
+        bool anyFkey = f1||f2||f3||f4||f5||f6||f7||f8||f9||f10;
+        bool anyNav  = kHome || kEnd || kPgUp || kPgDn || kIns || kDel;
+        // Direct Alt+letter combo: holding physical Alt + a normal letter that
+        // the 0x3571 table remaps (A..P) should yield the same F-key/nav code
+        // as the dedicated F-keys do — exactly like the real Profi keyboard.
+        // The letter is already placed in the matrix by the normal scan; we
+        // just add bit5 so the ROM remaps it. (A..J→F1-F10, K..P→nav.)
+        bool altLetter = altDown &&
+          (Kbd->isVKDown(fabgl::VK_A)||Kbd->isVKDown(fabgl::VK_a)||
+           Kbd->isVKDown(fabgl::VK_B)||Kbd->isVKDown(fabgl::VK_b)||
+           Kbd->isVKDown(fabgl::VK_C)||Kbd->isVKDown(fabgl::VK_c)||
+           Kbd->isVKDown(fabgl::VK_D)||Kbd->isVKDown(fabgl::VK_d)||
+           Kbd->isVKDown(fabgl::VK_E)||Kbd->isVKDown(fabgl::VK_e)||
+           Kbd->isVKDown(fabgl::VK_F)||Kbd->isVKDown(fabgl::VK_f)||
+           Kbd->isVKDown(fabgl::VK_G)||Kbd->isVKDown(fabgl::VK_g)||
+           Kbd->isVKDown(fabgl::VK_H)||Kbd->isVKDown(fabgl::VK_h)||
+           Kbd->isVKDown(fabgl::VK_I)||Kbd->isVKDown(fabgl::VK_i)||
+           Kbd->isVKDown(fabgl::VK_J)||Kbd->isVKDown(fabgl::VK_j)||
+           Kbd->isVKDown(fabgl::VK_K)||Kbd->isVKDown(fabgl::VK_k)||
+           Kbd->isVKDown(fabgl::VK_L)||Kbd->isVKDown(fabgl::VK_l)||
+           Kbd->isVKDown(fabgl::VK_M)||Kbd->isVKDown(fabgl::VK_m)||
+           Kbd->isVKDown(fabgl::VK_N)||Kbd->isVKDown(fabgl::VK_n)||
+           Kbd->isVKDown(fabgl::VK_O)||Kbd->isVKDown(fabgl::VK_o)||
+           Kbd->isVKDown(fabgl::VK_P)||Kbd->isVKDown(fabgl::VK_p));
+        // Bit5 (the 0x3571-remap modifier): for dedicated F1-F10/nav keys, and
+        // for a direct physical Alt+letter combo. NOT for Alt-alone (that lights
+        // the Alt cell via Sym+Enter/Space below; bit5 on row6 would corrupt it).
+        if (anyFkey || anyNav || altLetter)
+          Ports::extPort[6] &= ~0x20;
+
+        // Path A: bare letter (ROM decodes A=F1 … J=F10; K..P + ALT = nav)
+        if (f1)    PS2cols[1] &= ~0x01;   // A → (1,0)  F1
+        if (f2)    PS2cols[7] &= ~0x10;   // B → (7,4)  F2
+        if (f3)    PS2cols[0] &= ~0x08;   // C → (0,3)  F3
+        if (f4)    PS2cols[1] &= ~0x04;   // D → (1,2)  F4
+        if (f5)    PS2cols[2] &= ~0x04;   // E → (2,2)  F5
+        if (f6)    PS2cols[1] &= ~0x08;   // F → (1,3)  F6
+        if (f7)    PS2cols[1] &= ~0x10;   // G → (1,4)  F7
+        if (f8)    PS2cols[6] &= ~0x10;   // H → (6,4)  F8
+        if (f9)    PS2cols[5] &= ~0x04;   // I → (5,2)  F9
+        if (f10)   PS2cols[6] &= ~0x08;   // J → (6,3)  F10
+        if (kHome) PS2cols[6] &= ~0x04;   // K → (6,2)  HOME (0x7F)
+        if (kEnd)  PS2cols[6] &= ~0x02;   // L → (6,1)  END  (0x80)
+        if (kPgUp) PS2cols[7] &= ~0x04;   // M → (7,2)  PgUp (0x81)
+        if (kPgDn) PS2cols[7] &= ~0x08;   // N → (7,3)  PgDn (0x82)
+        if (kIns)  PS2cols[5] &= ~0x02;   // O → (5,1)  INS  (0x83)
+        if (kDel)  PS2cols[5] &= ~0x01;   // P → (5,0)  DEL  (0x84)
+
+        // Arrows = CapsShift + 5/6/7/8 (CAPS decode layer, no ALT)
+        //   LEFT=Caps+5(3,4) DOWN=Caps+6(4,4) UP=Caps+7(4,3) RIGHT=Caps+8(4,2)
+        if (kLeft)  { PS2cols[0] &= ~0x01; PS2cols[3] &= ~0x10; } // Caps+5 LEFT
+        if (kDown)  { PS2cols[0] &= ~0x01; PS2cols[4] &= ~0x10; } // Caps+6 DOWN
+        if (kUp)    { PS2cols[0] &= ~0x01; PS2cols[4] &= ~0x08; } // Caps+7 UP
+        if (kRight) { PS2cols[0] &= ~0x01; PS2cols[4] &= ~0x04; } // Caps+8 RIGHT
+
+        // Path B: shift-combo specials (hddboot decode tables 0x3B6F/97/BF).
+        //   F11=Sym+Q(0x67) F12=Sym+W(0x68) ESC=Caps+1(0x1B) TAB=Caps+I(0x09)
+        // The normal scanner maps VK_ESCAPE→Break (Caps+Space), so release the
+        // stray Space bit first so ESC decodes cleanly to 0x1B.
+        if ((kEsc || kTab) && !Kbd->isVKDown(fabgl::VK_SPACE))
+          PS2cols[7] |= 0x01;            // release Space (7,0) left by ESC=Break
+        // TAB: normal scan sets "Extended mode" = Caps+Sym; release stray SymShift.
+        if (kTab) PS2cols[7] |= 0x02;
+        // QUOTE: normal scan sets "Double quote" = Sym+P; release stray P (5,0).
+        if (sQuote) PS2cols[5] |= 0x01;
+        // CAPSLOCK: normal scan sets Caps+"2"; release stray "2" (3,1) so the
+        // CpLoc cell (code 0x70 = Caps+Sym) decodes cleanly.
+        if (kCaps) PS2cols[3] |= 0x02;
+        if (f11) { PS2cols[7] &= ~0x02; PS2cols[2] &= ~0x01; } // Sym+Q → F11 (0x67)
+        if (f12) { PS2cols[7] &= ~0x02; PS2cols[2] &= ~0x02; } // Sym+W → F12 (0x68)
+        if (kEsc) { PS2cols[0] &= ~0x01; PS2cols[3] &= ~0x01; } // Caps+1 → ESC (0x1B)
+        if (kTab) { PS2cols[0] &= ~0x01; PS2cols[5] &= ~0x04; } // Caps+I → TAB (0x09)
+        if (kCaps){ PS2cols[0] &= ~0x01; PS2cols[7] &= ~0x02; } // Caps+Sym → CpLoc (0x70)
+        // Alt cell (code 0x69) = SymShift + Enter. The bit5 modifier alone is
+        // stripped by the scanner (AND 0x1F at 0x0618) and never decodes to a
+        // code, so the test can't show it from extPort[6]; the real Profi Alt
+        // key closes Sym+Enter. Assert that so the Alt cell lights.
+        // Alt cell (Alt held alone, no remappable letter): L=Sym+Enter, R=Sym+Space.
+        // Skipped when altLetter — then Alt acts as the F-key/nav remap modifier.
+        if (lAlt && !altLetter) { PS2cols[7] &= ~0x02; PS2cols[6] &= ~0x01; } // → L-Alt (0x69)
+        if (rAlt && !altLetter) { PS2cols[7] &= ~0x02; PS2cols[7] &= ~0x01; } // → R-Alt (0x71)
+
+        // SymShift symbol keys (Profi sym layer): assert SymShift(7,1) + base key
+        if (sMinus)  { PS2cols[7] &= ~0x02; PS2cols[6] &= ~0x08; } // Sym+J → '-'
+        if (sEqual)  { PS2cols[7] &= ~0x02; PS2cols[6] &= ~0x02; } // Sym+L → '='
+        if (sLBrk)   { PS2cols[7] &= ~0x02; PS2cols[5] &= ~0x10; } // Sym+Y → '['
+        if (sRBrk)   { PS2cols[7] &= ~0x02; PS2cols[5] &= ~0x08; } // Sym+U → ']'
+        if (sBSlash) { PS2cols[7] &= ~0x02; PS2cols[1] &= ~0x04; } // Sym+D → '\'
+        if (sSlash)  { PS2cols[7] &= ~0x02; PS2cols[0] &= ~0x10; } // Sym+V → '/'
+        if (sColon)  { PS2cols[7] &= ~0x02; PS2cols[0] &= ~0x02; } // Sym+Z → ':'
+        if (sQuote)  { PS2cols[7] &= ~0x02; PS2cols[4] &= ~0x08; } // Sym+7 → '\''
+        if (sSemi)   { PS2cols[7] &= ~0x02; PS2cols[5] &= ~0x02; } // Sym+O → ';'
+
+        // Profi labels Ctrl/Shift opposite to ZX: cell "Ctrl"=CapsShift(0,0),
+        // cell "Shift"=SymShift(7,1). Normal scanner maps phys-Shift→CapsShift
+        // and phys-Ctrl→SymShift, so they appear swapped. In Ext mode drive
+        // these two bits from the swapped physical keys so cells match labels.
+        bool physCtrl  = Kbd->isVKDown(fabgl::VK_LCTRL)  || Kbd->isVKDown(fabgl::VK_RCTRL);
+        bool physShift = Kbd->isVKDown(fabgl::VK_LSHIFT) || Kbd->isVKDown(fabgl::VK_RSHIFT);
+        // Final authoritative value of the two shift bits, computed from ALL
+        // sources at once (the normal scanner's reversed phys-Shift→CapsShift /
+        // phys-Ctrl→SymShift is overridden here). A bit is asserted (cleared)
+        // if ANY consumer needs it; otherwise released.
+        //   CapsShift(0,0): phys Ctrl (swap), arrows, ESC, TAB, CapsLock
+        //   SymShift(7,1):  phys Shift (swap), F11, F12, CapsLock, all sym-symbols
+        bool anyArrow = kUp || kDown || kLeft || kRight;
+        // Disasm: CapsShift-alone→0x74→cell "Ctrl"; SymShift-alone→0x73→cell
+        // "Shift". So phys Ctrl → CapsShift, phys Shift → SymShift.
+        bool needCaps = physCtrl || anyArrow || kEsc || kTab || kCaps || kBS;
+        bool needSym  = physShift || f11 || f12 || kCaps || (altDown && !altLetter)
+                      || sMinus || sEqual || sLBrk || sRBrk || sBSlash
+                      || sSlash || sColon || sQuote || sSemi
+                      || sComma || sPeriod;
+        bitWrite(PS2cols[0], 0, !needCaps);
+        bitWrite(PS2cols[7], 1, !needSym);
+
       } else {
-        // Not in extended mode — clear extended state (all keys released)
+        // Not in extended mode — release all extended bits
         for (int i = 0; i < 8; i++) Ports::extPort[i] = 0xFF;
-        Ports::port[8] = Ports::port[9] = Ports::port[10] = 0xFF;
       }
 #endif
     }

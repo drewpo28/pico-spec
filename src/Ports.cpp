@@ -260,8 +260,6 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
           if ((portHigh & mask) != 0)
             data &= (extPort[row] | 0xDF); // mask: only bit 5 can be cleared
         }
-        // TODO: additional extended rows (F6-F12, arrows, nav keys) via port[8..10].
-        // Address scheme TBD — run keyboard test with port-read logging to find exact addresses.
       }
 #endif
     }
