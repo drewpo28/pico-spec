@@ -65,6 +65,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Debug.h"
 #if !PICO_RP2040
 #include "DivMMC.h"
+#include "IDE.h"
 #include "MB02.h"
 #endif
 #include "Midi.h"
@@ -805,6 +806,8 @@ void ESPectrum::setup() {
   Debug::log2SD("setup: DivMMC::init begin, freeHeap=%u", (unsigned)getFreeHeap());
   DivMMC::init();
   Debug::log2SD("setup: DivMMC::init done, freeHeap=%u", (unsigned)getFreeHeap());
+  // IDE/HDD (NEMO/PROFI schemes) — independent of DivMMC.
+  IDE::init();
   // MB-02+ disk interface (allocates SRAM in butter PSRAM after DivMMC)
   Debug::log2SD("setup: MB02::init begin");
   MB02::init();

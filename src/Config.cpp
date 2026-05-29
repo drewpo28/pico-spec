@@ -112,6 +112,9 @@ uint8_t  Config::mb02 = 0;
 bool     Config::mb02WP[4] = { true, true, true, true };
 uint8_t  Config::mb02SoundLed = 0; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
 bool     Config::zcontroller = false;
+uint8_t  Config::ide_scheme = 0;
+string   Config::ide_image[2] = {"", ""};
+uint16_t Config::ide_chs[2][3] = {{0,0,0},{0,0,0}};
 #endif
 
 uint8_t Config::scanlines = 0;
@@ -592,6 +595,17 @@ void Config::load() {
         { bool old_divmmc = false; nvs_get_b("divmmc", old_divmmc, sts); if (old_divmmc && esxdos == 0) esxdos = 1; }
         nvs_get_str("esxdos_hdf", esxdos_hdf_image[0], sts);
         nvs_get_str("esxdos_hd1", esxdos_hdf_image[1], sts);
+        nvs_get_u8("ide_scheme", ide_scheme, sts);
+        nvs_get_str("ide_img0", ide_image[0], sts);
+        nvs_get_str("ide_img1", ide_image[1], sts);
+        for (int s = 0; s < 2; s++) {
+            char k[10]; snprintf(k, sizeof(k), "ide_chs%d", s);
+            string chs; nvs_get_str(k, chs, sts);
+            unsigned c=0,h=0,se=0;
+            if (sscanf(chs.c_str(), "%u/%u/%u", &c,&h,&se) == 3) {
+                ide_chs[s][0]=c; ide_chs[s][1]=h; ide_chs[s][2]=se;
+            }
+        }
         nvs_get_u8("mb02", mb02, sts);
         for (int i = 0; i < 4; i++) {
             char k[12]; snprintf(k, sizeof(k), "mb02d%d.wp", i);
@@ -827,6 +841,14 @@ void Config::save() {
     nvs_set_u8(buf,"esxdos", esxdos);
     nvs_set_str(buf,"esxdos_hdf", esxdos_hdf_image[0].c_str());
     nvs_set_str(buf,"esxdos_hd1", esxdos_hdf_image[1].c_str());
+    nvs_set_u8(buf,"ide_scheme", ide_scheme);
+    nvs_set_str(buf,"ide_img0", ide_image[0].c_str());
+    nvs_set_str(buf,"ide_img1", ide_image[1].c_str());
+    for (int s = 0; s < 2; s++) {
+        char k[10]; snprintf(k, sizeof(k), "ide_chs%d", s);
+        char v[20]; snprintf(v, sizeof(v), "%u/%u/%u", ide_chs[s][0], ide_chs[s][1], ide_chs[s][2]);
+        nvs_set_str(buf, k, v);
+    }
     nvs_set_u8(buf,"mb02", mb02);
     for (int i = 0; i < 4; i++) {
         char k[12]; snprintf(k, sizeof(k), "mb02d%d.wp", i);

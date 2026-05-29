@@ -219,6 +219,9 @@ public:
     static bool mb02WP[4];   // MB-02+ per-slot write protect
     static uint8_t mb02SoundLed;// MB-02+ disk sound & LED: 0=Off, 1=Led, 2=Sound, 3=Sound+Led
     static bool zcontroller; // Z-Controller SD on ports 0x77/0x57 (mutually exclusive with esxDOS/MB-02+)
+    static uint8_t ide_scheme;   // IDE/HDD: 0=OFF 1=NEMO 2=PROFI (mutually exclusive with esxDOS DivMMC/DivIDE)
+    static string ide_image[2];  // IDE hd0/hd1 image paths ([0]=master, [1]=slave)
+    static uint16_t ide_chs[2][3]; // per-slot geometry override [C,H,S]; 0,0,0 = auto-detect
 #endif
     
     static signed char aud_volume;

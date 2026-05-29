@@ -371,7 +371,8 @@ static const char *MENU_TAPEPLAYER2[2] = { "Input (P" _PIN_XSTR(LOAD_WAV_PIO) ")
     "esxDOS\t>\n"\
     "MB-02+\t>\n"\
     "Z-Controller\t>\n"\
-    "Snapshot\t>\n"
+    "Snapshot\t>\n"\
+    "IDE/HDD\t>\n"
 #define MENU_STORAGE_MAIN_ES \
     "Almacenamiento\n"\
     "Casete\t>\n"\
@@ -379,7 +380,8 @@ static const char *MENU_TAPEPLAYER2[2] = { "Input (P" _PIN_XSTR(LOAD_WAV_PIO) ")
     "esxDOS\t>\n"\
     "MB-02+\t>\n"\
     "Z-Controller\t>\n"\
-    "Snapshots\t>\n"
+    "Snapshots\t>\n"\
+    "IDE/HDD\t>\n"
 static const char *MENU_STORAGE_MAIN[2] = { MENU_STORAGE_MAIN_EN, MENU_STORAGE_MAIN_ES };
 #else
 #define MENU_STORAGE_MAIN_EN \
@@ -418,6 +420,9 @@ static const char *MENU_BETA_DRIVE_LETTERS[4] = { "A", "B", "C", "D" };
 #if !PICO_RP2040
 static const char *MENU_ESXDOS_TITLE[2] = { "esxDOS\n", "esxDOS\n" };
 static const char *MENU_IMG_TITLE[2] = { "esxDOS Image\n", "Imagen esxDOS\n" };
+static const char *MENU_IDE_TITLE[2] = { "IDE/HDD\n", "IDE/HDD\n" };
+static const char *MENU_IDE_SCHEME[2] = { "Scheme", "Esquema" };
+static const char *MENU_IDE_IMG_TITLE[2] = { "IDE Image", "Imagen IDE" };
 #endif
 
 static const char *MENU_FASTMODE[2] = { "Fast Mode\n", "Modo rápido\n" };

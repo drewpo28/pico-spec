@@ -37,6 +37,9 @@ THE SOFTWARE.
 #include "OSDMain.h"
 #include "messages.h"
 #include "Z80_JLS/z80.h"
+#if !PICO_RP2040
+#include "td0.h"
+#endif
 
 static bool sclConvertToTRD(rvmWD1793 *wd);
 
@@ -82,6 +85,7 @@ static const uint16_t sectdatapos[16]= { 162,554,946,1338,1730,2122,2514,2906,32
 
 #if !PICO_RP2040
 static uint16_t vgCrc(uint16_t crc, uint8_t byte);
+void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side);
 #endif
 
 #ifndef ESP_PLATFORM
@@ -444,7 +448,7 @@ IRAM_ATTR void _do(rvmWD1793 *wd) {
 
     case kRVMWD177XTypeIICommand: {
 #if !PICO_RP2040
-      if (wd->disk[wd->diskS] && (wd->disk[wd->diskS]->IsFDIFile || wd->disk[wd->diskS]->IsMBDFile))
+      if (wd->disk[wd->diskS] && (wd->disk[wd->diskS]->IsFDIFile || wd->disk[wd->diskS]->IsMBDFile || wd->disk[wd->diskS]->IsTD0File))
           wd->fdiTstates = 0;
 #endif
 
@@ -581,7 +585,7 @@ IRAM_ATTR void _do(rvmWD1793 *wd) {
         {
             uint32_t sz = 128 << (wd->header[4] & 0x03);
 #if !PICO_RP2040
-            if (!wd->disk[wd->diskS]->IsUDIFile && !wd->disk[wd->diskS]->IsFDIFile && !wd->disk[wd->diskS]->IsMBDFile)
+            if (!wd->disk[wd->diskS]->IsUDIFile && !wd->disk[wd->diskS]->IsFDIFile && !wd->disk[wd->diskS]->IsMBDFile && !wd->disk[wd->diskS]->IsTD0File)
 #endif
                 sz = 0x100;
             wd->c = sz;
@@ -681,7 +685,7 @@ case kRVMWD177XWriteData: {
 #if !PICO_RP2040
       // On real WD1793, writing a sector produces valid CRC. Fix the MFM buffer
       // and cached flags so subsequent reads on this track return correct CRC.
-      if (wd->disk[wd->diskS] && (wd->disk[wd->diskS]->IsFDIFile || wd->disk[wd->diskS]->IsMBDFile) && wd->diskDirty) {
+      if (wd->disk[wd->diskS] && (wd->disk[wd->diskS]->IsFDIFile || wd->disk[wd->diskS]->IsMBDFile || wd->disk[wd->diskS]->IsTD0File) && wd->diskDirty) {
           for (int n = 0; n < wd->fdiSectorCount; n++) {
               uint32_t idPos = wd->fdiSectorIdPos[n];
               if (idPos + 5 < (uint32_t)wd->diskTrackLen &&
@@ -751,7 +755,7 @@ case kRVMWD177XWriteData: {
         // FDI: data mark not found after ID match (sector has no data area).
         // Go to ReadHeader (preserves retry) and force index pulse so retry
         // decrements — prevents infinite loop from TypeIICommand resetting retry=5.
-        if (wd->disk[wd->diskS] && (wd->disk[wd->diskS]->IsFDIFile || wd->disk[wd->diskS]->IsMBDFile)) {
+        if (wd->disk[wd->diskS] && (wd->disk[wd->diskS]->IsFDIFile || wd->disk[wd->diskS]->IsMBDFile || wd->disk[wd->diskS]->IsTD0File)) {
             wd->disk[wd->diskS]->indx = wd->diskTrackLen; // trigger index pulse
             wd->state=kRVMWD177XReadHeader;
             wd->next=kRVMWD177XReadSectorHeader;
@@ -794,7 +798,7 @@ case kRVMWD177XWriteData: {
       if(!--wd->c) { // CRC readed
 
 #if !PICO_RP2040
-        if (wd->disk[wd->diskS] && (wd->disk[wd->diskS]->IsFDIFile || wd->disk[wd->diskS]->IsMBDFile) && wd->fdiDataCrcError) {
+        if (wd->disk[wd->diskS] && (wd->disk[wd->diskS]->IsFDIFile || wd->disk[wd->diskS]->IsMBDFile || wd->disk[wd->diskS]->IsTD0File) && wd->fdiDataCrcError) {
           wd->status |= kRVMWD177XStatusCRC;
           wd->fdiDataCrcError = false;
         } else
@@ -917,7 +921,7 @@ case kRVMWD177XWriteTrack: {
               // For raw format disks (UDI/FDI/MBD), indx runs sequentially through the track buffer;
               // sectdatapos repositioning is only valid for TRD's fixed sector layout.
 #if !PICO_RP2040
-              if (!wd->disk[wd->diskS]->IsUDIFile && !wd->disk[wd->diskS]->IsFDIFile && !wd->disk[wd->diskS]->IsMBDFile)
+              if (!wd->disk[wd->diskS]->IsUDIFile && !wd->disk[wd->diskS]->IsFDIFile && !wd->disk[wd->diskS]->IsMBDFile && !wd->disk[wd->diskS]->IsTD0File)
 #endif
               wd->disk[wd->diskS]->indx = sectdatapos[wd->wtracksector - 1] + 41;
             } else if (wd->wtrackmark & 0b100000000) {
@@ -1086,7 +1090,7 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
 #if !PICO_RP2040
         // FDI/MBD: empty track (0 sectors) — report Record Not Found immediately
         // instead of spinning for 5 full revolutions (~5 seconds).
-        if (wd->disk[wd->diskS] && (wd->disk[wd->diskS]->IsFDIFile || wd->disk[wd->diskS]->IsMBDFile)
+        if (wd->disk[wd->diskS] && (wd->disk[wd->diskS]->IsFDIFile || wd->disk[wd->diskS]->IsMBDFile || wd->disk[wd->diskS]->IsTD0File)
             && wd->state == kRVMWD177XReadHeaderBytes
             && wd->fdiSectorCount == 0)
         {
@@ -1104,7 +1108,7 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
         // FDI/MBD find_marker: find nearest sector header ahead of current disk->indx.
         // Uses actual MFM buffer position (not CPU T-states) for compatibility
         // with the incremental indx++ model used in rvmwdDiskStep.
-        if (wd->disk[wd->diskS] && (wd->disk[wd->diskS]->IsFDIFile || wd->disk[wd->diskS]->IsMBDFile)
+        if (wd->disk[wd->diskS] && (wd->disk[wd->diskS]->IsFDIFile || wd->disk[wd->diskS]->IsMBDFile || wd->disk[wd->diskS]->IsTD0File)
             && (wd->state == kRVMWD177XReadHeaderBytes
                 || wd->state == kRVMWD177XReadAddressDataFlag)
             && wd->marka == mark
@@ -1575,7 +1579,7 @@ void rvmWD1793Reset(rvmWD1793 *wd) {
   {
     bool hasRawDisk = false;
     for (int i = 0; i < 4; i++)
-      if (wd->disk[i] && (wd->disk[i]->IsUDIFile || wd->disk[i]->IsFDIFile || wd->disk[i]->IsMBDFile))
+      if (wd->disk[i] && (wd->disk[i]->IsUDIFile || wd->disk[i]->IsFDIFile || wd->disk[i]->IsMBDFile || wd->disk[i]->IsTD0File))
         hasRawDisk = true;
     wd->fastmode = hasRawDisk ? false : Config::trdosFastMode;
   }
@@ -1756,6 +1760,127 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         wd->fastmode = false;
 
         printf("FDI: %d cylinders, %d sides\n", cyls, sides);
+        return true;
+
+    } else if ((magic[0] == 'T' && magic[1] == 'D') ||
+               (magic[0] == 't' && magic[1] == 'd')) {
+        // TD0 (Teledisk) — whole image is loaded (and LZH-decompressed when the
+        // magic is lowercase "td") into td0Image; track records are scanned to
+        // record per-track byte offsets. Read-only. See td0.{h,cpp}.
+        wd->disk[UnitNum]->IsSCLFile = false;
+        wd->disk[UnitNum]->IsUDIFile = false;
+        wd->disk[UnitNum]->IsFDIFile = false;
+        wd->disk[UnitNum]->IsMBDFile = false;
+        wd->disk[UnitNum]->IsProFile = false;
+        wd->disk[UnitNum]->IsTD0File = true;
+        wd->disk[UnitNum]->sclDataOffset = 0;
+        wd->disk[UnitNum]->td0Image = nullptr;
+        wd->disk[UnitNum]->td0ImageSize = 0;
+
+        bool packed = (magic[0] == 't');
+
+        // Read the 12-byte image header to learn the comment-record flag.
+        uint8_t imgHdr[12];
+        f_lseek(wd->disk[UnitNum]->Diskfile, 0);
+        f_read(wd->disk[UnitNum]->Diskfile, imgHdr, 12, &br);
+        bool hasComment = (imgHdr[7] & 0x80) != 0;
+
+        FSIZE_t fsize = f_size(wd->disk[UnitNum]->Diskfile);
+        if (fsize <= 12) { wdDiskEject(wd, UnitNum); Debug::led_blink(); return false; }
+
+        // Read the raw file body (everything after the 12-byte header).
+        uint32_t rawLen = (uint32_t)(fsize - 12);
+        uint8_t *raw = (uint8_t *)malloc(rawLen);
+        if (!raw) { wdDiskEject(wd, UnitNum); Debug::led_blink(); return false; }
+        f_lseek(wd->disk[UnitNum]->Diskfile, 12);
+        f_read(wd->disk[UnitNum]->Diskfile, raw, rawLen, &br);
+
+        if (packed) {
+            // Worst case a 80×2×16×256 disk decompresses to ~640 KB; cap generously.
+            const uint32_t kCap = 1u << 20; // 1 MB
+            uint8_t *dec = (uint8_t *)malloc(kCap);
+            if (!dec) { free(raw); wdDiskEject(wd, UnitNum); Debug::led_blink(); return false; }
+            uint32_t decLen = td0_unpack_lzh(raw, rawLen, dec, kCap);
+            free(raw);
+            wd->disk[UnitNum]->td0Image = dec;
+            wd->disk[UnitNum]->td0ImageSize = decLen;
+        } else {
+            wd->disk[UnitNum]->td0Image = raw;
+            wd->disk[UnitNum]->td0ImageSize = rawLen;
+        }
+
+        uint8_t *img = wd->disk[UnitNum]->td0Image;
+        uint32_t imgLen = wd->disk[UnitNum]->td0ImageSize;
+        uint32_t p = 0;
+
+        // Skip optional comment record: CRC(2) + len(2) + Y/M/D/H/M/S(6) + text.
+        if (hasComment) {
+            if (p + 4 > imgLen) { wdDiskEject(wd, UnitNum); Debug::led_blink(); return false; }
+            uint16_t clen = img[p + 2] | (img[p + 3] << 8);
+            p += 10 + clen;
+        }
+
+        // Walk track records to record offsets and geometry.
+        uint32_t maxCyl = 0, maxHead = 0;
+        for (int i = 0; i < 168; i++) wd->disk[UnitNum]->fdiTrackHdrOffsets[i] = 0xFFFFFFFF;
+
+        while (p < imgLen) {
+            uint8_t secs = img[p];
+            if (secs == 0xFF) break;          // end-of-image marker
+            uint8_t cyl  = img[p + 1];
+            uint8_t side = img[p + 2];
+            if (cyl > maxCyl)  maxCyl = cyl;
+            if (side > maxHead) maxHead = side;
+
+            // Stash this track's record offset, indexed cyl*sides+side. sides is
+            // not known yet, so temporarily index by cyl with a 2-side stride and
+            // remap below once geometry is known is overkill — instead store keyed
+            // by (cyl*2 + side) which we re-walk after fixing 'sides'.
+            uint32_t recPos = p;
+            p += 4;                            // track header: secs, cyl, side, crc
+            for (uint8_t s = 0; s < secs && p + 6 <= imgLen; s++) {
+                uint8_t flags = img[p + 4];
+                p += 6;                        // sector header
+                if (flags & (TD0_SEC_NO_DATA | TD0_SEC_NO_DATA2))
+                    continue;                  // no data block follows
+                if (p + 2 > imgLen) break;
+                uint16_t dlen = img[p] | (img[p + 1] << 8);
+                p += 2 + dlen;                 // length field + encoded block
+            }
+            // Temporary keyed store (cyl*2+side); remapped after we know sides.
+            int tmpIdx = cyl * 2 + side;
+            if (tmpIdx >= 0 && tmpIdx < 168)
+                wd->disk[UnitNum]->fdiTrackHdrOffsets[tmpIdx] = recPos;
+        }
+
+        uint8_t cyls  = (uint8_t)(maxCyl + 1);
+        uint8_t sides = (uint8_t)(maxHead + 1);
+        wd->disk[UnitNum]->tracks = cyls - 1;
+        wd->disk[UnitNum]->sides = sides;
+
+        // Remap offsets from the temporary (cyl*2+side) keying to the canonical
+        // (cyl*sides+side) keying used by the track loaders.
+        if (sides == 1) {
+            // collapse: index cyl*2+0 -> cyl
+            for (int c = 0; c < cyls && c < 168; c++)
+                wd->disk[UnitNum]->fdiTrackHdrOffsets[c] =
+                    (c * 2 < 168) ? wd->disk[UnitNum]->fdiTrackHdrOffsets[c * 2] : 0xFFFFFFFF;
+            for (int c = cyls; c < 168; c++)
+                wd->disk[UnitNum]->fdiTrackHdrOffsets[c] = 0xFFFFFFFF;
+        }
+        // sides==2: cyl*2+side already equals cyl*sides+side, no remap needed.
+
+        wd->disk[UnitNum]->writeprotect = 1; // TD0 is read-only
+        wd->disk[UnitNum]->t0s1_info = 0;
+        wd->disk[UnitNum]->cursectbufpos = 0xff;
+        wd->control |= kRVMWD177XPower0 << UnitNum;
+        wd->disk[UnitNum]->fname = Filename;
+        wd->diskLoadedCyl = -1;
+        wd->diskLoadedSide = -1;
+        wd->fastmode = false;
+
+        printf("TD0%s: %d cylinders, %d sides, %u bytes\n",
+               packed ? " (packed)" : "", cyls, sides, (unsigned)imgLen);
         return true;
 
     } else if (Filename.length() >= 4 &&
@@ -2225,6 +2350,170 @@ void fdiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     wd->diskLoadedSide = (int)side;
 }
 
+// Generate MFM track image from a TD0 (Teledisk) track record living in the
+// in-memory td0Image buffer. Mirrors fdiLoadTrack's MFM layout/CRC/gap logic
+// but decodes each sector's data (raw/pattern/RLE) from the TD0 stream.
+// Read-only: writes are silently dropped by rvmwdDiskStep (writeprotect=1).
+void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
+    if ((int)cyl == wd->diskLoadedCyl && (int)side == wd->diskLoadedSide)
+        return;
+
+    rvmwdDisk *disk = wd->disk[wd->diskS];
+    int trkIdx = cyl * disk->sides + side;
+    if (trkIdx < 0 || trkIdx >= 168 || !disk->td0Image
+        || disk->fdiTrackHdrOffsets[trkIdx] == 0xFFFFFFFF) {
+        wd->diskTrackLen = 0;
+        wd->fdiSectorCount = 0;
+        return;
+    }
+
+    uint8_t *img = disk->td0Image;
+    uint32_t imgLen = disk->td0ImageSize;
+    uint32_t p = disk->fdiTrackHdrOffsets[trkIdx];
+
+    if (p + 4 > imgLen) { wd->diskTrackLen = 0; wd->fdiSectorCount = 0; return; }
+    int secCount = img[p];
+    if (secCount > 32) secCount = 32;
+    p += 4; // skip track header (secs, cyl, side, crc)
+
+    // First pass: estimate track data length for dynamic gap sizing (same model
+    // as fdiLoadTrack). We must walk sector records; remember each sector's
+    // decoded geometry + a pointer to its encoded data block for pass two.
+    struct TD0Sec {
+        uint8_t c, h, r, n, flags;
+        uint16_t secSize;
+        const uint8_t *enc; // points at method byte, or null if no data
+        uint16_t encLen;    // bytes including method byte
+        bool present;       // false -> skip (NO_ID / NO_DATA / NO_DATA2)
+    } secs[32];
+
+    int kept = 0;
+    int trkdatalen = 0;
+    for (int s = 0; s < secCount && p + 6 <= imgLen; s++) {
+        uint8_t sc = img[p], sh = img[p + 1], sr = img[p + 2], sn = img[p + 3];
+        uint8_t flags = img[p + 4];
+        p += 6;
+
+        bool hasData = !(flags & (TD0_SEC_NO_DATA | TD0_SEC_NO_DATA2));
+        const uint8_t *enc = nullptr;
+        uint16_t encLen = 0;
+        if (hasData) {
+            if (p + 2 > imgLen) break;
+            encLen = img[p] | (img[p + 1] << 8);
+            p += 2;
+            enc = img + p;
+            if (p + encLen > imgLen) { encLen = (uint16_t)(imgLen - p); }
+            p += encLen;
+        }
+        // Sectors with no ID field are skipped (no header to expose to the FDC).
+        if (flags & TD0_SEC_NO_ID) continue;
+
+        TD0Sec &d = secs[kept];
+        d.c = sc; d.h = sh; d.r = sr; d.n = sn; d.flags = flags;
+        d.secSize = (uint16_t)(128 << (sn & 3));
+        d.enc = enc; d.encLen = encLen;
+        d.present = hasData;
+
+        trkdatalen += 2 + 6;       // A1 + FE + CHRN + CRC
+        if (hasData) trkdatalen += 4 + d.secSize; // A1 + FB + data + CRC
+        kept++;
+        if (kept >= 32) break;
+    }
+    secCount = kept;
+
+    // --- Dynamic gap sizing (identical to fdiLoadTrack) ---
+    int imageSize = 6250;
+    int freeSpace = imageSize - (trkdatalen + secCount * (3 + 2));
+    int synchroPulseLen = 1, firstSpaceLen = 1, secondSpaceLen = 1,
+        thirdSpaceLen = 1, synchroSpaceLen = 1;
+    freeSpace -= firstSpaceLen + secondSpaceLen + thirdSpaceLen + synchroSpaceLen;
+    if (freeSpace < 0) { imageSize += -freeSpace; freeSpace = 0; }
+    while (freeSpace > 0) {
+        if (freeSpace >= (secCount * 2))
+            if (synchroSpaceLen < 12) { synchroSpaceLen++; freeSpace -= secCount * 2; }
+        if (freeSpace < secCount) break;
+        if (firstSpaceLen < 10) { firstSpaceLen++; freeSpace -= secCount; }
+        if (freeSpace < secCount) break;
+        if (secondSpaceLen < 22) { secondSpaceLen++; freeSpace -= secCount; }
+        if (freeSpace < secCount) break;
+        if (thirdSpaceLen < 60) { thirdSpaceLen++; freeSpace -= secCount; }
+        if (freeSpace < secCount) break;
+        if (synchroSpaceLen >= 12 && firstSpaceLen >= 10 &&
+            secondSpaceLen >= 22 && thirdSpaceLen >= 60) break;
+    }
+    if (freeSpace > (secCount * 2) + 10) { synchroPulseLen++; freeSpace -= secCount; }
+    if (freeSpace > (secCount * 2) + 9) synchroPulseLen++;
+    while (synchroPulseLen < 3) { synchroPulseLen++; imageSize += secCount * 2; }
+    if (freeSpace < 0) { imageSize += -freeSpace; freeSpace = 0; }
+
+    int bufSize = (int)sizeof(wd->diskTrackBuf);
+    if (imageSize > bufSize) imageSize = bufSize;
+
+    uint8_t *buf = wd->diskTrackBuf;
+    int pos = 0;
+
+    for (int sec = 0; sec < secCount; sec++) {
+        TD0Sec &d = secs[sec];
+
+        for (int i = 0; i < firstSpaceLen && pos < imageSize; i++) buf[pos++] = 0x4E;
+        for (int i = 0; i < synchroSpaceLen && pos < imageSize; i++) buf[pos++] = 0x00;
+        int crcStart = pos;
+        for (int i = 0; i < synchroPulseLen && pos < imageSize; i++) buf[pos++] = 0xA1;
+
+        bool dataCrcErr = (d.flags & TD0_SEC_CRC_ERR) != 0;
+        if (sec < 32) {
+            wd->fdiSectorIdPos[sec] = pos; // position of 0xFE
+            wd->fdiSectorFlags[sec] = (dataCrcErr ? 1 : 0) | (d.present ? 0 : 2);
+        }
+        if (pos < imageSize) buf[pos++] = 0xFE;
+        if (pos + 4 <= imageSize) {
+            buf[pos++] = d.c; buf[pos++] = d.h; buf[pos++] = d.r; buf[pos++] = d.n;
+        }
+        uint16_t crc = 0xFFFF;
+        for (int i = crcStart; i < pos; i++) crc = vgCrc(crc, buf[i]);
+        if (pos + 2 <= imageSize) {
+            buf[pos++] = (uint8_t)(crc >> 8);
+            buf[pos++] = (uint8_t)(crc & 0xFF);
+        }
+
+        for (int i = 0; i < secondSpaceLen && pos < imageSize; i++) buf[pos++] = 0x4E;
+        for (int i = 0; i < synchroSpaceLen && pos < imageSize; i++) buf[pos++] = 0x00;
+
+        if (d.present) {
+            crcStart = pos;
+            for (int i = 0; i < synchroPulseLen && pos < imageSize; i++) buf[pos++] = 0xA1;
+            uint8_t dataMark = (d.flags & TD0_SEC_DELETED) ? 0xF8 : 0xFB;
+            if (pos < imageSize) buf[pos++] = dataMark;
+
+            int slen = d.secSize;
+            int avail = imageSize - pos;
+            int toEmit = (slen <= avail) ? slen : avail;
+            if (toEmit > 0 && d.enc && d.encLen > 0)
+                td0_decode_sector(d.enc, d.encLen, slen, buf + pos);
+            else if (toEmit > 0)
+                memset(buf + pos, 0, toEmit);
+            pos += toEmit;
+
+            crc = 0xFFFF;
+            for (int i = crcStart; i < pos; i++) crc = vgCrc(crc, buf[i]);
+            if (dataCrcErr) crc ^= 0xFFFF; // expose source CRC error to the FDC
+            if (pos + 2 <= imageSize) {
+                buf[pos++] = (uint8_t)(crc >> 8);
+                buf[pos++] = (uint8_t)(crc & 0xFF);
+            }
+        }
+
+        for (int i = 0; i < thirdSpaceLen && pos < imageSize; i++) buf[pos++] = 0x4E;
+    }
+
+    wd->fdiSectorCount = (secCount < 32) ? secCount : 32;
+    while (pos < imageSize) buf[pos++] = 0x4E;
+
+    wd->diskTrackLen = pos;
+    wd->diskLoadedCyl = (int)cyl;
+    wd->diskLoadedSide = (int)side;
+}
+
 // Generate MFM track image from MBD raw sector dump (MB-02+ BS-DOS format).
 // MBD is a simple linear layout: tracks × sides × sectors × sectorSize bytes.
 void mbdLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
@@ -2454,6 +2743,41 @@ IRAM_ATTR uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control) {
 
     }
 
+    if (disk->IsTD0File) {
+
+      if (seek)
+        return disk->s;
+
+      {
+        uint8_t loadSide = wd->side;
+        bool activeCmd = (wd->stepState == kRVMWD177XStepReadByte
+                       || wd->stepState == kRVMWD177XStepWriteByte);
+        if (activeCmd && wd->diskLoadedCyl == (int)disk->t && wd->diskLoadedSide >= 0)
+            loadSide = (uint8_t)wd->diskLoadedSide;
+        td0LoadTrack(wd, disk->t, loadSide);
+      }
+
+      if(disk->indx != 0xffffffff && disk->indx >= wd->diskTrackLen) {
+        disk->indx = 0xffffffff;
+        disk->indexDelay = 25;
+        return disk->s;
+      }
+
+      disk->indx++;
+
+      // TD0 is read-only — drop any write (writeprotect set at insert).
+      if(control & kRVMwdDiskControlWrite)
+        return 0;
+
+      if (disk->indx < wd->diskTrackLen)
+        disk->a = wd->diskTrackBuf[disk->indx];
+      else
+        disk->a = 0x4e;
+
+      return disk->s;
+
+    }
+
     if (disk->IsFDIFile) {
 
       if (seek)
@@ -2627,6 +2951,13 @@ void wdDiskEject(rvmWD1793 *wd, unsigned char UnitNum) {
         fclose2(wd->disk[UnitNum]->Diskfile);
         wd->disk[UnitNum]->Diskfile = NULL;
     }
+
+#if !PICO_RP2040
+    if (wd->disk[UnitNum]->td0Image) {
+        free(wd->disk[UnitNum]->td0Image);
+        wd->disk[UnitNum]->td0Image = NULL;
+    }
+#endif
 
     free(wd->disk[UnitNum]);
     wd->disk[UnitNum] = NULL;

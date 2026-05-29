@@ -600,7 +600,7 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
                 if (elem) {
                     menuAt(mfrows + (Config::aspect_16_9 ? 0 : 1), cols - (real_rows > virtual_rows ? 13 : 12));
                     char elements_txt[13];
-                    int nitem = (FileUtils::fileTypes[ftype].begin_row + FileUtils::fileTypes[ftype].focus ) - (4 + ndirs) + (fdir.length() == 1);
+                    int nitem = (FileUtils::fileTypes[ftype].begin_row + FileUtils::fileTypes[ftype].focus) - 3 - ndirs;
                     snprintf(elements_txt, sizeof(elements_txt), "%d/%d ", nitem > 0 ? nitem : 0 , elem);
                     VIDEO::vga.print(std::string(12 - strlen(elements_txt), ' ').c_str());
                     VIDEO::vga.print(elements_txt);

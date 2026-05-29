@@ -64,6 +64,7 @@ extern "C" const uint32_t profi_default_palette16[16];
 #endif
 #if !PICO_RP2040
 #include "DivMMC.h"
+#include "IDE.h"
 #include "MB02.h"
 #include "hardware/gpio.h"
 #include "sdcard.h"
@@ -239,6 +240,23 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       return 0xFF;
     }
   }
+#if !PICO_RP2040
+  // IDE/HDD — NEMO scheme (Pentagon, outside TR-DOS). Decoded BEFORE the ULA
+  // even-port branch because NEMO register ports (e.g. 0xC8/0xD0/0xF0) have A0=0
+  // and would otherwise be swallowed by the ULA port handler. 16-bit data via A0 latch.
+  if (IDE::scheme == IDE::NEMO && Z80Ops::isPentagon && !ESPectrum::trdos && !(address & 6)) {
+    if (address & 1) { LED::touchR(LED::SD); return IDE::read_latch(); } // A0=1: high-byte latch
+    if ((address & 0x18) == 0x08 && (address & 0xE0) == 0xC0) {          // control / alt-status
+      LED::touchR(LED::SD); return IDE::read8(8);
+    }
+    if ((address & 0x18) == 0x10) {                                      // register window
+      LED::touchR(LED::SD);
+      uint8_t reg = (address >> 5) & 7;
+      return (reg == 0) ? IDE::read_data_low() : IDE::read8(reg);
+    }
+    // else: not an IDE sub-address — fall through (don't shadow AY/ULA etc.)
+  }
+#endif
   // ULA PORT
   if ((address & 0x0001) == 0) {
     VIDEO::Draw(3, !(Z80Ops::isPentagon || Z80Ops::isProfi)); // I/O Contention (Late)
@@ -397,6 +415,27 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       uint8_t lo = address & 0xFF;
       if (lo == 0x77) { LED::touchR(LED::ZCTRL); return DivMMC::zc_read_status(); }
       if (lo == 0x57) { LED::touchR(LED::ZCTRL); return DivMMC::zc_read_data(); }
+    }
+
+    // IDE/HDD — PROFI scheme. Per Karabas-Pro/Profi manual "Порты IDE HDD (CF)":
+    //   read regs at #xxCB, write regs at #xxEB, system reg at #xxAB.
+    //   register selector = high byte A(10:8) = (address>>8)&7; #00CB = data low.
+    //   CS active when (CPM=1 & ROM14=1) OR (DOS=1 & ROM14=0).
+    //   CPM=(portDFFD&0x20), ROM14=MemESP::romLatch, DOS=ESPectrum::trdos.
+    if (IDE::scheme == IDE::PROFI && Config::arch == "Profi") {
+      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
+      if ((cpm && rom14) || (dos && !rom14)) {
+        uint8_t p1 = address & 0xFF;
+        uint8_t reg = (address >> 8) & 7;
+        // Data register: the 16-bit word is transferred as two single-byte reads —
+        // #00CB returns the low byte, #00EB returns the high byte (each advances
+        // the sector buffer by one byte). Register reads use #xxCB only.
+        if (p1 == 0xEB && reg == 0) { LED::touchR(LED::SD); return IDE::read8(0); }
+        if (p1 == 0xCB) {                       // read register window / data low
+          LED::touchR(LED::SD);
+          return IDE::read8(reg);
+        }
+      }
     }
 #endif
 
@@ -858,6 +897,23 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     }
   }
 #endif
+#if !PICO_RP2040
+  // IDE/HDD — NEMO scheme (Pentagon, outside TR-DOS). Decoded BEFORE the ULA
+  // even-port branch (NEMO register ports have A0=0). 16-bit data via A0 latch.
+  if (IDE::scheme == IDE::NEMO && Z80Ops::isPentagon && !ESPectrum::trdos && !(address & 6)) {
+    if (address & 1) { LED::touchW(LED::SD); IDE::write_latch(data); return; } // A0=1: high latch
+    if ((address & 0x18) == 0x08 && (address & 0xE0) == 0xC0) {                // control
+      LED::touchW(LED::SD); IDE::write8(8, data); return;
+    }
+    if ((address & 0x18) == 0x10) {                                           // register window
+      LED::touchW(LED::SD);
+      uint8_t reg = (address >> 5) & 7;
+      if (reg == 0) IDE::write_data_low(data); else IDE::write8(reg, data);
+      return;
+    }
+    // else: not an IDE sub-address — fall through (don't shadow AY/ULA etc.)
+  }
+#endif
   // ULA =======================================================================
   if ((address & 0x0001) == 0) {
     port254 = data;
@@ -1132,6 +1188,33 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       uint8_t lo = address & 0xFF;
       if (lo == 0x77) { LED::touchW(LED::ZCTRL); DivMMC::zc_write_config(data); return; }
       if (lo == 0x57) { LED::touchW(LED::ZCTRL); DivMMC::zc_write_data(data); return; }
+    }
+
+    // IDE/HDD — PROFI scheme. Per Karabas-Pro/Profi manual "Порты IDE HDD (CF)":
+    //   write regs at #xxEB, system reg at #06AB; reg = (address>>8)&7; #00EB = data low.
+    //   CS active when (CPM=1 & ROM14=1) OR (DOS=1 & ROM14=0).
+    if (IDE::scheme == IDE::PROFI && Config::arch == "Profi") {
+      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
+      if ((cpm && rom14) || (dos && !rom14)) {
+        uint8_t p1 = address & 0xFF;
+        uint8_t reg = (address >> 8) & 7;
+        // Data register: 16-bit word written as two single-byte writes —
+        // #00EB = low byte, #00CB = high byte (each advances buffer by one).
+        if (p1 == 0xCB && reg == 0) { LED::touchW(LED::SD); IDE::write8(0, data); return; }
+        if (p1 == 0xEB) {                       // write register window / data low
+          LED::touchW(LED::SD);
+          IDE::write8(reg, data);
+          return;
+        }
+        if (p1 == 0xAB) {                       // #06AB = ATA control register (R8)
+          // Per UnrealSpeccy IDE_PROFI: writes to #06AB go to hdd reg 8 (control:
+          // SRST/nIEN). Drivers (e.g. DOSBIO v2.02) issue 0x0E then 0x08 here to
+          // assert and release SRST as a software reset — must trigger reset_signature.
+          LED::touchW(LED::SD);
+          if (reg == 6) IDE::write8(8, data);
+          return;
+        }
+      }
     }
 #endif
 

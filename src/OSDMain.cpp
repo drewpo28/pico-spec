@@ -73,6 +73,7 @@ extern "C" const uint32_t profi_default_palette16[16];
 #endif
 #if !PICO_RP2040
 #include "DivMMC.h"
+#include "IDE.h"
 #include "MB02.h"
 #endif
 
@@ -1085,7 +1086,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         fname = zipFname;
                         ext = FileUtils::getLCaseExt(fname);
                     }
-                    if (ext == "trd" || ext == "scl" || ext == "udi" || ext == "fdi") {
+                    if (ext == "trd" || ext == "scl" || ext == "udi" || ext == "fdi" || ext == "td0" || ext == "pro") {
                         printf("Insert disk %s\n",fname.c_str());
                         rvmWD1793InsertDisk(&ESPectrum::fdd, 0, fname);
                     }
@@ -2465,6 +2466,158 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             }
                         }
                     }
+#if !PICO_RP2040
+                    else if (FileUtils::fsMount && stor_num == 7) { // IDE/HDD
+                        static const char* ide_modes[] = { "OFF", "NEMO", "PROFI" };
+                        menu_saverect = true;
+                        menu_curopt = 1;
+                        while (1) {
+                            menu_level = 2;
+                            // Root: Scheme row + hd0/hd1 rows (shown when a scheme is active).
+                            string menu = MENU_IDE_TITLE[Config::lang];
+                            menu += string(MENU_IDE_SCHEME[Config::lang]) + "\t" + ide_modes[Config::ide_scheme <= 2 ? Config::ide_scheme : 0] + "\n";
+                            bool showSlots = (Config::ide_scheme != 0);
+                            if (showSlots) {
+                                menu += formatSlotRow("hd0", Config::ide_image[0], false, false);
+                                menu += "\n";
+                                menu += formatSlotRow("hd1", Config::ide_image[1], false, false);
+                                menu += "\n";
+                            }
+                            uint8_t opt = menuRun(menu);
+                            if (opt == 1) {
+                                // Scheme submenu (OFF / NEMO / PROFI).
+                                menu_level = 3;
+                                menu_curopt = Config::ide_scheme + 1;
+                                menu_saverect = true;
+                                while (1) {
+                                    string smenu = MENU_IDE_TITLE[Config::lang];
+                                    for (int i = 0; i < 3; i++) {
+                                        smenu += (i == Config::ide_scheme) ? "[*] " : "[ ] ";
+                                        smenu += ide_modes[i];
+                                        smenu += "\n";
+                                    }
+                                    uint8_t sub = menuRun(smenu);
+                                    if (sub) {
+                                        uint8_t newval = sub - 1;
+                                        if (newval != Config::ide_scheme) {
+                                            // Mutually exclusive with esxDOS DivMMC/DivIDE
+                                            // (shared ports 0xEB/0xE7/0xA3 etc.).
+                                            if (newval && Config::esxdos) {
+                                                Config::esxdos = 0;
+                                                DivMMC::init();
+                                                OSD::osdCenteredMsg("esxDOS disabled", LEVEL_WARN, 2000);
+                                            }
+                                            Config::ide_scheme = newval;
+                                            IDE::init();
+                                            Config::save();
+                                            menu_curopt = sub;
+                                            menu_saverect = false;
+                                        }
+                                        menu_curopt = sub;
+                                        menu_saverect = false;
+                                    } else {
+                                        menu_curopt = 1;
+                                        break;
+                                    }
+                                }
+                            } else if (opt >= 2 && showSlots) {
+                                // hd0 / hd1 submenu (Insert / Eject).
+                                uint8_t slot = (opt == 2) ? 0 : 1;
+                                menu_saverect = true;
+                                menu_curopt = 1;
+                                while (1) {
+                                    menu_level = 3;
+                                    char title[8]; snprintf(title, sizeof(title), "hd%u\n", (unsigned)slot);
+                                    string drvmenu = title;
+                                    drvmenu += MENU_ESX_INSERT[Config::lang];
+                                    drvmenu += MENU_ESX_EJECT[Config::lang];
+                                    // Geometry row: shows effective C/H/S, LBA and size; "auto" when no override.
+                                    {
+                                        char geo[48];
+                                        uint16_t oc=Config::ide_chs[slot][0], oh=Config::ide_chs[slot][1], os=Config::ide_chs[slot][2];
+                                        uint16_t C=IDE::geomC(slot), H=IDE::geomH(slot), S=IDE::geomS(slot);
+                                        bool over = (oc&&oh&&os);
+                                        if (C && H && S)
+                                            snprintf(geo, sizeof(geo), "CHS\t%u/%u/%u%s\n", C, H, S, over?"":" (auto)");
+                                        else
+                                            snprintf(geo, sizeof(geo), "CHS\t<empty>\n");
+                                        drvmenu += geo;
+                                        uint32_t lba = IDE::geomLBA(slot);
+                                        char lbar[48];
+                                        snprintf(lbar, sizeof(lbar), "LBA\t%u (%u MB)\n", (unsigned)lba, (unsigned)(((uint64_t)lba*512)/(1024*1024)));
+                                        drvmenu += lbar;
+                                    }
+                                    uint8_t opt2 = menuRun(drvmenu);
+                                    if (opt2 == 1) {
+                                        menu_saverect = true;
+                                        string mFile = fileDialog(FileUtils::IMG_Path, MENU_IDE_IMG_TITLE[Config::lang], DISK_IMGFILE, 26, 15);
+                                        if (mFile != "") {
+                                            string fname = FileUtils::IMG_Path + mFile.substr(1);
+                                            if (FileUtils::getLCaseExt(fname) == "zip") {
+                                                string zipFname = ZipExtract::extract(fname, DISK_IMGFILE);
+                                                if (zipFname.empty()) { OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN); break; }
+                                                if (zipFname == "\x1b") break;
+                                                fname = zipFname;
+                                            }
+                                            Config::ide_image[slot] = fname;
+                                            IDE::init();
+                                            Config::save();
+                                            menu_curopt = opt2;
+                                            menu_saverect = false;
+                                        }
+                                    } else if (opt2 == 2) {
+                                        Config::ide_image[slot].clear();
+                                        IDE::init();
+                                        Config::save();
+                                        menu_curopt = opt2;
+                                        menu_saverect = false;
+                                    } else if (opt2 == 3) {
+                                        // Edit CHS override. Empty input = auto-detect (0/0/0).
+                                        char cur[20];
+                                        if (Config::ide_chs[slot][0] && Config::ide_chs[slot][1] && Config::ide_chs[slot][2])
+                                            snprintf(cur, sizeof(cur), "%u/%u/%u",
+                                                     Config::ide_chs[slot][0], Config::ide_chs[slot][1], Config::ide_chs[slot][2]);
+                                        else
+                                            snprintf(cur, sizeof(cur), "%u/%u/%u",
+                                                     IDE::geomC(slot), IDE::geomH(slot), IDE::geomS(slot));
+                                        // Inline-edit on the CHS row (row index 3 within submenu).
+                                        uint8_t vrow = (uint8_t)(3 - OSD::begin_row + 1);
+                                        int ex = OSD::x + (1 + 4) * OSD_FONT_W;     // after "CHS\t"
+                                        int ey = OSD::y + 1 + 3 * OSD_FONT_H;
+                                        string in = OSD::inlineTextEdit(ex, ey, 14, string(cur));
+                                        if (in != "\x1B") {
+                                            unsigned c=0,h=0,s=0;
+                                            if (in.empty()) { c=h=s=0; }   // auto
+                                            if (in.empty() || sscanf(in.c_str(), "%u/%u/%u", &c,&h,&s)==3) {
+                                                // Sanity: H<=16, S<=63 (ATA); 0/0/0 allowed (=auto)
+                                                if ((c==0&&h==0&&s==0) || (h>=1&&h<=16&&s>=1&&s<=63&&c>=1)) {
+                                                    Config::ide_chs[slot][0]=(uint16_t)c;
+                                                    Config::ide_chs[slot][1]=(uint16_t)h;
+                                                    Config::ide_chs[slot][2]=(uint16_t)s;
+                                                    IDE::init();
+                                                    Config::save();
+                                                } else {
+                                                    OSD::osdCenteredMsg("Invalid CHS (H<=16 S<=63)", LEVEL_WARN, 2000);
+                                                }
+                                            } else {
+                                                OSD::osdCenteredMsg("Format: C/H/S", LEVEL_WARN, 2000);
+                                            }
+                                        }
+                                        menu_saverect = false;
+                                        menu_curopt = 3;
+                                    } else {
+                                        menu_curopt = opt;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                menu_curopt = 7;
+                                menu_level = 1;
+                                break;
+                            }
+                        }
+                    }
+#endif
                     else {
                         menu_curopt = 2;
                         break;
@@ -8433,6 +8586,19 @@ void OSD::EmulatorInfo() {
                 pos += appendFilename(buf, pos, sizeof(buf), Config::esxdos_hdf_image[1], 19);
                 pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
             }
+        }
+
+        // IDE/HDD (NEMO/PROFI)
+        if (Config::ide_scheme != 0) {
+            static const char* idesc[] = { "Off", "NEMO", "PROFI" };
+            int si = Config::ide_scheme; if (si > 2) si = 0;
+            pos += snprintf(buf + pos, sizeof(buf) - pos, " IDE/HDD        : %s\n", idesc[si]);
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  hd0           : ");
+            pos += appendFilename(buf, pos, sizeof(buf), Config::ide_image[0], 19);
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  hd1           : ");
+            pos += appendFilename(buf, pos, sizeof(buf), Config::ide_image[1], 19);
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
         }
 #endif
 
