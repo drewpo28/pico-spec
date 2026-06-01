@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert pico-spec Profi DS80 framebuffer dump to 512×480 PNG (screen-accurate).
+"""Convert pico-spec Profi DS80 framebuffer dump to 640×480 PNG (screen-accurate).
 
 Usage:
     python3 profi2png.py fb.bin lut.bin pal.bin WIDTH HEIGHT out.png [--single-height]
@@ -7,14 +7,15 @@ Usage:
 Files produced by screenshot_profi.gdb:
     fb.bin   -- WIDTH*HEIGHT bytes, row-major framebuffer (320*240 = 76800 B)
                 Row layout: 32-byte black pad | 256-byte content | 32-byte pad.
-                Content bytes are pre-swapped with (k^2) for the HDMI ISR's (x^2) read.
+                Bytes are pre-swapped with (x^2) for the HDMI ISR's (x^2) read.
     lut.bin  -- 256 bytes, row-major uint8_t[16][16]: lut[ink][paper] → HDMI slot index
     pal.bin  -- 64 bytes, 16 × uint32_t LE (0x00RRGGBB): Profi live color palette
     WIDTH/HEIGHT -- framebuffer dimensions (normally 320 240)
 
-Output: 512×480 (each of the 240 framebuffer rows is doubled to match on-screen appearance).
-Pass --single-height for the raw 512×240 without row doubling.
-Each content byte expands to 2 pixels: reverse-map slot → (ink, paper) via lut,
+Output: 640×480 — the full framebuffer row (including border pads) so the whole
+picture fits; each of the 240 framebuffer rows is doubled to match the on-screen
+appearance. Pass --single-height for the raw 640×240 without row doubling.
+Each framebuffer byte expands to 2 pixels: reverse-map slot → (ink, paper) via lut,
 then look up each index in the 16-color palette.
 """
 import struct
@@ -81,13 +82,39 @@ def main():
                 rev[slot] = (ink, paper)
     print(f"reverse lut: {len(rev)} unique slots mapped")
 
-    # Content region per row.
-    # For standard DS80: w=320, content=256, pad_l=32.
-    CONTENT = 256
-    pad_l = (w - CONTENT) // 2  # 32 for w=320
+    # Detect which video mode this framebuffer is in.
+    # DS80 hires packs a pair of pixels per byte as an HDMI "slot" index that
+    # spans a wide range (up to ~244, incl. the sync slots). A standard ZX
+    # screen (e.g. the debugger overlay, drawn in normal video mode) stores
+    # direct 16-colour palette indices, so every byte is 0..15.
+    max_byte = max(fb[:w * h])
+    is_ds80 = max_byte > 15
+    print(f"mode: {'DS80 pair-LUT' if is_ds80 else 'standard 16-colour'} "
+          f"(max fb byte = {max_byte})")
 
-    W_out = CONTENT * 2  # 512 pixels
-    # Default: double each row to match on-screen 512×480 appearance (HDMI 240→480 line doubling).
+    if not is_ds80:
+        # Standard mode: each byte is a direct palette index; pixels are already
+        # square, so emit the framebuffer at native w×h (the full FullBorder
+        # picture, borders included). No pair-LUT, no row doubling.
+        img = Image.new('RGB', (w, h))
+        px = img.load()
+        for y in range(h):
+            row_off = y * w
+            for x in range(w):
+                # HDMI ISR reads bytes with (x^2); undo it to get visual order.
+                fb_idx = x ^ 2
+                if fb_idx >= w:
+                    fb_idx = x
+                px[x, y] = palette[fb[row_off + fb_idx] & 0x0F]
+        img.save(out_path)
+        print(f"saved {out_path} ({w}x{h})")
+        return
+
+    # DS80 hires: render the full framebuffer row (including the border pads on
+    # each side) so the whole picture fits. For standard DS80 w=320, so the
+    # output is 320*2 = 640 pixels wide.
+    W_out = w * 2  # 640 pixels for w=320
+    # Default: double each row to match on-screen 640×480 appearance (HDMI 240→480 line doubling).
     row_scale = 1 if single_height else 2
     H_out = h * row_scale
     img = Image.new('RGB', (W_out, H_out))
@@ -95,24 +122,20 @@ def main():
 
     for y in range(h):
         row_off = y * w
-        # Decode the row into a flat list of RGB pixels (512 entries).
+        # Decode the row into a flat list of RGB pixels (W_out entries).
         row_pixels: list[tuple[int, int, int]] = []
-        for k in range(CONTENT):
-            # The framebuffer stores visual content byte k at position:
-            #   fb_row[(pad_l + k) ^ 2]
-            # because the renderer pre-applies the (k^2) swap that the HDMI ISR
-            # undoes with its (x^2) read: write[k] → fb[k^2], read[(k^2)^2] = read[k] ✓
-            # Applied to the absolute row offset: abs_x = pad_l + k, stored at abs_x ^ 2.
-            # For pad_l=32 (0b100000): abs_x ^ 2 only flips bit1, stays within the row.
-            abs_x = pad_l + k
+        for abs_x in range(w):
+            # The framebuffer pre-applies the (x^2) swap that the HDMI ISR
+            # undoes with its (x^2) read: write[x] → fb[x^2], read[(x^2)^2] = read[x] ✓
+            # x^2 only flips bit1, so it always stays within the row.
             fb_idx = abs_x ^ 2
             if fb_idx >= w:
-                fb_idx = abs_x  # safety fallback (should never fire for pad_l=32)
+                fb_idx = abs_x  # safety fallback
             slot = fb[row_off + fb_idx]
             ink_idx, paper_idx = rev.get(slot, (0, 0))
             row_pixels.append(palette[ink_idx])
             row_pixels.append(palette[paper_idx])
-        # Write row_scale times: 1 = native 512×240, 2 = screen-accurate 512×480.
+        # Write row_scale times: 1 = native 640×240, 2 = screen-accurate 640×480.
         for dy in range(row_scale):
             out_y = y * row_scale + dy
             for x, color in enumerate(row_pixels):

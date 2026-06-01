@@ -767,6 +767,20 @@ void ESPectrum::setup() {
   else
       MemESP::romInUse = 0;
   if (Config::arch == "Profi") ESPectrum::trdos = true; // SYSEN
+  // Profi CP/M: clear physical page 1 (ram[1]) so BDOS.BIN loading via the INI
+  // driver lands in a known-zero state. The BOOTFDD self-install clears ram[5/6/58]
+  // but deliberately skips ram[1] (it holds BOOTFDD.COM from TR-DOS). On butter-PSRAM
+  // systems, stale data from a previous corrupted INI overflow (which can overwrite
+  // page 1 if INTRQ never fires) causes page 1 code to be garbage on the next boot,
+  // breaking the BDOS loading. Zeroing on every reset costs ~10ms but guarantees
+  // that page 1 starts clean — the BIOS BDOS load then populates it correctly.
+  if (Config::arch == "Profi") {
+    uint8_t *p1 = MemESP::ram[1].direct();
+    if (p1 && p1 >= (uint8_t*)0x11000000) {
+      memset(p1, 0, 16384);
+      Debug::log("[setup] Profi: cleared ram[1] (page1 for CP/M BDOS)");
+    }
+  }
   MemESP::bankLatch = 0;
   MemESP::videoLatch = 0;
   MemESP::romLatch = 0;

@@ -423,6 +423,9 @@ static const char *MENU_IMG_TITLE[2] = { "esxDOS Image\n", "Imagen esxDOS\n" };
 static const char *MENU_IDE_TITLE[2] = { "IDE/HDD\n", "IDE/HDD\n" };
 static const char *MENU_IDE_SCHEME[2] = { "Scheme", "Esquema" };
 static const char *MENU_IDE_IMG_TITLE[2] = { "IDE Image", "Imagen IDE" };
+static const char *MENU_IDE_CREATE[2] = { "Create empty image\n", "Crear imagen vacía\n" };
+static const char *MENU_IDE_CREATE_SIZE[2] = { "New HDD size\n", "Tamaño del nuevo HDD\n" };
+static const char *MENU_IDE_CREATE_NAME[2] = { "Image name:\n", "Nombre de imagen:\n" };
 #endif
 
 static const char *MENU_FASTMODE[2] = { "Fast Mode\n", "Modo rápido\n" };

@@ -548,6 +548,19 @@ static string slotInlineEdit(uint8_t opt2, const string& current) {
     return OSD::inlineTextEdit(ex, ey, 20, name);
 }
 
+#if !PICO_RP2040
+// Throttled progress overlay for IDE::createImage (zero-fill can take seconds).
+static void ide_create_progress(uint32_t done, uint32_t total) {
+    static int lastpct = -1;
+    int pct = total ? (int)((uint64_t)done * 100 / total) : 100;
+    if (pct == lastpct) return;
+    lastpct = pct;
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Creating HDD... %d%%", pct);
+    OSD::osdCenteredMsg(msg, LEVEL_INFO, 0);
+}
+#endif
+
 
 static bool persistSave(uint8_t slotnumber, uint8_t opt2, bool quicksave = false)
 {
@@ -2457,7 +2470,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 menu_curopt = sna_mnu;
                             } else {
 #if !PICO_RP2040
-                                menu_curopt = 4;
+                                menu_curopt = 6;
 #else
                                 menu_curopt = 3;
 #endif
@@ -2482,6 +2495,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 menu += "\n";
                                 menu += formatSlotRow("hd1", Config::ide_image[1], false, false);
                                 menu += "\n";
+                                menu += MENU_IDE_CREATE[Config::lang];
                             }
                             uint8_t opt = menuRun(menu);
                             if (opt == 1) {
@@ -2520,7 +2534,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         break;
                                     }
                                 }
-                            } else if (opt >= 2 && showSlots) {
+                            } else if ((opt == 2 || opt == 3) && showSlots) {
                                 // hd0 / hd1 submenu (Insert / Eject).
                                 uint8_t slot = (opt == 2) ? 0 : 1;
                                 menu_saverect = true;
@@ -2610,6 +2624,72 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         break;
                                     }
                                 }
+                            } else if (opt == 4 && showSlots) {
+                                // "Create empty image": pick slot → size → name, then create+mount.
+                                // Nested Esc-driven loops mirror the Scheme submenu so each level
+                                // backs out to its parent (slot picker → IDE/HDD root) on Esc.
+                                static const struct { const char* label; uint32_t mb; } ide_presets[] = {
+                                    { "10 MB\n", 10 }, { "32 MB\n", 32 }, { "64 MB\n", 64 }, { "128 MB\n", 128 }
+                                };
+                                menu_level = 3;
+                                menu_curopt = 1;
+                                menu_saverect = true;
+                                bool created = false;
+                                while (!created) {
+                                    // Level 3 — target slot.
+                                    string slmenu = MENU_IDE_CREATE[Config::lang];
+                                    slmenu += "hd0\n";
+                                    slmenu += "hd1\n";
+                                    uint8_t slsel = menuRun(slmenu);
+                                    if (slsel != 1 && slsel != 2) { menu_curopt = 4; break; }  // Esc → IDE/HDD
+                                    uint8_t slot = slsel - 1;
+                                    // Level 4 — size preset.
+                                    menu_level = 4;
+                                    menu_curopt = 1;
+                                    menu_saverect = true;
+                                    while (1) {
+                                        string szmenu = MENU_IDE_CREATE_SIZE[Config::lang];
+                                        for (auto &p : ide_presets) szmenu += p.label;
+                                        uint8_t sz = menuRun(szmenu);
+                                        if (sz < 1 || sz > 4) break;   // Esc → back to slot picker
+                                        uint32_t mb = ide_presets[sz - 1].mb;
+                                        // Name — inline-edit over the selected size row.
+                                        uint8_t vrow = (uint8_t)(sz - OSD::begin_row + 1);
+                                        int ex = OSD::x + 1 * OSD_FONT_W;
+                                        int ey = OSD::y + 1 + vrow * OSD_FONT_H;
+                                        string name = OSD::inlineTextEdit(ex, ey, 18, "new");
+                                        menu_saverect = false;
+                                        menu_curopt = sz;
+                                        if (name == "\x1B") continue;   // Esc on name → stay in size menu
+                                        while (!name.empty() && name.back()  == ' ') name.pop_back();
+                                        while (!name.empty() && name.front() == ' ') name.erase(name.begin());
+                                        if (name.empty()) continue;
+                                        if (FileUtils::getLCaseExt(name) != "hdd") name += ".hdd";
+                                        string path = FileUtils::IMG_Path + name;
+                                        FILINFO fno;
+                                        if (f_stat(path.c_str(), &fno) == FR_OK) {
+                                            OSD::osdCenteredMsg("File already exists", LEVEL_WARN, 2000);
+                                            continue;
+                                        }
+                                        OSD::osdCenteredMsg("Creating HDD...", LEVEL_INFO, 0);
+                                        bool ok = IDE::createImage(path.c_str(), mb, ide_create_progress);
+                                        if (!ok) { OSD::osdCenteredMsg("Create failed", LEVEL_WARN, 2000); continue; }
+                                        Config::ide_image[slot] = path;
+                                        IDE::init();
+                                        Config::save();
+                                        OSD::osdCenteredMsg("HDD image created", LEVEL_INFO, 1500);
+                                        // Success: unwind size + slot menus back to the IDE/HDD root.
+                                        VIDEO::SaveRect.restore_last();   // pop size-menu rect
+                                        VIDEO::SaveRect.restore_last();   // pop slot-menu rect
+                                        created = true;
+                                        menu_curopt = 4;
+                                        break;
+                                    }
+                                    // Back at the slot-picker level (Esc from size, or after create).
+                                    menu_level = 3;
+                                    menu_saverect = false;
+                                }
+                                menu_saverect = false;
                             } else {
                                 menu_curopt = 7;
                                 menu_level = 1;

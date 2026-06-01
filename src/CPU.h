@@ -59,7 +59,7 @@ visit https://zxespectrum.speccy.org/contacto
 #define INT_START_PENTAGON 0
 #define INT_END_PENTAGON 36
 #define INT_START_PROFI 0
-#define INT_END_PROFI 32
+#define INT_END_PROFI 39
 
 
 /// TODO:

@@ -27,6 +27,12 @@ option(PICO_DV "RP2350-PICO-DV" OFF)
 option(ZERO "RP2040-PiZero" OFF)
 option(ZERO2 "RP2350-PiZero" OFF)
 
+# Per-subsystem port-access tracing toggles (debugging). OFF by default — when
+# ON, gated `#if XXX_TRACE` Debug::log() calls in the sources become active.
+# Add new toggles here following the same option(...) + compile-definition pattern.
+option(IDE_PORT_TRACE "Enable PROFI IDE/HDD port access tracing" OFF)
+option(FDD_PORT_TRACE "Enable WD1793 (ВГ93) FDD command/port tracing" OFF)
+
 #set(FLASH_SIZE_GREEN ON)
 #set(m1p2launcher ON)
 
@@ -253,6 +259,20 @@ endif ()
 target_link_options(${PROJECT_NAME} PRIVATE -Xlinker --print-memory-usage --data-sections)
 target_compile_definitions(${PROJECT_NAME} PRIVATE FLASH_SIZE=${FLASH_SIZE})
 target_compile_definitions(${PROJECT_NAME} PRIVATE CONFIG_BOARD_TAG="${CONFIG_BOARD_TAG}")
+
+# IDE/HDD port tracing toggle (see Ports.cpp / IDE.cpp `#if IDE_PORT_TRACE`).
+if (IDE_PORT_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE IDE_PORT_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE IDE_PORT_TRACE=0)
+endif ()
+
+# WD1793 FDD command tracing toggle (see wd1793.cpp `#if FDD_PORT_TRACE`).
+if (FDD_PORT_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE FDD_PORT_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE FDD_PORT_TRACE=0)
+endif ()
 
 if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
 target_compile_options(${PROJECT_NAME} PUBLIC

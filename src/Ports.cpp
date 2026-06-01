@@ -70,6 +70,15 @@ extern "C" const uint32_t profi_default_palette16[16];
 #include "sdcard.h"
 #endif
 
+// Set to 1 to trace every 0x7FFD / 0xDFFD paging-port write (Profi debugging).
+// Off by default — these fire thousands of times during DS80/CP/M init.
+#ifndef PROFI_PORT_TRACE
+#define PROFI_PORT_TRACE 0
+#endif
+
+// IDE_PORT_TRACE (PROFI IDE/HDD port tracing) is defined by CMake (default 0).
+// Undefined → 0 in #if, so no fallback #define is needed here.
+
 // Place hot port functions in SRAM instead of XIP flash
 #undef IRAM_ATTR
 #define IRAM_ATTR __not_in_flash("ports")
@@ -177,6 +186,12 @@ static uint8_t profi_fdc_busy = 0;
 // the Z80 stack to find the original return address (non-0x40DE frame) and
 // redirect execution there via EI+RET, avoiding stack overflow and crash.
 static int profi_nodisk_reissue_cnt = 0;
+// Tracks whether the last Profi CP/M FDC command was issued via the shifted
+// 0x83 port path (Dos5 5.30 driver) vs the standard 0x1F/0x3F path.
+// Used to decide what IN A,(0x3F) returns: INTRQ/DRQ status (shifted scheme)
+// vs track register (standard scheme). Set on CMD write via 0x83; cleared on
+// CMD write via normal path (address & 0xE3 == 0x03).
+static bool profi_shifted_fdc = false;
 
 extern int ram_pages, butter_pages, psram_pages, swap_pages;
 
@@ -241,10 +256,14 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     }
   }
 #if !PICO_RP2040
-  // IDE/HDD — NEMO scheme (Pentagon, outside TR-DOS). Decoded BEFORE the ULA
-  // even-port branch because NEMO register ports (e.g. 0xC8/0xD0/0xF0) have A0=0
-  // and would otherwise be swallowed by the ULA port handler. 16-bit data via A0 latch.
-  if (IDE::scheme == IDE::NEMO && Z80Ops::isPentagon && !ESPectrum::trdos && !(address & 6)) {
+  // IDE/HDD — NEMO scheme. Enabled on ANY machine when the user selects NEMO
+  // (the NEMO interface is a bus card, not machine-specific). Decoded BEFORE the
+  // ULA even-port branch because NEMO register ports (e.g. 0xC8/0xD0/0xF0) have
+  // A0=0 and would otherwise be swallowed by the ULA port handler. 16-bit data
+  // via A0 latch. Authentic NEMO is mapped outside TR-DOS; on Profi the SYSEN
+  // line keeps ESPectrum::trdos permanently asserted (not real TR-DOS paging),
+  // so the !trdos rule is bypassed there.
+  if (IDE::scheme == IDE::NEMO && !(address & 6) && (Z80Ops::isProfi || !ESPectrum::trdos)) {
     if (address & 1) { LED::touchR(LED::SD); return IDE::read_latch(); } // A0=1: high-byte latch
     if ((address & 0x18) == 0x08 && (address & 0xE0) == 0xC0) {          // control / alt-status
       LED::touchR(LED::SD); return IDE::read8(8);
@@ -422,18 +441,48 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     //   register selector = high byte A(10:8) = (address>>8)&7; #00CB = data low.
     //   CS active when (CPM=1 & ROM14=1) OR (DOS=1 & ROM14=0).
     //   CPM=(portDFFD&0x20), ROM14=MemESP::romLatch, DOS=ESPectrum::trdos.
+    // Profi IDE — per UnrealSpeccy io.cpp MM_PROFI modified-ports section:
+    //   Gate: (p7FFD & 0x10) && (pDFFD & 0x20) = ROM14=1 AND CPM=1 only.
+    //   Port decode: (p1 & 0x9F)==0x8B, then A6 selects CS1 vs CS3.
+    //   16-bit latch: #xxCB(A6=1,A5=0) → read_data()+latch_hi, return lo;
+    //                 #xxEB(A6=1,A5=1) → return latch_hi (HIGH byte).
     if (IDE::scheme == IDE::PROFI && Config::arch == "Profi") {
-      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
-      if ((cpm && rom14) || (dos && !rom14)) {
+      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch;
+      if (cpm && rom14) {                               // same gate as UnrealSpeccy
         uint8_t p1 = address & 0xFF;
         uint8_t reg = (address >> 8) & 7;
-        // Data register: the 16-bit word is transferred as two single-byte reads —
-        // #00CB returns the low byte, #00EB returns the high byte (each advances
-        // the sector buffer by one byte). Register reads use #xxCB only.
-        if (p1 == 0xEB && reg == 0) { LED::touchR(LED::SD); return IDE::read8(0); }
-        if (p1 == 0xCB) {                       // read register window / data low
-          LED::touchR(LED::SD);
-          return IDE::read8(reg);
+        if ((p1 & 0x9F) == 0x8B) {
+          if (p1 & 0x40) {                             // CS1 (A6=1): data/registers
+            LED::touchR(LED::SD);
+            uint8_t rv;
+            if (p1 & 0x20)                             // A5=1 = #xxEB: HIGH byte latch
+              rv = IDE::read_latch();
+            else if (reg == 0)                         // A5=0 = #xxCB: low byte (16-bit data)
+              rv = IDE::read_data_low();
+            else
+              rv = IDE::read8(reg);
+#if IDE_PORT_TRACE
+            Debug::log("[IDE RD] pc=%04X port=%02X reg=%d val=%02X CS1",
+                       Z80::getRegPC(), (unsigned)p1, reg, rv);
+#endif
+            return rv;
+          }
+          // CS3 (A6=0) = #xxAB: ATA control block. reg6 → alternate status
+          // (mirror of the status register). MBOOTHDD reads/writes #06AB with A5=0,
+          // so do NOT gate on A5 here.
+          if (reg == 6) {
+            LED::touchR(LED::SD);
+            uint8_t rv = IDE::read8(7);                  // altstatus == status
+#if IDE_PORT_TRACE
+            Debug::log("[IDE RD] pc=%04X port=%02X reg=%d val=%02X CS3-altstatus",
+                       Z80::getRegPC(), (unsigned)p1, reg, rv);
+#endif
+            return rv;
+          }
+#if IDE_PORT_TRACE
+          Debug::log("[IDE RD] pc=%04X port=%02X reg=%d CS3 (unhandled)",
+                     Z80::getRegPC(), (unsigned)p1, reg);
+#endif
         }
       }
     }
@@ -491,13 +540,39 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       //   0x83 → reg0 (CMD/STATUS), 0xA3 → reg1 (TRACK),
       //   0xC3 → reg2 (SECTOR),     0xE3 → reg3 (DATA)
       // 0xBF & 0x9F == 0x9F ≠ 0x83, so SYS port 0xBF falls through to switch below.
-      // Per Karabas-Pro manual p.22: shifted FDC active only when CPM=1 AND
-      // ROM14=0. With ROM14=1 these addresses belong to extended periphery.
-      if (Config::arch == "Profi" && (portDFFD & 0x20) && !MemESP::romLatch &&
+      // Profi CP/M shifted FDC: 0x83/0xA3/0xC3/0xE3 → WD1793 regs 0..3.
+      // The Karabas-Pro manual p.22 says this is gated by ROM14=0, but the
+      // Dos5 5.30 CP/M floppy driver (e.g. at 0x8625: OUT (0x3F)/OUT (0x83) cmd;
+      // IN (0x83) BUSY poll) accesses these ports with ROM14=1 too. Gating on
+      // ROM14=0 left IN (0x83) returning 0xFF (bus float) → BUSY bit stuck high
+      // → the Type-I busy-wait at 0x862B (IN A,(0x83); RRCA; JR C) spun forever.
+      // CPM=1 alone is the correct enable; 0xBF (SYS) is unaffected since
+      // 0xBF & 0x9F == 0x9F ≠ 0x83.
+      if (Config::arch == "Profi" && (portDFFD & 0x20) &&
           ((address & 0x9F) == 0x83)) {
         LED::touchR(LED::FDD);
-        FDDStep(false);
+        // Force FDC advancement (true = force, regardless of HLD/HLT motor state).
+        // The case 0xe3 SYS-register path uses FDDStep(true) for the same reason:
+        // IN A,(0x83) is polled in tight busy-wait loops at 0x8625/0x862B with no
+        // other code advancing the FDC, so we must force each step here.
+        FDDStep(true);
         return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
+      }
+
+      // Profi CP/M port 0x3F: per manual "Порты FDD", in the ROM14=1 & CPM=1
+      // (MBOOTHDD) scheme #3F is the WD93 SYS register (RQ93) — read returns the
+      // status (INTRQ bit7, DRQ bit6), used in the sector-read loop at 0x86A4
+      // (IN A,(0x3F); AND 0xC0; JP M → INI from 0xE3). In ROM14=0 (standard /
+      // BOOTFDD) #3F is the WD track register — handled by case 0x23 below.
+      // Gate matches the OUT(#3F) SYS write path: CPM=1 & ROM14=1.
+      if (Config::arch == "Profi" && (portDFFD & 0x20) && MemESP::romLatch &&
+          ((address & 0xFF) == 0x3F)) {
+        LED::touchR(LED::FDD);
+        FDDStep(true);
+        uint8_t v = 0;
+        if (ESPectrum::fdd.control & kRVMWD177XDRQ)                        v |= 0x40;
+        if (ESPectrum::fdd.control & (kRVMWD177XINTRQ | kRVMWD177XFINTRQ)) v |= 0x80;
+        return v;
       }
 
       switch (address & 0xe3) {
@@ -510,41 +585,28 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
 
       case 0xa3:
-        // Profi: port 0xBF (address & 0xe3 == 0xa3) is the RQ93 SYS register
-        // in Profi modes with ROM14=0 (TR-DOS, CP/M with std ROM, or SYS ROM).
-        // On Karabas-Pro the TR-DOS ROM always writes the SYS register at
-        // 0xBF, not 0xFF.  In CP/M mode the FDC data registers shift to
-        // 0x83/0xA3/0xC3/0xE3 (caught by the earlier CP/M pre-check), so 0xBF
-        // never conflicts with the TRACK register
-        // (0xA3 & 0x9F == 0x83, but 0xBF & 0x9F == 0x9F).
-        // Per manual p.22: when ROM14=1 the address #BF is reassigned to the
-        // RTC AS register (extended periphery), so SYS handling must drop out.
+        // Port #BF (address & 0xe3 == 0xa3) is the RQ93 SYS register only in
+        // ROM14=0 & CPM=1 (BOOTFDD). When ROM14=1 the SYS register moves to #3F
+        // (MBOOTHDD scheme, handled before this switch) and #BF is reassigned
+        // to extended periphery.
         if (Config::arch != "Profi" || MemESP::romLatch)
           break;
-        [[fallthrough]];
-      case 0xe3: {
+        goto fdc_sys_status;
+      case 0xe3:
+        // Port #FF (and #FF-family) is the SYS register only in the standard
+        // scheme (CPM=0). In CP/M the SYS register is at #BF/#3F and the
+        // #FF-family belongs to extended periphery (IDE etc.) — see the write
+        // path. So do NOT return FDC status for these ports in CP/M mode.
+        if (Config::arch == "Profi" && (portDFFD & 0x20))
+          break;
+      fdc_sys_status: {
+        // SYS-register status read: bit 7 = INTRQ, bit 6 = DRQ (Beta-128
+        // ordering, verified on Profi 5.06 SYS-ROM at 0x07A4: `JP M`).
         LED::touchR(LED::FDD);
         FDDStep(true);
-
         uint8_t v = 0;
-        // Profi 5.06 SYS-ROM uses Beta-128 bit ordering (bit 7 = INTRQ,
-        // bit 6 = DRQ) — verified empirically: ROM at 0x07A4 does `JP M`
-        // (sign flag set) to exit Read Sector loop, expecting bit 7 to be
-        // INTRQ (command-done), not DRQ. The Karabas-Pro dev manual v1.01
-        // p.23 swaps these — that's the Karabas FPGA wiring, not Profi 5.06.
-        // Treat all Profi variants as Beta-128 ordering for now.
-        if (Config::arch == "Profi") {
-          if (ESPectrum::fdd.control & kRVMWD177XDRQ)
-            v |= 0x40;
-          if (ESPectrum::fdd.control & (kRVMWD177XINTRQ | kRVMWD177XFINTRQ))
-            v |= 0x80;
-        } else {
-          // Beta-128 / TR-DOS: bit 6 = DRQ, bit 7 = INTRQ
-          if (ESPectrum::fdd.control & kRVMWD177XDRQ)
-            v |= 0x40;
-          if (ESPectrum::fdd.control & (kRVMWD177XINTRQ | kRVMWD177XFINTRQ))
-            v |= 0x80;
-        }
+        if (ESPectrum::fdd.control & kRVMWD177XDRQ)                        v |= 0x40;
+        if (ESPectrum::fdd.control & (kRVMWD177XINTRQ | kRVMWD177XFINTRQ)) v |= 0x80;
         return v;
       }
       }
@@ -668,6 +730,61 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   return data;
 }
 
+// Profi CP/M system (RQ93) register write: drive select, soft-reset, HLT/test,
+// side select (bit4: 1→side0, 0→side1) and density (bit5: ~DDEN). Shared by the
+// standard scheme (SYS at 0xBF/0xFF) and the Dos5 5.30 shifted scheme, where the
+// MBOOTHDD loader addresses the SYS register at 0x3F (not 0xBF). Without routing
+// 0x3F here it landed in the WD TRACK register (0x3F&0xe3==0x23), so the
+// side-select OUT(0x3F),0x1C was silently lost and fdd.side stuck → side-compare
+// rejected the catalog on track0/side0 → "FDD Read Error".
+static inline void profiFdcSysWrite(uint8_t data) {
+#if FDD_PORT_TRACE
+  Debug::log("[FDC SYS] data=%02X drv=%d reset=%d side(bit4)=%d dden=%d pc=%04X",
+             data, data & 3, (int)((data & 0x04) == 0),
+             (int)((data & 0x10) != 0), (int)((data & 0x20) == 0),
+             Z80::getRegPC());
+#endif
+  // Change active disk unit. Profi 5.06 has 2 physical drives, so drive bits
+  // wrap modulo 2 (ZXMAK2 WD1793.cs:227).
+  uint8_t new_drive = data & 0x3;
+  if (Config::arch == "Profi") new_drive &= 0x1;
+  if (ESPectrum::fdd.diskS != new_drive) {
+    ESPectrum::fdd.diskS = new_drive;
+    if (ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != NULL &&
+        ESPectrum::fdd.side &&
+        ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->sides == 1)
+      ESPectrum::fdd.side = 0;
+    ESPectrum::fdd.sclConverted = false;
+  }
+
+  if (!(data & 0x4)) {
+    rvmWD1793Reset(&ESPectrum::fdd);
+    profi_nodisk_reissue_cnt = 0;
+    profi_shifted_fdc = false;
+  }
+
+  if (data & 0x8)
+    ESPectrum::fdd.control |= kRVMWD177XTest;
+  else
+    ESPectrum::fdd.control &= ~kRVMWD177XTest;
+
+  if (data & 0x10)
+    ESPectrum::fdd.side = 0;
+  else {
+    if (ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != NULL)
+      ESPectrum::fdd.side =
+          ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->sides == 1 ? 0 : 1;
+    else
+      ESPectrum::fdd.side = 1;
+  }
+
+  // RQ93 bit 5: ~DDEN (0=MFM double density, 1=FM single density)
+  if (data & 0x20)
+    ESPectrum::fdd.control &= ~kRVMWD177XDDEN;
+  else
+    ESPectrum::fdd.control |= kRVMWD177XDDEN;
+}
+
 IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   int Audiobit;
   if (Config::numPortWriteBP > 0 && Config::hasBreakPoint(address, Config::BP_PORT_WRITE))
@@ -743,14 +860,16 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // norom (bit 4) clears lock unconditionally.
     {
       uint8_t prev_page0ram = MemESP::page0ram;
-      // Log only when DS80 bit transitions (bit 7), or any change in low-volume bits.
+#if PROFI_PORT_TRACE
       static uint8_t prev_dffd = 0xFE;
-      if ((prev_dffd & 0x80) != (data & 0x80) || prev_dffd == 0xFE) {
-        // Debug::log("[DFFD] new=0x%02X DS80=%d CPM=%d NOROM=%d SCO=%d SCR=%d page2..0=%d pc=0x%04X",
-        //            data, (data >> 7) & 1, (data >> 5) & 1, (data >> 4) & 1,
-        //            (data >> 3) & 1, (data >> 6) & 1, data & 7, Z80::getRegPC());
+      if (prev_dffd != data) {
+        Debug::log("[DFFD] new=0x%02X DS80=%d CPM=%d NOROM=%d SCO=%d SCR=%d page2..0=%d pc=0x%04X rom14=%d trdos=%d",
+                   data, (data >> 7) & 1, (data >> 5) & 1, (data >> 4) & 1,
+                   (data >> 3) & 1, (data >> 6) & 1, data & 7, Z80::getRegPC(),
+                   (int)MemESP::romLatch, (int)ESPectrum::trdos);
         prev_dffd = data;
       }
+#endif
       portDFFD = data;
       MemESP::page0ram = bitRead(data, 4);
       if (MemESP::page0ram) MemESP::pagingLock = false; // norom → unlock
@@ -767,8 +886,8 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         MemESP::ramContended[3] = false;
       }
       // SCO (bit3): per ZXMAK2 UpdateMapping —
-      //   sco=0: MapRead4000 = RAM[5];      MapReadC000 = RAM[ramPage]
-      //   sco=1: MapRead4000 = RAM[ramPage]; MapReadC000 = RAM[7]
+      //   sco=0: MapRead4000 = RAM[5];       MapReadC000 = RAM[ramPage]  ← std 128K
+      //   sco=1: MapRead4000 = RAM[ramPage];  MapReadC000 = RAM[7]       ← Profi extended
       if (bitRead(data, 3)) {
         MemESP::ramCurrent[1] = MemESP::ram[MemESP::bankLatch].sync(1);
         MemESP::ramCurrent[3] = MemESP::ram[7].sync(3);
@@ -898,9 +1017,12 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   }
 #endif
 #if !PICO_RP2040
-  // IDE/HDD — NEMO scheme (Pentagon, outside TR-DOS). Decoded BEFORE the ULA
-  // even-port branch (NEMO register ports have A0=0). 16-bit data via A0 latch.
-  if (IDE::scheme == IDE::NEMO && Z80Ops::isPentagon && !ESPectrum::trdos && !(address & 6)) {
+  // IDE/HDD — NEMO scheme. Enabled on ANY machine when the user selects NEMO
+  // (bus card, not machine-specific). Decoded BEFORE the ULA even-port branch
+  // (NEMO register ports have A0=0). 16-bit data via A0 latch. On Profi the
+  // SYSEN line keeps ESPectrum::trdos permanently asserted, so the !trdos rule
+  // (authentic NEMO is outside TR-DOS) is bypassed there.
+  if (IDE::scheme == IDE::NEMO && !(address & 6) && (Z80Ops::isProfi || !ESPectrum::trdos)) {
     if (address & 1) { LED::touchW(LED::SD); IDE::write_latch(data); return; } // A0=1: high latch
     if ((address & 0x18) == 0x08 && (address & 0xE0) == 0xC0) {                // control
       LED::touchW(LED::SD); IDE::write8(8, data); return;
@@ -1190,29 +1312,43 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       if (lo == 0x57) { LED::touchW(LED::ZCTRL); DivMMC::zc_write_data(data); return; }
     }
 
-    // IDE/HDD — PROFI scheme. Per Karabas-Pro/Profi manual "Порты IDE HDD (CF)":
-    //   write regs at #xxEB, system reg at #06AB; reg = (address>>8)&7; #00EB = data low.
-    //   CS active when (CPM=1 & ROM14=1) OR (DOS=1 & ROM14=0).
+    // IDE/HDD — PROFI scheme, per UnrealSpeccy MM_PROFI modified-ports section:
+    //   Gate: ROM14=1 AND CPM=1 (same as UnrealSpeccy: p7FFD&0x10 && pDFFD&0x20).
+    //   Port decode: (p1 & 0x9F)==0x8B; CS1=A6=1 for data/registers.
+    //   16-bit latch: #xxCB(A5=0) → store HIGH byte in write_latch;
+    //                 #xxEB(A5=1, reg=0) → write 16-bit: data|(latch<<8).
+    //   CS3: #xxAB(A6=0,A5=1, reg=6) → ATA control register (SRST/nIEN).
     if (IDE::scheme == IDE::PROFI && Config::arch == "Profi") {
-      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
-      if ((cpm && rom14) || (dos && !rom14)) {
+      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch;
+      if (cpm && rom14) {
         uint8_t p1 = address & 0xFF;
         uint8_t reg = (address >> 8) & 7;
-        // Data register: 16-bit word written as two single-byte writes —
-        // #00EB = low byte, #00CB = high byte (each advances buffer by one).
-        if (p1 == 0xCB && reg == 0) { LED::touchW(LED::SD); IDE::write8(0, data); return; }
-        if (p1 == 0xEB) {                       // write register window / data low
-          LED::touchW(LED::SD);
-          IDE::write8(reg, data);
-          return;
-        }
-        if (p1 == 0xAB) {                       // #06AB = ATA control register (R8)
-          // Per UnrealSpeccy IDE_PROFI: writes to #06AB go to hdd reg 8 (control:
-          // SRST/nIEN). Drivers (e.g. DOSBIO v2.02) issue 0x0E then 0x08 here to
-          // assert and release SRST as a software reset — must trigger reset_signature.
-          LED::touchW(LED::SD);
-          if (reg == 6) IDE::write8(8, data);
-          return;
+        if ((p1 & 0x9F) == 0x8B) {
+#if IDE_PORT_TRACE
+          Debug::log("[IDE WR] pc=%04X port=%02X reg=%d data=%02X",
+                     Z80::getRegPC(), (unsigned)p1, reg, data);
+#endif
+          if (p1 & 0x40) {                           // CS1 (A6=1): data/registers
+            LED::touchW(LED::SD);
+            if (!(p1 & 0x20)) {                      // A5=0 = #xxCB: HIGH byte latch
+              IDE::write_latch(data);
+              return;
+            }
+            // A5=1 = #xxEB: write register or 16-bit data
+            if (reg == 0)                            // data register: combine with latch
+              IDE::write_data_low(data);             // latch_write is HIGH byte
+            else
+              IDE::write8(reg, data);
+            return;
+          }
+          // CS3 (A6=0) = #xxAB reg6: ATA device control (0x3F6, SRST/nIEN).
+          // MBOOTHDD issues the ATA soft-reset via OUT (#06AB),A — port 0xAB has
+          // A5=0, so do NOT gate on A5 (the old `p1&0x20` check dropped the reset).
+          if (reg == 6) {
+            LED::touchW(LED::SD);
+            IDE::write8(8, data);
+            return;
+          }
         }
       }
     }
@@ -1294,13 +1430,27 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       //   0x83 → reg0 (CMD/STATUS), 0xA3 → reg1 (TRACK),
       //   0xC3 → reg2 (SECTOR),     0xE3 → reg3 (DATA)
       // 0xBF & 0x9F == 0x9F ≠ 0x83, so SYS port 0xBF falls through to switch below.
-      // Per Karabas-Pro manual p.22: shifted FDC active only when CPM=1 AND
-      // ROM14=0. With ROM14=1 these addresses belong to extended periphery.
-      if (Config::arch == "Profi" && (portDFFD & 0x20) && !MemESP::romLatch &&
+      // Profi CP/M shifted FDC (see matching read path): enable on CPM=1 alone,
+      // not gated by ROM14. The Dos5 5.30 CP/M driver writes Type-I commands to
+      // 0x83 (e.g. OUT (0x83),0x0C/0x1C at 0x864F/0x866C) with ROM14=1.
+      if (Config::arch == "Profi" && (portDFFD & 0x20) &&
           ((address & 0x9F) == 0x83)) {
         LED::touchW(LED::FDD);
         FDDStep(false);
+        // CMD write via shifted 0x83 → activate shifted-scheme status for IN(0x3F)
+        if (((address >> 5) & 0x3) == 0) profi_shifted_fdc = true;
         rvmWD1793Write(&ESPectrum::fdd, ((address >> 5) & 0x3), data);
+      } else if (Config::arch == "Profi" && (portDFFD & 0x20) && MemESP::romLatch &&
+                 (address & 0xFF) == 0x3F) {
+        // Per manual "Порты FDD": in the ROM14=1 & CPM=1 (MBOOTHDD) scheme the
+        // WD93 SYS register (RQ93) is at #3F — NOT the track register. The
+        // MBOOTHDD loader selects drive/side/reset via OUT(#3F) (e.g. 0x1C=side0,
+        // 0x0C=side1). #3F&0xe3==0x23 would otherwise land in the track-register
+        // case and silently drop the side select → fdd.side stuck → side-compare
+        // rejects the catalog on track0/side0 → "FDD Read Error".
+        LED::touchW(LED::FDD);
+        FDDStep(true);
+        profiFdcSysWrite(data);
       } else switch (address & 0xe3) {
 
       case 0x03:
@@ -1309,6 +1459,8 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       case 0x63:
         LED::touchW(LED::FDD);
         FDDStep(false);
+        // CMD write via normal path → deactivate shifted-scheme status
+        if (((address >> 5) & 0x3) == 0) profi_shifted_fdc = false;
 #if !PICO_RP2040
         // Profi CP/M: detect the DSKKE9A re-issue loop (CALL 0x40EA → JR 0x40D9).
         // The DSKKE9A disk driver uses an infinite re-issue loop: after issuing a
@@ -1381,68 +1533,47 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         break;
       case 0xa3:
         // Profi: port 0xBF (address & 0xe3 == 0xa3) is the RQ93 SYS register
-        // in Profi modes with ROM14=0 (TR-DOS, CP/M with std ROM, or SYS ROM).
-        // On Karabas-Pro the TR-DOS ROM always writes the SYS register at
-        // 0xBF, not 0xFF.  Per manual p.22: when ROM14=1 the address #BF
-        // is reassigned to the RTC AS register (extended periphery).
+        // only in ROM14=0 & CPM=1 (the BOOTFDD scheme). When ROM14=1 the address
+        // #BF is reassigned to extended periphery, and the SYS register moves to
+        // #3F (the ROM14=1 & CPM=1 / MBOOTHDD scheme, handled before this switch).
         if (Config::arch != "Profi" || MemESP::romLatch)
           break;
-        [[fallthrough]];
-      case 0xe3:
         LED::touchW(LED::FDD);
         FDDStep(true);
-
-        // Change active disk unit.
-        // Profi 5.06 hardware has only 2 physical drives (A:/B:), so the WD1793
-        // SYS register drive bits wrap modulo 2 (ZXMAK2 WD1793.cs:227 —
-        // `drive = (value & 3) % fdd.Length` where fdd.Length=2 for Profi).
-        // Without this wrap, CP/M `sea` issuing OUT(#BF),#4E (drv-bits=2) lands
-        // on empty slot 2 and the FDC hangs waiting for BUSY=1 from no disk.
-        uint8_t new_drive = data & 0x3;
-        if (Config::arch == "Profi") new_drive &= 0x1;
-        if (ESPectrum::fdd.diskS != new_drive) {
-          ESPectrum::fdd.diskS = new_drive;
-          if (ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != NULL &&
-              ESPectrum::fdd.side &&
-              ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->sides == 1)
-            ESPectrum::fdd.side = 0;
-          ESPectrum::fdd.sclConverted = false;
-        }
-
-        if (!(data & 0x4)) {
-          rvmWD1793Reset(&ESPectrum::fdd);
-          profi_nodisk_reissue_cnt = 0;  // reset re-issue counter on WD reset
-        }
-
-        if (data & 0x8)
-          ESPectrum::fdd.control |= kRVMWD177XTest;
-        else
-          ESPectrum::fdd.control &= ~kRVMWD177XTest;
-
-        if (data & 0x10)
-          ESPectrum::fdd.side = 0;
-        else {
-          if (ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != NULL)
-            ESPectrum::fdd.side =
-                ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->sides == 1 ? 0 : 1;
-          else
-            ESPectrum::fdd.side = 1;
-        }
-
-
-        // RQ93 bit 5: ~DDEN (0=MFM double density, 1=FM single density)
-        if (data & 0x20)
-          ESPectrum::fdd.control &= ~kRVMWD177XDDEN;  // bit5=1 → FM (single)
-        else
-          ESPectrum::fdd.control |= kRVMWD177XDDEN;   // bit5=0 → MFM (double)
-
+        profiFdcSysWrite(data);
+        break;
+      case 0xe3:
+        // Port #FF (and the #FF-family: #E7/#EB/#EF/#F3/#F7/#FB that also satisfy
+        // address&0xe3==0xe3) is the WD93 SYS register ONLY in the standard scheme
+        // (CPM=0). Per manual "Порты FDD", in CP/M the SYS register moves to #BF
+        // (ROM14=0) or #3F (ROM14=1), and the #FF-family belongs to extended
+        // periphery — notably the PROFI IDE/HDD ports (#xxEB) probed by the HDD22
+        // driver. Routing those to the FDC here issued a spurious soft-reset
+        // (SYS bit2=0 → rvmWD1793Reset → track=0xFF), which corrupted the floppy
+        // track register mid-boot and made MBOOTHDD mis-seek (530.pro hang).
+        // So gate out CP/M mode: only the standard TR-DOS scheme uses #FF as SYS.
+        if (Config::arch == "Profi" && (portDFFD & 0x20))
+          break;
+        LED::touchW(LED::FDD);
+        FDDStep(true);
+        profiFdcSysWrite(data);
         break;
       }
     }
     ioContentionLate(MemESP::ramContended[rambank]);
   }
-  // Pentagon only
-  if ((Z80Ops::isPentagon || Z80Ops::isProfi) && ((address & 0x1008) == 0)) { // 1008 !-> EFF7
+  // Pentagon #EFF7 (page0ram/notMore128). The loose Pentagon decode
+  // (address & 0x1008)==0 (= A12=0 & A3=0) COLLIDES with the Profi CP/M FDC
+  // command port #83: e.g. RDSEC 0x82/0x86 → OUT(0x83),A makes address 0x8283/
+  // 0x8683 (A12=0, low-byte bit3=0), which spuriously enters this handler and
+  // clobbers page0ram = bit3(opcode) → pages ROM into bank0 mid-RDSEC. The
+  // MBOOTHDD stack lives at 0x00D8 (page0), so the next CALL/RET reads its
+  // return address from ROM → wild jump (NOP-slide crash). Profi gets page0ram
+  // from DFFD bit4 (above) and does not use the Pentagon-1024 #EFF7 port, so
+  // require the real #EFF7 address for Profi to avoid the FDC-port collision.
+  bool eff7_decode = (Config::arch == "Profi") ? ((address & 0xF008) == 0xE000)
+                                               : ((address & 0x1008) == 0);
+  if ((Z80Ops::isPentagon || Z80Ops::isProfi) && eff7_decode) { // EFF7
     LED::touchW(LED::RAM);
     if (!MemESP::pagingLock) {
       uint8_t prev = MemESP::page0ram;
@@ -1459,6 +1590,17 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // videoLatch/pagingLock and produces a black screen on ALF.
   if ((!Z80Ops::is48) && !Z80Ops::isALF && ((address & 0x8002) == 0)) { // 8002 !-> 7FFD
     LED::touchW(LED::RAM);
+#if PROFI_PORT_TRACE
+    if (Config::arch == "Profi") {
+      static uint8_t prev_7ffd = 0xFE;
+      if (prev_7ffd != data) {
+        Debug::log("[7FFD] new=0x%02X bank=%d videoLatch=%d romLatch=%d lock=%d pc=%04X",
+                   data, data & 7, (data >> 3) & 1, (data >> 4) & 1, (data >> 5) & 1,
+                   Z80::getRegPC());
+        prev_7ffd = data;
+      }
+    }
+#endif
     if (!MemESP::pagingLock) {
       uint8_t D5 = bitRead(data, 5);
       if (Z80Ops::is1024) {

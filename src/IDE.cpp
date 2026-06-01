@@ -7,6 +7,10 @@
 #include "Config.h"
 #include "Debug.h"
 
+// IDE_PORT_TRACE (every ATA register/command access + sector read/write) is
+// defined by CMake (default 0). One-time init/geometry logs stay unconditional.
+// Undefined → 0 in #if, so no fallback #define is needed here.
+
 // ============================================================
 // Static storage
 // ============================================================
@@ -36,9 +40,17 @@ uint8_t IDE::reg_control = 0;
 uint8_t* IDE::buffer = nullptr;
 int  IDE::data_index = -1;
 bool IDE::data_write = false;
+bool IDE::data_discard = false;
 
 uint8_t IDE::latch_read = 0;
 uint8_t IDE::latch_write = 0;
+
+// Profi HiDD standard geometry. The Profi BIOS always reads cylinder=1 with
+// this fixed geometry to locate the ProfiHiDD header (no IDENTIFY before first
+// read). The header itself then reports the actual partition geometry.
+// These are not arbitrary — they are defined by the Profi CP/M disk format spec.
+static const uint16_t PROFI_HEADS   = 16;
+static const uint16_t PROFI_SECTORS = 16;
 
 // ============================================================
 // Status / error bits
@@ -172,7 +184,10 @@ bool IDE::open_image(int slot, const char* path) {
     // CHS geometry of H=16, S=16, and the SYS-ROM boot reads CHS cyl=1 (=lba 256
     // with H*S=256) to fetch this header — so we MUST report H=16,S=16, otherwise
     // the synthesized H=16,S=63 sends cyl=1 to lba 1008 and boot fails.
-    if (fsize >= 131088 + 8) {
+    // Only honored under the PROFI scheme: under NEMO the same image is presented
+    // as a plain raw disk (H=16,S=63) so NEMO tools (Demeter, etc.) can partition
+    // it in their own format. Image interpretation follows the selected interface.
+    if (scheme == PROFI && fsize >= 131088 + 8) {
         uint8_t psig[8];
         f_lseek(&file[slot], 131088);
         f_read(&file[slot], psig, 8, &br);
@@ -225,6 +240,18 @@ void IDE::init() {
                 cylinders[d] = c; heads[d] = h; sectors[d] = s;
                 Debug::log("IDE hd%d: geometry override C=%u H=%u S=%u", d, c, h, s);
             }
+            // Profi CP/M: BIOS always uses H=16 S=16 for CHS addressing (standard
+            // Profi geometry). The first sector the BIOS reads is cylinder=1 which
+            // maps to LBA 256 (= 1*16*16). Any other S would give wrong LBA, causing
+            // "HDD Failure" before the ProfiHiDD header can be read and geometry synced.
+            // Force H=16 S=16 here; read_sector() will re-sync from the ProfiHiDD header
+            // at LBA 256 and update cylinders to match the actual image size.
+            if (scheme == PROFI) {
+                heads[d] = 16; sectors[d] = 16;
+                if (c) cylinders[d] = c;  // keep user cylinder count if specified
+                Debug::log("IDE hd%d: Profi forced H=16 S=16 C=%u for CHS compat",
+                           d, cylinders[d]);
+            }
         }
     }
 
@@ -241,6 +268,38 @@ uint32_t IDE::geomLBA(int slot) {
     return (uint32_t)cylinders[slot]*heads[slot]*sectors[slot];
 }
 uint32_t IDE::sizeBytes(int slot) { return (slot>=0&&slot<2)?size_bytes[slot]:0; }
+
+bool IDE::createImage(const char* path, uint32_t megabytes,
+                      void (*progress)(uint32_t, uint32_t)) {
+    if (!path || !path[0] || megabytes == 0) return false;
+
+    FIL f;
+    FRESULT fr = f_open(&f, path, FA_CREATE_ALWAYS | FA_WRITE);
+    if (fr != FR_OK) {
+        Debug::log("IDE: createImage open %s failed (err=%d)", path, fr);
+        return false;
+    }
+
+    // Zero-fill in 16 KB chunks. RP2350-only (IDE is #if !PICO_RP2040), heap OK.
+    const uint32_t CHUNK = 16 * 1024;
+    uint8_t* zbuf = (uint8_t*)calloc(CHUNK, 1);
+    if (!zbuf) { f_close(&f); f_unlink(path); return false; }
+
+    uint64_t total    = (uint64_t)megabytes * 1024u * 1024u;
+    uint32_t totalSec = (uint32_t)(total / 512);
+    bool ok = true;
+    for (uint64_t off = 0; off < total; off += CHUNK) {
+        uint32_t n = (total - off) < CHUNK ? (uint32_t)(total - off) : CHUNK;
+        UINT bw;
+        if (f_write(&f, zbuf, n, &bw) != FR_OK || bw != n) { ok = false; break; }
+        if (progress) progress((uint32_t)((off + n) / 512), totalSec);
+    }
+    free(zbuf);
+    f_close(&f);
+    if (!ok) { f_unlink(path); Debug::log("IDE: createImage write failed"); return false; }
+    Debug::log("IDE: created %s (%u MB)", path, (unsigned)megabytes);
+    return true;
+}
 
 // Place the ATA reset/diagnostic signature in the registers (ATA-3: a
 // hard/soft reset or EXECUTE DEVICE DIAGNOSTIC leaves count=sec=err=1, cyl=0,
@@ -260,6 +319,7 @@ void IDE::reset() {
     reg_control = 0;
     data_index = -1;
     data_write = false;
+    data_discard = false;
     latch_read = 0;
     latch_write = 0;
     reset_signature();
@@ -316,8 +376,69 @@ void IDE::read_sector() {
     f_lseek(&file[d], pos);
     f_read(&file[d], buffer, 512, &br);
     if (br < 512) memset(buffer + br, 0xFF, 512 - br);
+#if IDE_PORT_TRACE
     Debug::log("IDE READ  hd%d lba=%u off=%u -> %u bytes [%02X %02X %02X %02X ...]",
                d, l, (unsigned)pos, (unsigned)br, buffer[0], buffer[1], buffer[2], buffer[3]);
+#endif
+
+    // Profi CP/M: the geometry sector (ProfiHiDD header) lives at CHS(1,0,1),
+    // which maps to LBA = heads[d] * sectors[d] (first sector of cylinder 1).
+    // We don't hardcode 256 — use the actual current geometry so the check is
+    // valid regardless of what H/S were set to.
+    if (scheme == PROFI) {
+        uint32_t hidd_lba = (uint32_t)heads[d] * sectors[d];  // cyl=1, head=0, sec=1
+        if (l == hidd_lba) {
+            // ProfiHiDD signature at offset 16: "ProfiHiDD" stored as byte-swapped
+            // 16-bit words (per the 16-bit Profi IDE data transfer protocol):
+            // 'P'+'r' → 0x72,0x50 | 'o'+'f' → 0x66,0x6F | 'H'+'i' → 0x48,0x69 | 'D'+'D'
+            static const uint8_t sig_be[8] = {0x72,0x50,0x66,0x6F,0x48,0x69,0x44,0x44};
+            bool has_sig = (memcmp(buffer + 16, sig_be, 8) == 0);
+            bool empty   = true;
+            for (int i = 0; i < 512 && empty; i++) if (buffer[i]) empty = false;
+
+            if (empty) {
+                // Fresh/uninitialised HDD image: synthesize a valid ProfiHiDD header
+                // with H=16 S=16 (standard Profi CP/M) so the BIOS detects the drive.
+                // This matches our forced H=16 S=16 init, so lba(cyl=1)=256 is consistent.
+                const uint16_t h = 16, s = 16;
+                uint32_t total_secs = (uint32_t)(f_size(&file[d]) / 512);
+                uint16_t c = (total_secs > 0) ? (uint16_t)(total_secs / ((uint32_t)h * s)) : 1;
+                memset(buffer, 0, 512);
+                buffer[0] = h >> 8;   buffer[1] = h & 0xFF;  // H big-endian
+                buffer[2] = s >> 8;   buffer[3] = s & 0xFF;  // S big-endian
+                buffer[4] = c >> 8;   buffer[5] = c & 0xFF;  // C big-endian
+                const char sig[] = "ProfiHiDD";
+                for (int i = 0; i < 8; i += 2) {
+                    buffer[16 + i]     = sig[i + 1];
+                    buffer[16 + i + 1] = sig[i];
+                }
+                buffer[24] = sig[8];
+                has_sig = true;
+                Debug::log("IDE hd%d: synthesized ProfiHiDD H=%u S=%u C=%u at LBA %u",
+                           d, h, s, c, l);
+            }
+
+            if (has_sig) {
+                // Sync drive geometry from the ProfiHiDD header so lba() matches the
+                // BIOS's CHS calculations. Header stores H,S,C as big-endian 16-bit words.
+                // After the 16-bit latch read (BIOS 0x8840 loop), the BIOS buffer has:
+                //   bios_buf[0] = HIGH byte from #00EB latch = file_byte[1]
+                //   bios_buf[1] = LOW byte from #00CB       = file_byte[0]
+                // Then 0x8FF3: bios_buf[0] → 0x8F13=H  and  bios_buf[2] → 0x8F12=S.
+                // With big-endian storage [0x00,0x10] for H=16: file[0]=0x00, file[1]=0x10.
+                // read_data_low() returns file[0]=0x00 (E), latch=file[1]=0x10; read_latch()=0x10 (A).
+                // BIOS stores A(=0x10) first → bios_buf[0]=0x10 → H=16 ✓.
+                uint16_t h = ((uint16_t)buffer[0] << 8) | buffer[1];
+                uint16_t s = ((uint16_t)buffer[2] << 8) | buffer[3];
+                uint16_t c = ((uint16_t)buffer[4] << 8) | buffer[5];
+                if (h >= 1 && h <= 255 && s >= 1 && s <= 255 && c >= 1) {
+                    heads[d] = h; sectors[d] = s; cylinders[d] = c;
+                    Debug::log("IDE hd%d: ProfiHiDD geometry H=%u S=%u C=%u at LBA %u",
+                               d, h, s, c, l);
+                }
+            }
+        }
+    }
     data_index = 0;
     data_write = false;
     reg_status = IDE_STATUS_READY | IDE_STATUS_DRQ;
@@ -332,9 +453,11 @@ void IDE::write_sector_done() {
     f_lseek(&file[d], pos);
     f_write(&file[d], buffer, 512, &bw);
     f_sync(&file[d]);
+#if IDE_PORT_TRACE
     Debug::log("IDE WRITE hd%d lba=%u off=%u <- %u bytes [%02X %02X %02X %02X ...]",
                d, l, (unsigned)pos, (unsigned)bw,
                buffer[0], buffer[1], buffer[2], buffer[3]);
+#endif
 }
 
 void IDE::advance_lba() {
@@ -349,9 +472,11 @@ void IDE::advance_lba() {
 }
 
 void IDE::execute_command(uint8_t cmd) {
+#if IDE_PORT_TRACE
     Debug::log("IDE CMD   %02X drv=%d %s cyl=%u sec=%u cnt=%u head=%02X",
                cmd, drive(), (reg_head & IDE_LBA_BIT) ? "LBA" : "CHS",
                (reg_cyl_hi << 8) | reg_cyl_lo, reg_sector, reg_sector_count, reg_head);
+#endif
     reg_error = 0;
     reg_status = IDE_STATUS_READY;
 
@@ -384,10 +509,18 @@ void IDE::execute_command(uint8_t cmd) {
             reg_status = IDE_STATUS_READY;
             break;
 
+        case 0x50: // FORMAT TRACK — accept one sector of interleave data, discard (ATA no-op)
+            data_index = 0;
+            data_write = true;
+            data_discard = true;
+            reg_status = IDE_STATUS_READY | IDE_STATUS_DRQ;
+            break;
+
         case 0x30: // WRITE SECTOR (retry)
         case 0x31: // WRITE SECTOR (no retry)
             data_index = 0;
             data_write = true;
+            data_discard = false;
             reg_status = IDE_STATUS_READY | IDE_STATUS_DRQ;
             break;
 
@@ -505,19 +638,33 @@ uint8_t IDE::read8(uint8_t reg) {
         case 5: return reg_cyl_hi;
         case 6: return reg_head;
         case 7:
-        case 8: return reg_status;
+        case 8: {
+#if IDE_PORT_TRACE
+            static uint8_t _last_st = 0xFF;
+            if (reg_status != _last_st) {
+                Debug::log("[IDE RD] status=0x%02X", reg_status);
+                _last_st = reg_status;
+            }
+#endif
+            return reg_status;
+        }
         default: return 0xFF;
     }
 }
 
 void IDE::write8(uint8_t reg, uint8_t value) {
+#if IDE_PORT_TRACE
+    if (reg != 0)  // don't log data register writes (too noisy)
+        Debug::log("[IDE WR] reg=%d val=0x%02X", reg, value);
+#endif
     switch (reg) {
         case 0: // Data
             if (data_index >= 0 && data_write) {
                 buffer[data_index++] = value;
                 if (data_index >= 512) {
-                    write_sector_done();
+                    if (!data_discard) write_sector_done();
                     data_index = -1;
+                    data_discard = false;
                     if (reg_sector_count > 0) {
                         reg_sector_count--;
                         if (reg_sector_count > 0) {
@@ -542,7 +689,9 @@ void IDE::write8(uint8_t reg, uint8_t value) {
         case 8: { // control register (nIEN/SRST)
             uint8_t prev = reg_control;
             reg_control = value;
+#if IDE_PORT_TRACE
             Debug::log("IDE OUT R8 ctrl=%02X", value);
+#endif
             // SRST asserted (1) then deasserted (0) -> device reset, load signature.
             if ((prev & IDE_CONTROL_SRST) && !(value & IDE_CONTROL_SRST)) {
                 Debug::log("IDE SRST -> reset signature");

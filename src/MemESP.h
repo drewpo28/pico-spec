@@ -259,6 +259,12 @@ inline void MemESP::writebyte(uint16_t addr, uint8_t data)
 #endif
     uint8_t* p = ramCurrent[page];
     if (p < (uint8_t*)0x11000000) return;
+    // NOTE: the Profi CP/M BOOTFDD has 0x801A = 0xC9, which the BIOS reads via
+    // `LD A,(0x801A); AND A; JR NZ` to select the floppy boot path (A≠0).
+    // An earlier experiment patched this byte to 0x00 to force the HDD boot path,
+    // but the HDD CP/M boot is not implemented and that patch hung the boot.
+    // We boot CP/M from floppy; the IDE HDD remains accessible as a data drive
+    // from within CP/M via the Profi IDE ports — so no 0x801A patch here.
     p[addr & 0x3fff] = data;
 }
 

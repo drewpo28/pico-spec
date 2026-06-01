@@ -39,6 +39,7 @@ THE SOFTWARE.
 #include "Z80_JLS/z80.h"
 #if !PICO_RP2040
 #include "td0.h"
+extern size_t getContiguousHeap(void);
 #endif
 
 static bool sclConvertToTRD(rvmWD1793 *wd);
@@ -997,8 +998,29 @@ case kRVMWD177XWriteTrack: {
 }
 
 IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
-  
+
   for (;steps > 0; steps--) {
+
+#if !PICO_RP2040
+    // Host-paced data transfer (Profi CP/M).  When DRQ is pending the CPU has
+    // not yet read/written the data register, so the byte-by-byte transfer must
+    // FREEZE — disk rotation and byte production both stop until the host
+    // services DRQ.  Without this, a large step burst (the frame-end
+    // rvmWD1793Step in CPU.cpp fires with HLD/HLT set during a read, and the
+    // first status poll after a frame wrap accumulates a huge tstates_diff)
+    // blasts through the entire sector before the CPU reads a single byte: the
+    // data is lost (LostData) and the command ends with the host never having
+    // participated, hanging the BIOS poll loop at #BF.
+    // Mirrors pentevo's per-byte ts_byte pacing (S_READ → S_WAIT → S_READ).
+    // Gated to Profi CP/M + non-fastmode so TR-DOS / FDI / UDI byte loops and
+    // fastmode bulk transfers are unaffected.
+    if (Config::arch == "Profi" && (Ports::portDFFD & 0x20) && !wd->fastmode &&
+        (wd->control & kRVMWD177XDRQ) &&
+        (wd->stepState == kRVMWD177XStepReadByte ||
+         wd->stepState == kRVMWD177XStepWriteByte)) {
+      break;
+    }
+#endif
 
     uint8_t d=0x0;
     uint8_t s=0x0;
@@ -1063,7 +1085,8 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
         // Treat Type I steps as fastmode in this case.
         bool profi_cpm_typeI =
             (Config::arch == "Profi" && (Ports::portDFFD & 0x20)
-             && wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsProFile
+             && wd->disk[wd->diskS]
+             && (wd->disk[wd->diskS]->IsProFile || wd->disk[wd->diskS]->IsFDIFile)
              && (wd->command & kRVMWD177XTypeI) == 0
              && wd->state == kRVMWD177XTypeICheck);
 
@@ -1318,12 +1341,34 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
 
       }
 
+
       if(!(wd->status & kRVMWD177XStatusBusy)) {
 
         wd->control &= ~(kRVMWD177XINTRQ|kRVMWD177XFINTRQ);
 
         wd->command = value;
 
+#if !PICO_RP2040 && FDD_PORT_TRACE
+        // FDD command trace — every accepted WD1793 command with key registers.
+        // Enable via -DFDD_PORT_TRACE=ON. Decodes the (ROM14,CPM) port scheme bug
+        // class: watch `side` vs the command side bit (bit3) on RDSEC/WRSEC.
+        if (Config::arch == "Profi") {
+            const char *cn;
+            uint8_t c = wd->command;
+            if (!(c & 0x80))                cn = (c & 0x10) ? "SEEK" : ((c & 0x60) ? "STEP" : "RESTORE");
+            else if ((c & 0xE0) == 0x80)    cn = (c & 0x20) ? "WRSEC" : "RDSEC";
+            else if ((c & 0xF0) == 0xC0)    cn = "RDADDR";
+            else if ((c & 0xF0) == 0xE0)    cn = "RDTRK";
+            else if ((c & 0xF0) == 0xF0)    cn = "WRTRK";
+            else if ((c & 0xF0) == 0xD0)    cn = "FORCEINT";
+            else                            cn = "?";
+            Debug::log("[FDC CMD] %02X %-7s trk=%d sec=%d side=%d dataReg=%d "
+                       "diskS=%d cpm=%d romInUse=%d fast=%d pc=%04X",
+                       c, cn, wd->track, wd->sector, wd->side, wd->data,
+                       wd->diskS, (int)((Ports::portDFFD & 0x20) != 0),
+                       (int)MemESP::romInUse, (int)wd->fastmode, Z80::getRegPC());
+        }
+#endif
 
         if(wd->disk[wd->diskS]  && (wd->control & (kRVMWD177XPower0 << wd->diskS))) {
 
@@ -1464,6 +1509,10 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
       //if(!(wd->status & kRVMWD177XStatusBusy)) {
         wd->track=value;
       //}
+#if !PICO_RP2040 && FDD_PORT_TRACE
+      if (Config::arch == "Profi")
+        Debug::log("[FDC TRK] track<-%d pc=%04X", value, Z80::getRegPC());
+#endif
       break;
     case 2: //Sector
       //if(!(wd->status & kRVMWD177XStatusBusy)) {
@@ -1788,18 +1837,39 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         FSIZE_t fsize = f_size(wd->disk[UnitNum]->Diskfile);
         if (fsize <= 12) { wdDiskEject(wd, UnitNum); Debug::led_blink(); return false; }
 
-        // Read the raw file body (everything after the 12-byte header).
+        // SDK's malloc wraps with check_alloc → panic on OOM, so we must
+        // gate every allocation behind getContiguousHeap() instead of
+        // relying on NULL returns. Reserve a safety margin so concurrent
+        // allocators (FatFs LFN scratch, OSD redraw) don't trip the same
+        // panic right after.
+        const size_t kHeapSafety = 4 * 1024;
+
         uint32_t rawLen = (uint32_t)(fsize - 12);
+
+        if ((size_t)rawLen + kHeapSafety > getContiguousHeap()) {
+            wdDiskEject(wd, UnitNum); Debug::led_blink(); return false;
+        }
         uint8_t *raw = (uint8_t *)malloc(rawLen);
-        if (!raw) { wdDiskEject(wd, UnitNum); Debug::led_blink(); return false; }
         f_lseek(wd->disk[UnitNum]->Diskfile, 12);
         f_read(wd->disk[UnitNum]->Diskfile, raw, rawLen, &br);
 
         if (packed) {
-            // Worst case a 80×2×16×256 disk decompresses to ~640 KB; cap generously.
-            const uint32_t kCap = 1u << 20; // 1 MB
+            // Cap decompressed size to whatever the heap can hold after the
+            // raw buffer is in place. td0_unpack_lzh honours dstCapacity and
+            // returns the actually-written byte count, so a smaller cap just
+            // truncates the disk image (later tracks unreachable) rather
+            // than panicking — far better than refusing to mount entirely.
+            const uint32_t kCapMax = 1u << 20; // 1 MB upper bound
+            size_t avail = getContiguousHeap();
+            uint32_t kCap = (avail > kHeapSafety) ? (uint32_t)(avail - kHeapSafety) : 0;
+            if (kCap > kCapMax) kCap = kCapMax;
+            // Need at least one full 80×2×9×512 disk to be useful (~720 KB);
+            // if we can't fit at least 64 KB, give up rather than mounting a
+            // hopelessly truncated image.
+            if (kCap < 64 * 1024) {
+                free(raw); wdDiskEject(wd, UnitNum); Debug::led_blink(); return false;
+            }
             uint8_t *dec = (uint8_t *)malloc(kCap);
-            if (!dec) { free(raw); wdDiskEject(wd, UnitNum); Debug::led_blink(); return false; }
             uint32_t decLen = td0_unpack_lzh(raw, rawLen, dec, kCap);
             free(raw);
             wd->disk[UnitNum]->td0Image = dec;

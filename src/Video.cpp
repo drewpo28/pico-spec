@@ -1611,16 +1611,16 @@ void VIDEO::Reset() {
         lin_end2 = 240;
         lineptr_offset = ((Z80Ops::isPentagon || Z80Ops::isProfi) ? 26 : 24) / 2;
     } else if (isFullBorder && isFullBorder240) {
-        lin_end = 24;
-        lin_end2 = 216;
+        lin_end = Z80Ops::isProfi ? 32 : 24;
+        lin_end2 = Z80Ops::isProfi ? 224 : 216;
         lineptr_offset = ((Z80Ops::isPentagon || Z80Ops::isProfi) ? 26 : 24) / 2;
     } else if (is169) {
         lin_end = 4;
         lin_end2 = 196;
         lineptr_offset = 13;
     } else {
-        lin_end = 24;
-        lin_end2 = 216;
+        lin_end = Z80Ops::isProfi ? 32 : 24;
+        lin_end2 = Z80Ops::isProfi ? 224 : 216;
         lineptr_offset = 8;  // 32 bytes = (320-256)/2 pixels
     }
 
@@ -1636,7 +1636,7 @@ void VIDEO::Reset() {
         // The grmem layout (pixCoff formula) covers all 240 lines; lines 192..239
         // live at offsets 6144..8191 (odd) and 14336..16383 (even) of the 16KB page.
         // Shift tStatesScreen back by lin_end lines so rendering starts at FB row 0.
-        tStatesScreen -= (int)lin_end * (int)tStatesPerLine;  // e.g. 12583 - 24×224 = 7207
+        tStatesScreen -= (int)lin_end * (int)tStatesPerLine;  // e.g. 12583 - 32×224 = 5415
         lin_end  = 0;
         lin_end2 = 240;
 #endif
@@ -2656,7 +2656,9 @@ IRAM_ATTR void VIDEO::EndFrame() {
                 for (int _y = 0; _y < (int)vga.yres; _y++)
                     if (vga.frameBuffer[_y]) memset(vga.frameBuffer[_y], 0, vga.xres);
             }
-            Debug::log("[DS80] activate: tStScreen=%d grmem=%p clrmem=%p", tStatesScreen, grmem, profi_clrmem);
+            Debug::log("[DS80] activate: tStScreen=%d grmem=%p clrmem=%p videoLatch=%d ram4=%p ram6=%p",
+                       tStatesScreen, grmem, profi_clrmem, (int)MemESP::videoLatch,
+                       MemESP::ram[4].direct(), MemESP::ram[6].direct());
         } else if (profi_ds80_deactivate_pending) {
             profi_ds80_deactivate_pending = false;
             Debug::log("[EF] DS80 deactivate: grmem=%p clrmem=%p", grmem, profi_clrmem);

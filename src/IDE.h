@@ -39,6 +39,14 @@ public:
     static uint32_t geomLBA(int slot);   // total addressable sectors (C*H*S)
     static uint32_t sizeBytes(int slot); // image data size in bytes
 
+    // Create a new zero-filled raw HDD image of `megabytes` MB at `path`.
+    // For PROFI the ProfiHiDD header is synthesized on first read, so a plain
+    // zeroed file is enough to be detected and mountable. Returns false on
+    // open/write failure (and removes any partial file). Optional `progress`
+    // is called per chunk with (writtenSectors, totalSectors) for an OSD bar.
+    static bool createImage(const char* path, uint32_t megabytes,
+                            void (*progress)(uint32_t, uint32_t) = nullptr);
+
     // 8-bit ATA register access (R0..R7, R8=control). reg 0 = data port.
     static uint8_t read8(uint8_t reg);
     static void    write8(uint8_t reg, uint8_t value);
@@ -89,6 +97,7 @@ private:
     static uint8_t* buffer;
     static int  data_index;     // byte position (-1 = no transfer)
     static bool data_write;     // true = PIO_OUT (host writes), false = PIO_IN
+    static bool data_discard;   // true = accept data but don't write to disk (FORMAT TRACK)
 
     // 16-bit high-byte latch (NEMO/PROFI).
     static uint8_t latch_read;
