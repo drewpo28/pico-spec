@@ -1038,6 +1038,15 @@ void ESPectrum::setup() {
   }
 #endif
 
+  // Profi first boot: run the full reset(0) path so the machine starts in the
+  // SYS ROM (bank0) Service menu — identical to the F11 hard-reset / Alt-F11
+  // "Service ROM" behaviour. The inline paging above sets the right banks but
+  // not all the per-reset state, which left first boot dropping into 48K.
+  // Skip when a snapshot is queued (LoadSnapshot below sets up its own state).
+  if (Config::arch == "Profi" && Config::ram_file == NO_RAM_FILE) {
+    ESPectrum::reset(0);
+  }
+
   // Load snapshot if present in Config::
   Debug::log("setup: ram_file='%s'", Config::ram_file.c_str());
   Debug::log2SD("setup: ram_file='%s'", Config::ram_file.c_str());

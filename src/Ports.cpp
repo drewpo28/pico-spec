@@ -500,6 +500,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         (ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsUDIFile ||
          ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsFDIFile ||
          ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsMBDFile ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsTD0File ||
          ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsProFile);
     // Any mounted disk — includes TRD/SCL which are not "raw" but still need
     // real FDC routing so Profi SYS ROM disk probe succeeds.
@@ -1362,6 +1363,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         (ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsUDIFile ||
          ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsFDIFile ||
          ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsMBDFile ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsTD0File ||
          ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsProFile);
     bool out_has_any_disk = ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != nullptr;
 #else
