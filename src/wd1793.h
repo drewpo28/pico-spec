@@ -168,12 +168,18 @@ typedef struct
     // with special sector ID layout — first track (cyl 0 side 0) uses IDs
     // {1,2,3,4,9} (5th sector has ID=9 for CP/M boot), other tracks {1,2,3,4,5}.
     bool IsProFile;
-    // TD0 (Teledisk) flag. The whole image is decoded (and LZH-decompressed if
-    // needed) into td0Image at insert; per-track byte offsets within that buffer
-    // are stored in fdiTrackHdrOffsets[]. Read-only. RP2350 only.
+    // TD0 (Teledisk) flag. Streamed track-by-track from SD to avoid holding the
+    // whole (potentially ~1 MB) image in RAM. Packed images (lowercase "td"
+    // magic) are LZH-decompressed once into a temp file on the SD card at insert;
+    // unpacked images ("TD") stream directly from the original file. Per-track
+    // byte offsets within the (decompressed) stream are stored in
+    // fdiTrackHdrOffsets[]; td0Stream is the FIL to seek/read. Read-only. RP2350.
     bool IsTD0File;
-    uint8_t* td0Image;      // malloc'd decompressed/loaded TD0 stream (track data start)
-    uint32_t td0ImageSize;  // bytes valid in td0Image
+    FIL* td0Stream;          // file to stream track records from (Diskfile or temp)
+    bool td0OwnsStream;      // true if td0Stream is a temp file we must close+unlink
+    std::string td0TempPath; // temp file path to unlink on eject (if owned)
+    uint8_t* td0TrackBuf;    // per-track scratch buffer (sized to largest track record)
+    uint32_t td0TrackBufCap; // capacity of td0TrackBuf
 #endif
 } rvmwdDisk;
 

@@ -722,6 +722,51 @@ static void viewMBD(FIL* f, FSIZE_t fileSize, string& info, int& lines) {
     info += line; info += "\n"; lines++;
 }
 
+// ---- TD0 (Teledisk) ----
+static void viewTD0(FIL* f, FSIZE_t fileSize, string& info, int& lines) {
+    if (fileSize < 12) return;
+    uint8_t h[12]; UINT br;
+    f_lseek(f, 0);
+    f_read(f, h, 12, &br);
+    if (br != 12) return;
+
+    bool packed = (h[0] == 't');    // 'TD' = normal, 'td' = advanced (LZH) compression
+    uint8_t ver = h[4];             // Teledisk version (e.g. 21 = v2.1)
+    uint8_t sides = h[9];
+    bool hasComment = (h[7] & 0x80) != 0;
+
+    char line[48];
+    snprintf(line, sizeof(line), "Teledisk v%d.%d %s", ver / 10, ver % 10,
+             packed ? "(LZH)" : "(normal)");
+    info += line; info += "\n"; lines++;
+    snprintf(line, sizeof(line), "Sides: %d", sides);
+    info += line; info += "\n"; lines++;
+
+    if (!hasComment) return;
+    if (packed) { info += "Comment: (packed)\n"; lines++; return; }
+
+    // Comment block follows the 12-byte header (plaintext for normal TD0):
+    // CRC(2), len(2 LE), Y, M(0-based), D, h, m, s, then `len` bytes of text
+    // with NUL bytes separating lines.
+    uint8_t c[10];
+    f_lseek(f, 12);
+    f_read(f, c, 10, &br);
+    if (br != 10) return;
+    uint16_t clen = c[2] | (c[3] << 8);
+    snprintf(line, sizeof(line), "Date: %04d-%02d-%02d %02d:%02d",
+             1900 + c[4], c[5] + 1, c[6], c[7], c[8]);
+    info += line; info += "\n"; lines++;
+    if (clen) {
+        char txt[40];
+        UINT rd = clen > (uint16_t)(sizeof(txt) - 1) ? (UINT)(sizeof(txt) - 1) : clen;
+        f_read(f, txt, rd, &br);
+        txt[br] = 0;
+        for (UINT i = 0; i < br; i++)
+            if (txt[i] == 0 || txt[i] == '\r' || txt[i] == '\n') { txt[i] = 0; break; }
+        if (txt[0]) { info += txt; info += "\n"; lines++; }
+    }
+}
+
 // ---- PRO (Profi CP/M raw floppy image, no header) ----
 static void viewPRO(FIL* f, FSIZE_t fileSize, string& info, int& lines) {
     // Layout per wd1793 loadDisk(): 819200 = 80T/2S/5×1024 (800K),
@@ -828,6 +873,7 @@ void FileInfo::viewInfo(const string& path) {
     else if (ext == "hdf") viewHDF(&f, fileSize, info, lines);
     else if (ext == "pro") viewPRO(&f, fileSize, info, lines);
     else if (ext == "mbd") viewMBD(&f, fileSize, info, lines);
+    else if (ext == "td0") viewTD0(&f, fileSize, info, lines);
     else if (ext == "hdd") viewHDD(&f, fileSize, info, lines);
     else if (ext == "vhd") viewVHD(&f, fileSize, info, lines);
     else if (ext == "mmc") { /* just show filename + size (title) */ }

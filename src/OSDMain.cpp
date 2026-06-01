@@ -959,8 +959,16 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             // Service ROM: boot SYS ROM (bank0), SYSEN=true (set by reset(0) for Profi).
                             ESPectrum::reset(0);
                         } else if (opt == 2) {
-                            // TR-DOS: boot SYS ROM first — user selects TR-DOS from service menu.
-                            ESPectrum::reset(0);
+                            // TR-DOS: per UnrealSpeccy memory.cpp set_mode(RM_DOS) —
+                            //   comp.flags |= CF_TRDOS;  comp.p7FFD |= 0x10;
+                            // set_banks() then maps bank0 = (CF_TRDOS && p7FFD&0x10)
+                            // ? DOS_ROM : ... → the TR-DOS ROM (bank1). The CPU is
+                            // reset to PC=0 and TR-DOS cold-starts from its own ROM
+                            // vector. Mirror exactly: reset into bank1, then assert
+                            // trdos (CF_TRDOS) + romLatch=1 (p7FFD bit4).
+                            ESPectrum::reset(1);
+                            MemESP::romLatch = 1;
+                            ESPectrum::trdos = true;
                         } else if (opt == 3) {
                             // 128K ROM: trdos=false, romLatch=0 → bank2
                             ESPectrum::reset(2);
@@ -1336,7 +1344,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     }
                     rvmWD1793InsertDisk(&ESPectrum::fdd, 0, fname);
                     if (ESPectrum::fdd.disk[0])
-                        ESPectrum::fdd.disk[0]->writeprotect = Config::driveWP[0];
+                        // TD0 is read-only (no write-back) → always WP regardless of the slot flag.
+                        ESPectrum::fdd.disk[0]->writeprotect =
+                            Config::driveWP[0] || ESPectrum::fdd.disk[0]->IsTD0File;
                     Config::save();
                 }
 #if !PICO_RP2040
@@ -1549,6 +1559,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 Config::ram_file = NO_RAM_FILE;
             }
             Config::last_ram_file = NO_RAM_FILE;
+            if (Config::arch == "Profi") {
+                // Profi hard reset = boot Service ROM (bank0, SYSEN), same as
+                // Alt-F11 → "Service ROM". reset(0) sets trdos=true to hold SYSEN.
+                ESPectrum::reset(0);
+            } else
             ESPectrum::reset();
         } else if (hkIdx == Config::HK_REBOOT) { // ESP32 reset
             if (confirmReboot(OSD_DLG_REBOOT)) {
@@ -1900,7 +1915,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             }
                                             rvmWD1793InsertDisk(&ESPectrum::fdd, slot, fname);
                                             if (ESPectrum::fdd.disk[slot])
-                                                ESPectrum::fdd.disk[slot]->writeprotect = Config::driveWP[slot];
+                                                // TD0 is read-only (no write-back) → always WP.
+                                                ESPectrum::fdd.disk[slot]->writeprotect =
+                                                    Config::driveWP[slot] || ESPectrum::fdd.disk[slot]->IsTD0File;
                                             Config::save();
                                         }
                                         // Mirror menuRun's Esc path so the drive submenu
@@ -1921,7 +1938,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         // Toggle per-slot Write Protect.
                                         Config::driveWP[slot] = !Config::driveWP[slot];
                                         if (ESPectrum::fdd.disk[slot])
-                                            ESPectrum::fdd.disk[slot]->writeprotect = Config::driveWP[slot];
+                                            // TD0 is read-only (no write-back) → stays WP even if toggled off.
+                                            ESPectrum::fdd.disk[slot]->writeprotect =
+                                                Config::driveWP[slot] || ESPectrum::fdd.disk[slot]->IsTD0File;
                                         Config::save();
                                         menu_curopt = 3;
                                         menu_saverect = false;

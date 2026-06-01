@@ -30,6 +30,15 @@
 // e.g. enough for an 80×2 disk). Returns the number of decompressed bytes.
 unsigned td0_unpack_lzh(const unsigned char *src, unsigned size, unsigned char *dst, unsigned dstCapacity);
 
+// Streaming variant: decompress the LZH-packed payload and hand the output to
+// `sink` in chunks, so the full decompressed image never has to live in RAM at
+// once. `src` (the small packed payload) must stay resident; the sink receives
+// (ctx, buf, len) and returns true to continue or false to abort. Returns the
+// total number of decompressed bytes handed to the sink (or until the sink
+// aborts / the input is exhausted).
+typedef bool (*td0_sink_fn)(void *ctx, const unsigned char *buf, unsigned len);
+unsigned td0_unpack_lzh_stream(const unsigned char *src, unsigned size, td0_sink_fn sink, void *ctx);
+
 // Decode one sector's encoded data block into a flat sector buffer.
 //   encData    : points at the encoding-method byte (first byte of the
 //                "data record" that follows the 2-byte length field)

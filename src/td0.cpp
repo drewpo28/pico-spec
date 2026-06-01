@@ -332,3 +332,49 @@ unsigned td0_unpack_lzh(const unsigned char *src, unsigned size, unsigned char *
     }
     return count;
 }
+
+unsigned td0_unpack_lzh_stream(const unsigned char *src, unsigned size, td0_sink_fn sink, void *ctx)
+{
+    LzhState &st = g_lzh;
+    st.packed_ptr = src;
+    st.packed_end = src + size;
+
+    int i, j, k, c;
+    unsigned total = 0;
+    StartHuff(st);
+
+    // Small bounded staging buffer flushed through the sink; the full
+    // decompressed image never lives in RAM at once.
+    unsigned char out[2048];
+    unsigned op = 0;
+
+    while (st.packed_ptr < st.packed_end) {
+        c = DecodeChar(st);
+        if (c < 256) {
+            out[op++] = (unsigned char)c;
+            st.text_buf[st.r++] = (unsigned char)c;
+            st.r &= (N - 1);
+            total++;
+        } else {
+            i = (st.r - DecodePosition(st) - 1) & (N - 1);
+            j = c - 255 + THRESHOLD;
+            for (k = 0; k < j; k++) {
+                c = st.text_buf[(i + k) & (N - 1)];
+                out[op++] = (unsigned char)c;
+                st.text_buf[st.r++] = (unsigned char)c;
+                st.r &= (N - 1);
+                total++;
+                if (op == sizeof(out)) {
+                    if (!sink(ctx, out, op)) return total;
+                    op = 0;
+                }
+            }
+        }
+        if (op >= sizeof(out) - 1) {     // headroom for the literal branch
+            if (!sink(ctx, out, op)) return total;
+            op = 0;
+        }
+    }
+    if (op && !sink(ctx, out, op)) return total;
+    return total;
+}
