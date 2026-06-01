@@ -148,22 +148,23 @@ bool IDE::open_image(int slot, const char* path) {
         f_lseek(&file[slot], fsize - 512);
         f_read(&file[slot], ft, 512, &br);
         if (br == 512 && memcmp(ft, "conectix", 8) == 0) {
-            // Disk Type at 0x60 (big-endian 4 bytes); 2 = Fixed.
-            uint32_t disk_type = ((uint32_t)ft[0x60] << 24) | ((uint32_t)ft[0x61] << 16) |
-                                 ((uint32_t)ft[0x62] << 8) | ft[0x63];
+            // Microsoft VHD footer (big-endian fields):
+            //   Disk Type     @ 0x3C (4B); 2 = Fixed
+            //   Current Size   @ 0x30 (8B), in bytes
+            //   Disk Geometry  @ 0x38: cyl(2B), heads(1B), spt(1B)
+            uint32_t disk_type = ((uint32_t)ft[0x3C] << 24) | ((uint32_t)ft[0x3D] << 16) |
+                                 ((uint32_t)ft[0x3E] << 8) | ft[0x3F];
             if (disk_type != 2) {
                 Debug::log("IDE hd%d: VHD type %u unsupported (only Fixed=2)", slot, disk_type);
                 f_close(&file[slot]);
                 file_open[slot] = false;
                 return false;
             }
-            // Current Size at 0x38 (big-endian 8 bytes), in bytes.
             uint64_t cur_size = 0;
-            for (int i = 0; i < 8; ++i) cur_size = (cur_size << 8) | ft[0x38 + i];
-            // Disk Geometry at 0x56: cyl(2 BE), heads(1), spt(1).
-            uint16_t vc = (ft[0x56] << 8) | ft[0x57];
-            uint8_t  vh = ft[0x58];
-            uint8_t  vs = ft[0x59];
+            for (int i = 0; i < 8; ++i) cur_size = (cur_size << 8) | ft[0x30 + i];
+            uint16_t vc = (ft[0x38] << 8) | ft[0x39];
+            uint8_t  vh = ft[0x3A];
+            uint8_t  vs = ft[0x3B];
             cylinders[slot] = vc ? vc : 1;
             heads[slot]     = vh ? vh : 16;
             sectors[slot]   = vs ? vs : 63;

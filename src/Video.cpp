@@ -3173,7 +3173,13 @@ void SaveRectT::save(int16_t x, int16_t y, int16_t w, int16_t h) {
             offsets.push_back(off);
             return;
         }
-        FIL f;
+        // sizeof(FIL) ~= 580 B (FF_MAX_SS=512 sector buf). The OSD runs on a tight
+        // ~2 KB core stack and SaveRect::save is reached from deep call chains
+        // (e.g. fileDialog -> viewInfo -> showInfoBox -> save) — a FIL on the stack
+        // overflows it and corrupts neighbouring memory (timer callbacks etc),
+        // crashing later in alarm_pool_irq_handler. save() is synchronous
+        // (open/write/close within one call) so a static FIL is safe even nested.
+        static FIL f;
         if (f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) {
             offsets.push_back(off); // open failed — dummy
             return;
@@ -3261,7 +3267,10 @@ void SaveRectT::restore_last() {
             if (offsets.empty()) offsets.push_back(0);
             return;
         }
-        FIL f;
+        // Static FIL: sizeof(FIL) ~= 580 B would overflow the tight ~2 KB OSD
+        // stack from deep call chains (same fix as save()). restore is
+        // synchronous (open/read/close in one call) so a static FIL is safe.
+        static FIL f;
         if (f_open(&f, "/tmp/save_rect.tmp", FA_READ) != FR_OK) {
             if (offsets.empty()) offsets.push_back(0);
             return;
