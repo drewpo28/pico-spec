@@ -123,8 +123,6 @@ uint8_t* VIDEO::profi_clrmem = nullptr;
 #if !PICO_RP2040
 // Profi DS80 packed-pair framebuffer in butter PSRAM.
 // Layout: PROFI_FB_W bytes/row = 32 black-pad + 256 content + 32 black-pad.
-// Content bytes are pre-swapped for the ISR's (x^2) read pattern so that
-// getLineBuffer() returns profi_fb_psram rows directly — no EndFrame blit needed.
 // 1 byte = pair of 4-bit palette indices via profi_pair_lookup[ink][paper].
 // HDMI driver expands each fb byte to 2 different HDMI pixels → 512 native pixels.
 #define PROFI_FB_W 320   // 32 left-pad + 256 content + 32 right-pad
@@ -133,7 +131,6 @@ uint8_t* VIDEO::profi_clrmem = nullptr;
 // lines are centred, leaving 48 fb rows split symmetrically (24 top + 24 bottom).
 // In 640×480 (yres=240) there is no vertical border (content fills the height).
 #define DS80_BORDER_TOP 24
-uint8_t* VIDEO::profi_fb_psram = nullptr;
 uint8_t  VIDEO::profi_pair_lookup[16][16];
 
 // Profi DS80 default palette — GGGRRRBb format (3-3-2 bits).
@@ -1652,22 +1649,6 @@ void VIDEO::Reset() {
         // Reset live palette to defaults on machine reset
         profiPaletteReset();
 
-        // Allocate 320×240 packed-pair fb in butter PSRAM (once, on first Profi reset).
-        // Row layout: 32 black-pad + 256 content + 32 black-pad (total 320 B/row).
-        // Padding bytes stay 0 (profi_pair_lookup[0][0]=0 = black) for the full session.
-        // Placed at END of butter PSRAM to avoid collision with the Z80 RAM page allocator.
-        if (!profi_fb_psram) {
-            constexpr int total = PROFI_FB_W * PROFI_FB_H;  // 320×240 = 76800 B
-            uint32_t butter_sz = butter_psram_size();
-            if (butter_sz >= (uint32_t)total) {
-                profi_fb_psram = (uint8_t*)PSRAM_DATA + (butter_sz - total);
-                memset(profi_fb_psram, 0, total);
-                Debug::log("[VID] Profi 320×240 packed-pair fb @%p (%d B)", profi_fb_psram, total);
-            } else {
-                Debug::log("[VID] Profi fb needs %d B PSRAM, have %u — not allocated",
-                           total, (unsigned)butter_sz);
-            }
-        }
     }
 #endif
 
@@ -2180,8 +2161,8 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             *lineptr32++ = mix2;
         }
     } else if (Config::arch == "Profi" && (Ports::portDFFD & 0x80)) {
-        // Profi DS80 native rendering — writes 256-byte-wide packed pairs into
-        // profi_fb_psram (1 byte = pair of 4-bit palette indices: high nibble =
+        // Profi DS80 native rendering — writes 256-byte-wide packed pairs directly into
+        // vga.frameBuffer (1 byte = pair of 4-bit palette indices: high nibble =
         // left source pixel, low nibble = right). HDMI ISR is configured (via
         // hdmi_set_profi_ds80_mode) so each fb byte expands to 2 *different*
         // HDMI pixels — native 512 horizontal resolution.
@@ -2193,11 +2174,6 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
         uint32_t pixCoff = 2048 * (line >> 6) + 256 * (line & 7) + ((line & 0x38) << 2);
         unsigned int end_col = coldraw_cnt < 32u ? coldraw_cnt : 32u;
         unsigned int start_col = end_col - loopCount;
-        // Write directly into vga.frameBuffer (SRAM) — same approach as all other modes.
-        // The HDMI ISR on core1 can only DMA/read from SRAM; PSRAM (butter/XIP) at
-        // profi_fb_psram causes SIGBUS from the ISR context. By writing scan-line-synchronous
-        // into the SRAM framebuffer, we get the same tear-free guarantee as standard modes:
-        // by the time HDMI scans line N, the Z80 has already rendered it.
         //
         // Row layout: pad_l bytes of border, then 256 content bytes (with (k^2) pre-swap
         // for the ISR's x^2 read pattern), then pad_r bytes of border.
@@ -2738,19 +2714,8 @@ IRAM_ATTR void VIDEO::EndFrame() {
 
     // ----------------------------------------------------------------
     // DS80 frame finalization: NO BLIT NEEDED.
-    //
-    // profi_fb_psram is now 320 B/row (32 pad + 256 content + 32 pad).
-    // Content bytes are written pre-swapped in the scan-time renderer
-    // (pbase+(k^2) indexing), so each row is ready for the HDMI ISR's
-    // (x^2) read pattern without any post-processing.
-    //
-    // getLineBuffer() returns profi_fb_psram + line*320 directly for
-    // lines 0..239 when DS80 is active, eliminating the blit entirely
-    // and with it all blit/HDMI-scan race conditions (tearing).
-    //
-    // vga.frameBuffer[240..479] are zeroed once at DS80 activation and
-    // never written again (lin_end2=240 prevents the standard renderer
-    // from touching those rows), so they remain black for the full session.
+    // vga.frameBuffer written scan-line-synchronous by the Z80 renderer;
+    // rows 240..479 zeroed at DS80 activation and never touched again.
     // ----------------------------------------------------------------
     // Clear DMA attr shadow and charrow write counters for next frame
     if (Config::dma_mode)
