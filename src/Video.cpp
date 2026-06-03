@@ -1623,16 +1623,22 @@ void VIDEO::Reset() {
         lin_end2 = 240;
         lineptr_offset = ((Z80Ops::isPentagon || Z80Ops::isProfi) ? 26 : 24) / 2;
     } else if (isFullBorder && isFullBorder240) {
-        lin_end = Z80Ops::isProfi ? 32 : 24;
-        lin_end2 = Z80Ops::isProfi ? 224 : 216;
+        // Profi centred like Pentagon (24 top / 24 bottom border): using 32/224
+        // shifted the picture down 1 char row and squeezed the bottom border so
+        // the stats overlay (y=220) fell inside the paper area → flicker.
+        lin_end = 24;
+        lin_end2 = 216;
         lineptr_offset = ((Z80Ops::isPentagon || Z80Ops::isProfi) ? 26 : 24) / 2;
     } else if (is169) {
         lin_end = 4;
         lin_end2 = 196;
         lineptr_offset = 13;
     } else {
-        lin_end = Z80Ops::isProfi ? 32 : 24;
-        lin_end2 = Z80Ops::isProfi ? 224 : 216;
+        // Profi centred like Pentagon (24 top / 24 bottom border): using 32/224
+        // shifted the picture down 1 char row and squeezed the bottom border so
+        // the stats overlay (y=220) fell inside the paper area → flicker.
+        lin_end = 24;
+        lin_end2 = 216;
         lineptr_offset = 8;  // 32 bytes = (320-256)/2 pixels
     }
 

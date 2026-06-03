@@ -61,7 +61,7 @@ visit https://zxespectrum.speccy.org/contacto
 #define TS_BORDER_320x240 8948  // START OF BORDER 48 (+5 correction)
 #define TS_BORDER_320x240_128 8878  // START OF BORDER 128 (+5 correction)
 #define TS_BORDER_320x240_PENTAGON 12595  // START OF BORDER PENTAGON
-#define TS_BORDER_320x240_PROFI 5403      // START OF BORDER PROFI (32 top lines: 12583 - 32*224 - 16 + 4)
+#define TS_BORDER_320x240_PROFI 7195      // START OF BORDER PROFI (24 top lines, centred: 12583 - 24*224 - 16 + 4)
 #define TS_BORDER_320x240_BYTE 9005       // START OF BORDER BYTE (formula 9000 + 5)
 
 #define TS_BORDER_360x200 13428  // START OF BORDER 48
@@ -79,7 +79,7 @@ visit https://zxespectrum.speccy.org/contacto
 #define TS_BORDER_360x240 8940          // START OF BORDER 48 HALF (formula 8935 + 5)
 #define TS_BORDER_360x240_128 8870      // START OF BORDER 128 HALF (formula 8865 + 5)
 #define TS_BORDER_360x240_PENTAGON 12585 // START OF BORDER PENTAGON HALF (formula 12581 + 4)
-#define TS_BORDER_360x240_PROFI 5393    // START OF BORDER PROFI HALF (32 top lines: 12583 - 32*224 - 26 + 4)
+#define TS_BORDER_360x240_PROFI 7185    // START OF BORDER PROFI HALF (24 top lines, centred: 12583 - 24*224 - 26 + 4)
 #define TS_BORDER_360x240_BYTE 8997     // START OF BORDER BYTE HALF (formula 8992 + 5)
 
 // Colors as 8-bit palette indices (VGA8 mode)
