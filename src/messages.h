@@ -291,6 +291,10 @@ static const char *OSD_ZIP_ERR[2] = { OSD_ZIP_ERR_EN,OSD_ZIP_ERR_ES };
 #define OSD_ZIP_EXTRACTING_ES "    Extrayendo...    "
 static const char *OSD_ZIP_EXTRACTING[2] = { OSD_ZIP_EXTRACTING_EN,OSD_ZIP_EXTRACTING_ES };
 
+#define OSD_PROFI_LOADING_EN "  Loading Profi system...  \n  Please wait (SPI PSRAM)  "
+#define OSD_PROFI_LOADING_ES "  Cargando sistema Profi...  \n  Espere (SPI PSRAM)  "
+static const char *OSD_PROFI_LOADING[2] = { OSD_PROFI_LOADING_EN,OSD_PROFI_LOADING_ES };
+
 #define OSD_FILE_DELETE_TITLE_EN "Delete?"
 #define OSD_FILE_DELETE_TITLE_ES "Borrar?"
 static const char *OSD_FILE_DELETE_TITLE[2] = { OSD_FILE_DELETE_TITLE_EN,OSD_FILE_DELETE_TITLE_ES };

@@ -1986,6 +1986,22 @@ void ESPectrum::loop() {
       }
   }
 
+#if !PICO_RP2040
+  // Profi DS80 (hires) on SPI-PSRAM-only boards (no fast butter/QSPI-XIP PSRAM)
+  // loads slowly through the slow SPI bus.  When DS80 mode turns on we want a
+  // "loading" notice over the "PROFI PLUS" startup screen — but it has to wait
+  // until the SYS ROM has actually painted that screen (see the handler after
+  // CPU::loop()), otherwise the blocking box freezes a still-black pre-logo frame.
+  const bool profi_spi_boot = (Config::arch == "Profi") &&
+                              (butter_psram_size() == 0) &&
+                              (psram_size() >= (16 << 10));
+  bool prev_ds80_active = false;
+  uint64_t profi_ds80_msg_at = 0; // 0 = not scheduled; else time_us_64() deadline
+  // Delay from DS80-on to showing the box: long enough for the startup screen to
+  // be drawn.  Tunable — raise if the box still lands before the logo appears.
+  const uint64_t PROFI_DS80_MSG_DELAY_US = 2500000ull;
+#endif
+
   for (;;) {
     if (debug_number != 0) {
       char msg[16];
@@ -2020,6 +2036,42 @@ void ESPectrum::loop() {
     beeperTstatesInSample = 0;
 
     CPU::loop();
+
+#if !PICO_RP2040
+    if (profi_spi_boot) {
+      // DS80 turning on (rising edge) schedules the notice; we show it only after
+      // PROFI_DS80_MSG_DELAY_US so the startup screen is painted behind it (the box
+      // is blocking and pauses rendering — see below — so the logo must be drawn
+      // first, with the emulation running, before we freeze it).
+      if (profi_ds80_active && !prev_ds80_active)
+        profi_ds80_msg_at = time_us_64() + PROFI_DS80_MSG_DELAY_US;
+      if (profi_ds80_msg_at && time_us_64() >= profi_ds80_msg_at) {
+        // The notice MUST be the blocking variant (millispause>0): the framebuffer
+        // is single-buffered and the centre is re-rendered every frame during
+        // active scan, so a non-blocking centre draw races the renderer and never
+        // shows.  The blocking path sleeps with rendering paused so it stays put.
+        // When DS80 is still active, wrap it in the same palette guard the menu's
+        // DS80Guard uses, so the standard OSD colour bytes render correctly over
+        // the DS80 packed-pair framebuffer instead of as striped garbage.  (If the
+        // startup screen turns out to be standard mode by now, skip the guard.)
+        const bool ds80 = profi_ds80_active;
+        if (ds80) {
+          VIDEO::profi_ds80_osd_active = true;
+          VIDEO::applyProfiOSDPalette();
+        }
+        OSD::osdCenteredMsg(OSD_PROFI_LOADING[Config::lang], LEVEL_WARN, 2500);
+        if (ds80) {
+          VIDEO::profi_ds80_osd_active = false;
+          if (profi_ds80_active) {
+            VIDEO::restoreProfiLivePalette();
+            VIDEO::clearDS80Padding();
+          }
+        }
+        profi_ds80_msg_at = 0; // one-shot per DS80 activation
+      }
+      prev_ds80_active = profi_ds80_active;
+    }
+#endif
 
     // GS-Z80 runs on core1 alongside pcm_call(); core0 only reads the ring.
 
