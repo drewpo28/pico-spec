@@ -564,19 +564,16 @@ static void assign_ram(int i) {
   // hit these pages 50-100 times/frame → 11ms × 72 = 792ms/frame → 1 FPS.
   // Fix: allocate as SRAM-backed (POINTER) so sync() returns the SRAM pointer
   // instantly without any SPI DMA.  Also covers arch set to Profi at boot.
-  //
-  // Page 61: Profi CP/M's hot working page — evicted/reloaded ~1.2×/frame in
-  // steady state (observed as `[SPI] evict last_pg=61`).  Each swap is ~4ms of
-  // SPI PSRAM (read+write), which can't be batched away (1-bit SPI bandwidth).
-  // Give it an SRAM buffer AND pin() it so _sync() never evicts it → the swap
-  // disappears entirely.  Cost: one extra 16KB page (Profi only, leaves ~77KB
-  // heap free — well above gigascreen's lazy ~38KB prevFB malloc, and 128K mode
-  // is unaffected since this is arch=="Profi" gated).
+  // Page 61 is Profi CP/M's hot working page (swaps ~1.2/frame in steady state);
+  // give it an SRAM buffer too.  Left UNPINNED so it stays in the evictable pool
+  // (pool grows to {56,58,61}, doesn't shrink) — as a hot page it sits at the LRU
+  // tail and is rarely chosen as a victim, so its swap effectively disappears.
+  // (Earlier this appeared to break the BIOS 1024K test, but that was the buggy
+  // 32-bit write_page truncating writes — now to_vram uses write_range.)
   bool force_sram = (Config::arch == "Profi") && (i == 56 || i == 58 || i == 61)
                     && (butter_psram_size() == 0);
   if (force_sram) {
     MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, false); // unlocked → in pool
-    if (i == 61) MemESP::ram[i].pin(); // never evict the hot CP/M working page
     ++ram_pages;
   } else if (getFreeHeap() >= MEM_PG_SZ + MEM_REMAIN) {
     MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, false);

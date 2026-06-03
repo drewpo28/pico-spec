@@ -73,7 +73,7 @@ uint8_t* mem_desc_t::to_vram(void) {
     uint8_t* res = _int->p;
     uint32_t ba = _int->vram_off;
     if (psram_size() >= ba + MEM_PG_SZ) {
-        psram_write_page(ba, res); // single SPI CS for full 16KB (32-bit PIO counters)
+        psram_write_page(ba, res); // single SPI CS for full 16KB (32-bit PIO, exact x)
         _int->mem_type = PSRAM_SPI;
     } else {
         #ifdef PICO_DEFAULT_LED_PIN
@@ -97,7 +97,7 @@ void mem_desc_t::from_vram(uint8_t* p) {
     if (psram_size() >= ba + MEM_PG_SZ) {
         mem_spi_evict_count++;
         mem_spi_evict_page = ba / MEM_PG_SZ;
-        psram_read_range(ba, p, MEM_PG_SZ); // 8-bit burst, proven stable
+        psram_read_page(ba, p); // single SPI CS for full 16KB (32-bit PIO, exact x/y)
     } else {
         UINT br;
         FSIZE_t lba = ba;

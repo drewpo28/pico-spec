@@ -627,7 +627,6 @@ void psram_write_range(uint32_t addr, const uint8_t* src, size_t total);
 // ~3.5× faster than psram_read/write_range for full-page operations.
 void psram_read_page(uint32_t addr, uint8_t* dst);
 void psram_write_page(uint32_t addr, const uint8_t* src);
-void psram_page_selftest(uint32_t scratch_addr); // diagnostic, run once at init
 
 #ifdef __cplusplus
 }

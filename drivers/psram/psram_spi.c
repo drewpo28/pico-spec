@@ -1,8 +1,6 @@
 #include "psram_spi.h"
 #include "hardware/clocks.h"
 #include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
 
 // Forward declarations (definitions appear after pio_spi_psram_cs_init below).
 static inline void pio_spi_psram_cs_init(PIO pio, uint sm, uint prog_offs, uint n_bits,
@@ -75,11 +73,8 @@ uint32_t init_psram() {
         }
     }
 #endif
-    // Init the second SM for single-transaction 16KB page transfers.
-    if (__psram_sz) {
-        psram_page_sm_init(psram_pio, _clkdiv, _fudge);
-        psram_page_selftest(0); // scratch at addr 0 (overwritten when emulator loads)
-    }
+    // Init the 32-bit-counter program for single-transaction 16KB page transfers.
+    if (__psram_sz) psram_page_sm_init(psram_pio, _clkdiv, _fudge);
 #else
     __psram_sz = 0;
 #endif
@@ -169,24 +164,25 @@ static inline void psram_sm_switch(uint offset) {
 static inline void psram_sm_jump32(void) { psram_sm_switch(psram_spi_32_offset); }
 static inline void psram_sm_jump8(void)  { psram_sm_switch(psram_spi.offset); }
 
+// Read a full 16KB page in ONE SPI CS assertion using the 32-bit-counter program.
+// x (write bits) and y (read bits) are pushed as TRUE 32-bit FIFO words via CPU
+// writes — byte-DMA mis-lanes the byte, corrupting the 32-bit counter.  The SPI
+// command bytes (Fast Read 0x0b + addr + dummy) go via byte-DMA, consumed by
+// `out pins,1` exactly as in the proven 8-bit path.
 void psram_read_page(uint32_t addr, uint8_t* dst) {
     if (!psram_page_ready) { psram_read_range(addr, dst, PSRAM_PG_SZ); return; }
-    // PIO rule: x=N clocks exactly N bits (same as 8-bit program — NOT N-1).
-    // x = 40 (5 bytes × 8): cmd + addr + dummy.
-    // y = 131072 (16384 bytes × 8): data bits to read in.
-    // Big-endian 32-bit (right-shift OSR: first byte → bits[31:24]).
-    uint8_t cmd[13];
-    cmd[0]=0; cmd[1]=0; cmd[2]=0; cmd[3]=40;           // x = 40
-    cmd[4]=0; cmd[5]=2; cmd[6]=0;   cmd[7]=0;           // y = 131072 = 0x00020000
-    cmd[8]=0x0bu;
-    cmd[9]=(uint8_t)(addr>>16); cmd[10]=(uint8_t)(addr>>8); cmd[11]=(uint8_t)addr;
-    cmd[12]=0; // dummy byte
-
+    uint8_t cmd[5];
+    cmd[0]=0x0bu;                                   // Fast Read
+    cmd[1]=(uint8_t)(addr>>16); cmd[2]=(uint8_t)(addr>>8); cmd[3]=(uint8_t)addr;
+    cmd[4]=0;                                       // dummy byte
 #if defined(PSRAM_SPINLOCK)
     psram_spi.spin_irq_state = spin_lock_blocking(psram_spi.spinlock);
 #endif
     psram_sm_jump32();
-    dma_channel_transfer_from_buffer_now(psram_spi.write_dma_chan, cmd, 13);
+    io_rw_32 *txf32 = (io_rw_32*)&psram_spi.pio->txf[psram_spi.sm];
+    *txf32 = 40;                       // x = 40 write bits (cmd + 3 addr + dummy)
+    *txf32 = PSRAM_PG_SZ * 8u;         // y = 131072 read bits (16KB)
+    dma_channel_transfer_from_buffer_now(psram_spi.write_dma_chan, cmd, 5);
     dma_channel_transfer_to_buffer_now(psram_spi.read_dma_chan, dst, PSRAM_PG_SZ);
     dma_channel_wait_for_finish_blocking(psram_spi.write_dma_chan);
     dma_channel_wait_for_finish_blocking(psram_spi.read_dma_chan);
@@ -196,108 +192,27 @@ void psram_read_page(uint32_t addr, uint8_t* dst) {
 #endif
 }
 
-// Diagnostic: same as psram_read_page but bounded (no permanent hang) and reports
-// how many bytes the read DMA actually received.  Returns bytes still OUTSTANDING
-// (0 = full 16KB read OK; >0 = SM produced fewer bytes than expected → bad y).
-static uint32_t psram_read_page_probe(uint32_t addr, uint8_t* dst, uint32_t nbytes) {
-    uint32_t ybits = nbytes * 8u;
-    // SPI command bytes only (x/y go via CPU 32-bit FIFO writes, NOT here).
-    uint8_t cmd[5];
-    cmd[0]=0x0bu;
-    cmd[1]=(uint8_t)(addr>>16); cmd[2]=(uint8_t)(addr>>8); cmd[3]=(uint8_t)addr;
-    cmd[4]=0; // dummy byte
-    psram_sm_jump32();
-    // Push x and y as true 32-bit FIFO words so out x,32 / out y,32 load them
-    // exactly (byte-DMA would replicate/mis-lane the byte → garbage counter).
-    io_rw_32 *txf32 = (io_rw_32*)&psram_spi.pio->txf[psram_spi.sm];
-    *txf32 = 40;     // x = 40 write bits (cmd+addr+dummy = 5 bytes)
-    *txf32 = ybits;  // y = read bits
-    dma_channel_transfer_from_buffer_now(psram_spi.write_dma_chan, cmd, 5);
-    dma_channel_transfer_to_buffer_now(psram_spi.read_dma_chan, dst, nbytes);
-    dma_channel_wait_for_finish_blocking(psram_spi.write_dma_chan);
-    uint pc_after_write = pio_sm_get_pc(psram_spi.pio, psram_spi.sm);
-    // Bounded wait for read DMA: spin until done OR no progress for a long time.
-    uint32_t prev = 0xFFFFFFFFu, stall = 0;
-    for (;;) {
-        if (!dma_channel_is_busy(psram_spi.read_dma_chan)) break;
-        uint32_t rem = dma_channel_hw_addr(psram_spi.read_dma_chan)->transfer_count;
-        if (rem == prev) {
-            if (++stall > 2000000u) break; // ~no progress → give up
-        } else { stall = 0; prev = rem; }
-    }
-    uint pc_after_read = pio_sm_get_pc(psram_spi.pio, psram_spi.sm);
-    uint32_t outstanding = dma_channel_hw_addr(psram_spi.read_dma_chan)->transfer_count;
-    bool tx_empty = pio_sm_is_tx_fifo_empty(psram_spi.pio, psram_spi.sm);
-    bool rx_empty = pio_sm_is_rx_fifo_empty(psram_spi.pio, psram_spi.sm);
-    printf("[PGTEST]   32off=%u 8off=%u pc_wr=%u pc_rd=%u txE=%d rxE=%d\n",
-        psram_spi_32_offset, psram_spi.offset, pc_after_write, pc_after_read,
-        tx_empty, rx_empty);
-    dma_channel_abort(psram_spi.read_dma_chan);
-    psram_sm_jump8();
-    return outstanding;
-}
-
-// One-shot self-test of the 32-bit single-transaction read path, run at init.
-// Writes a known ramp to a scratch page (via proven write_range), reads it back
-// with both read_range (reference) and read_page_probe, and reports mismatches.
-void psram_page_selftest(uint32_t scratch_addr) {
-    if (!psram_page_ready) { printf("[PGTEST] page SM not ready\n"); return; }
-    uint8_t* ref = (uint8_t*)malloc(PSRAM_PG_SZ);
-    uint8_t* got = (uint8_t*)malloc(PSRAM_PG_SZ);
-    if (!ref || !got) { printf("[PGTEST] malloc failed\n"); free(ref); free(got); return; }
-    for (uint32_t i = 0; i < PSRAM_PG_SZ; i++) ref[i] = (uint8_t)(i * 7u + 0x5Au);
-    psram_write_range(scratch_addr, ref, PSRAM_PG_SZ);
-
-    // Reference read via proven 8-bit burst.
-    uint8_t* chk = (uint8_t*)malloc(PSRAM_PG_SZ);
-    if (chk) {
-        psram_read_range(scratch_addr, chk, PSRAM_PG_SZ);
-        int bad = memcmp(chk, ref, PSRAM_PG_SZ);
-        printf("[PGTEST] read_range vs written: %s\n", bad ? "MISMATCH" : "OK");
-        free(chk);
-    }
-
-    // Test at two scales: small (64B) isolates read mechanics from y magnitude.
-    const uint32_t sizes[2] = { 64u, PSRAM_PG_SZ };
-    for (int s = 0; s < 2; s++) {
-        uint32_t n = sizes[s];
-        memset(got, 0xA5, n);
-#if defined(PSRAM_SPINLOCK)
-        psram_spi.spin_irq_state = spin_lock_blocking(psram_spi.spinlock);
-#endif
-        uint32_t outstanding = psram_read_page_probe(scratch_addr, got, n);
-#if defined(PSRAM_SPINLOCK)
-        spin_unlock(psram_spi.spinlock, psram_spi.spin_irq_state);
-#endif
-        uint32_t received = n - outstanding;
-        uint32_t firstbad = n;
-        for (uint32_t i = 0; i < n; i++) if (got[i] != ref[i]) { firstbad = i; break; }
-        printf("[PGTEST] read_page n=%lu: received=%lu outstanding=%lu firstbad=%lu",
-            (unsigned long)n, (unsigned long)received,
-            (unsigned long)outstanding, (unsigned long)firstbad);
-        printf(" got[0..3]=%02X %02X %02X %02X exp[0..3]=%02X %02X %02X %02X\n",
-            got[0], got[1], got[2], got[3], ref[0], ref[1], ref[2], ref[3]);
-    }
-    free(ref); free(got);
-}
-
 void psram_write_page(uint32_t addr, const uint8_t* src) {
     if (!psram_page_ready) { psram_write_range(addr, src, PSRAM_PG_SZ); return; }
-    // x = 131104 = (4+16384)*8 (cmd+addr + 16KB data), y = 0 (write-only).
-    // 131104 = 0x00020020 → BE: {0,2,0,32}.
-    static uint8_t header[12];
-    header[0]=0; header[1]=2; header[2]=0; header[3]=32; // x = 131104 = 0x00020020
-    header[4]=0; header[5]=0; header[6]=0;    header[7]=0;    // y = 0
-    header[8]=0x02u;
-    header[9]=(uint8_t)(addr>>16); header[10]=(uint8_t)(addr>>8); header[11]=(uint8_t)addr;
+    // x (write bits) and y (=0) are pushed as TRUE 32-bit FIFO words via CPU —
+    // byte-DMA mis-lanes the byte and yields a garbage counter (the old big-endian
+    // header version "worked" only by luck: huge x wrote all data then bailed on
+    // TXSTALL, but could truncate → corrupt page → BIOS sees <1024K).  Here x is
+    // EXACT (131104), so the writeloop ends precisely after the last data bit.
+    uint8_t cmd[4];
+    cmd[0]=0x02u;                                   // Write
+    cmd[1]=(uint8_t)(addr>>16); cmd[2]=(uint8_t)(addr>>8); cmd[3]=(uint8_t)addr;
 
 #if defined(PSRAM_SPINLOCK)
     psram_spi.spin_irq_state = spin_lock_blocking(psram_spi.spinlock);
 #endif
     psram_sm_jump32();
-    // DMA 1: 12-byte header.  PIO clocks out 4 SPI bytes (cmd+addr) then stalls
-    // (TX empty, CS stays asserted) waiting for the next burst.
-    dma_channel_transfer_from_buffer_now(psram_spi.write_dma_chan, header, 12);
+    io_rw_32 *txf32 = (io_rw_32*)&psram_spi.pio->txf[psram_spi.sm];
+    *txf32 = (4u + PSRAM_PG_SZ) * 8u;  // x = 131104 write bits (cmd+addr + 16KB)
+    *txf32 = 0;                        // y = 0 (write-only)
+    // DMA 1: 4 SPI command bytes (0x02 + addr).  SM stalls in writeloop
+    // (TX empty, CS asserted) waiting for the payload.
+    dma_channel_transfer_from_buffer_now(psram_spi.write_dma_chan, cmd, 4);
     dma_channel_wait_for_finish_blocking(psram_spi.write_dma_chan);
     // DMA 2: 16KB payload.  PIO resumes and clocks out all data, then CS deasserts.
     dma_channel_transfer_from_buffer_now(psram_spi.write_dma_chan, src, PSRAM_PG_SZ);
