@@ -1123,6 +1123,7 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
         // for Read Sector), but Type I Seek step-delay accumulator never fills
         // when CP/M poll loop spins ~30 T-states/iter, blocking Type I forever.
         // Treat Type I steps as fastmode in this case.
+#if !PICO_RP2040
         bool profi_cpm_typeI =
             (Config::arch == "Profi" && (Ports::portDFFD & 0x20)
              && wd->disk[wd->diskS]
@@ -1130,6 +1131,9 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
                  || wd->disk[wd->diskS]->IsTD0File)
              && (wd->command & kRVMWD177XTypeI) == 0
              && wd->state == kRVMWD177XTypeICheck);
+#else
+        bool profi_cpm_typeI = false;
+#endif
 
         if (wd->fastmode || profi_cpm_typeI) {
           wd->c = 0;

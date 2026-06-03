@@ -1345,7 +1345,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     if (ESPectrum::fdd.disk[0])
                         // TD0 is read-only (no write-back) → always WP regardless of the slot flag.
                         ESPectrum::fdd.disk[0]->writeprotect =
-                            Config::driveWP[0] || ESPectrum::fdd.disk[0]->IsTD0File;
+                            Config::driveWP[0]
+#if !PICO_RP2040
+                            || ESPectrum::fdd.disk[0]->IsTD0File
+#endif
+                            ;
                     Config::save();
                 }
 #if !PICO_RP2040
@@ -1916,7 +1920,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             if (ESPectrum::fdd.disk[slot])
                                                 // TD0 is read-only (no write-back) → always WP.
                                                 ESPectrum::fdd.disk[slot]->writeprotect =
-                                                    Config::driveWP[slot] || ESPectrum::fdd.disk[slot]->IsTD0File;
+                                                    Config::driveWP[slot]
+#if !PICO_RP2040
+                                                    || ESPectrum::fdd.disk[slot]->IsTD0File
+#endif
+                                                    ;
                                             Config::save();
                                         }
                                         // Mirror menuRun's Esc path so the drive submenu
@@ -1939,7 +1947,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         if (ESPectrum::fdd.disk[slot])
                                             // TD0 is read-only (no write-back) → stays WP even if toggled off.
                                             ESPectrum::fdd.disk[slot]->writeprotect =
-                                                Config::driveWP[slot] || ESPectrum::fdd.disk[slot]->IsTD0File;
+                                                Config::driveWP[slot]
+#if !PICO_RP2040
+                                                || ESPectrum::fdd.disk[slot]->IsTD0File
+#endif
+                                                ;
                                         Config::save();
                                         menu_curopt = 3;
                                         menu_saverect = false;
@@ -3698,11 +3710,19 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 bool ext_ram = has_psram || FileUtils::fsMount;
                 // Profi needs PSRAM (DS80 hires framebuffer in PSRAM); without it
                 // the emulation is pointless, so hide the entry on SD-only boards.
+                // It also needs RP2350 (RP2040 has no DS80 hires support), so it is
+                // hidden on RP2040 regardless of PSRAM.
                 // Stripping "Profi" keeps indices of the items before it stable;
                 // any trailing item (ALF) shifts up by one and is keyed off the
-                // computed last index below.
+                // computed last index below.  show_profi gates both the menu entry
+                // and the arch_num==8 branch so the indices stay consistent.
+#if PICO_RP2040
+                const bool show_profi = false;
+#else
+                const bool show_profi = has_psram;
+#endif
                 string arch_menu = ext_ram ? MENU_ARCH[Config::lang] : MENU_ARCH_NO_SD[Config::lang];
-                if (ext_ram && !has_psram) {
+                if (ext_ram && !show_profi) {
                     const string profi_line = "Profi\t>\n";
                     size_t p = arch_menu.find(profi_line);
                     if (p != string::npos) arch_menu.erase(p, profi_line.size());
@@ -3988,7 +4008,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     break;
                                 }
                             }
-                        } else if (has_psram && arch_num == 8) { // Profi (needs PSRAM for DS80; SD alone is not enough)
+                        } else if (show_profi && arch_num == 8) { // Profi (needs PSRAM+RP2350 for DS80)
                             menu_curopt = 1;
                             menu_saverect = true;
                             opt2 = 0;
@@ -4063,11 +4083,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                                 // so EndFrame won't fire to do it for us.
                                                 // applyProfiOSDPalette() reads the new flag and
                                                 // picks STD (conv_color swap) or DS80 (Graphics remap).
+#if !PICO_RP2040
                                                 if (profi_ds80_active) {
                                                     VIDEO::restoreProfiLivePalette(); // clean slate
                                                     VIDEO::profi_ds80_osd_active = true;
                                                     VIDEO::applyProfiOSDPalette();
                                                 }
+#endif
                                             }
                                             menu_curopt = opt3;
                                             menu_saverect = false;
@@ -4087,7 +4109,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             }
                         }
 #if !NO_ALF
-                        else if (arch_num == 9 || (ext_ram && !has_psram && arch_num == 8) || !ext_ram) { // ALF TV GAME (shifts to 8 when Profi hidden)
+                        else if (arch_num == 9 || (ext_ram && !show_profi && arch_num == 8) || !ext_ram) { // ALF TV GAME (shifts to 8 when Profi hidden)
                             arch = "ALF";
                             romset = "ALF1";
                             menu_curopt = opt2;
@@ -4167,6 +4189,23 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     OSD::osdCenteredMsg("Betadisk enabled", LEVEL_INFO, 1500);
                                 }
                                 Config::save();
+#if !PICO_RP2040
+                                // Profi on SPI-PSRAM boards needs its hires colour
+                                // pages 56/58/61 backed by SRAM (see assign_ram()).
+                                // That backing is decided once in setup() from the
+                                // boot arch, and ESPectrum::reset() does NOT re-assign
+                                // it.  So a runtime switch INTO Profi from another arch
+                                // leaves 56/58/61 in SPI PSRAM (direct()==null) → DS80
+                                // colour memory invalid → screen never switches.  Config
+                                // is already saved as Profi above, so reboot: setup()
+                                // re-backs the pages with arch=Profi, exactly like a
+                                // cold boot into Profi (which works).
+                                if (arch == "Profi" && butter_psram_size() == 0
+                                    && MemESP::ram[56].memType() != mem_type_t::POINTER) {
+                                    OSD::esp_hard_reset();
+                                    return;
+                                }
+#endif
                                 Config::requestMachine(arch, romset);
                             }
 

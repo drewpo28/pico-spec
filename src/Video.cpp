@@ -126,6 +126,13 @@ uint32_t VIDEO::profi_clr_spi_base = 0xFFFFFFFFu;
 extern "C" uint8_t  read8psram(uint32_t addr32);
 #endif
 
+// Graphics-layer DS80 colour remap state (see Graphics8BitPalette).  Declared
+// unconditionally in the header and referenced by inline dot()/drawChar()/etc.
+// accessors in every build, so the definitions must exist for all targets — on
+// RP2040 ds80_active stays false (no DS80 hires there) so the lut is never used.
+bool    Graphics8BitPalette::ds80_active = false;
+uint8_t Graphics8BitPalette::ds80_color_lut[17] = {0};
+
 #if !PICO_RP2040
 // Profi DS80 packed-pair framebuffer in butter PSRAM.
 // Layout: PROFI_FB_W bytes/row = 32 black-pad + 256 content + 32 black-pad.
@@ -195,8 +202,7 @@ bool VIDEO::profi_ds80_osd_active = false;
 // intended colour while the framebuffer byte still indexes the DS80 packed-pair
 // conv_color table.  The lut maps ZX index → profi_pair_lookup[c][c] (a SOLID pair
 // slot: both half-pixels = palette[c]).  ORANGE (16) has no DS80 slot → BRI_YELLOW.
-bool    Graphics8BitPalette::ds80_active = false;
-uint8_t Graphics8BitPalette::ds80_color_lut[17] = {0};
+// (ds80_active / ds80_color_lut defined unconditionally above.)
 
 void VIDEO::rebuildDS80ColorLut() {
 #if !PICO_RP2040
@@ -2162,6 +2168,7 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             *lineptr32++ = mix1;
             *lineptr32++ = mix2;
         }
+#if !PICO_RP2040
     } else if (Config::arch == "Profi" && (Ports::portDFFD & 0x80)) {
         // Profi DS80 native rendering — writes 256-byte-wide packed pairs directly into
         // vga.frameBuffer (1 byte = pair of 4-bit palette indices: high nibble =
@@ -2253,6 +2260,7 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             // Advance lineptr32 to keep std fb cursor in sync with standard renderer stride.
             lineptr32 += 2;
         }
+#endif // !PICO_RP2040 (Profi DS80 branch)
     } else {
         for (; loopCount--; ) {
 #if !PICO_RP2040

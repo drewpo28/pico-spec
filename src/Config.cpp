@@ -253,6 +253,7 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
             MemESP::rom[0].assign_rom(gb_rom_0_sinclair_128k);
             MemESP::rom[1].assign_rom(gb_rom_1_sinclair_128k);
         }
+#if !PICO_RP2040
     } else if (arch == "Profi") {
         if (newRomSet=="") romSet = "Profi"; else romSet = newRomSet;
         if (newRomSet=="") romSetProfi = "Profi"; else romSetProfi = newRomSet;
@@ -260,6 +261,7 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
         MemESP::rom[1].assign_rom(gb_rom_profi + (16 << 10));
         MemESP::rom[2].assign_rom(gb_rom_profi + (32 << 10));
         MemESP::rom[3].assign_rom(gb_rom_profi + (48 << 10));
+#endif
     } else { // Pentagon by default
         if (newRomSet=="") romSet = "128Kp"; else romSet = newRomSet;
         if (romSetPent=="") romSetPent = "128Kp"; else romSetPent = newRomSet;
@@ -463,6 +465,12 @@ void Config::load() {
         nvs_get_str("pref_romSetP512", pref_romSetP512, sts);
         nvs_get_str("pref_romSetP1M", pref_romSetP1M, sts);
         nvs_get_str("pref_romSetProfi", pref_romSetProfi, sts);
+#if PICO_RP2040
+        // Profi (DS80 hires) is RP2350-only; a stale NVS value from another board
+        // or firmware would otherwise boot into an unsupported, broken state.
+        if (arch == "Profi")      { arch = "128K"; romSet = "128K"; }
+        if (pref_arch == "Profi") { pref_arch = "Last"; }
+#endif
         nvs_get_str("ram", ram_file, sts);
         nvs_get_b("AY48", AY48, sts);
 #if !PICO_RP2040

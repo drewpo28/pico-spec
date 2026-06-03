@@ -20,7 +20,7 @@ static bool psram_page_ready = false;
 
 static uint32_t __psram_sz = 0;
 static uint32_t _psram_size() {
-#ifdef PSRAM    
+#ifdef PSRAM
     int32_t res = 0;
     for (res = ITE_PSRAM; res < MAX_PSRAM; res += ITE_PSRAM) {
         psram_write32(&psram_spi, res, res);
@@ -61,6 +61,14 @@ uint32_t init_psram() {
         if (_clkdiv < 1.0f) _clkdiv = 1.0f;
         psram_spi = psram_spi_init_clkdiv(psram_pio, -1, _clkdiv, false);
     }
+    // The first SPI transaction after the chip's 0x66/0x99 reset comes back garbage
+    // (observed: read of 1 MB boundary returns 0x180000 instead of 0x100000), which
+    // truncated the size probe and intermittently reported an 8 MB chip as 1 MB —
+    // notably after a watchdog warm reboot (e.g. esp_hard_reset() when toggling
+    // General Sound), making GS think there isn't enough PSRAM.  Let the chip settle
+    // and absorb that first bad transaction with a throwaway read before sizing.
+    busy_wait_us(150);
+    { volatile uint32_t warmup = psram_read32(&psram_spi, 0); (void)warmup; }
     __psram_sz = _psram_size();
 #ifndef PSRAM_NO_FUGE
     if ( !__psram_sz ) {
@@ -176,7 +184,14 @@ void psram_read_page(uint32_t addr, uint8_t* dst) {
     cmd[1]=(uint8_t)(addr>>16); cmd[2]=(uint8_t)(addr>>8); cmd[3]=(uint8_t)addr;
     cmd[4]=0;                                       // dummy byte
 #if defined(PSRAM_SPINLOCK)
-    psram_spi.spin_irq_state = spin_lock_blocking(psram_spi.spinlock);
+    // Cross-core (core1 GS) mutual exclusion only — do NOT disable IRQs here.
+    // A 16KB page transfer takes ~11ms on slow plain-SPI PSRAM; holding IRQs off
+    // that long starves the VGA DMA IRQ (dma_handler_VGA), which then misses the
+    // VSYNC-pattern switch → monitor loses signal during paging storms (e.g. the
+    // Profi 1024K boot eviction storm).  No core0 IRQ handler ever takes this lock
+    // (VGA/audio/USB IRQs never touch PSRAM; GS::pump runs on core1), so the
+    // unsafe (IRQ-preserving) variant is deadlock-free.
+    spin_lock_unsafe_blocking(psram_spi.spinlock);
 #endif
     psram_sm_jump32();
     io_rw_32 *txf32 = (io_rw_32*)&psram_spi.pio->txf[psram_spi.sm];
@@ -188,7 +203,7 @@ void psram_read_page(uint32_t addr, uint8_t* dst) {
     dma_channel_wait_for_finish_blocking(psram_spi.read_dma_chan);
     psram_sm_jump8();
 #if defined(PSRAM_SPINLOCK)
-    spin_unlock(psram_spi.spinlock, psram_spi.spin_irq_state);
+    spin_unlock_unsafe(psram_spi.spinlock);
 #endif
 }
 
@@ -204,7 +219,9 @@ void psram_write_page(uint32_t addr, const uint8_t* src) {
     cmd[1]=(uint8_t)(addr>>16); cmd[2]=(uint8_t)(addr>>8); cmd[3]=(uint8_t)addr;
 
 #if defined(PSRAM_SPINLOCK)
-    psram_spi.spin_irq_state = spin_lock_blocking(psram_spi.spinlock);
+    // IRQ-preserving cross-core lock — see psram_read_page() for the rationale
+    // (16KB transfer must not keep IRQs off or VGA loses VSYNC).
+    spin_lock_unsafe_blocking(psram_spi.spinlock);
 #endif
     psram_sm_jump32();
     io_rw_32 *txf32 = (io_rw_32*)&psram_spi.pio->txf[psram_spi.sm];
@@ -229,7 +246,7 @@ void psram_write_page(uint32_t addr, const uint8_t* src) {
         tight_loop_contents();
     psram_sm_jump8();
 #if defined(PSRAM_SPINLOCK)
-    spin_unlock(psram_spi.spinlock, psram_spi.spin_irq_state);
+    spin_unlock_unsafe(psram_spi.spinlock);
 #endif
 }
 

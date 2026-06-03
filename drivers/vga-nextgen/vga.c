@@ -86,8 +86,13 @@ static uint16_t palette_vga16_scanline[256] = { 0 };
 // Built by vga_set_profi_ds80_mode(); slot comes from profi_pair_lookup[p0][p1].
 // low byte = left pixel (p0), high byte = right pixel (p1) — PIO right-shifts out LSB first.
 // [0] = even scan lines, [1] = odd scan lines (Bayer 2×2 checkerboard dithering).
+// Profi DS80 is RP2350-only; the 1 KB palette is excluded on RP2040 to save RAM
+// (heap is ~5 KB after the framebuffer there).
+#if !PICO_RP2040
 static uint16_t palette_vga_ds80[2][256] = { { 0 } };
+#endif
 // Unified DS80-active flag: set by both vga_set_profi_ds80_mode and hdmi_set_profi_ds80_mode.
+// Kept on all platforms (1 byte) — stays false on RP2040.
 volatile bool profi_ds80_active = false;
 
 static uint text_buffer_width = 0;
@@ -273,13 +278,16 @@ if (!text_buffer) return;
     uint8_t* output_buffer_8bit;
     switch (graphics_mode) {
         case GRAPHICSMODE_DEFAULT: {
+#if !PICO_RP2040
             if (profi_ds80_active) {
                 uint16_t* pal = palette_vga_ds80[screen_line & 1];
                 for (int x = 0; x < width; ++x) {
                     register uint8_t idx = input_buffer_8bit[x ^ 2];
                     *output_buffer_16bit++ = pal[idx];
                 }
-            } else {
+            } else
+#endif
+            {
                 uint16_t* pal = (vga_scanlines && (screen_line & 1))
                     ? palette_vga16_scanline
                     : palette_vga16[screen_line & 1];
@@ -555,6 +563,12 @@ void vga_set_palette_entry_solid(uint8_t i, uint32_t color888) {
 void vga_set_profi_ds80_mode(bool active,
                               const uint32_t *palette16_rgb888,
                               const uint8_t  *pair_lut) {
+#if PICO_RP2040
+    // Profi DS80 is RP2350-only; no palette table on RP2040. Keep the symbol so
+    // any (guarded-out) caller still links, but it never activates.
+    (void)active; (void)palette16_rgb888; (void)pair_lut;
+    profi_ds80_active = false;
+#else
     if (active && palette16_rgb888 && pair_lut) {
         // Dithered VGA pixel values for each of 16 Profi colors.
         uint8_t vga_even_left[16];   // even scan-line, left  pixel (even screen x)
@@ -592,6 +606,7 @@ void vga_set_profi_ds80_mode(bool active,
     } else {
         profi_ds80_active = false;
     }
+#endif // !PICO_RP2040
 }
 
 void graphics_set_bgcolor_hdmi(uint32_t color888);
