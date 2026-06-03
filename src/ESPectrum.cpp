@@ -765,6 +765,25 @@ void ESPectrum::setup() {
 #endif
     Debug::log("setup: no ext_ram: pages done, freeHeap=%u", getFreeHeap());
   }
+  // Initialise every SRAM/butter-backed ZX RAM page to a defined state (0).
+  // Without this the emulated RAM starts with build-dependent garbage:
+  //  - RP2350 pages 0-7 live in the .ram_128k linker section, declared (NOLOAD),
+  //    so the C runtime never zeroes them.
+  //  - heap pages from `new unsigned char[]` are not zero-initialised either.
+  // The leftover content is stable across power cycles for a given binary but
+  // differs between builds (layout/boot writes change), which made halt2int's
+  // floating-bus probe return a flaky Early/Unknown verdict that flipped from
+  // build to build with no source change.  A defined power-on state (matching a
+  // real machine after the ROM clears the screen) makes the result reproducible.
+  // PSRAM_SPI/SWAP pages are skipped (extended pages, not used by 48K; butter is
+  // already cleared at boot).  Runs once at cold setup, before romset/snapshot load.
+  for (size_t i = 0; i < MEM_PG_CNT; ++i) {
+    if (MemESP::ram[i].memType() == mem_type_t::POINTER) {
+      uint8_t *p = MemESP::ram[i].direct();
+      if (p && p >= (uint8_t *)0x11000000) memset(p, 0, MEM_PG_SZ);
+    }
+  }
+  Debug::log("setup: ZX RAM pages zeroed, freeHeap=%u", getFreeHeap());
   // Load romset
   Debug::log("setup: requestMachine begin, freeHeap=%u", getFreeHeap());
   Debug::log2SD("setup: requestMachine begin arch=%s romSet=%s freeHeap=%u",
