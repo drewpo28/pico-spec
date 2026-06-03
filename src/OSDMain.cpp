@@ -2397,7 +2397,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             return;
                         }
                     }
-                    else if (FileUtils::fsMount && stor_num == 6) { // Snapshot
+                    else if (FileUtils::fsMount && stor_num == 7) { // Snapshot
 #else
                     else if (FileUtils::fsMount && stor_num == 3) { // Snapshot
 #endif
@@ -2489,7 +2489,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 menu_curopt = sna_mnu;
                             } else {
 #if !PICO_RP2040
-                                menu_curopt = 6;
+                                menu_curopt = 7;
 #else
                                 menu_curopt = 3;
 #endif
@@ -2499,7 +2499,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         }
                     }
 #if !PICO_RP2040
-                    else if (FileUtils::fsMount && stor_num == 7) { // IDE/HDD
+                    else if (FileUtils::fsMount && stor_num == 6) { // IDE/HDD
                         static const char* ide_modes[] = { "OFF", "NEMO", "PROFI" };
                         menu_saverect = true;
                         menu_curopt = 1;
@@ -2638,6 +2638,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         }
                                         menu_saverect = false;
                                         menu_curopt = 3;
+                                    } else if (opt2 == 4) {
+                                        // LBA row is informational — Enter does nothing,
+                                        // stay on this hd submenu with the cursor on LBA.
+                                        menu_saverect = false;
+                                        menu_curopt = 4;
                                     } else {
                                         menu_curopt = opt;
                                         break;
@@ -2710,7 +2715,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                                 menu_saverect = false;
                             } else {
-                                menu_curopt = 7;
+                                menu_curopt = 6;
                                 menu_level = 1;
                                 break;
                             }
@@ -3691,10 +3696,22 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 // ***********************************************************************************
                 menu_saverect = true;
                 menu_curopt = 1;
-                bool ext_ram = butter_psram_size() || FileUtils::fsMount || psram_size() > 0;
+                bool has_psram = butter_psram_size() || psram_size() > 0;
+                bool ext_ram = has_psram || FileUtils::fsMount;
+                // Profi needs PSRAM (DS80 hires framebuffer in PSRAM); without it
+                // the emulation is pointless, so hide the entry on SD-only boards.
+                // Stripping "Profi" keeps indices of the items before it stable;
+                // any trailing item (ALF) shifts up by one and is keyed off the
+                // computed last index below.
+                string arch_menu = ext_ram ? MENU_ARCH[Config::lang] : MENU_ARCH_NO_SD[Config::lang];
+                if (ext_ram && !has_psram) {
+                    const string profi_line = "Profi\t>\n";
+                    size_t p = arch_menu.find(profi_line);
+                    if (p != string::npos) arch_menu.erase(p, profi_line.size());
+                }
                 while (1) {
                     menu_level = 1;
-                    uint8_t arch_num = menuRun(ext_ram ? MENU_ARCH[Config::lang] : MENU_ARCH_NO_SD[Config::lang]);
+                    uint8_t arch_num = menuRun(arch_menu.c_str());
                     if (arch_num) {
                         string arch = Config::arch;
                         string romset = Config::romSet;
@@ -3973,7 +3990,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     break;
                                 }
                             }
-                        } else if (ext_ram && arch_num == 8) { // Profi
+                        } else if (has_psram && arch_num == 8) { // Profi (needs PSRAM for DS80; SD alone is not enough)
                             menu_curopt = 1;
                             menu_saverect = true;
                             opt2 = 0;
@@ -4072,7 +4089,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             }
                         }
 #if !NO_ALF
-                        else if (arch_num == 9 || !ext_ram) { // ALF TV GAME
+                        else if (arch_num == 9 || (ext_ram && !has_psram && arch_num == 8) || !ext_ram) { // ALF TV GAME (shifts to 8 when Profi hidden)
                             arch = "ALF";
                             romset = "ALF1";
                             menu_curopt = opt2;

@@ -21,13 +21,14 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 
 ## Features
 
-- ZX Spectrum 48K, 128K, Pentagon 128k/512k/1024k, Byte and ALF TV Game. 100% cycle accurate emulation.
+- ZX Spectrum 48K, 128K, Pentagon 128k/512k/1024k, Profi 1024K, Byte and ALF TV Game. 100% cycle accurate emulation.
 - State of the art Z80 emulation (Authored by [José Luis Sánchez](https://github.com/jsanchezv/z80cpp))
-- Selectable Sinclair 48K, Sinclair 128K and Amstrad +2 english and spanish ROMs. Byte and ALF TV Game - russian ROMs, + Pentagons with Gluck services ROMs & TR-DOS 5.05D ROM.
+- Selectable Sinclair 48K, Sinclair 128K and Amstrad +2 english and spanish ROMs. Byte and ALF TV Game - russian ROMs, + Pentagons with Gluck services ROMs & TR-DOS 5.05D ROM. Profi 1024K ROM set (Service / TR-DOS / 128K / 48K).
 - Possibility of using custom ROM with easy flashing procedure from SD card.
 - ZX81+ IF2 ROM by courtesy Paul Farrow with .P file loading from SD card.
 - Timex SCLD video modes emulation (hi-res 512->256 OR-merge, hi-color, dual-screen).
 - Pentagon 16-color video mode (Pentagon only): per-pixel 16-color attribute mode toggleable from the OSD Video menu.
+- Profi DS80 512×240 hi-res video mode (Profi only): switchable STD/DS80 output with a dedicated OSD palette option; CP/M and TR-DOS supported (RP2350 only).
 - VGA/HDMI output with 5 selectable video modes: 640x480@60Hz, 640x480@50Hz, 720x480@60Hz, 720x576@60Hz, 720x576@50Hz.
 - Hot video mode switching without reboot (VGA/HDMI).
 - VGA/HDMI scanlines effect.
@@ -55,7 +56,8 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - PS/2 Joystick emulation (Cursor, Sinclair, Kempston and Fuller).
 - Two real joysticks support (Up to 8 button joysticks).
 - USB HID gamepad support: XInput (Xbox 360/One), DualShock 4 (PS4), DualSense (PS5), generic HID gamepads with auto-detected report descriptors.
-- Emulation of Betadisk interface with four drives and TRD, SCL, UDI and FDI (read and write) support. Fast and realtime modes. Per-drive Write Protect, inline drive status in the Drives menu, F5 slot-picker popup (F2 toggle WP, F8 eject) when mounting from the file browser.
+- Emulation of Betadisk interface with four drives and TRD, SCL, UDI, FDI (read and write) and TD0 (Teledisk, read-only) support. Fast and realtime modes. Per-drive Write Protect, inline drive status in the Drives menu, F5 slot-picker popup (F2 toggle WP, F8 eject) when mounting from the file browser.
+- IDE/HDD emulation: NEMO and Profi schemes, HDF / raw .hdd / Fixed VHD images, create-empty-image helper, mounted from the Storage → IDE/HDD menu (RP2350 only).
 - MB-02+ disk interface emulation: WD2797 FDC, Z80-DMA, 512KB SRAM paging, BS-DOS 308, MBD disk images, 4 drives, NMI menu (RP2350 only).
 - esxDOS support (DivMMC, DivIDE, DivSD) — [esxdos.org](https://esxdos.org/index.html).
 - Z-Controller emulation: raw SD card access via ports #57/#77, mutually exclusive with esxDOS and MB-02+ (RP2350 only).
@@ -116,7 +118,7 @@ Default hotkey bindings (all hotkeys except F1 and ALT+F1 are reconfigurable via
 - ALT+F8 Jump to address
 - ALT+F9 Input poke
 - ALT+F10 NMI (Pentagon: modal menu with NMI / Magic Button options)
-- ALT+F11 Reset to... (modal menu: Service/Gluk, TR-DOS, 128K, 48K — depends on machine)
+- ALT+F11 Reset to... (modal menu: Service/Gluk/Service ROM, TR-DOS, 128K, 48K — depends on machine; Profi has its own Service ROM / TR-DOS / 128K / 48K set)
 - ALT+F12 USB Boot / Update Firmware
 - ALT+PageUp Switch Gigascreen mode (Off → On → Auto cycle)
 - ALT+F3 Quick load snapshot
