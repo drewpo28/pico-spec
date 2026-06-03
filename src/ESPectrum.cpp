@@ -559,17 +559,16 @@ extern int ram_pages, butter_pages, psram_pages, swap_pages;
 static void assign_ram(int i) {
   static size_t butter_remains = butter_psram_size();
   static size_t butter_idx = 0;
-  // Profi DS80 hires color attr pages (56/58): on SPI-PSRAM-only boards the
-  // Profi BIOS selects bankLatch=56..63 (portDFFD[2:0]=7) causing sync() to
-  // hit these pages 50-100 times/frame → 11ms × 72 = 792ms/frame → 1 FPS.
-  // Fix: allocate as SRAM-backed (POINTER) so sync() returns the SRAM pointer
-  // instantly without any SPI DMA.  Also covers arch set to Profi at boot.
-  // Page 61 is Profi CP/M's hot working page (swaps ~1.2/frame in steady state);
-  // give it an SRAM buffer too.  Left UNPINNED so it stays in the evictable pool
-  // (pool grows to {56,58,61}, doesn't shrink) — as a hot page it sits at the LRU
-  // tail and is rarely chosen as a victim, so its swap effectively disappears.
-  // (Earlier this appeared to break the BIOS 1024K test, but that was the buggy
-  // 32-bit write_page truncating writes — now to_vram uses write_range.)
+  // Profi DS80 hires color attr pages (56/58) + CP/M's hot working page (61):
+  // on SPI-PSRAM boards the Profi BIOS selects bankLatch=56..63 (portDFFD[2:0]=7)
+  // causing sync()/swaps 50-100×/frame → ~1 FPS.  Fix: allocate as SRAM-backed
+  // (POINTER) so sync() returns the SRAM pointer instantly without any SPI DMA.
+  // Page 61 left UNPINNED so it stays in the evictable pool ({56,58,61}).
+  // 1024K BIOS test stays correct (the earlier 160K was the buggy 32-bit
+  // write_page truncating writes, not force_sram).
+  // butter/QSPI-XIP boards are excluded: forcing these into SRAM there gave no
+  // IDL gain (the bottleneck is the whole Z80 working set in XIP, not the color
+  // pages), so don't waste 48KB SRAM.
   bool force_sram = (Config::arch == "Profi") && (i == 56 || i == 58 || i == 61)
                     && (butter_psram_size() == 0);
   if (force_sram) {
