@@ -49,32 +49,38 @@ visit https://zxespectrum.speccy.org/contacto
 #define TSTATES_PER_LINE 224
 #define TSTATES_PER_LINE_128 228
 #define TSTATES_PER_LINE_PENTAGON 224
+#define TSTATES_PER_LINE_PROFI 224
 #define TSTATES_PER_LINE_BYTE 224
 
 #define TS_SCREEN_48           14335  // START OF ULA DRAW PAPER 48K
 #define TS_SCREEN_128          14361  // START OF ULA DRAW PAPER 128K
 #define TS_SCREEN_PENTAGON     17983  // START OF ULA DRAW PAPER PENTAGON
-#define TS_SCREEN_BYTE         14335
+#define TS_SCREEN_PROFI        12583  // START OF ULA DRAW PAPER PROFI (56*224+39)
+#define TS_SCREEN_BYTE         14392  // START OF ULA DRAW PAPER BYTE (64*224+56)
 
 #define TS_BORDER_320x240 8948  // START OF BORDER 48 (+5 correction)
 #define TS_BORDER_320x240_128 8878  // START OF BORDER 128 (+5 correction)
 #define TS_BORDER_320x240_PENTAGON 12595  // START OF BORDER PENTAGON
-#define TS_BORDER_320x240_BYTE 8948
+#define TS_BORDER_320x240_PROFI 5403      // START OF BORDER PROFI (32 top lines: 12583 - 32*224 - 16 + 4)
+#define TS_BORDER_320x240_BYTE 9005       // START OF BORDER BYTE (formula 9000 + 5)
 
 #define TS_BORDER_360x200 13428  // START OF BORDER 48
 #define TS_BORDER_360x200_128 13438  // START OF BORDER 128
 #define TS_BORDER_360x200_PENTAGON 17075  // START OF BORDER PENTAGON
-#define TS_BORDER_360x200_BYTE 13428
+#define TS_BORDER_360x200_PROFI 11675     // START OF BORDER PROFI (= PENTAGON - 5400)
+#define TS_BORDER_360x200_BYTE 13485      // START OF BORDER BYTE (formula 13480 + 5)
 
 #define TS_BORDER_360x288 3564          // START OF BORDER 48 FULL (formula 3559 + 5)
 #define TS_BORDER_360x288_128 3398      // START OF BORDER 128 FULL (formula 3393 + 5)
 #define TS_BORDER_360x288_PENTAGON 7209 // START OF BORDER PENTAGON FULL (formula 7205 + 4)
-#define TS_BORDER_360x288_BYTE 3564
+#define TS_BORDER_360x288_PROFI 1809    // START OF BORDER PROFI FULL (= PENTAGON - 5400)
+#define TS_BORDER_360x288_BYTE 3621     // START OF BORDER BYTE FULL (formula 3616 + 5)
 
 #define TS_BORDER_360x240 8940          // START OF BORDER 48 HALF (formula 8935 + 5)
 #define TS_BORDER_360x240_128 8870      // START OF BORDER 128 HALF (formula 8865 + 5)
 #define TS_BORDER_360x240_PENTAGON 12585 // START OF BORDER PENTAGON HALF (formula 12581 + 4)
-#define TS_BORDER_360x240_BYTE 8940
+#define TS_BORDER_360x240_PROFI 5393    // START OF BORDER PROFI HALF (32 top lines: 12583 - 32*224 - 26 + 4)
+#define TS_BORDER_360x240_BYTE 8997     // START OF BORDER BYTE HALF (formula 8992 + 5)
 
 // Colors as 8-bit palette indices (VGA8 mode)
 // Standard Spectrum color order: 0-7 normal, 8-15 bright, 16 orange
@@ -176,6 +182,38 @@ public:
   static void vgataskinit(void *unused);
 
   static uint8_t* grmem;
+  static uint8_t* profi_clrmem;   // Profi hires color attr page (56 or 58), NULL if in SPI PSRAM
+#if !PICO_RP2040
+  // When profi_clrmem is NULL (page evicted to SPI), this holds the SPI base offset
+  // for read8psram fallback.  0xFFFFFFFF = not applicable.
+  static uint32_t profi_clr_spi_base;
+#endif
+#if !PICO_RP2040
+  // pair_lookup[ink][paper] → safe HDMI palette index (avoids sync range 220-244, border 255).
+  // Built by init_profi_pair_lookup() in Reset(). Used by rasterizer and passed to HDMI driver.
+  static uint8_t profi_pair_lookup[16][16];
+  // Live 16-color palette in RGB888 — modifiable by guest via OUT (port_low=0x7E).
+  static uint32_t profi_palette_live[16];
+  static volatile bool profi_palette_dirty;      // pending HDMI palette refresh — applied in EndFrame
+  static volatile bool profi_ds80_activate_pending;   // deferred off→on mode switch (set in Ports, applied in EndFrame)
+  static volatile bool profi_ds80_deactivate_pending; // deferred on→off mode switch (set in Ports, applied in EndFrame)
+  // OSD palette override: while OSD is open over a DS80 screen, conv_color is
+  // temporarily switched to the standard ZX palette so OSD colour bytes (0..16)
+  // render correctly.  HDMI stays in DS80 mode; the frozen Profi background is
+  // re-interpreted through the standard palette (accepted tradeoff — OSD always ZX).
+  static bool profi_ds80_osd_active;     // true while OSD standard-palette override is in effect
+  static void rebuildDS80ColorLut();     // rebuild Graphics8BitPalette::ds80_color_lut from profi_pair_lookup
+  static void applyProfiOSDPalette();    // enable Graphics-layer DS80 colour remap (OSD draws correct colours)
+  static void restoreProfiLivePalette(); // disable Graphics-layer DS80 colour remap
+  static void discardProfiOSDPaletteSnapshot(); // drop saved palette without re-enabling DS80
+  static void clearDS80Padding();        // re-blacken DS80 side-padding columns after OSD close
+  static void profiPaletteReset();
+  // Update palette[index] from a Profi RRRGGGBB color byte; sets dirty flag.
+  static void profiPaletteWrite(uint8_t index, uint8_t profi_color);
+#endif
+
+  static bool isProfiDS80();
+  static void updateBorderBrd(); // set VIDEO::brd correctly for current mode (DS80 or normal)
 
   static uint16_t spectrum_colors[NUM_SPECTRUM_COLORS];
 

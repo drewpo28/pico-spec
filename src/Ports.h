@@ -46,6 +46,10 @@ public:
     static uint8_t input(uint16_t address);
     static void output(uint16_t address, uint8_t data);
     static uint8_t port[128];
+    // Profi extended keyboard: bit 5 of each standard row (row 0-7).
+    // 0xFF = key not pressed; bit 5 cleared = key pressed.
+    // Used only when Config::arch=="Profi" && Config::profi_ext_keys.
+    static uint8_t extPort[8];
 
     static uint8_t (*getFloatBusData)();
     static uint8_t getFloatBusData48();
@@ -56,6 +60,8 @@ public:
     static uint8_t dmaInput(uint16_t address);
 
     static uint8_t portAFF7;
+    static uint8_t portDFFD;
+    static uint8_t portEFF7; // Extended feature register (Profi CP/M uses bit 1=EFF7_512)
 
 #if !PICO_RP2040
     // KR580VI53 (Intel 8253 PIT) — Byte computer sound synthesizer

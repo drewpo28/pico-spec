@@ -68,7 +68,12 @@ visit https://zxespectrum.speccy.org/contacto
 extern "C" void graphics_set_scanlines(bool enabled);
 extern "C" void graphics_set_dither(bool enabled);
 #if !PICO_RP2040
+extern "C" volatile bool profi_ds80_active;
+extern "C" const uint32_t profi_default_palette16[16];
+#endif
+#if !PICO_RP2040
 #include "DivMMC.h"
+#include "IDE.h"
 #include "MB02.h"
 #endif
 
@@ -384,7 +389,7 @@ void OSD::clearStats() {
                 ptr[col * 2 + 1] = brdColor;
             }
         }
-    } else if (Z80Ops::isPentagon) {
+    } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
         for (int line = 220; line < 236; line++) {
             uint16_t *ptr = (uint16_t *)(VIDEO::vga.frameBuffer[line]);
             for (int col = 84; col < 156; col++)
@@ -543,6 +548,19 @@ static string slotInlineEdit(uint8_t opt2, const string& current) {
     return OSD::inlineTextEdit(ex, ey, 20, name);
 }
 
+#if !PICO_RP2040
+// Throttled progress overlay for IDE::createImage (zero-fill can take seconds).
+static void ide_create_progress(uint32_t done, uint32_t total) {
+    static int lastpct = -1;
+    int pct = total ? (int)((uint64_t)done * 100 / total) : 100;
+    if (pct == lastpct) return;
+    lastpct = pct;
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Creating HDD... %d%%", pct);
+    OSD::osdCenteredMsg(msg, LEVEL_INFO, 0);
+}
+#endif
+
 
 static bool persistSave(uint8_t slotnumber, uint8_t opt2, bool quicksave = false)
 {
@@ -686,6 +704,73 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
         ~AYGuard() { if (Config::audio_driver == 3) send_to_595(HIGH(AY_Enable)); }
     } ayGuard;
 
+#if !PICO_RP2040
+    // DS80 OSD palette guard.
+    //
+    // While OSD is open, the Z80/main loop is paused (suspended inside do_OSD()),
+    // so EndFrame() never fires — the deferred profi_ds80_*_pending flags cannot
+    // be applied here.  The HDMI ISR on core1 keeps scanning the (now frozen) DS80
+    // framebuffer, so the Profi screen stays visible behind the dialog.
+    //
+    // Problem: OSD draws standard ZX colour bytes (indices 0..16) into the
+    // framebuffer, but in DS80 mode a framebuffer byte indexes the DS80 packed-pair
+    // conv_color table, not the standard ZX palette — so OSD bytes render as garbled
+    // striped colours (the reported bug).
+    //
+    // Fix: applyProfiOSDPalette() makes the OSD render correctly, in one of two modes
+    // chosen by the "OSD palette" menu toggle (applied live, no reboot):
+    //   STD : restore the standard ZX conv_color snapshot → menu in TRUE ZX colours,
+    //         Profi background re-interpreted through std palette (sacrificed).
+    //   DS80: enable the Graphics-layer remap (Graphics8BitPalette::ds80_active +
+    //         ds80_color_lut[]) so each ZX index → profi_pair_lookup[c][c] (solid Profi
+    //         colour) → menu in Profi-palette colours, background fully correct.
+    // Either way HDMI stays in DS80 mode and the change reverts on OSD close.
+    //
+    // Edge case: if a machine reset fires during OSD, ESPectrum::reset() clears DS80
+    // state directly.  The dtor re-arms activation only if the machine is still DS80.
+    struct DS80Guard {
+        bool was_active;
+        DS80Guard() : was_active(profi_ds80_active) {
+            // Cancel any pending activation that arrived just before OSD opened
+            // (avoids a spurious framebuffer-zeroing + geometry reset under the dialog).
+            VIDEO::profi_ds80_activate_pending = false;
+            if (was_active) {
+                VIDEO::profi_ds80_osd_active = true;
+                VIDEO::applyProfiOSDPalette();   // STD swap or DS80 remap (per toggle)
+            }
+        }
+        ~DS80Guard() {
+            if (VIDEO::profi_ds80_osd_active) {
+                VIDEO::profi_ds80_osd_active = false;
+                // CRITICAL: only restore the DS80 palette if HDMI is STILL in DS80 mode.
+                // If a machine reset fired during OSD (e.g. switching to 48K/128K from a
+                // menu), ESPectrum::reset() already called hdmi_set_profi_ds80_mode(false).
+                // restoreProfiLivePalette() would call hdmi_set_profi_ds80_mode(true,…),
+                // RE-ENABLING DS80 packed-pair scanout over a non-DS80 framebuffer →
+                // shifted/garbled screen.  Skip it when we've left DS80.
+                if (profi_ds80_active) {
+                    VIDEO::restoreProfiLivePalette(); // back to live DS80 pair palette
+                    // DS80 renderer only rewrites the 256 content bytes per row, so any
+                    // side-padding the dialog drew over stays dirty — re-blacken it.
+                    VIDEO::clearDS80Padding();
+                } else {
+                    // Left DS80 during OSD: drop the saved-palette flag without re-arming
+                    // DS80, so a later DS80 session starts clean.
+                    VIDEO::discardProfiOSDPaletteSnapshot();
+                }
+            }
+            // Cancel any stray deferred flags from transitions during OSD.
+            VIDEO::profi_ds80_activate_pending   = false;
+            VIDEO::profi_ds80_deactivate_pending = false;
+            // Reset-during-OSD: profi_ds80_active was cleared by ESPectrum::reset()
+            // directly.  Re-arm activation only if the machine is still DS80.
+            if (was_active && !profi_ds80_active && VIDEO::isProfiDS80()) {
+                VIDEO::profi_ds80_activate_pending = true;
+            }
+        }
+    } ds80Guard;
+#endif
+
     static uint8_t last_sna_row = 0;
     fabgl::VirtualKeyItem Nextkey;
 
@@ -700,6 +785,17 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             break;
         }
     }
+
+#if !PICO_RP2040
+    // Alt+` (grave/tilde) — toggle Profi extended keyboard mode (only in Profi arch)
+    if (Config::arch == "Profi" && ALT && !CTRL &&
+        (KeytoESP == fabgl::VK_GRAVEACCENT || KeytoESP == fabgl::VK_TILDE)) {
+        Config::profi_ext_keys = !Config::profi_ext_keys;
+        Config::save();
+        osdCenteredMsg(Config::profi_ext_keys ? " XT keyboard ON  " : " XT keyboard OFF ", LEVEL_INFO, 500);
+        return;
+    }
+#endif
 
 #ifdef VGA_HDMI
     // Mode switches require a hard reset — heap fragmentation breaks runtime
@@ -776,7 +872,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     MemESP::recoverPage0();
                     osdCenteredMsg(Config::byte_cobmect_mode ? OSD_COBMECT_ON[Config::lang] : OSD_COBMECT_OFF[Config::lang], LEVEL_INFO, 500);
                 }
-            } else if (Z80Ops::isPentagon) {
+            } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
                 menu_level = 0;
                 menu_curopt = 1;
                 menu_saverect = true;
@@ -832,7 +928,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             } else {
                 // Build machine-dependent menu
                 string reset_menu;
-                if (Z80Ops::isPentagon) {
+                if (Config::arch == "Profi") {
+                    reset_menu = MENU_RESETTO_PROFI[Config::lang];
+                } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
                     if (Config::romSet == "128Kpg")
                         reset_menu = MENU_RESETTO_PENTGLUK[Config::lang];
                     else
@@ -855,7 +953,31 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     if (Config::ram_file != NO_RAM_FILE) Config::ram_file = NO_RAM_FILE;
                     Config::last_ram_file = NO_RAM_FILE;
 
-                    if (Z80Ops::isPentagon && Config::romSet == "128Kpg") {
+                    if (Config::arch == "Profi") {
+                        // Service ROM=1, TR-DOS=2, 128K=3, 48K=4
+                        if (opt == 1) {
+                            // Service ROM: boot SYS ROM (bank0), SYSEN=true (set by reset(0) for Profi).
+                            ESPectrum::reset(0);
+                        } else if (opt == 2) {
+                            // TR-DOS: per UnrealSpeccy memory.cpp set_mode(RM_DOS) —
+                            //   comp.flags |= CF_TRDOS;  comp.p7FFD |= 0x10;
+                            // set_banks() then maps bank0 = (CF_TRDOS && p7FFD&0x10)
+                            // ? DOS_ROM : ... → the TR-DOS ROM (bank1). The CPU is
+                            // reset to PC=0 and TR-DOS cold-starts from its own ROM
+                            // vector. Mirror exactly: reset into bank1, then assert
+                            // trdos (CF_TRDOS) + romLatch=1 (p7FFD bit4).
+                            ESPectrum::reset(1);
+                            MemESP::romLatch = 1;
+                            ESPectrum::trdos = true;
+                        } else if (opt == 3) {
+                            // 128K ROM: trdos=false, romLatch=0 → bank2
+                            ESPectrum::reset(2);
+                        } else if (opt == 4) {
+                            // 48K/SOS ROM: trdos=false, romLatch=1 → bank3
+                            ESPectrum::reset(3);
+                            MemESP::romLatch = 1;
+                        }
+                    } else if ((Z80Ops::isPentagon || Z80Ops::isProfi) && Config::romSet == "128Kpg") {
                         // Service (Gluk)=1, TR-DOS=2, 128K=3, 48K=4
                         if (opt == 1) {
                             ESPectrum::reset(3); // Gluk ROM
@@ -869,7 +991,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             ESPectrum::reset(1); // 48K BASIC ROM
                             MemESP::pagingLock = 1;
                         }
-                    } else if (Z80Ops::isPentagon) {
+                    } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
                         // TR-DOS=1, 128K=2, 48K=3
                         if (opt == 1) {
                             ESPectrum::reset(4); // TR-DOS ROM
@@ -985,7 +1107,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         fname = zipFname;
                         ext = FileUtils::getLCaseExt(fname);
                     }
-                    if (ext == "trd" || ext == "scl" || ext == "udi" || ext == "fdi") {
+                    if (ext == "trd" || ext == "scl" || ext == "udi" || ext == "fdi" || ext == "td0" || ext == "pro") {
                         printf("Insert disk %s\n",fname.c_str());
                         rvmWD1793InsertDisk(&ESPectrum::fdd, 0, fname);
                     }
@@ -1222,7 +1344,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     }
                     rvmWD1793InsertDisk(&ESPectrum::fdd, 0, fname);
                     if (ESPectrum::fdd.disk[0])
-                        ESPectrum::fdd.disk[0]->writeprotect = Config::driveWP[0];
+                        // TD0 is read-only (no write-back) → always WP regardless of the slot flag.
+                        ESPectrum::fdd.disk[0]->writeprotect =
+                            Config::driveWP[0] || ESPectrum::fdd.disk[0]->IsTD0File;
                     Config::save();
                 }
 #if !PICO_RP2040
@@ -1310,7 +1434,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             // Show / hide OnScreen Stats
             {
                 uint8_t mode = VIDEO::OSD & 0x03;
-                bool hasFdd = (Z80Ops::isPentagon || (Z80Ops::is128 && Z80Ops::isByte)
+                bool hasFdd = ((Z80Ops::isPentagon || Z80Ops::isProfi) || (Z80Ops::is128 && Z80Ops::isByte)
 #if !PICO_RP2040
                                 || ((Z80Ops::is48 || Z80Ops::is128) && MB02::enabled))
                         && Tape::tapeStatus != TAPE_LOADING
@@ -1435,6 +1559,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 Config::ram_file = NO_RAM_FILE;
             }
             Config::last_ram_file = NO_RAM_FILE;
+            if (Config::arch == "Profi") {
+                // Profi hard reset = boot Service ROM (bank0, SYSEN), same as
+                // Alt-F11 → "Service ROM". reset(0) sets trdos=true to hold SYSEN.
+                ESPectrum::reset(0);
+            } else
             ESPectrum::reset();
         } else if (hkIdx == Config::HK_REBOOT) { // ESP32 reset
             if (confirmReboot(OSD_DLG_REBOOT)) {
@@ -1786,7 +1915,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             }
                                             rvmWD1793InsertDisk(&ESPectrum::fdd, slot, fname);
                                             if (ESPectrum::fdd.disk[slot])
-                                                ESPectrum::fdd.disk[slot]->writeprotect = Config::driveWP[slot];
+                                                // TD0 is read-only (no write-back) → always WP.
+                                                ESPectrum::fdd.disk[slot]->writeprotect =
+                                                    Config::driveWP[slot] || ESPectrum::fdd.disk[slot]->IsTD0File;
                                             Config::save();
                                         }
                                         // Mirror menuRun's Esc path so the drive submenu
@@ -1807,7 +1938,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         // Toggle per-slot Write Protect.
                                         Config::driveWP[slot] = !Config::driveWP[slot];
                                         if (ESPectrum::fdd.disk[slot])
-                                            ESPectrum::fdd.disk[slot]->writeprotect = Config::driveWP[slot];
+                                            // TD0 is read-only (no write-back) → stays WP even if toggled off.
+                                            ESPectrum::fdd.disk[slot]->writeprotect =
+                                                Config::driveWP[slot] || ESPectrum::fdd.disk[slot]->IsTD0File;
                                         Config::save();
                                         menu_curopt = 3;
                                         menu_saverect = false;
@@ -2356,7 +2489,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 menu_curopt = sna_mnu;
                             } else {
 #if !PICO_RP2040
-                                menu_curopt = 4;
+                                menu_curopt = 6;
 #else
                                 menu_curopt = 3;
 #endif
@@ -2365,6 +2498,225 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             }
                         }
                     }
+#if !PICO_RP2040
+                    else if (FileUtils::fsMount && stor_num == 7) { // IDE/HDD
+                        static const char* ide_modes[] = { "OFF", "NEMO", "PROFI" };
+                        menu_saverect = true;
+                        menu_curopt = 1;
+                        while (1) {
+                            menu_level = 2;
+                            // Root: Scheme row + hd0/hd1 rows (shown when a scheme is active).
+                            string menu = MENU_IDE_TITLE[Config::lang];
+                            menu += string(MENU_IDE_SCHEME[Config::lang]) + "\t" + ide_modes[Config::ide_scheme <= 2 ? Config::ide_scheme : 0] + "\n";
+                            bool showSlots = (Config::ide_scheme != 0);
+                            if (showSlots) {
+                                menu += formatSlotRow("hd0", Config::ide_image[0], false, false);
+                                menu += "\n";
+                                menu += formatSlotRow("hd1", Config::ide_image[1], false, false);
+                                menu += "\n";
+                                menu += MENU_IDE_CREATE[Config::lang];
+                            }
+                            uint8_t opt = menuRun(menu);
+                            if (opt == 1) {
+                                // Scheme submenu (OFF / NEMO / PROFI).
+                                menu_level = 3;
+                                menu_curopt = Config::ide_scheme + 1;
+                                menu_saverect = true;
+                                while (1) {
+                                    string smenu = MENU_IDE_TITLE[Config::lang];
+                                    for (int i = 0; i < 3; i++) {
+                                        smenu += (i == Config::ide_scheme) ? "[*] " : "[ ] ";
+                                        smenu += ide_modes[i];
+                                        smenu += "\n";
+                                    }
+                                    uint8_t sub = menuRun(smenu);
+                                    if (sub) {
+                                        uint8_t newval = sub - 1;
+                                        if (newval != Config::ide_scheme) {
+                                            // Mutually exclusive with esxDOS DivMMC/DivIDE
+                                            // (shared ports 0xEB/0xE7/0xA3 etc.).
+                                            if (newval && Config::esxdos) {
+                                                Config::esxdos = 0;
+                                                DivMMC::init();
+                                                OSD::osdCenteredMsg("esxDOS disabled", LEVEL_WARN, 2000);
+                                            }
+                                            Config::ide_scheme = newval;
+                                            IDE::init();
+                                            Config::save();
+                                            menu_curopt = sub;
+                                            menu_saverect = false;
+                                        }
+                                        menu_curopt = sub;
+                                        menu_saverect = false;
+                                    } else {
+                                        menu_curopt = 1;
+                                        break;
+                                    }
+                                }
+                            } else if ((opt == 2 || opt == 3) && showSlots) {
+                                // hd0 / hd1 submenu (Insert / Eject).
+                                uint8_t slot = (opt == 2) ? 0 : 1;
+                                menu_saverect = true;
+                                menu_curopt = 1;
+                                while (1) {
+                                    menu_level = 3;
+                                    char title[8]; snprintf(title, sizeof(title), "hd%u\n", (unsigned)slot);
+                                    string drvmenu = title;
+                                    drvmenu += MENU_ESX_INSERT[Config::lang];
+                                    drvmenu += MENU_ESX_EJECT[Config::lang];
+                                    // Geometry row: shows effective C/H/S, LBA and size; "auto" when no override.
+                                    {
+                                        char geo[48];
+                                        uint16_t oc=Config::ide_chs[slot][0], oh=Config::ide_chs[slot][1], os=Config::ide_chs[slot][2];
+                                        uint16_t C=IDE::geomC(slot), H=IDE::geomH(slot), S=IDE::geomS(slot);
+                                        bool over = (oc&&oh&&os);
+                                        if (C && H && S)
+                                            snprintf(geo, sizeof(geo), "CHS\t%u/%u/%u%s\n", C, H, S, over?"":" (auto)");
+                                        else
+                                            snprintf(geo, sizeof(geo), "CHS\t<empty>\n");
+                                        drvmenu += geo;
+                                        uint32_t lba = IDE::geomLBA(slot);
+                                        char lbar[48];
+                                        snprintf(lbar, sizeof(lbar), "LBA\t%u (%u MB)\n", (unsigned)lba, (unsigned)(((uint64_t)lba*512)/(1024*1024)));
+                                        drvmenu += lbar;
+                                    }
+                                    uint8_t opt2 = menuRun(drvmenu);
+                                    if (opt2 == 1) {
+                                        menu_saverect = true;
+                                        string mFile = fileDialog(FileUtils::IMG_Path, MENU_IDE_IMG_TITLE[Config::lang], DISK_IMGFILE, 26, 15);
+                                        if (mFile != "") {
+                                            string fname = FileUtils::IMG_Path + mFile.substr(1);
+                                            if (FileUtils::getLCaseExt(fname) == "zip") {
+                                                string zipFname = ZipExtract::extract(fname, DISK_IMGFILE);
+                                                if (zipFname.empty()) { OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN); break; }
+                                                if (zipFname == "\x1b") break;
+                                                fname = zipFname;
+                                            }
+                                            Config::ide_image[slot] = fname;
+                                            IDE::init();
+                                            Config::save();
+                                            menu_curopt = opt2;
+                                            menu_saverect = false;
+                                        }
+                                    } else if (opt2 == 2) {
+                                        Config::ide_image[slot].clear();
+                                        IDE::init();
+                                        Config::save();
+                                        menu_curopt = opt2;
+                                        menu_saverect = false;
+                                    } else if (opt2 == 3) {
+                                        // Edit CHS override. Empty input = auto-detect (0/0/0).
+                                        char cur[20];
+                                        if (Config::ide_chs[slot][0] && Config::ide_chs[slot][1] && Config::ide_chs[slot][2])
+                                            snprintf(cur, sizeof(cur), "%u/%u/%u",
+                                                     Config::ide_chs[slot][0], Config::ide_chs[slot][1], Config::ide_chs[slot][2]);
+                                        else
+                                            snprintf(cur, sizeof(cur), "%u/%u/%u",
+                                                     IDE::geomC(slot), IDE::geomH(slot), IDE::geomS(slot));
+                                        // Inline-edit on the CHS row (row index 3 within submenu).
+                                        uint8_t vrow = (uint8_t)(3 - OSD::begin_row + 1);
+                                        int ex = OSD::x + (1 + 4) * OSD_FONT_W;     // after "CHS\t"
+                                        int ey = OSD::y + 1 + 3 * OSD_FONT_H;
+                                        string in = OSD::inlineTextEdit(ex, ey, 14, string(cur));
+                                        if (in != "\x1B") {
+                                            unsigned c=0,h=0,s=0;
+                                            if (in.empty()) { c=h=s=0; }   // auto
+                                            if (in.empty() || sscanf(in.c_str(), "%u/%u/%u", &c,&h,&s)==3) {
+                                                // Sanity: H<=16, S<=63 (ATA); 0/0/0 allowed (=auto)
+                                                if ((c==0&&h==0&&s==0) || (h>=1&&h<=16&&s>=1&&s<=63&&c>=1)) {
+                                                    Config::ide_chs[slot][0]=(uint16_t)c;
+                                                    Config::ide_chs[slot][1]=(uint16_t)h;
+                                                    Config::ide_chs[slot][2]=(uint16_t)s;
+                                                    IDE::init();
+                                                    Config::save();
+                                                } else {
+                                                    OSD::osdCenteredMsg("Invalid CHS (H<=16 S<=63)", LEVEL_WARN, 2000);
+                                                }
+                                            } else {
+                                                OSD::osdCenteredMsg("Format: C/H/S", LEVEL_WARN, 2000);
+                                            }
+                                        }
+                                        menu_saverect = false;
+                                        menu_curopt = 3;
+                                    } else {
+                                        menu_curopt = opt;
+                                        break;
+                                    }
+                                }
+                            } else if (opt == 4 && showSlots) {
+                                // "Create empty image": pick slot → size → name, then create+mount.
+                                // Nested Esc-driven loops mirror the Scheme submenu so each level
+                                // backs out to its parent (slot picker → IDE/HDD root) on Esc.
+                                static const struct { const char* label; uint32_t mb; } ide_presets[] = {
+                                    { "10 MB\n", 10 }, { "32 MB\n", 32 }, { "64 MB\n", 64 }, { "128 MB\n", 128 }
+                                };
+                                menu_level = 3;
+                                menu_curopt = 1;
+                                menu_saverect = true;
+                                bool created = false;
+                                while (!created) {
+                                    // Level 3 — target slot.
+                                    string slmenu = MENU_IDE_CREATE[Config::lang];
+                                    slmenu += "hd0\n";
+                                    slmenu += "hd1\n";
+                                    uint8_t slsel = menuRun(slmenu);
+                                    if (slsel != 1 && slsel != 2) { menu_curopt = 4; break; }  // Esc → IDE/HDD
+                                    uint8_t slot = slsel - 1;
+                                    // Level 4 — size preset.
+                                    menu_level = 4;
+                                    menu_curopt = 1;
+                                    menu_saverect = true;
+                                    while (1) {
+                                        string szmenu = MENU_IDE_CREATE_SIZE[Config::lang];
+                                        for (auto &p : ide_presets) szmenu += p.label;
+                                        uint8_t sz = menuRun(szmenu);
+                                        if (sz < 1 || sz > 4) break;   // Esc → back to slot picker
+                                        uint32_t mb = ide_presets[sz - 1].mb;
+                                        // Name — inline-edit over the selected size row.
+                                        uint8_t vrow = (uint8_t)(sz - OSD::begin_row + 1);
+                                        int ex = OSD::x + 1 * OSD_FONT_W;
+                                        int ey = OSD::y + 1 + vrow * OSD_FONT_H;
+                                        string name = OSD::inlineTextEdit(ex, ey, 18, "new");
+                                        menu_saverect = false;
+                                        menu_curopt = sz;
+                                        if (name == "\x1B") continue;   // Esc on name → stay in size menu
+                                        while (!name.empty() && name.back()  == ' ') name.pop_back();
+                                        while (!name.empty() && name.front() == ' ') name.erase(name.begin());
+                                        if (name.empty()) continue;
+                                        if (FileUtils::getLCaseExt(name) != "hdd") name += ".hdd";
+                                        string path = FileUtils::IMG_Path + name;
+                                        FILINFO fno;
+                                        if (f_stat(path.c_str(), &fno) == FR_OK) {
+                                            OSD::osdCenteredMsg("File already exists", LEVEL_WARN, 2000);
+                                            continue;
+                                        }
+                                        OSD::osdCenteredMsg("Creating HDD...", LEVEL_INFO, 0);
+                                        bool ok = IDE::createImage(path.c_str(), mb, ide_create_progress);
+                                        if (!ok) { OSD::osdCenteredMsg("Create failed", LEVEL_WARN, 2000); continue; }
+                                        Config::ide_image[slot] = path;
+                                        IDE::init();
+                                        Config::save();
+                                        OSD::osdCenteredMsg("HDD image created", LEVEL_INFO, 1500);
+                                        // Success: unwind size + slot menus back to the IDE/HDD root.
+                                        VIDEO::SaveRect.restore_last();   // pop size-menu rect
+                                        VIDEO::SaveRect.restore_last();   // pop slot-menu rect
+                                        created = true;
+                                        menu_curopt = 4;
+                                        break;
+                                    }
+                                    // Back at the slot-picker level (Esc from size, or after create).
+                                    menu_level = 3;
+                                    menu_saverect = false;
+                                }
+                                menu_saverect = false;
+                            } else {
+                                menu_curopt = 7;
+                                menu_level = 1;
+                                break;
+                            }
+                        }
+                    }
+#endif
                     else {
                         menu_curopt = 2;
                         break;
@@ -3307,7 +3659,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 uint8_t opt2 = menuRun(mc_menu);
                                 if (opt2) {
                                     bool want = (opt2 == 1);
-                                    if (want && !Z80Ops::isPentagon) {
+                                    if (want && !(Z80Ops::isPentagon || Z80Ops::isProfi)) {
                                         OSD::osdCenteredMsg(OSD_16COL_NEEDS_PENTAGON[Config::lang], LEVEL_WARN, 1500);
                                     } else {
                                         Config::mode16col_onoff = want;
@@ -3621,9 +3973,106 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     break;
                                 }
                             }
+                        } else if (ext_ram && arch_num == 8) { // Profi
+                            menu_curopt = 1;
+                            menu_saverect = true;
+                            opt2 = 0;
+                            while (1) {
+                                // menu_level set INSIDE the loop (canonical pattern) so the
+                                // outer Profi submenu level stays stable across iterations,
+                                // even after an inner submenu (level 3) returns.
+                                menu_level = 2;
+                                // Profi submenu: ROM selection + XT keyboard + OSD palette
+                                string profi_sub =
+                                    string(Config::lang ? "Profi\n" : "Profi\n") +
+                                    "1024K\n" +
+                                    string("XT keyboard [") +
+                                    (Config::profi_ext_keys ? "ON" : "OFF") + "]\n" +
+                                    string("OSD palette [") +
+                                    (Config::profi_ds80_std_palette_osd ? "STD" : "DS80") + "]\n";
+                                uint8_t opt_p = menuRun(profi_sub);
+                                if (opt_p == 1) {
+                                    // ROM selected
+                                    arch = "Profi";
+                                    romset = "Profi";
+                                    opt2 = 1; // signal machine switch
+                                    menu_curopt = 1;
+                                    menu_saverect = false;
+                                    break;
+                                } else if (opt_p == 2) {
+                                    // XT keyboard toggle (Yes/No submenu) — level 3
+                                    menu_level = 3;
+                                    menu_curopt = 1;
+                                    menu_saverect = true;
+                                    while (1) {
+                                        string ext_menu = string(Config::lang ? "Teclado XT\n" : "XT keyboard\n");
+                                        ext_menu += MENU_YESNO[Config::lang];
+                                        bool prev_ext = Config::profi_ext_keys;
+                                        if (prev_ext) {
+                                            ext_menu.replace(ext_menu.find("[Y",0), 2, "[*");
+                                            ext_menu.replace(ext_menu.find("[N",0), 2, "[ ");
+                                        } else {
+                                            ext_menu.replace(ext_menu.find("[Y",0), 2, "[ ");
+                                            ext_menu.replace(ext_menu.find("[N",0), 2, "[*");
+                                        }
+                                        uint8_t opt3 = menuRun(ext_menu);
+                                        if (opt3) {
+                                            Config::profi_ext_keys = (opt3 == 1);
+                                            if (Config::profi_ext_keys != prev_ext) Config::save();
+                                            menu_curopt = opt3;
+                                            menu_saverect = false;
+                                        } else {
+                                            menu_curopt = 2;
+                                            menu_level = 2;
+                                            break; // back to Profi submenu
+                                        }
+                                    }
+                                } else if (opt_p == 3) {
+                                    // OSD palette toggle (STD / DS80) submenu — level 3
+                                    menu_level = 3;
+                                    menu_curopt = 1;
+                                    menu_saverect = true;
+                                    while (1) {
+                                        // Two explicit options: STD (standard ZX palette) / DS80
+                                        // (live Profi palette).  Active one marked with [*].
+                                        string osd_pal_menu = string(Config::lang ? "Paleta OSD\n" : "OSD palette\n");
+                                        bool prev_pal = Config::profi_ds80_std_palette_osd;
+                                        osd_pal_menu += string("STD\t[")  + (prev_pal  ? "*" : " ") + "]\n";
+                                        osd_pal_menu += string("DS80\t[") + (!prev_pal ? "*" : " ") + "]\n";
+                                        uint8_t opt3 = menuRun(osd_pal_menu);
+                                        if (opt3) {
+                                            Config::profi_ds80_std_palette_osd = (opt3 == 1); // 1=STD, 2=DS80
+                                            if (Config::profi_ds80_std_palette_osd != prev_pal) {
+                                                Config::save();
+                                                // Re-apply immediately — OSD blocks the main loop
+                                                // so EndFrame won't fire to do it for us.
+                                                // applyProfiOSDPalette() reads the new flag and
+                                                // picks STD (conv_color swap) or DS80 (Graphics remap).
+                                                if (profi_ds80_active) {
+                                                    VIDEO::restoreProfiLivePalette(); // clean slate
+                                                    VIDEO::profi_ds80_osd_active = true;
+                                                    VIDEO::applyProfiOSDPalette();
+                                                }
+                                            }
+                                            menu_curopt = opt3;
+                                            menu_saverect = false;
+                                        } else {
+                                            menu_curopt = 3;
+                                            menu_level = 2;
+                                            break; // back to Profi submenu
+                                        }
+                                    }
+                                } else {
+                                    // ESC — exit Profi submenu
+                                    opt2 = 0;
+                                    menu_curopt = 1;
+                                    menu_level = 2;
+                                    break;
+                                }
+                            }
                         }
 #if !NO_ALF
-                        else if (arch_num == 8 || !ext_ram) { // ALF TV GAME
+                        else if (arch_num == 9 || !ext_ram) { // ALF TV GAME
                             arch = "ALF";
                             romset = "ALF1";
                             menu_curopt = opt2;
@@ -3667,6 +4116,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             Config::romSet = romset;
                                             Config::romSetP1M = romset;
                                         }
+                                    } else if (arch == "Profi") {
+                                        if (Config::pref_romSetProfi == "Last") {
+                                            Config::romSet = romset;
+                                            Config::romSetProfi = romset;
+                                        }
                                     } else {
                                         Config::romSet = romset;
                                     }
@@ -3680,7 +4134,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if !PICO_RP2040
                                 bool isByte = (romset == "48Kby" || romset == "128Kby");
                                 if (Config::mb02 && (arch == "Pentagon" || arch == "P512" || arch == "P1024" ||
-                                    isByte)) {
+                                    arch == "Profi" || isByte)) {
                                     Config::mb02 = 0;
                                     MB02::init();
                                     OSD::osdCenteredMsg("MB-02+ disabled", LEVEL_WARN, 2000);
@@ -3692,8 +4146,8 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     OSD::osdCenteredMsg("Timex disabled", LEVEL_WARN, 2000);
                                 }
 #endif
-                                // TR-DOS is mandatory on Pentagon
-                                if ((arch == "Pentagon" || arch == "P512" || arch == "P1024") && !Config::betadisk) {
+                                // TR-DOS is mandatory on Pentagon / Profi
+                                if ((arch == "Pentagon" || arch == "P512" || arch == "P1024" || arch == "Profi") && !Config::betadisk) {
                                     Config::betadisk = true;
                                     OSD::osdCenteredMsg("Betadisk enabled", LEVEL_INFO, 1500);
                                 }
@@ -3862,10 +4316,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         }
                     }
                     else if (options_num == 2) {
-                        menu_level = 2;
                         menu_curopt = 1;
                         menu_saverect = true;
                         while (1) {
+                            // menu_level set INSIDE the loop (canonical pattern): inner
+                            // ROM-pref submenus run at level 3 and restore 2 on Esc, but
+                            // setting it here keeps the outer level stable across iterations.
+                            menu_level = 2;
                             uint8_t opt2 = menuRun(MENU_ROM_PREF[Config::lang]);
                             if (opt2) {
                                 if (opt2 == 1) {
@@ -4587,9 +5044,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             menu_curopt = opt2;
                                             menu_saverect = false;
                                         } else if (opt2 == 3) {
+                                            // showLedLegend() does its own SaveRect save/restore,
+                                            // so the LED menu background is already intact on return.
+                                            // menu_saverect MUST be false here: a true would re-save
+                                            // and recalculate y (shifts the menu) and imbalance the
+                                            // SaveRect stack → SIGBUS.
                                             showLedLegend();
                                             menu_curopt = 3;
-                                            menu_saverect = true;
+                                            menu_saverect = false;
                                         } else {
                                             menu_curopt = 8;
                                             menu_level = 2;
@@ -8224,11 +8686,24 @@ void OSD::EmulatorInfo() {
                 pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
             }
         }
+
+        // IDE/HDD (NEMO/PROFI)
+        if (Config::ide_scheme != 0) {
+            static const char* idesc[] = { "Off", "NEMO", "PROFI" };
+            int si = Config::ide_scheme; if (si > 2) si = 0;
+            pos += snprintf(buf + pos, sizeof(buf) - pos, " IDE/HDD        : %s\n", idesc[si]);
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  hd0           : ");
+            pos += appendFilename(buf, pos, sizeof(buf), Config::ide_image[0], 19);
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  hd1           : ");
+            pos += appendFilename(buf, pos, sizeof(buf), Config::ide_image[1], 19);
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
+        }
 #endif
 
         // TR-DOS — available for Pentagon or Byte 128K
         {
-            bool trdos_available = Z80Ops::isPentagon || (Z80Ops::is128 && Z80Ops::isByte);
+            bool trdos_available = (Z80Ops::isPentagon || Z80Ops::isProfi) || (Z80Ops::is128 && Z80Ops::isByte);
             if (trdos_available) {
                 pos += snprintf(buf + pos, sizeof(buf) - pos, " TR-DOS         : On");
                 if (Config::trdosFastMode) {

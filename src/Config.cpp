@@ -21,12 +21,14 @@ string   Config::romSet128 = "128K";
 string   Config::romSetPent = "128Kp";
 string   Config::romSetP512 = "128Kp";
 string   Config::romSetP1M = "128Kp";
+string   Config::romSetProfi = "Profi";
 string   Config::pref_arch = "Last";
 string   Config::pref_romSet_48 = "Last";
 string   Config::pref_romSet_128 = "Last";
 string   Config::pref_romSetPent = "Last";
 string   Config::pref_romSetP512 = "Last";
 string   Config::pref_romSetP1M = "Last";
+string   Config::pref_romSetProfi = "Last";
 string   Config::ram_file = NO_RAM_FILE;
 string   Config::last_ram_file = NO_RAM_FILE;
 
@@ -53,6 +55,8 @@ bool     Config::Issue2 = true;
 bool     Config::flashload = true;
 bool     Config::tape_player = false; // Tape player mode
 volatile bool Config::real_player = false;
+bool     Config::profi_ext_keys = false; // Profi extended keyboard mode
+bool     Config::profi_ds80_std_palette_osd = false; // standard ZX palette for OSD over DS80
 bool     Config::tape_timing_rg = false; // Rodolfo Guerra ROMs tape timings
 bool     Config::rightSpace = true;
 bool     Config::wasd = true;
@@ -108,6 +112,9 @@ uint8_t  Config::mb02 = 0;
 bool     Config::mb02WP[4] = { true, true, true, true };
 uint8_t  Config::mb02SoundLed = 0; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
 bool     Config::zcontroller = false;
+uint8_t  Config::ide_scheme = 0;
+string   Config::ide_image[2] = {"", ""};
+uint16_t Config::ide_chs[2][3] = {{0,0,0},{0,0,0}};
 #endif
 
 uint8_t Config::scanlines = 0;
@@ -246,6 +253,13 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
             MemESP::rom[0].assign_rom(gb_rom_0_sinclair_128k);
             MemESP::rom[1].assign_rom(gb_rom_1_sinclair_128k);
         }
+    } else if (arch == "Profi") {
+        if (newRomSet=="") romSet = "Profi"; else romSet = newRomSet;
+        if (newRomSet=="") romSetProfi = "Profi"; else romSetProfi = newRomSet;
+        MemESP::rom[0].assign_rom(gb_rom_profi);
+        MemESP::rom[1].assign_rom(gb_rom_profi + (16 << 10));
+        MemESP::rom[2].assign_rom(gb_rom_profi + (32 << 10));
+        MemESP::rom[3].assign_rom(gb_rom_profi + (48 << 10));
     } else { // Pentagon by default
         if (newRomSet=="") romSet = "128Kp"; else romSet = newRomSet;
         if (romSetPent=="") romSetPent = "128Kp"; else romSetPent = newRomSet;
@@ -441,12 +455,14 @@ void Config::load() {
         nvs_get_str("romSetPent", romSetPent, sts);
         nvs_get_str("romSetP512", romSetP512, sts);
         nvs_get_str("romSetP1M", romSetP1M, sts);
+        nvs_get_str("romSetProfi", romSetProfi, sts);
         nvs_get_str("pref_arch", pref_arch, sts);
         nvs_get_str("pref_romSet_48", pref_romSet_48, sts);
         nvs_get_str("pref_romSet_128", pref_romSet_128, sts);
         nvs_get_str("pref_romSetPent", pref_romSetPent, sts);
         nvs_get_str("pref_romSetP512", pref_romSetP512, sts);
         nvs_get_str("pref_romSetP1M", pref_romSetP1M, sts);
+        nvs_get_str("pref_romSetProfi", pref_romSetProfi, sts);
         nvs_get_str("ram", ram_file, sts);
         nvs_get_b("AY48", AY48, sts);
 #if !PICO_RP2040
@@ -524,6 +540,8 @@ void Config::load() {
         }
         recountBP();
         nvs_get_b("tape_player", tape_player, sts);
+        nvs_get_b("profi_ext_keys", profi_ext_keys, sts);
+        nvs_get_b("profi_ds80_osd_pal", profi_ds80_std_palette_osd, sts);
         bool b; nvs_get_b("real_player", b, sts);
 #if LOAD_WAV_PIO
         if (real_player && !b) {
@@ -577,6 +595,17 @@ void Config::load() {
         { bool old_divmmc = false; nvs_get_b("divmmc", old_divmmc, sts); if (old_divmmc && esxdos == 0) esxdos = 1; }
         nvs_get_str("esxdos_hdf", esxdos_hdf_image[0], sts);
         nvs_get_str("esxdos_hd1", esxdos_hdf_image[1], sts);
+        nvs_get_u8("ide_scheme", ide_scheme, sts);
+        nvs_get_str("ide_img0", ide_image[0], sts);
+        nvs_get_str("ide_img1", ide_image[1], sts);
+        for (int s = 0; s < 2; s++) {
+            char k[10]; snprintf(k, sizeof(k), "ide_chs%d", s);
+            string chs; nvs_get_str(k, chs, sts);
+            unsigned c=0,h=0,se=0;
+            if (sscanf(chs.c_str(), "%u/%u/%u", &c,&h,&se) == 3) {
+                ide_chs[s][0]=c; ide_chs[s][1]=h; ide_chs[s][2]=se;
+            }
+        }
         nvs_get_u8("mb02", mb02, sts);
         for (int i = 0; i < 4; i++) {
             char k[12]; snprintf(k, sizeof(k), "mb02d%d.wp", i);
@@ -739,12 +768,14 @@ void Config::save() {
     nvs_set_str(buf,"romSetPent",romSetPent.c_str());
     nvs_set_str(buf,"romSetP512",romSetP512.c_str());
     nvs_set_str(buf,"romSetP1M",romSetP1M.c_str());
+    nvs_set_str(buf,"romSetProfi",romSetProfi.c_str());
     nvs_set_str(buf,"pref_arch",pref_arch.c_str());
     nvs_set_str(buf,"pref_romSet_48",pref_romSet_48.c_str());
     nvs_set_str(buf,"pref_romSet_128",pref_romSet_128.c_str());
     nvs_set_str(buf,"pref_romSetPent",pref_romSetPent.c_str());
     nvs_set_str(buf,"pref_romSetP512",pref_romSetP512.c_str());
     nvs_set_str(buf,"pref_romSetP1M",pref_romSetP1M.c_str());
+    nvs_set_str(buf,"pref_romSetProfi",pref_romSetProfi.c_str());
     nvs_set_str(buf,"ram",ram_file.c_str());
     nvs_set_str(buf,"slog",slog_on ? "true" : "false");
 ///        nvs_set_str(buf,"sdstorage", FileUtils::MountPoint);
@@ -767,6 +798,8 @@ void Config::save() {
     nvs_set_str(buf,"flashload", flashload ? "true" : "false");
     nvs_set_str(buf,"ledIndicators", ledIndicators ? "true" : "false");
     nvs_set_str(buf,"tape_player", tape_player ? "true" : "false");
+    nvs_set_str(buf,"profi_ext_keys", profi_ext_keys ? "true" : "false");
+    nvs_set_str(buf,"profi_ds80_osd_pal", profi_ds80_std_palette_osd ? "true" : "false");
     nvs_set_str(buf,"real_player", real_player ? "true" : "false");
     nvs_set_str(buf,"rightSpace", rightSpace ? "true" : "false");
     nvs_set_str(buf,"wasd", wasd ? "true" : "false");
@@ -808,6 +841,14 @@ void Config::save() {
     nvs_set_u8(buf,"esxdos", esxdos);
     nvs_set_str(buf,"esxdos_hdf", esxdos_hdf_image[0].c_str());
     nvs_set_str(buf,"esxdos_hd1", esxdos_hdf_image[1].c_str());
+    nvs_set_u8(buf,"ide_scheme", ide_scheme);
+    nvs_set_str(buf,"ide_img0", ide_image[0].c_str());
+    nvs_set_str(buf,"ide_img1", ide_image[1].c_str());
+    for (int s = 0; s < 2; s++) {
+        char k[10]; snprintf(k, sizeof(k), "ide_chs%d", s);
+        char v[20]; snprintf(v, sizeof(v), "%u/%u/%u", ide_chs[s][0], ide_chs[s][1], ide_chs[s][2]);
+        nvs_set_str(buf, k, v);
+    }
     nvs_set_u8(buf,"mb02", mb02);
     for (int i = 0; i < 4; i++) {
         char k[12]; snprintf(k, sizeof(k), "mb02d%d.wp", i);

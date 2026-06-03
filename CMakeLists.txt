@@ -27,6 +27,23 @@ option(PICO_DV "RP2350-PICO-DV" OFF)
 option(ZERO "RP2040-PiZero" OFF)
 option(ZERO2 "RP2350-PiZero" OFF)
 
+# Per-subsystem port-access tracing toggles (debugging). OFF by default — when
+# ON, gated `#if XXX_TRACE` Debug::log() calls in the sources become active.
+# Add new toggles here following the same option(...) + compile-definition pattern.
+option(IDE_PORT_TRACE "Enable PROFI IDE/HDD port access tracing" OFF)
+option(FDD_PORT_TRACE "Enable WD1793 (ВГ93) FDD command/port tracing" OFF)
+option(PROFI_PORT_TRACE "Enable 0x7FFD/0xDFFD paging-port write tracing" OFF)
+
+# Per-board Debug-Probe UART toggles (logging over UART). Declared here together;
+# the board-specific `if(<board>_DBG_UART)` blocks below consume them (they call
+# pico_enable_stdio_uart() + remap pins, which needs the target to exist first).
+# Each enables stdio over the board's Debug-Probe header — see the block for pins.
+set(MURM1_DBG_UART   OFF  CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1) — moves KBD to GP16/GP17, disables NESPAD")
+set(PICO_PC_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on DBG1 header GP0/GP1 (PICO_PC)")
+set(PICO_DV_DBG_UART ON CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
+set(ZERO_DBG_UART    OFF CACHE BOOL "Enable Debug Probe UART0 on GP16/GP13 (ZERO)")
+set(ZERO2_DBG_UART   OFF  CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO2)")
+
 #set(FLASH_SIZE_GREEN ON)
 #set(m1p2launcher ON)
 
@@ -254,6 +271,27 @@ target_link_options(${PROJECT_NAME} PRIVATE -Xlinker --print-memory-usage --data
 target_compile_definitions(${PROJECT_NAME} PRIVATE FLASH_SIZE=${FLASH_SIZE})
 target_compile_definitions(${PROJECT_NAME} PRIVATE CONFIG_BOARD_TAG="${CONFIG_BOARD_TAG}")
 
+# IDE/HDD port tracing toggle (see Ports.cpp / IDE.cpp `#if IDE_PORT_TRACE`).
+if (IDE_PORT_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE IDE_PORT_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE IDE_PORT_TRACE=0)
+endif ()
+
+# WD1793 FDD command tracing toggle (see wd1793.cpp `#if FDD_PORT_TRACE`).
+if (FDD_PORT_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE FDD_PORT_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE FDD_PORT_TRACE=0)
+endif ()
+
+# 0x7FFD/0xDFFD paging-port write tracing (see Ports.cpp `#if PROFI_PORT_TRACE`).
+if (PROFI_PORT_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PROFI_PORT_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PROFI_PORT_TRACE=0)
+endif ()
+
 if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
 target_compile_options(${PROJECT_NAME} PUBLIC
         -Wno-error=suggest-attribute=format
@@ -379,11 +417,10 @@ IF(MURM2)
         PICO_DEFAULT_LED_PIN=25
     )
 ELSEIF(PICO_PC)
-    # Optional UART for Debug Probe. Set PICO_PC_DBG_UART=ON to enable UART0 on the
+    # Debug-Probe UART toggle PICO_PC_DBG_UART declared at top. Enables UART0 on the
     # on-board DBG1 header (GP0=TX, GP1=RX) of Olimex RP2040-PICO-PC.
     # DBG1 shares pins with KBD_CLOCK/KBD_DATA → keyboard is auto-remapped to FREE
     # pins GP10/GP11 when DBG_UART is enabled.
-    set(PICO_PC_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on DBG1 header GP0/GP1 (PICO_PC)")
     if(PICO_PC_DBG_UART)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
         set(PICO_PC_KBD_CLOCK 10) # GP0 taken by UART TX → move KBD to FREE pin
@@ -463,9 +500,8 @@ ELSEIF(PICO_PC)
         PICO_DEFAULT_LED_PIN=25
     )
 ELSEIF(PICO_DV)
-    # Optional UART for Debug Probe. Set DBG_UART_PINS=ON to enable UART1 on GP20/GP21.
+    # Debug-Probe UART toggle PICO_DV_DBG_UART declared at top. Enables UART1 on GP20/GP21.
     # Note: GP20 is also LOAD_WAV_PIO default — auto-remapped to GP3 when UART enabled.
-    set(PICO_DV_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
     if(PICO_DV_DBG_UART)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
         set(PICO_DV_LOAD_WAV_PIO 3)  # GP20 taken by UART → use FREE pin
@@ -540,9 +576,8 @@ ELSEIF(PICO_DV)
         PICO_DEFAULT_LED_PIN=25
 )
 ELSEIF(ZERO)
-    # Optional UART for Debug Probe. Set ZERO_DBG_UART=ON to enable UART0 on GP16(TX)/GP13(RX).
+    # Debug-Probe UART toggle ZERO_DBG_UART declared at top. Enables UART0 on GP16(TX)/GP13(RX).
     # Both pins are FREE on ZERO; UART0 used because UART1 has no free pins on this board.
-    set(ZERO_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on GP16/GP13 (ZERO)")
     if(ZERO_DBG_UART)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
     endif()
@@ -608,7 +643,7 @@ ELSEIF(ZERO)
         PICO_DEFAULT_LED_PIN=25
     )
 ELSEIF(ZERO2)
-    set(ZERO2_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO2)")
+    # Debug-Probe UART toggle ZERO2_DBG_UART declared at top (UART1 on GP20/GP21).
     if(ZERO2_DBG_UART)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
     endif()
@@ -686,7 +721,8 @@ ELSEIF(ZERO2)
         DEFAULT_THROTTLING=0
     )
 ELSE()
-    set(MURM1_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1) — moves KBD to GP16/GP17, disables NESPAD")
+    # Debug-Probe UART toggle MURM1_DBG_UART declared at top (UART0 on GP0/GP1;
+    # moves KBD to GP16/GP17, disables NESPAD).
     if(MURM1_DBG_UART)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
         set(MURM1_KBD_CLOCK_PIN 16)

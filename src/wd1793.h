@@ -164,6 +164,22 @@ typedef struct
     bool IsMBDFile;
     uint8_t mbdSectorsPerTrack;       // sectors per track (typically 11)
     uint16_t mbdSectorSize;           // bytes per sector (typically 1024)
+    // PRO format flag: Profi CP/M raw disk. Uses MBD-style track builder but
+    // with special sector ID layout — first track (cyl 0 side 0) uses IDs
+    // {1,2,3,4,9} (5th sector has ID=9 for CP/M boot), other tracks {1,2,3,4,5}.
+    bool IsProFile;
+    // TD0 (Teledisk) flag. Streamed track-by-track from SD to avoid holding the
+    // whole (potentially ~1 MB) image in RAM. Packed images (lowercase "td"
+    // magic) are LZH-decompressed once into a temp file on the SD card at insert;
+    // unpacked images ("TD") stream directly from the original file. Per-track
+    // byte offsets within the (decompressed) stream are stored in
+    // fdiTrackHdrOffsets[]; td0Stream is the FIL to seek/read. Read-only. RP2350.
+    bool IsTD0File;
+    FIL* td0Stream;          // file to stream track records from (Diskfile or temp)
+    bool td0OwnsStream;      // true if td0Stream is a temp file we must close+unlink
+    std::string td0TempPath; // temp file path to unlink on eject (if owned)
+    uint8_t* td0TrackBuf;    // per-track scratch buffer (sized to largest track record)
+    uint32_t td0TrackBufCap; // capacity of td0TrackBuf
 #endif
 } rvmwdDisk;
 
@@ -300,6 +316,18 @@ typedef struct
 
     bool fastmode;
     bool wd2797_mode;
+    // Profi CP/M boot polls "wait for BUSY=1" right after each Type I command.
+    // If our state machine completes the Type I instantly (e.g., Seek to the
+    // already-current track), BUSY=0 immediately → BIOS loop hangs forever.
+    // This one-shot flag forces BUSY=1 in the first status read after a Type I
+    // command that completed synchronously, then auto-clears.
+    bool typeI_busy_oneshot;
+    // Profi CP/M WAIT-line simulation: hold BUSY=1 persistently in the STATUS
+    // REGISTER (not just the oneshot) until a status read occurs.  Used for
+    // no-disk commands so the DSKKE9A CALL 0x40EA re-issue loop sees BUSY=1
+    // and re-issues are rejected, preventing infinite recursion + stack growth.
+    // Cleared on the first status register read (port 0x1F reg 0).
+    bool profi_busy_hold;
 
     bool sclConverted;
 

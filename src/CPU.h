@@ -42,10 +42,14 @@ visit https://zxespectrum.speccy.org/contacto
 #define TSTATES_PER_FRAME_48 69888
 #define TSTATES_PER_FRAME_128 70908
 #define TSTATES_PER_FRAME_PENTAGON 71680
+#define TSTATES_PER_FRAME_PROFI 69888
+#define TSTATES_PER_FRAME_BYTE  69888
 
 #define MICROS_PER_FRAME_48 19968
 #define MICROS_PER_FRAME_128 19992
 #define MICROS_PER_FRAME_PENTAGON 20480
+#define MICROS_PER_FRAME_PROFI 19968
+#define MICROS_PER_FRAME_BYTE  19968
 
 #define INT_START48 0
 #define INT_END48 32
@@ -54,6 +58,9 @@ visit https://zxespectrum.speccy.org/contacto
 #define INT_END128 36 // 35 in real +2 and Weiv's Spectramine. I'll have to check those numbers
 #define INT_START_PENTAGON 0
 #define INT_END_PENTAGON 36
+#define INT_START_PROFI 0
+#define INT_END_PROFI 39
+
 
 /// TODO:
 #define IRAM_ATTR

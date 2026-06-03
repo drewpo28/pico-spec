@@ -409,12 +409,19 @@ void ZipExtract::viewInfo(const string& zipPath) {
         pos = (nl != string::npos) ? nl + 1 : info.size();
     }
 
-    // Wait for any key
+    // Drain the F1 press (and any auto-repeat re-injections while F1 is still
+    // held) that opened this dialog — otherwise it dismisses the box at once.
+    { fabgl::VirtualKeyItem drain;
+      while (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable())
+          ESPectrum::PS2Controller.keyboard()->getNextVirtualKey(&drain); }
+
+    // Wait for any key — except F1, which opened this box from the file browser.
+    // Treating F1 as dismiss lets key auto-repeat close + reopen it in a loop.
     fabgl::VirtualKeyItem Menukey;
     while (1) {
         if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
             if (ESPectrum::readKbd(&Menukey)) {
-                if (Menukey.down) break;
+                if (Menukey.down && Menukey.vk != fabgl::VK_F1) break;
             }
         }
         sleep_ms(5);

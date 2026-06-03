@@ -49,6 +49,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Z80_JLS/z80.h"
 #include "Z80_JLS/z80operations.h"
 #include "psram_spi.h"
+#include "Ports.h"
 #if !PICO_RP2040
 #include "Z80DMA.h"
 #endif
@@ -59,6 +60,12 @@ extern "C" void graphics_set_scanlines(bool enabled);
 extern "C" void graphics_set_dither(bool enabled);
 extern "C" void hdmi_reinit(void);
 extern "C" void vga_reinit(void);
+#if !PICO_RP2040
+extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
+extern "C" void vga_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
+extern "C" volatile bool profi_ds80_active;
+extern "C" volatile uint hdmi_current_line;
+#endif
 // Place hot video functions in SRAM instead of XIP flash
 #undef IRAM_ATTR
 #define IRAM_ATTR __not_in_flash("video")
@@ -113,6 +120,238 @@ uint8_t VIDEO::tStatesPerLine;
 int VIDEO::tStatesScreen;
 int VIDEO::tStatesBorder;
 uint8_t* VIDEO::grmem;
+uint8_t* VIDEO::profi_clrmem = nullptr;
+#if !PICO_RP2040
+uint32_t VIDEO::profi_clr_spi_base = 0xFFFFFFFFu;
+extern "C" uint8_t  read8psram(uint32_t addr32);
+#endif
+
+#if !PICO_RP2040
+// Profi DS80 packed-pair framebuffer in butter PSRAM.
+// Layout: PROFI_FB_W bytes/row = 32 black-pad + 256 content + 32 black-pad.
+// 1 byte = pair of 4-bit palette indices via profi_pair_lookup[ink][paper].
+// HDMI driver expands each fb byte to 2 different HDMI pixels → 512 native pixels.
+#define PROFI_FB_W 320   // 32 left-pad + 256 content + 32 right-pad
+#define PROFI_FB_H 240
+// DS80 vertical border for the 720×576 (yres=288) full-border mode: the 240 content
+// lines are centred, leaving 48 fb rows split symmetrically (24 top + 24 bottom).
+// In 640×480 (yres=240) there is no vertical border (content fills the height).
+#define DS80_BORDER_TOP 24
+uint8_t  VIDEO::profi_pair_lookup[16][16];
+
+// Profi DS80 default palette — GGGRRRBb format (3-3-2 bits).
+// Raw startup bytes: {0x00,0x02,0x10,0x12,0x80,0x82,0x90,0x92,
+//                     0x00,0x03,0x18,0x1B,0xC0,0xC3,0xD8,0xDB}
+// Standard bytes have bit5=bit2=0 → G/R use only their 2 MSBs → dim=170(0xAA), bright=255.
+extern "C" const uint32_t profi_default_palette16[16] = {
+    0x000000, // 0  0x00 black
+    0x0000AA, // 1  0x02 dark blue
+    0xAA0000, // 2  0x10 dark red
+    0xAA00AA, // 3  0x12 dark magenta
+    0x00AA00, // 4  0x80 dark green
+    0x00AAAA, // 5  0x82 dark cyan
+    0xAAAA00, // 6  0x90 dark yellow
+    0xAAAAAA, // 7  0x92 light gray
+    0x000000, // 8  0x00 bright-black = same as index 0
+    0x0000FF, // 9  0x03 bright blue
+    0xFF0000, // 10 0x18 bright red
+    0xFF00FF, // 11 0x1B bright magenta
+    0x00FF00, // 12 0xC0 bright green
+    0x00FFFF, // 13 0xC3 bright cyan
+    0xFFFF00, // 14 0xD8 bright yellow
+    0xFFFFFF, // 15 0xDB white
+};
+
+// Live Profi palette: modifiable at runtime via OUT (port_low=0x7E).
+// Initialized to defaults at boot; refresh-applied to HDMI on each write.
+uint32_t VIDEO::profi_palette_live[16] = {
+    0x000000, 0x0000AA, 0xAA0000, 0xAA00AA, 0x00AA00, 0x00AAAA, 0xAAAA00, 0xAAAAAA,
+    0x000000, 0x0000FF, 0xFF0000, 0xFF00FF, 0x00FF00, 0x00FFFF, 0xFFFF00, 0xFFFFFF
+};
+
+// Convert Profi palette byte to RGB888.
+// Format: GGGRRRBb — bits[7:5]=G (3-bit), bits[4:2]=R (3-bit), bits[1:0]=B (2-bit).
+// 256 distinct colors (8×8×4). Confirmed by ZX-Profi hardware docs (habr.com/ru/articles/836836/).
+// G/R: 3-bit scale — levels 0..6 map to 0,43,85,128,170,213,255; level 7 clamps to 255.
+// B:   2-bit scale — level × 85 (blue "has implicit LSB=0", equivalent to 3-bit value×2).
+// Standard palette bytes (bit5=bit2=0) decode identically to ZXMAK2: dim=170 (0xAA), bright=255.
+static inline uint32_t profi_color_to_rgb888(uint8_t c) {
+    static const uint8_t gr[8] = {0, 43, 85, 128, 170, 213, 255, 255};
+    static const uint8_t bl[4] = {0, 85, 170, 255};
+    uint8_t R = gr[(c >> 2) & 0x07];   // bits[4:2]
+    uint8_t G = gr[(c >> 5) & 0x07];   // bits[7:5]
+    uint8_t B = bl[c & 0x03];           // bits[1:0]
+    return ((uint32_t)R << 16) | ((uint32_t)G << 8) | B;
+}
+
+volatile bool VIDEO::profi_palette_dirty = false;
+volatile bool VIDEO::profi_ds80_activate_pending   = false;
+volatile bool VIDEO::profi_ds80_deactivate_pending = false;
+bool VIDEO::profi_ds80_osd_active = false;
+
+// Graphics-layer DS80 colour remap (see Graphics8BitPalette).  When DS80 is active,
+// dotFast()/dot()/fillRect() pass standard ZX colour indices (0..16) through
+// Graphics8BitPalette::ds80_color_lut[] so OSD/LED/menu drawing renders in the
+// intended colour while the framebuffer byte still indexes the DS80 packed-pair
+// conv_color table.  The lut maps ZX index → profi_pair_lookup[c][c] (a SOLID pair
+// slot: both half-pixels = palette[c]).  ORANGE (16) has no DS80 slot → BRI_YELLOW.
+bool    Graphics8BitPalette::ds80_active = false;
+uint8_t Graphics8BitPalette::ds80_color_lut[17] = {0};
+
+void VIDEO::rebuildDS80ColorLut() {
+#if !PICO_RP2040
+    for (int c = 0; c < 16; c++)
+        Graphics8BitPalette::ds80_color_lut[c] = profi_pair_lookup[c][c];
+    // ORANGE (16): no DS80 palette entry — fall back to BRI_YELLOW (14).
+    Graphics8BitPalette::ds80_color_lut[16] = profi_pair_lookup[14][14];
+#endif
+}
+
+// Saved copy of the running app's live Profi palette while the OSD "STD" override is
+// active (so it can be restored verbatim on close).
+#if !PICO_RP2040
+static uint32_t profi_palette_saved[16];
+static bool     profi_palette_saved_valid = false;
+#endif
+
+// OSD palette override for DS80.  The Graphics-layer ZX→DS80 colour remap
+// (Graphics8BitPalette::ds80_active) is already ON for the whole DS80 session — these
+// functions only choose WHICH palette the solid pair slots resolve to, per the
+// "OSD palette" menu toggle (Config::profi_ds80_std_palette_osd):
+//
+//   DS80: keep the running app's live palette unchanged → menu in app colours,
+//         Profi background stays fully correct.  (apply = no-op)
+//
+//   STD : temporarily load the standard ZX palette into profi_palette_live and refresh
+//         the DS80 pair slots (hdmi_set_profi_ds80_mode only rewrites palette slots
+//         0..255 — it never touches the sync/audio/DMA region, so HDMI sync is safe).
+//         → menu in TRUE ZX colours; the Profi background also shifts to ZX colours
+//         (the accepted "OSD in ZX, background sacrificed" tradeoff).  The app palette
+//         is saved here and restored by restoreProfiLivePalette().
+void VIDEO::applyProfiOSDPalette() {
+#if !PICO_RP2040
+    if (Config::profi_ds80_std_palette_osd && !profi_palette_saved_valid) {
+        // Save the app palette, load standard ZX defaults, refresh the pair slots + lut.
+        for (int i = 0; i < 16; i++) profi_palette_saved[i] = profi_palette_live[i];
+        profi_palette_saved_valid = true;
+        for (int i = 0; i < 16; i++) profi_palette_live[i] = profi_default_palette16[i];
+        if (SELECT_VGA)
+            vga_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+        else
+            hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+        rebuildDS80ColorLut();
+    }
+#endif
+}
+
+// Undo applyProfiOSDPalette()'s STD palette swap (restore the running app's palette).
+// Does NOT touch ds80_active — the remap stays ON while DS80 is active.
+void VIDEO::restoreProfiLivePalette() {
+#if !PICO_RP2040
+    if (profi_palette_saved_valid) {
+        for (int i = 0; i < 16; i++) profi_palette_live[i] = profi_palette_saved[i];
+        profi_palette_saved_valid = false;
+        if (SELECT_VGA)
+            vga_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+        else
+            hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+        rebuildDS80ColorLut();
+    }
+#endif
+}
+
+// Drop the saved app-palette snapshot WITHOUT touching HDMI or re-enabling DS80.
+// Used when DS80 was switched off (machine reset) while the OSD STD-palette override
+// was active: the saved palette is no longer meaningful and must not trigger a
+// hdmi_set_profi_ds80_mode(true,…) re-activation.
+void VIDEO::discardProfiOSDPaletteSnapshot() {
+#if !PICO_RP2040
+    profi_palette_saved_valid = false;
+#endif
+}
+
+// Re-blacken the DS80 side-padding columns (left 0..pad_l-1 and right pad_l+256..xres-1)
+// across all framebuffer rows.  The DS80 renderer only ever rewrites the 256 content
+// bytes per row, so padding that an OSD dialog drew over is otherwise left dirty after
+// the menu closes (visible artefacts in the side border).  Call after OSD close.
+void VIDEO::clearDS80Padding() {
+#if !PICO_RP2040
+    if (!vga.frameBuffer) return;
+    const int pad_l = ((int)vga.xres - 256) / 2;
+    if (pad_l <= 0) return;
+    const int right_off = pad_l + 256;
+    const int pad_r = (int)vga.xres - right_off;
+    for (int y = 0; y < (int)vga.yres; y++) {
+        uint8_t* row = (uint8_t*)vga.frameBuffer[y];
+        if (!row) continue;
+        memset(row, 0, pad_l);
+        if (pad_r > 0) memset(row + right_off, 0, pad_r);
+    }
+#endif
+}
+
+void VIDEO::profiPaletteReset() {
+    for (int i = 0; i < 16; i++) profi_palette_live[i] = profi_default_palette16[i];
+    profi_palette_dirty = true; // refresh on next EndFrame if DS80 active
+}
+
+void VIDEO::profiPaletteWrite(uint8_t index, uint8_t profi_color) {
+#if !PICO_RP2040
+    // Only honor palette writes when DS80 mode is active — avoids corrupting
+    // defaults from incidental port-0x7E writes during BIOS startup setup.
+    if (!profi_ds80_active) return;
+    uint8_t idx = index & 0x0F;
+    uint32_t newRgb = profi_color_to_rgb888(profi_color);
+    profi_palette_live[idx] = newRgb;
+    // Defer HDMI refresh to HDMI ISR vblank (set dirty flag, applied in EndFrame).
+    profi_palette_dirty = true;
+#endif
+}
+
+// Build profi_pair_lookup[ink][paper] → HDMI conv_color slot index.
+//
+// Slot budget (250 available):
+//   0..239:   free pair data slots (220..237 = audio range, suppressed in DS80 by DMA handler)
+//   240..244: BASE_HDMI_CTRL_INX + IDX_SCANLINE — NEVER pair data (sync/porch)
+//   245..254: free pair data slots
+//   255:      border fill — NEVER pair data
+//
+// We need 250 unique pairs (256 total − 6 merges).
+// Merges: ink=0..5, paper=8 → paper=0  (bright-black bg = black bg for these inks).
+//   ink=6..15 (INCLUDING ink=8): NO normalization.
+//   → (8,8) gets its OWN slot → both pixels render as palette[8] → solid color, no stripes.
+//   → ink=8 is fully independent from ink=0 → changing palette[8] can't corrupt black pixels.
+// written[] guard in hdmi_set_profi_ds80_mode() ensures paper=0 TMDS wins for merged slots.
+static void init_profi_pair_lookup() {
+    // safe[]: all slots except 240..244 (sync/scanline) and 255 (border) → 250 slots
+    int safe[256], ns = 0;
+    for (int i = 0; i < 256; i++) {
+        if (i >= 240 && i <= 244) continue;
+        if (i == 255) continue;
+        safe[ns++] = i;  // ns == 250
+    }
+    bool assigned[16][16] = {};
+    int slot_idx = 0;
+    for (int ink = 0; ink < 16; ink++) {
+        for (int paper = 0; paper < 16; paper++) {
+            // For inks 0..5 only: paper=8 → paper=0 (6 merges to fit in 250 slots).
+            // For inks 6..15 (including ink=8): full independence — paper=8 is own slot.
+            int cp = (paper == 8 && ink <= 5) ? 0 : paper;
+            if (!assigned[ink][cp]) {
+                assigned[ink][cp] = true;
+                VIDEO::profi_pair_lookup[ink][paper] = (uint8_t)safe[slot_idx++];
+            } else {
+                VIDEO::profi_pair_lookup[ink][paper] = VIDEO::profi_pair_lookup[ink][cp];
+            }
+        }
+    }
+    // slot_idx == 250 here
+}
+
+bool VIDEO::isProfiDS80() {
+    return Config::arch == "Profi" && (Ports::portDFFD & 0x80);
+}
+#endif
 uint16_t VIDEO::offBmp[SPEC_H];
 uint16_t VIDEO::offAtt[SPEC_H];
 SaveRectT VIDEO::SaveRect;
@@ -368,6 +607,18 @@ void precalcborder32()
         uint8_t border = zxColor(i,0);
         VIDEO::border32[i] = border | (border << 8) | (border << 16) | (border << 24);
     }
+}
+
+void VIDEO::updateBorderBrd() {
+#if !PICO_RP2040
+    if (isProfiDS80()) {
+        // DS80 has no border — use black for all surrounding areas
+        uint8_t b = profi_pair_lookup[0][0];
+        brd = (uint32_t)b * 0x01010101u;
+        return;
+    }
+#endif
+    brd = border32[borderColor];
 }
 
 // Palette definitions (Unreal Speccy format)
@@ -735,7 +986,7 @@ void VIDEO::ulaPlusDisable() {
 
     for (int n = 0; n < 16; n++)
         AluByte[n] = (unsigned int*)AluBytesStd_flash[n];
-    brd = border32[borderColor];
+    updateBorderBrd();
     brdChange = true;
 }
 
@@ -1218,7 +1469,7 @@ void VIDEO::changeMode() {
     uint8_t savedBorderColor = borderColor;
     VIDEO::Reset();
     borderColor = savedBorderColor;
-    brd = border32[borderColor];
+    updateBorderBrd();
     precalcborder32();
 
     // 6. Repaint framebuffer with current border color
@@ -1326,6 +1577,17 @@ void VIDEO::Reset() {
         Draw_OSD169 = MainScreen;
         Draw_OSD43 = BottomBorder;
         DrawBorder = TopBorder_Blank;
+    } else if (Config::arch == "Profi") {
+        tStatesPerLine = TSTATES_PER_LINE_PROFI;
+        tStatesScreen = TS_SCREEN_PROFI;
+        tStatesBorder = isFullBorder ? (isFullBorder240 ? TS_BORDER_360x240_PROFI : TS_BORDER_360x288_PROFI)
+                      : is169 ? TS_BORDER_360x200_PROFI : TS_BORDER_320x240_PROFI;
+        VsyncFinetune[0] = 0;
+        VsyncFinetune[1] = 0;
+
+        Draw_OSD169 = MainScreen;
+        Draw_OSD43 = BottomBorder;
+        DrawBorder = TopBorder_Blank;
     }
 
     // Border column layout (unified for all models):
@@ -1333,7 +1595,7 @@ void VIDEO::Reset() {
     // 48K/128K: step=4 (8px per column), brdPairWrite=true
     // Pentagon:  step=1 (2px per column), brdPairWrite=false (XOR)
     brdcol_end = isFullBorder ? 180 : 160;  // vga.xres / 2 (T-states = half pixel count)
-    if (Z80Ops::isPentagon) {
+    if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
         brdcol_step = 1;
         brdPairWrite = false;
         brdcol_start = is169 ? 10 : 0;
@@ -1355,29 +1617,58 @@ void VIDEO::Reset() {
     if (isFullBorder && !isFullBorder240) {
         lin_end = 48;
         lin_end2 = 240;
-        lineptr_offset = (Z80Ops::isPentagon ? 26 : 24) / 2;
+        lineptr_offset = ((Z80Ops::isPentagon || Z80Ops::isProfi) ? 26 : 24) / 2;
     } else if (isFullBorder && isFullBorder240) {
-        lin_end = 24;
-        lin_end2 = 216;
-        lineptr_offset = (Z80Ops::isPentagon ? 26 : 24) / 2;
+        lin_end = Z80Ops::isProfi ? 32 : 24;
+        lin_end2 = Z80Ops::isProfi ? 224 : 216;
+        lineptr_offset = ((Z80Ops::isPentagon || Z80Ops::isProfi) ? 26 : 24) / 2;
     } else if (is169) {
         lin_end = 4;
         lin_end2 = 196;
         lineptr_offset = 13;
     } else {
-        lin_end = 24;
-        lin_end2 = 216;
+        lin_end = Z80Ops::isProfi ? 32 : 24;
+        lin_end2 = Z80Ops::isProfi ? 224 : 216;
         lineptr_offset = 8;  // 32 bytes = (320-256)/2 pixels
     }
 
-    grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
+    if (Config::arch == "Profi" && (Ports::portDFFD & 0x80)) {
+        grmem = MemESP::videoLatch ? MemESP::ram[6].direct() : MemESP::ram[4].direct();
+        uint32_t clrPage = MemESP::videoLatch ? 58 : 56;
+        extern int ram_pages, butter_pages, psram_pages, swap_pages;
+        int totPg = ram_pages + butter_pages + psram_pages + swap_pages;
+        profi_clrmem = ((int)clrPage < totPg) ? MemESP::ram[clrPage].direct() : nullptr;
+        Debug::log("[VID] DS80 Reset: clrPage=%u totPg=%d clrmem=%p grmem=%p", clrPage, totPg, profi_clrmem, grmem);
+#if !PICO_RP2040
+        // DS80 is a full 512×240 framebuffer — no border, 240 content lines.
+        // The grmem layout (pixCoff formula) covers all 240 lines; lines 192..239
+        // live at offsets 6144..8191 (odd) and 14336..16383 (even) of the 16KB page.
+        // Shift tStatesScreen back by lin_end lines so rendering starts at FB row 0.
+        tStatesScreen -= (int)lin_end * (int)tStatesPerLine;  // e.g. 12583 - 32×224 = 5415
+        lin_end  = 0;
+        lin_end2 = 240;
+#endif
+    } else {
+        grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
+        profi_clrmem = nullptr;
+    }
+
+#if !PICO_RP2040
+    if (Config::arch == "Profi") {
+        // Build pair_lookup every reset (palette may change). Cheap — 16×16 = 256 iters.
+        init_profi_pair_lookup();
+        // Reset live palette to defaults on machine reset
+        profiPaletteReset();
+
+    }
+#endif
 
     #ifdef DIRTY_LINES
     // for (int i=0; i < SPEC_H; i++) VIDEO::dirty_lines[i] = 0x01;
     memset((uint8_t *)VIDEO::dirty_lines,0x01,SPEC_H);
     #endif // DIRTY_LINES
 
-    VIDEO::snow_toggle = Config::arch != "P1024" && Config::arch != "P512" && Config::arch != "Pentagon" ? Config::render : false;
+    VIDEO::snow_toggle = (Config::arch != "P1024" && Config::arch != "P512" && Config::arch != "Pentagon" && Config::arch != "Profi") ? Config::render : false;
 
     if (VIDEO::snow_toggle) {
         Draw = &Blank_Snow;
@@ -1458,6 +1749,41 @@ void VIDEO::Reset() {
         else
             Draw_OSD43 = BottomBorder_OSD;
     }
+
+#if !PICO_RP2040
+    // DS80 transition on reset: ensure DS80 state is fully cleaned up whenever
+    // we're entering non-DS80 mode (e.g. after F11 reset from service menu).
+    //
+    // Two cases that must both be handled:
+    //   A) profi_ds80_active=true  → HDMI is in DS80 mode, must deactivate.
+    //   B) profi_ds80_active=false AND profi_ds80_activate_pending=true →
+    //      DS80 was requested (port write) but EndFrame hasn't processed it yet.
+    //      Without clearing activate_pending here, the very next EndFrame after
+    //      reset fires the activate handler → DS80 HDMI active on a machine now
+    //      running standard Profi code → standard palette bytes interpreted as
+    //      DS80 packed-pairs → fine vertical colour stripes on every pixel pair.
+    {
+        bool ds80_should_be_active = (Config::arch == "Profi") && (Ports::portDFFD & 0x80);
+        Debug::log("[VRESET] portDFFD=0x%02X ds80=%d act=%d deact=%d should=%d",
+            (int)Ports::portDFFD, (int)profi_ds80_active,
+            (int)profi_ds80_activate_pending, (int)profi_ds80_deactivate_pending,
+            (int)ds80_should_be_active);
+        if (!ds80_should_be_active) {
+            // Always kill any pending activation — prevents case B above.
+            profi_ds80_activate_pending = false;
+            if (profi_ds80_active) {
+                // Case A: schedule deactivation; pre-fill with 0xFF so DS80 HDMI
+                // shows clean black for the one frame until EndFrame processes it.
+                // (0xFF = slot 255 = black/black in DS80 mode per hdmi.c line 810-811)
+                profi_ds80_deactivate_pending = true;
+                if (vga.frameBuffer) {
+                    for (int _y = 0; _y < (int)vga.yres; _y++)
+                        if (vga.frameBuffer[_y]) memset(vga.frameBuffer[_y], 0xFF, vga.xres);
+                }
+            }
+        }
+    }
+#endif
 }
 
 extern size_t getFreeHeap(void);
@@ -1599,8 +1925,11 @@ IRAM_ATTR void VIDEO::MainScreen_Blank_Snow(unsigned int statestoadd, bool conte
             attOffset = offAtt[curline];
         }
 
-        snowpage = MemESP::videoLatch ? 7 : 5;
-        
+        if (Config::arch == "Profi" && (Ports::portDFFD & 0x80))
+            snowpage = MemESP::videoLatch ? 6 : 4;
+        else
+            snowpage = MemESP::videoLatch ? 7 : 5;
+
         dispUpdCycle = 0; // For ULA cycle perfect emulation
 
         #ifdef DIRTY_LINES
@@ -1841,6 +2170,97 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             *lineptr32++ = mix1;
             *lineptr32++ = mix2;
         }
+    } else if (Config::arch == "Profi" && (Ports::portDFFD & 0x80)) {
+        // Profi DS80 native rendering — writes 256-byte-wide packed pairs directly into
+        // vga.frameBuffer (1 byte = pair of 4-bit palette indices: high nibble =
+        // left source pixel, low nibble = right). HDMI ISR is configured (via
+        // hdmi_set_profi_ds80_mode) so each fb byte expands to 2 *different*
+        // HDMI pixels — native 512 horizontal resolution.
+        //
+        // Per ZXMAK2 ProfiRenderer (byte-column interleaved): for col j (0..31)
+        //   even src byte-col 2j in second half (+0x2000), odd 2j+1 in first half (+0).
+        // Attr (4-bit): ink = bits 2..0 | (bit6 << 3); paper = bits 5..3 | (bit7 << 3).
+        uint32_t line = curline;
+        uint32_t pixCoff = 2048 * (line >> 6) + 256 * (line & 7) + ((line & 0x38) << 2);
+        unsigned int end_col = coldraw_cnt < 32u ? coldraw_cnt : 32u;
+        unsigned int start_col = end_col - loopCount;
+        //
+        // Row layout: pad_l bytes of border, then 256 content bytes (with (k^2) pre-swap
+        // for the ISR's x^2 read pattern), then pad_r bytes of border.
+        // Vertical: 640×480 (yres=240) shows content full-height (voff=0, no top/bottom
+        // border). 720×576 (yres=288) centres the 240 content lines with a symmetric
+        // 24-row top/bottom border band (voff=DS80_BORDER_TOP) — top/bottom rows are
+        // filled in EndFrame; here we offset content + paint the per-line side borders.
+        const int pad_l = vga.frameBuffer ? ((int)vga.xres - 256) / 2 : 32;
+        const int ds80_voff = (vga.yres >= 288) ? DS80_BORDER_TOP : 0;
+        const uint32_t frow = line + (uint32_t)ds80_voff;   // framebuffer row for this content line
+        uint8_t* fb_row = (vga.frameBuffer && frow < (uint32_t)vga.yres)
+                          ? (uint8_t*)vga.frameBuffer[frow] : nullptr;
+        // F8 stats overlay (DS80 640×480 only): drawStats writes the cached lines into
+        // fb rows 220..235 every frame (in vblank).  The content renderer + side-border
+        // fill would overwrite them during the next active scan → 1-frame content /
+        // 1-frame stats → flicker.  The stats rectangle (fb bytes 168..311) straddles
+        // the content area AND the right border pad (288..319), so BOTH the content
+        // write and the right-pad fill must carve it out, leaving it for drawStats.
+        // (720×576 keeps stats in the bottom border band, carved out in EndFrame.)
+        bool skip_stats_row = (ds80_voff == 0) && (VIDEO::OSD & 0x03) && !(VIDEO::OSD & 0x04)
+                              && frow >= 220 && frow < 236;
+        // Per-line side borders: fill left/right pads with the CURRENT border colour
+        // (mapped to its solid DS80 pair slot) once, on the first column batch of the
+        // line.  Done per-scanline so raster border effects (OUT 0xFE bursts) show.
+        if (fb_row && start_col == 0) {
+            // Border colour = Palette[(~borderIndex) & 7] (per ZXMAK2 ProfiRenderer
+            // UlaAction.Profi32_0 → m_borderColorPaper).  Note the INVERSE index: the
+            // Profi ULA derives the solid-border colour from the complement of the
+            // port-0xFE value, then maps it through the live palette.
+            uint8_t bidx = (uint8_t)(~VIDEO::borderColor) & 0x07;
+            uint8_t bbyte = profi_pair_lookup[bidx][bidx];
+            memset(fb_row, bbyte, pad_l);
+            const int rpad_start = pad_l + 256;
+            const int xres = (int)vga.xres;
+            if (skip_stats_row && 312 > rpad_start && 312 < xres) {
+                // Right pad overlaps the stats box (168..311): fill only 312..xres-1,
+                // leaving 288..311 for drawStats.  (Left of 312 in the right pad is the
+                // stats box itself.)
+                memset(fb_row + 312, bbyte, xres - 312);
+            } else {
+                memset(fb_row + rpad_start, bbyte, xres - rpad_start);
+            }
+        }
+        for (unsigned int j = start_col; j < end_col; j++) {
+            uint8_t bmpEven = grmem[pixCoff + j + 8192];
+            uint8_t bmpOdd  = grmem[pixCoff + j];
+            uint8_t rawE = profi_clrmem ? profi_clrmem[pixCoff + j + 8192] : 0x07;
+            uint8_t rawO = profi_clrmem ? profi_clrmem[pixCoff + j]        : 0x07;
+            uint8_t inkE = (rawE & 0x07) | ((rawE & 0x40) >> 3);
+            uint8_t papE = ((rawE & 0x38) >> 3) | ((rawE & 0x80) >> 4);
+            uint8_t inkO = (rawO & 0x07) | ((rawO & 0x40) >> 3);
+            uint8_t papO = ((rawO & 0x38) >> 3) | ((rawO & 0x80) >> 4);
+            // Stats overlay carve-out: skip the 8-byte column block if it overlaps the
+            // stats rectangle (fb bytes 168..311) on a stats row — drawStats owns it.
+            size_t pbase = (size_t)pad_l + (size_t)j * 8;
+            bool in_stats = skip_stats_row && (pbase + 8 > 168) && (pbase < 312);
+            if (fb_row && !in_stats) {
+                // 16 source pixels per col → 8 packed bytes at content offset pad_l + j*8.
+                // Pre-apply (k^2) swap so ISR reads in correct order: store v[k] at pbase+(k^2).
+                // Even src byte (8 px): pairs (bit7,bit6), (bit5,bit4), (bit3,bit2), (bit1,bit0)
+                for (int k = 0; k < 4; k++) {
+                    int sh = 6 - k * 2;
+                    uint8_t p0 = ((bmpEven >> (sh + 1)) & 1) ? inkE : papE;
+                    uint8_t p1 = ((bmpEven >> sh) & 1) ? inkE : papE;
+                    fb_row[pbase + (k ^ 2)] = profi_pair_lookup[p0][p1];
+                }
+                // Odd src byte (8 px), packed in next 4 bytes.
+                for (int k = 0; k < 4; k++) {
+                    int sh = 6 - k * 2;
+                    uint8_t p0 = ((bmpOdd >> (sh + 1)) & 1) ? inkO : papO;
+                    uint8_t p1 = ((bmpOdd >> sh) & 1) ? inkO : papO;
+                    fb_row[pbase + 4 + (k ^ 2)] = profi_pair_lookup[p0][p1];
+                }
+            }
+            // Advance lineptr32 to keep std fb cursor in sync with standard renderer stride.
+            lineptr32 += 2;
+        }
     } else {
         for (; loopCount--; ) {
 #if !PICO_RP2040
@@ -2020,11 +2440,16 @@ IRAM_ATTR void VIDEO::MainScreen_Snow_Opcode(bool contended) {
     uint8_t page = Z80::getRegI() & 0xc0;
     if (page == 0x40) { // Snow 48K, 128K
         snow_effect = 1;
-        snowpage = MemESP::videoLatch ? 7 : 5;
+        if (Config::arch == "Profi" && (Ports::portDFFD & 0x80))
+            snowpage = MemESP::videoLatch ? 6 : 4;
+        else
+            snowpage = MemESP::videoLatch ? 7 : 5;
     } else if (Z80Ops::is128 && (MemESP::bankLatch & 0x01) && page == 0xc0) {  // Snow 128K
         snow_effect = 1;
         if (MemESP::bankLatch == 1 || MemESP::bankLatch == 3)
             snowpage = MemESP::videoLatch ? 3 : 1;
+        else if (Config::arch == "Profi" && (Ports::portDFFD & 0x80))
+            snowpage = MemESP::videoLatch ? 6 : 4;
         else
             snowpage = MemESP::videoLatch ? 7 : 5;
     }
@@ -2166,6 +2591,174 @@ IRAM_ATTR void VIDEO::EndFrame() {
     tstateDraw = tStatesScreen;
 
 #if !PICO_RP2040
+    // ----------------------------------------------------------------
+    // Profi DS80 deferred HDMI mode switch — applied NOW (vblank context).
+    //
+    // Problem: hdmi_set_profi_ds80_mode() rewrites conv_color[] which the
+    // HDMI DMA reads in real time.  Calling it from Ports.cpp (Z80 loop,
+    // core0) races the DMA on core1 during active scan → TMDS corruption
+    // → picture disappears / flickers.
+    //
+    // Fix: Ports.cpp only sets flags; EndFrame() (always at vblank start)
+    // applies them safely.  Deactivation restores 1240 conv_color entries
+    // (incl. sync/audio); activation encodes 225+1 DS80 pair slots — both
+    // must run during blanking.
+    // ----------------------------------------------------------------
+    {
+        if (profi_ds80_activate_pending) {
+            profi_ds80_activate_pending   = false;
+            profi_palette_dirty           = false; // palette included in activate
+            if (SELECT_VGA)
+                vga_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+            else
+                hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+            // Enable the Graphics-layer ZX→DS80 colour remap for the whole DS80 session
+            // (not just OSD): any vga.* draw with a standard ZX index (FDD indicator,
+            // LED legend, OSD, …) is then mapped to the correct solid DS80 pair slot.
+            // The DS80 scan-time renderer writes pair slots into the fb directly (not via
+            // dotFast), so it is unaffected by the remap.
+            rebuildDS80ColorLut();
+            Graphics8BitPalette::ds80_active = true;
+            // DS80 border colour = Palette[(~borderColor) & 7] (inverse index, per
+            // ZXMAK2).  Reset() sets borderColor=7 → (~7)&7 = 0 → Palette[0] = BLACK,
+            // which is the desired default until a guest OUT 0xFE changes it.  (Do NOT
+            // force borderColor=0 here: that would invert to Palette[7] = light grey.)
+            // Apply DS80 geometry: full 240-line screen, no border.
+            // (Mirrors Reset() DS80 branch; skips palette/pair-lookup re-init.)
+            grmem = MemESP::videoLatch ? MemESP::ram[6].direct() : MemESP::ram[4].direct();
+            {
+                uint32_t clrPg = MemESP::videoLatch ? 58u : 56u;
+                // preload(): on SPI-PSRAM boards, the color page may have been evicted
+                // to SPI during the ROM's 1024K test.  Force it back into SRAM so
+                // profi_clrmem is a valid direct() pointer for fast rendering.
+                MemESP::ram[clrPg].preload(); // load into SRAM if in SPI PSRAM
+                MemESP::ram[clrPg].pin();    // prevent eviction: bankLatch sync() hits
+                                             // page 58 72×/frame on SPI-PSRAM boards
+                extern int ram_pages, butter_pages, psram_pages, swap_pages;
+                int totPg = ram_pages + butter_pages + psram_pages + swap_pages;
+                profi_clrmem = ((int)clrPg < totPg) ? MemESP::ram[clrPg].direct() : nullptr;
+                profi_clr_spi_base = 0xFFFFFFFFu;
+                if (!profi_clrmem && MemESP::ram[clrPg].memType() == mem_type_t::PSRAM_SPI)
+                    profi_clr_spi_base = MemESP::ram[clrPg].spiBase();
+            }
+            tStatesScreen -= (int)lin_end * (int)tStatesPerLine;
+            lin_end  = 0;
+            lin_end2 = 240;
+            tstateDraw   = tStatesScreen;
+            linedraw_cnt = 0;
+            // Zero all vga.frameBuffer rows: scan-time renderer writes only content bytes
+            // (pad_l..pad_l+255) into each DS80 row; padding bytes must start at 0 (black
+            // pair) and are never overwritten. Rows 240..yres-1 stay black throughout DS80.
+            if (vga.frameBuffer) {
+                for (int _y = 0; _y < (int)vga.yres; _y++)
+                    if (vga.frameBuffer[_y]) memset(vga.frameBuffer[_y], 0, vga.xres);
+            }
+            Debug::log("[DS80] activate: tStScreen=%d grmem=%p clrmem=%p videoLatch=%d ram4=%p ram6=%p",
+                       tStatesScreen, grmem, profi_clrmem, (int)MemESP::videoLatch,
+                       MemESP::ram[4].direct(), MemESP::ram[6].direct());
+        } else if (profi_ds80_deactivate_pending) {
+            profi_ds80_deactivate_pending = false;
+            Debug::log("[EF] DS80 deactivate: grmem=%p clrmem=%p", grmem, profi_clrmem);
+            if (SELECT_VGA)
+                vga_set_profi_ds80_mode(false, nullptr, nullptr);
+            else
+                hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
+            Graphics8BitPalette::ds80_active = false; // leave DS80 → raw ZX indices again
+            // Clear framebuffer: DS80 packed-pair slot values look like garbage
+            // when re-interpreted through the standard HDMI conv_color table.
+            if (vga.frameBuffer) {
+                for (int _y = 0; _y < (int)vga.yres; _y++)
+                    if (vga.frameBuffer[_y]) memset(vga.frameBuffer[_y], 0, vga.xres);
+            }
+            // Restore standard Profi (non-DS80) geometry.
+            grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
+            profi_clrmem = nullptr;
+            MemESP::ram[MemESP::videoLatch ? 58u : 56u].unpin(); // restore normal eviction
+            {
+                bool isFB    = VIDEO::isFullBorderMode();
+                bool isFB240 = VIDEO::isFullBorder240();
+                bool is169   = Config::aspect_16_9 != 0;
+                if      (isFB && !isFB240) { lin_end = 48; lin_end2 = 240; }
+                else if (isFB)             { lin_end = 24; lin_end2 = 216; }
+                else if (is169)            { lin_end = 4;  lin_end2 = 196; }
+                else                       { lin_end = 24; lin_end2 = 216; }
+            }
+            tStatesScreen = TS_SCREEN_PROFI;
+            tstateDraw    = tStatesScreen;
+            linedraw_cnt  = lin_end;
+        }
+    }
+
+    // Profi palette refresh — immediately after mode-switch handling, while
+    // still guaranteed to be in blanking window (ESPectrum_vsync fires at v_active).
+    {
+        if (profi_palette_dirty && profi_ds80_active
+            && !profi_ds80_activate_pending && !profi_ds80_deactivate_pending) {
+            if (SELECT_VGA)
+                vga_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+            else
+                hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+            profi_palette_dirty = false;
+        }
+    }
+
+    // DS80 720×576 top/bottom border bands: the scan-time renderer only writes the
+    // 240 content lines (fb rows DS80_BORDER_TOP..+239), so the top rows 0..TOP-1 and
+    // the bottom rows TOP+240..yres-1 are never touched by it.  Fill them with the
+    // current border colour each frame (frame-accurate; side borders are per-line).
+    // 640×480 (yres=240) has no vertical border band → nothing to do.
+    {
+        if (profi_ds80_active && vga.frameBuffer && (int)vga.yres >= 288) {
+            // Border colour = Palette[(~borderIndex) & 7] (inverse index — see renderer).
+            uint8_t bidx = (uint8_t)(~VIDEO::borderColor) & 0x07;
+            uint8_t bbyte = profi_pair_lookup[bidx][bidx];
+            const int botStart = DS80_BORDER_TOP + 240;
+            // Top band: never overlaps the stats overlay → plain full-width fill.
+            for (int y = 0; y < DS80_BORDER_TOP; y++)
+                if (vga.frameBuffer[y]) memset(vga.frameBuffer[y], bbyte, vga.xres);
+            // Bottom band: the F8 stats overlay (isFullBorder288: x=188, y=268, 144×16)
+            // lives here.  If we fill those rows full-width every frame, the per-frame
+            // drawStats() repaint races the fill → flicker when stats text updates.
+            // Carve the stats rectangle out of the fill and let drawStats own it.
+            bool statsHere = (VIDEO::OSD & 0x03) && !(VIDEO::OSD & 0x04);
+            const int sx = 188, sw = 144, sy = 268, sh = 16;   // matches OSD::drawStats 288-mode
+            for (int y = botStart; y < (int)vga.yres; y++) {
+                if (!vga.frameBuffer[y]) continue;
+                uint8_t* row = (uint8_t*)vga.frameBuffer[y];
+                if (statsHere && y >= sy && y < sy + sh) {
+                    // Fill only the border segments left/right of the stats box.
+                    if (sx > 0) memset(row, bbyte, sx);
+                    int rstart = sx + sw;
+                    if (rstart < (int)vga.xres) memset(row + rstart, bbyte, (int)vga.xres - rstart);
+                } else {
+                    memset(row, bbyte, vga.xres);
+                }
+            }
+        }
+    }
+
+    // SPI PSRAM swap diagnostics: log eviction count once every 60 frames.
+    {
+        static uint32_t evict_log_frame = 0;
+        static uint32_t evict_accum = 0;
+        static uint32_t evict_last_page = 0;
+        evict_accum  += mem_spi_evict_count;
+        evict_last_page = mem_spi_evict_page;
+        mem_spi_evict_count = 0;
+        if (++evict_log_frame >= 60) {
+            evict_log_frame = 0;
+            if (evict_accum)
+                Debug::log("[SPI] evict/60f=%u last_pg=%u (%.1f/frame)",
+                           evict_accum, evict_last_page, evict_accum / 60.0f);
+            evict_accum = 0;
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // DS80 frame finalization: NO BLIT NEEDED.
+    // vga.frameBuffer written scan-line-synchronous by the Z80 renderer;
+    // rows 240..479 zeroed at DS80 activation and never touched again.
+    // ----------------------------------------------------------------
     // Clear DMA attr shadow and charrow write counters for next frame
     if (Config::dma_mode)
         Z80DMA::resetAttrShadow();
@@ -2218,6 +2811,17 @@ IRAM_ATTR void VIDEO::EndFrame() {
         Draw_Opcode = &MainScreen_Blank_Opcode;
     }
 
+#if !PICO_RP2040
+    // DS80 mode has no border (lin_end=0). The border renderer uses
+    // "brdlin_cnt == lin_end" to transition TopBorder→MiddleBorder, but
+    // with lin_end=0 that check never fires (brdlin_cnt starts at 0 and
+    // is incremented to 1 before the first test → 1 != 0 → infinite loop).
+    // The loop eventually accesses vga.frameBuffer[480] (past end of the
+    // 480-entry array) → SIGBUS.  Fix: disable border rendering when DS80
+    // is active or just became active this frame.
+    if (isProfiDS80()) DrawBorder = &Border_Blank;
+#endif
+
     if (!skipFrame) {
         if (brdChange || brdGigascreenChange) {
             DrawBorder();
@@ -2238,6 +2842,11 @@ IRAM_ATTR void VIDEO::EndFrame() {
         DrawBorder = &Border_Blank;
     else
         DrawBorder = &TopBorder_Blank;
+#if !PICO_RP2040
+    // Re-apply DS80 border-blank override (TopBorder_Blank above would
+    // fire next frame and overflow brdlin_cnt past yres when lin_end=0).
+    if (isProfiDS80()) DrawBorder = &Border_Blank;
+#endif
     lastBrdTstate = tStatesBorder;
     brdChange = false;
 
@@ -2265,6 +2874,13 @@ IRAM_ATTR void VIDEO::EndFrame() {
     }
 
     framecnt++;
+
+#if !PICO_RP2040
+    // Debug::log("[HB] f=%u pc=0x%04X bc=0x%04X hl=0x%04X iff=%u rom=%u dffd=0x%02X eff7=0x%02X bl=%u vidlatch=%u",
+    //     framecnt, Z80::getRegPC(), Z80::getRegBC(), Z80::getRegHL(),
+    //     (unsigned)(Z80::isIFF1()?1:0), MemESP::romInUse, Ports::portDFFD, Ports::portEFF7,
+    //     MemESP::bankLatch, MemESP::videoLatch);
+#endif
 }
 
 //----------------------------------------------------------------------------------------------------------------
@@ -2410,7 +3026,7 @@ IRAM_ATTR void VIDEO::TopBorder() {
             brdcol_cnt = brdcol_start;
             lastBrdTstate += tStatesPerLine - brdcol_end;
 
-            if (brdlin_cnt == lin_end) {
+            if (brdlin_cnt >= lin_end) {
                 DrawBorder = &MiddleBorder;
                 MiddleBorder();
                 return;
@@ -2564,7 +3180,13 @@ void SaveRectT::save(int16_t x, int16_t y, int16_t w, int16_t h) {
             offsets.push_back(off);
             return;
         }
-        FIL f;
+        // sizeof(FIL) ~= 580 B (FF_MAX_SS=512 sector buf). The OSD runs on a tight
+        // ~2 KB core stack and SaveRect::save is reached from deep call chains
+        // (e.g. fileDialog -> viewInfo -> showInfoBox -> save) — a FIL on the stack
+        // overflows it and corrupts neighbouring memory (timer callbacks etc),
+        // crashing later in alarm_pool_irq_handler. save() is synchronous
+        // (open/write/close within one call) so a static FIL is safe even nested.
+        static FIL f;
         if (f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) {
             offsets.push_back(off); // open failed — dummy
             return;
@@ -2652,7 +3274,10 @@ void SaveRectT::restore_last() {
             if (offsets.empty()) offsets.push_back(0);
             return;
         }
-        FIL f;
+        // Static FIL: sizeof(FIL) ~= 580 B would overflow the tight ~2 KB OSD
+        // stack from deep call chains (same fix as save()). restore is
+        // synchronous (open/read/close in one call) so a static FIL is safe.
+        static FIL f;
         if (f_open(&f, "/tmp/save_rect.tmp", FA_READ) != FR_OK) {
             if (offsets.empty()) offsets.push_back(0);
             return;

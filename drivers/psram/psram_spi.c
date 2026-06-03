@@ -1,6 +1,19 @@
 #include "psram_spi.h"
+#include "hardware/clocks.h"
+#include <string.h>
+
+// Forward declarations (definitions appear after pio_spi_psram_cs_init below).
+static inline void pio_spi_psram_cs_init(PIO pio, uint sm, uint prog_offs, uint n_bits,
+    float clkdiv, bool fudge, uint pin_cs, uint pin_mosi, uint pin_miso);
+static void psram_page_sm_init(PIO pio, float clkdiv, bool fudge);
 
 static psram_spi_inst_t psram_spi;
+
+// Second PIO state machine running the 32-bit-counter variant of the SPI program.
+// Used exclusively for full 16KB page transfers (from_vram / to_vram) so that
+// each 16KB transfer is a SINGLE SPI CS assertion with ONE DMA setup instead of
+// 529–607 separate transactions — ~3× faster per eviction.
+static bool psram_page_ready = false;
 
 #define ITE_PSRAM (1ul << 20)
 #define MAX_PSRAM (16ul << 20)
@@ -34,22 +47,190 @@ uint32_t init_psram() {
 #else
     PIO psram_pio = pio0;
 #endif
-    psram_spi = psram_spi_init_clkdiv(psram_pio, -1, 2.0, false);
+    // Target SPI clock = PSRAM_MAX_SCK_MHZ (default 126 MHz — within the 133 MHz
+    // SPI spec of most PSRAM chips).  clkdiv = sys_clk / (target * 2) because the
+    // PIO SPI program uses 2 cycles per bit.  Clamps to 1.0 minimum.
+#ifndef PSRAM_MAX_SCK_MHZ
+#define PSRAM_MAX_SCK_MHZ 126
+#endif
+    float _clkdiv;
+    bool  _fudge = false;
+    {
+        float sys_mhz = (float)clock_get_hz(clk_sys) / 1e6f;
+        _clkdiv = sys_mhz / (PSRAM_MAX_SCK_MHZ * 2.0f);
+        if (_clkdiv < 1.0f) _clkdiv = 1.0f;
+        psram_spi = psram_spi_init_clkdiv(psram_pio, -1, _clkdiv, false);
+    }
     __psram_sz = _psram_size();
 #ifndef PSRAM_NO_FUGE
     if ( !__psram_sz ) {
         psram_spi_uninit(psram_spi, false);
-        psram_spi = psram_spi_init_clkdiv(psram_pio, -1, 2.0, true);
+        psram_spi = psram_spi_init_clkdiv(psram_pio, -1, _clkdiv, true);
+        _fudge = true;
         __psram_sz = _psram_size();
         if ( !__psram_sz ) {
             psram_spi_uninit(psram_spi, true);
         }
     }
 #endif
+    // Init the 32-bit-counter program for single-transaction 16KB page transfers.
+    if (__psram_sz) psram_page_sm_init(psram_pio, _clkdiv, _fudge);
 #else
     __psram_sz = 0;
 #endif
     return __psram_sz;
+}
+
+// Burst-read `total` bytes from SPI PSRAM into `dst`.
+// Uses 31-byte chunks (248 bits = max for 8-bit PIO counter) per SPI transaction
+// instead of 4 bytes each — reduces command overhead by ~4× (from 56% to 14%).
+void psram_read_range(uint32_t addr, uint8_t* dst, size_t total) {
+    while (total > 0) {
+        size_t chunk = (total > 31) ? 31 : total;
+        uint8_t cmd[7] = {
+            40,                       // 40 bits write (5 bytes: cmd+3 addr+dummy)
+            (uint8_t)(chunk * 8),     // bits to read (max 248 = 31 bytes)
+            0x0bu,                    // Fast Read command
+            (uint8_t)(addr >> 16),
+            (uint8_t)(addr >> 8),
+            (uint8_t)(addr),
+            0                         // dummy byte (required by Fast Read)
+        };
+        pio_spi_write_read_dma_blocking(&psram_spi, cmd, sizeof(cmd), dst, chunk);
+        addr  += chunk;
+        dst   += chunk;
+        total -= chunk;
+    }
+}
+
+// Burst-write `total` bytes from `src` to SPI PSRAM.
+// Uses 27-byte data chunks per SPI transaction (cmd[0]=(4+27)*8=248 < 256).
+void psram_write_range(uint32_t addr, const uint8_t* src, size_t total) {
+    while (total > 0) {
+        size_t chunk = (total > 27) ? 27 : total;
+        uint8_t cmd[33]; // 2 header + 1 cmd + 3 addr + up to 27 data
+        cmd[0] = (uint8_t)((4 + chunk) * 8); // total write bits (cmd+addr+data)
+        cmd[1] = 0;           // no read
+        cmd[2] = 0x02u;       // Write command
+        cmd[3] = (uint8_t)(addr >> 16);
+        cmd[4] = (uint8_t)(addr >> 8);
+        cmd[5] = (uint8_t)(addr);
+        memcpy(cmd + 6, src, chunk);
+        pio_spi_write_dma_blocking(&psram_spi, cmd, 6 + chunk);
+        addr  += chunk;
+        src   += chunk;
+        total -= chunk;
+    }
+}
+
+// ── Page-size (16KB) single-transaction functions ────────────────────────────
+// All 16KB fits in ONE SPI CS assertion using 32-bit PIO counters.
+// PIO program spi_psram_32[_fudge] uses out x,32 / out y,32 so x and y must be
+// sent as 4-byte big-endian values in the TX stream (matching right-shift OSR).
+
+// Single-SM approach: load 32-bit program into same PIO, switch SM PC via
+// pio_sm_exec(jmp) when large transfers are needed. No second SM → no GPIO OR
+// conflict (two SMs on same PIO sharing pins: GPIO output = OR of both SM
+// side-sets, so SM0's idle CS=HIGH would prevent SM1 from asserting CS).
+#define PSRAM_PG_SZ 0x4000u   // same as MEM_PG_SZ — avoid including MemESP.h
+static uint psram_spi_32_offset = 0; // offset of 32-bit program in PIO memory
+
+static void psram_page_sm_init(PIO pio, float clkdiv, bool fudge) {
+    (void)clkdiv; // clock already set by main SM init; 32-bit prog shares same SM
+    psram_spi_32_offset = pio_add_program(pio,
+        fudge ? &spi_psram_32_fudge_program : &spi_psram_32_program);
+    psram_page_ready = true;
+}
+
+// Switch the main SM between the 8-bit and 32-bit SPI programs.
+// A simple instr-poke JMP is NOT enough: the 8-bit program runs with an 8-bit
+// autopull threshold while the 32-bit program does `out x,32`, so after a 32-bit
+// transfer the OSR/ISR shift counters and any residual FIFO bytes are left in a
+// state that corrupts the next 8-bit `out x,8` (wrong x/y → SM stalls forever).
+// Full reset (disable → clear FIFOs → restart shift state → JMP → enable) gives a
+// guaranteed-clean SM.  Overhead (~tens of cycles) is negligible vs a 16KB burst.
+// JMP unconditional with side-set 0b01 (CS deasserted, SCK low):
+// side_set 2, no opt → bits[12:11] = side-set; side=0b01 → bit11=1 → 0x0800.
+#define PIO_JMP_SIDE01(addr) (0x0800u | (uint)(addr))
+static inline void psram_sm_switch(uint offset) {
+    PIO pio = psram_spi.pio;
+    uint sm = psram_spi.sm;
+    pio_sm_set_enabled(pio, sm, false);
+    pio_sm_clear_fifos(pio, sm);
+    pio_sm_restart(pio, sm);          // reset OSR/ISR shift counters + autopull state
+    pio_sm_exec(pio, sm, PIO_JMP_SIDE01(offset)); // set PC, keep CS deasserted
+    pio_sm_set_enabled(pio, sm, true);
+}
+static inline void psram_sm_jump32(void) { psram_sm_switch(psram_spi_32_offset); }
+static inline void psram_sm_jump8(void)  { psram_sm_switch(psram_spi.offset); }
+
+// Read a full 16KB page in ONE SPI CS assertion using the 32-bit-counter program.
+// x (write bits) and y (read bits) are pushed as TRUE 32-bit FIFO words via CPU
+// writes — byte-DMA mis-lanes the byte, corrupting the 32-bit counter.  The SPI
+// command bytes (Fast Read 0x0b + addr + dummy) go via byte-DMA, consumed by
+// `out pins,1` exactly as in the proven 8-bit path.
+void psram_read_page(uint32_t addr, uint8_t* dst) {
+    if (!psram_page_ready) { psram_read_range(addr, dst, PSRAM_PG_SZ); return; }
+    uint8_t cmd[5];
+    cmd[0]=0x0bu;                                   // Fast Read
+    cmd[1]=(uint8_t)(addr>>16); cmd[2]=(uint8_t)(addr>>8); cmd[3]=(uint8_t)addr;
+    cmd[4]=0;                                       // dummy byte
+#if defined(PSRAM_SPINLOCK)
+    psram_spi.spin_irq_state = spin_lock_blocking(psram_spi.spinlock);
+#endif
+    psram_sm_jump32();
+    io_rw_32 *txf32 = (io_rw_32*)&psram_spi.pio->txf[psram_spi.sm];
+    *txf32 = 40;                       // x = 40 write bits (cmd + 3 addr + dummy)
+    *txf32 = PSRAM_PG_SZ * 8u;         // y = 131072 read bits (16KB)
+    dma_channel_transfer_from_buffer_now(psram_spi.write_dma_chan, cmd, 5);
+    dma_channel_transfer_to_buffer_now(psram_spi.read_dma_chan, dst, PSRAM_PG_SZ);
+    dma_channel_wait_for_finish_blocking(psram_spi.write_dma_chan);
+    dma_channel_wait_for_finish_blocking(psram_spi.read_dma_chan);
+    psram_sm_jump8();
+#if defined(PSRAM_SPINLOCK)
+    spin_unlock(psram_spi.spinlock, psram_spi.spin_irq_state);
+#endif
+}
+
+void psram_write_page(uint32_t addr, const uint8_t* src) {
+    if (!psram_page_ready) { psram_write_range(addr, src, PSRAM_PG_SZ); return; }
+    // x (write bits) and y (=0) are pushed as TRUE 32-bit FIFO words via CPU —
+    // byte-DMA mis-lanes the byte and yields a garbage counter (the old big-endian
+    // header version "worked" only by luck: huge x wrote all data then bailed on
+    // TXSTALL, but could truncate → corrupt page → BIOS sees <1024K).  Here x is
+    // EXACT (131104), so the writeloop ends precisely after the last data bit.
+    uint8_t cmd[4];
+    cmd[0]=0x02u;                                   // Write
+    cmd[1]=(uint8_t)(addr>>16); cmd[2]=(uint8_t)(addr>>8); cmd[3]=(uint8_t)addr;
+
+#if defined(PSRAM_SPINLOCK)
+    psram_spi.spin_irq_state = spin_lock_blocking(psram_spi.spinlock);
+#endif
+    psram_sm_jump32();
+    io_rw_32 *txf32 = (io_rw_32*)&psram_spi.pio->txf[psram_spi.sm];
+    *txf32 = (4u + PSRAM_PG_SZ) * 8u;  // x = 131104 write bits (cmd+addr + 16KB)
+    *txf32 = 0;                        // y = 0 (write-only)
+    // DMA 1: 4 SPI command bytes (0x02 + addr).  SM stalls in writeloop
+    // (TX empty, CS asserted) waiting for the payload.
+    dma_channel_transfer_from_buffer_now(psram_spi.write_dma_chan, cmd, 4);
+    dma_channel_wait_for_finish_blocking(psram_spi.write_dma_chan);
+    // DMA 2: 16KB payload.  PIO resumes and clocks out all data, then CS deasserts.
+    dma_channel_transfer_from_buffer_now(psram_spi.write_dma_chan, src, PSRAM_PG_SZ);
+    dma_channel_wait_for_finish_blocking(psram_spi.write_dma_chan);
+    // DMA completion only means all bytes reached the TX FIFO — the PIO is still
+    // clocking them out (and CS still asserted).  We MUST wait for the actual SPI
+    // transfer to finish before switching programs, or the page write is truncated.
+    // Drain FIFO into OSR, then wait for TXSTALL: the SM loops back to begin:,
+    // executes `out x,32` on an empty FIFO and stalls — proof that the last data
+    // bit was clocked and CS deasserted (begin: side 0b01).
+    while (!pio_sm_is_tx_fifo_empty(psram_spi.pio, psram_spi.sm)) tight_loop_contents();
+    psram_spi.pio->fdebug = 1u << (PIO_FDEBUG_TXSTALL_LSB + psram_spi.sm);
+    while (!(psram_spi.pio->fdebug & (1u << (PIO_FDEBUG_TXSTALL_LSB + psram_spi.sm))))
+        tight_loop_contents();
+    psram_sm_jump8();
+#if defined(PSRAM_SPINLOCK)
+    spin_unlock(psram_spi.spinlock, psram_spi.spin_irq_state);
+#endif
 }
 
 void psram_cleanup() {

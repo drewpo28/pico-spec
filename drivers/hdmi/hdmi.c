@@ -62,6 +62,10 @@ static uint8_t hdmi_scanline_buf[400];
 //ДМА палитра для конвертации
 //в хвосте этой памяти выделяется dma_data
 static alignas(4096) uint32_t conv_color[1240];
+// Snapshot of the standard palette taken at DS80-enable time. Used to restore
+// conv_color back to the doubled-pixel mode when DS80 turns off.
+static uint32_t conv_color_std_snapshot[1240];
+static bool conv_color_std_snapshot_valid = false;
 // map64colors removed — frame buffer now stores direct 8-bit palette indices
 
 //индекс, проверяющий зависание
@@ -248,6 +252,9 @@ static inline void* __not_in_flash_func(nf_memset)(void* ptr, int value, size_t 
     return ptr;
 }
 
+// Current HDMI scanline counter (exposed for Profi palette refresh sync).
+volatile uint hdmi_current_line = 0;
+
 static void __scratch_x("hdmi_driver") dma_handler_HDMI() {
     static uint32_t inx_buf_dma;
     static uint line = 0;
@@ -275,6 +282,7 @@ static void __scratch_x("hdmi_driver") dma_handler_HDMI() {
     } else {
         ++line;
     }
+    hdmi_current_line = line; // expose to main context for palette refresh sync
 
     // Сигнализируем vsync в начале blanking-периода (после последней видимой строки),
     // чтобы эмулятор рендерил следующий кадр во время blanking,
@@ -376,9 +384,12 @@ ex:
             nf_memset(activ_buf + h_sync, BASE_HDMI_CTRL_INX, blanking_rest);
             nf_memset(activ_buf, BASE_HDMI_CTRL_INX + 1, h_sync);
 
+
 #if !PICO_RP2040
-            if (hdmi_audio_enabled) {
-                // DI packets on specific vblank lines (ISR fires on odd lines only)
+            if (hdmi_audio_enabled && !profi_ds80_active) {
+                // DI packets on specific vblank lines (ISR fires on odd lines only).
+                // In DS80 mode audio writes are suppressed: slots 220-244 hold DS80
+                // pair TMDS data and must not be overwritten by audio TERC4 packets.
                 uint32_t vbl_line = line - mode.v_active;  // offset from start of vblank
                 uint64_t *src = NULL;
                 if (vbl_line == 3) {
@@ -728,6 +739,95 @@ void graphics_set_palette(uint8_t i, uint32_t color888) {
 };
 
 #define RGB888(r, g, b) ((r<<16) | (g << 8 ) | b )
+
+// Profi DS80 "packed nibble" mode:
+//   Normally conv_color[i*2] and conv_color[i*2+1] hold TMDS for one palette
+//   index, so 1 fb byte → 2 identical HDMI pixels (hardware doubling).
+//
+//   In DS80 mode we switch PIO X register to a *separate* conv_color_ds80
+//   buffer where entries 0..255 are encoded as packed pairs: each fb byte 'b'
+//   yields 2 different HDMI pixels (high nibble = left, low = right).
+//   Entries 220..244 (HDMI sync/control) are mirrored from conv_color so the
+//   HDMI stream stays well-formed.
+//
+//   The switch happens at vsync time (HDMI ISR honors a pending flag) so we
+//   never tear scanout mid-frame.
+extern volatile bool profi_ds80_active; // defined in vga.c, shared with VGA path
+
+// Profi DS80 packed-pair palette setup.
+// active=true:
+//   - Snapshot the current conv_color (for full restore on disable, including audio/sync).
+//   - For every (ink,paper) pair encoded in pair_lut[ink*16+paper], write
+//     conv_color[slot] = (TMDS(palette[ink]), TMDS(palette[paper])).
+//     pair_lut contains only safe indices (not in sync range 220-244, not 255).
+//   - Explicitly set slot 255 = (TMDS(black), TMDS(black)) so HDMI border fill is black.
+//   - Sync/audio range 220-244 is never touched → stream stays well-formed.
+// active=false: restore from snapshot.
+// Idempotent in both directions.
+void hdmi_set_profi_ds80_mode(bool active,
+                               const uint32_t *palette16_rgb888,
+                               const uint8_t  *pair_lut) {
+    // active=true with palette args: activate OR refresh palette (no early-return)
+    // active=true without args: skip
+    // active=false: deactivate (skip if already inactive)
+    if (active && (!palette16_rgb888 || !pair_lut)) return;
+    if (!active && !profi_ds80_active) return;
+
+    uint64_t *cc64 = (uint64_t *)conv_color;
+    if (active) {
+        // Snapshot only on first activation, not on refresh
+        if (!profi_ds80_active) {
+            for (int i = 0; i < 1240; i++) conv_color_std_snapshot[i] = conv_color[i];
+            conv_color_std_snapshot_valid = true;
+        }
+
+        uint64_t tmds16[16];
+        for (int p = 0; p < 16; p++) {
+            uint32_t c = palette16_rgb888[p] & 0x00ffffff;
+            tmds16[p] = get_ser_diff_data(
+                tmds_encoder((c >> 16) & 0xff),
+                tmds_encoder((c >>  8) & 0xff),
+                tmds_encoder( c        & 0xff));
+        }
+        // Write all 240 unique slots referenced by pair_lut (slots 0..239).
+        // pixel-0 = ink  (first  HDMI pixel clock of the pair)
+        // pixel-1 = paper (second HDMI pixel clock of the pair)
+        //
+        // DC balance: pixel-1 is the XOR complement of pixel-0's TMDS differential
+        // pairs.  The monitor decodes both codewords to the same colour, but
+        // alternating polarity keeps the physical lines DC-balanced.
+        // Without this complement DS80 mode accumulated DC offset → signal ringing
+        // → blue fringe right of bright pixels and intermittent sync loss.
+        //
+        // pair_lut normalises paper=8 → paper=0 (bright-black bg = black bg), so
+        // (ink, paper=8) shares the slot of (ink, paper=0).  The written[] guard
+        // ensures the canonical paper=0 TMDS value is NOT overwritten by paper=8.
+        // ink=8 has independent slots (different from ink=0) so palette[8] renders
+        // independently; changing palette[8] cannot corrupt black-ink pixels.
+        bool written[256] = {};
+        for (int ink = 0; ink < 16; ink++) {
+            for (int paper = 0; paper < 16; paper++) {
+                uint8_t slot = pair_lut[ink * 16 + paper];
+                // pair_lut guarantees slot ∈ 0..239 (never in sync/border range)
+                if (!written[slot]) {
+                    written[slot] = true;
+                    cc64[slot * 2 + 0] = tmds16[ink];
+                    cc64[slot * 2 + 1] = tmds16[paper] ^ 0x0003ffffffffffffl;
+                }
+            }
+        }
+        // Slot 255: border fill byte — must be (black, black).
+        cc64[255 * 2 + 0] = tmds16[0];
+        cc64[255 * 2 + 1] = tmds16[0] ^ 0x0003ffffffffffffl;
+
+        profi_ds80_active = true;
+    } else {
+        if (conv_color_std_snapshot_valid) {
+            for (int i = 0; i < 1240; i++) conv_color[i] = conv_color_std_snapshot[i];
+        }
+        profi_ds80_active = false;
+    }
+}
 
 void graphics_init_hdmi() {
     // PIO и DMA

@@ -14,6 +14,10 @@
 #endif
 #endif
 
+#if !PICO_RP2040
+extern "C" volatile bool profi_ds80_active; // defined in vga.c, set by both HDMI and VGA DS80 paths
+#endif
+
 namespace LED {
 
 static constexpr int CELL_W = 9;   // 8px sprite + 1px gap
@@ -255,11 +259,23 @@ static bool resolveLayout(int& base_x, int& base_y) {
 static inline uint8_t fgColor(Id i) {
     bool r = rdec[i] > 0;
     bool w = wdec[i] > 0;
-    if (r && w) return ORANGE;
-    if (r)      return BRI_GREEN;
-    if (w)      return BRI_RED;
-    // Idle: complementary ZX color — always contrasts with current border.
-    return VIDEO::borderColor ^ 7;
+    // Pick a 0..15 ZX colour index. ORANGE (16) has no DS80 palette slot, so use
+    // BRI_YELLOW for the read+write state — keeps a valid index in both modes.
+    uint8_t zx;
+    if (r && w)      zx = BRI_YELLOW;
+    else if (r)      zx = BRI_GREEN;
+    else if (w)      zx = BRI_RED;
+    // Idle: complementary ZX colour — always contrasts with current border.
+    else             zx = VIDEO::borderColor ^ 7;
+
+#if !PICO_RP2040
+    // DS80 mode: the framebuffer byte indexes the DS80 packed-pair conv_color
+    // table, not the standard ZX palette.  Emit a solid-colour pair slot
+    // (profi_pair_lookup[zx][zx]) so the LED glyph shows the intended colour.
+    if (profi_ds80_active)
+        return VIDEO::profi_pair_lookup[zx & 0x0F][zx & 0x0F];
+#endif
+    return zx;
 }
 
 // Draws only the foreground pixels of the glyph; background pixels are left

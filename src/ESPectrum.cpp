@@ -65,6 +65,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Debug.h"
 #if !PICO_RP2040
 #include "DivMMC.h"
+#include "IDE.h"
 #include "MB02.h"
 #endif
 #include "Midi.h"
@@ -77,6 +78,11 @@ visit https://zxespectrum.speccy.org/contacto
 using namespace std;
 
 extern size_t getFreeHeap(void);
+
+#if !PICO_RP2040
+extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
+extern "C" volatile bool profi_ds80_active;
+#endif
 
 //=======================================================================================
 // KEYBOARD
@@ -553,7 +559,22 @@ extern int ram_pages, butter_pages, psram_pages, swap_pages;
 static void assign_ram(int i) {
   static size_t butter_remains = butter_psram_size();
   static size_t butter_idx = 0;
-  if (getFreeHeap() >= MEM_PG_SZ + MEM_REMAIN) {
+  // Profi DS80 hires color attr pages (56/58) + CP/M's hot working page (61):
+  // on SPI-PSRAM boards the Profi BIOS selects bankLatch=56..63 (portDFFD[2:0]=7)
+  // causing sync()/swaps 50-100×/frame → ~1 FPS.  Fix: allocate as SRAM-backed
+  // (POINTER) so sync() returns the SRAM pointer instantly without any SPI DMA.
+  // Page 61 left UNPINNED so it stays in the evictable pool ({56,58,61}).
+  // 1024K BIOS test stays correct (the earlier 160K was the buggy 32-bit
+  // write_page truncating writes, not force_sram).
+  // butter/QSPI-XIP boards are excluded: forcing these into SRAM there gave no
+  // IDL gain (the bottleneck is the whole Z80 working set in XIP, not the color
+  // pages), so don't waste 48KB SRAM.
+  bool force_sram = (Config::arch == "Profi") && (i == 56 || i == 58 || i == 61)
+                    && (butter_psram_size() == 0);
+  if (force_sram) {
+    MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, false); // unlocked → in pool
+    ++ram_pages;
+  } else if (getFreeHeap() >= MEM_PG_SZ + MEM_REMAIN) {
     MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, false);
     ++ram_pages;
   } else {
@@ -583,6 +604,7 @@ void ESPectrum::setup() {
 
   mem_desc_t::reset();
   Ports::portAFF7 = 0;
+  Ports::portDFFD = 0;
   //=======================================================================================
   // LOAD CONFIG
   //=======================================================================================
@@ -743,6 +765,25 @@ void ESPectrum::setup() {
 #endif
     Debug::log("setup: no ext_ram: pages done, freeHeap=%u", getFreeHeap());
   }
+  // Initialise every SRAM/butter-backed ZX RAM page to a defined state (0).
+  // Without this the emulated RAM starts with build-dependent garbage:
+  //  - RP2350 pages 0-7 live in the .ram_128k linker section, declared (NOLOAD),
+  //    so the C runtime never zeroes them.
+  //  - heap pages from `new unsigned char[]` are not zero-initialised either.
+  // The leftover content is stable across power cycles for a given binary but
+  // differs between builds (layout/boot writes change), which made halt2int's
+  // floating-bus probe return a flaky Early/Unknown verdict that flipped from
+  // build to build with no source change.  A defined power-on state (matching a
+  // real machine after the ROM clears the screen) makes the result reproducible.
+  // PSRAM_SPI/SWAP pages are skipped (extended pages, not used by 48K; butter is
+  // already cleared at boot).  Runs once at cold setup, before romset/snapshot load.
+  for (size_t i = 0; i < MEM_PG_CNT; ++i) {
+    if (MemESP::ram[i].memType() == mem_type_t::POINTER) {
+      uint8_t *p = MemESP::ram[i].direct();
+      if (p && p >= (uint8_t *)0x11000000) memset(p, 0, MEM_PG_SZ);
+    }
+  }
+  Debug::log("setup: ZX RAM pages zeroed, freeHeap=%u", getFreeHeap());
   // Load romset
   Debug::log("setup: requestMachine begin, freeHeap=%u", getFreeHeap());
   Debug::log2SD("setup: requestMachine begin arch=%s romSet=%s freeHeap=%u",
@@ -752,15 +793,33 @@ void ESPectrum::setup() {
   Debug::log2SD("setup: requestMachine done, freeHeap=%u", (unsigned)getFreeHeap());
 
   MemESP::page0ram = 0;
+  ESPectrum::trdos = false;
   // Pentagon+Gluk: boot with Gluk ROM to install service monitor at 0xDB00
+  // Profi: boot with SYS ROM (bank0), SYSEN=true — per ZXMAK2 BusReset() spec
   if (Config::romSet == "128Kpg" || Config::romSet == "128Kbg")
       MemESP::romInUse = 3;
   else
       MemESP::romInUse = 0;
+  if (Config::arch == "Profi") ESPectrum::trdos = true; // SYSEN
+  // Profi CP/M: clear physical page 1 (ram[1]) so BDOS.BIN loading via the INI
+  // driver lands in a known-zero state. The BOOTFDD self-install clears ram[5/6/58]
+  // but deliberately skips ram[1] (it holds BOOTFDD.COM from TR-DOS). On butter-PSRAM
+  // systems, stale data from a previous corrupted INI overflow (which can overwrite
+  // page 1 if INTRQ never fires) causes page 1 code to be garbage on the next boot,
+  // breaking the BDOS loading. Zeroing on every reset costs ~10ms but guarantees
+  // that page 1 starts clean — the BIOS BDOS load then populates it correctly.
+  if (Config::arch == "Profi") {
+    uint8_t *p1 = MemESP::ram[1].direct();
+    if (p1 && p1 >= (uint8_t*)0x11000000) {
+      memset(p1, 0, 16384);
+      Debug::log("[setup] Profi: cleared ram[1] (page1 for CP/M BDOS)");
+    }
+  }
   MemESP::bankLatch = 0;
   MemESP::videoLatch = 0;
   MemESP::romLatch = 0;
   MemESP::newSRAM = false;
+  Debug::log("[setup] arch=%s romInUse=%d", Config::arch.c_str(), MemESP::romInUse);
 
   MemESP::ramCurrent[0] = MemESP::rom[MemESP::romInUse].direct();
   MemESP::ramCurrent[1] = MemESP::ram[5].direct();
@@ -778,7 +837,7 @@ void ESPectrum::setup() {
 
   MemESP::ramContended[0] = false;
   MemESP::ramContended[1] = Config::arch == "P1024" || Config::arch == "P512" ||
-                                    Config::arch == "Pentagon"
+                                    Config::arch == "Pentagon" || Config::arch == "Profi"
                                 ? false
                                 : true;
   MemESP::ramContended[2] = false;
@@ -795,6 +854,8 @@ void ESPectrum::setup() {
   Debug::log2SD("setup: DivMMC::init begin, freeHeap=%u", (unsigned)getFreeHeap());
   DivMMC::init();
   Debug::log2SD("setup: DivMMC::init done, freeHeap=%u", (unsigned)getFreeHeap());
+  // IDE/HDD (NEMO/PROFI schemes) — independent of DivMMC.
+  IDE::init();
   // MB-02+ disk interface (allocates SRAM in butter PSRAM after DivMMC)
   Debug::log2SD("setup: MB02::init begin");
   MB02::init();
@@ -1011,6 +1072,15 @@ void ESPectrum::setup() {
   }
 #endif
 
+  // Profi first boot: run the full reset(0) path so the machine starts in the
+  // SYS ROM (bank0) Service menu — identical to the F11 hard-reset / Alt-F11
+  // "Service ROM" behaviour. The inline paging above sets the right banks but
+  // not all the per-reset state, which left first boot dropping into 48K.
+  // Skip when a snapshot is queued (LoadSnapshot below sets up its own state).
+  if (Config::arch == "Profi" && Config::ram_file == NO_RAM_FILE) {
+    ESPectrum::reset(0);
+  }
+
   // Load snapshot if present in Config::
   Debug::log("setup: ram_file='%s'", Config::ram_file.c_str());
   Debug::log2SD("setup: ram_file='%s'", Config::ram_file.c_str());
@@ -1055,7 +1125,31 @@ void ESPectrum::reset(uint8_t romInUse) {
   else if (Config::joystick == JOY_FULLER)
     Ports::port[0x7f] = 0xff; // Fuller
   Ports::portAFF7 = 0;
+#if !PICO_RP2040
+  // If DS80 packed-pair HDMI mode was active before reset, disable it before
+  // clearing DFFD — otherwise HDMI ISR keeps expanding bytes as pairs and the
+  // normal-mode framebuffer renders as vertical scanline garbage.
+  if (Ports::portDFFD & 0x80) {
+    hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
+    Graphics8BitPalette::ds80_active = false; // leaving DS80 → raw ZX indices again
+    // Clear framebuffer immediately after switching HDMI back to standard mode.
+    // DS80 packed-pair slot values (0..254) in the framebuffer look like garbage
+    // when re-read through the restored standard conv_color table.
+    // VIDEO::Reset() won't clear it (profi_ds80_active is now false), so we
+    // must do it here.  Fill with 0 = palette index BLACK in both standard and
+    // DS80 modes.
+    if (VIDEO::vga.frameBuffer) {
+      for (int _y = 0; _y < (int)VIDEO::vga.yres; _y++)
+        if (VIDEO::vga.frameBuffer[_y]) memset(VIDEO::vga.frameBuffer[_y], 0, VIDEO::vga.xres);
+    }
+    Debug::log("[RESET] DS80 off + FB cleared");
+  }
+#endif
+  Ports::portDFFD = 0;
+  // Profi SYSEN: boot into SYS ROM (bank0) with trdos=true to protect page0
+  ESPectrum::trdos = (Config::arch == "Profi" && romInUse == 0);
 
+  Debug::log("[reset] arch=%s romInUse=%d trdos=%d", Config::arch.c_str(), romInUse, (int)ESPectrum::trdos);
   // Memory
   MemESP::page0ram = 0;
   MemESP::romInUse = romInUse;
@@ -1077,7 +1171,7 @@ void ESPectrum::reset(uint8_t romInUse) {
 
   MemESP::ramContended[0] = false;
   MemESP::ramContended[1] = Config::arch == "P1024" || Config::arch == "P512" ||
-                                    Config::arch == "Pentagon"
+                                    Config::arch == "Pentagon" || Config::arch == "Profi"
                                 ? false
                                 : true;
   MemESP::ramContended[2] = false;
@@ -1276,20 +1370,39 @@ IRAM_ATTR void ESPectrum::processKeyboard() {
             KeytoESP == fabgl::VK_VOLUMEUP || KeytoESP == fabgl::VK_VOLUMEDOWN ||
             KeytoESP == fabgl::VK_VOLUMEMUTE ||
             KeytoESP == fabgl::VK_DELETE)) {
-        int64_t osd_start = esp_timer_get_time();
-        OSD::do_OSD(
-            KeytoESP,
-            Kbd->isVKDown(fabgl::VK_LALT) || Kbd->isVKDown(fabgl::VK_RALT),
-            Kbd->isVKDown(fabgl::VK_LCTRL) || Kbd->isVKDown(fabgl::VK_RCTRL));
-        Kbd->emptyVirtualKeyQueue();
+        // In Profi extended keyboard mode, F-keys and nav-keys pass to Z80 matrix
+        // instead of opening OSD. PAUSE always opens OSD (escape hatch).
+        // GRAVEACCENT/TILDE still go to OSD (for Alt+` toggle and max-speed hotkey).
+#if !PICO_RP2040
+        bool passToZ80 = Z80Ops::isProfi && Config::profi_ext_keys
+            && KeytoESP != fabgl::VK_PAUSE
+            && KeytoESP != fabgl::VK_TILDE
+            && KeytoESP != fabgl::VK_GRAVEACCENT
+            && KeytoESP != fabgl::VK_PRINTSCREEN
+            && KeytoESP != fabgl::VK_SCROLLLOCK
+            && KeytoESP != fabgl::VK_NUMLOCK
+            && KeytoESP != fabgl::VK_VOLUMEUP
+            && KeytoESP != fabgl::VK_VOLUMEDOWN
+            && KeytoESP != fabgl::VK_VOLUMEMUTE;
+        if (!passToZ80)
+#endif
+        {
+          int64_t osd_start = esp_timer_get_time();
+          OSD::do_OSD(
+              KeytoESP,
+              Kbd->isVKDown(fabgl::VK_LALT) || Kbd->isVKDown(fabgl::VK_RALT),
+              Kbd->isVKDown(fabgl::VK_LCTRL) || Kbd->isVKDown(fabgl::VK_RCTRL));
+          Kbd->emptyVirtualKeyQueue();
 #ifdef DIRTY_LINES
-        for (int i = 0; i < SPEC_H; i++)
-          VIDEO::dirty_lines[i] |= 0x01;
+          for (int i = 0; i < SPEC_H; i++)
+            VIDEO::dirty_lines[i] |= 0x01;
 #endif // DIRTY_LINES
-       // Refresh border
-        VIDEO::brdnextframe = true;
-        ESPectrum::ts_start += esp_timer_get_time() - osd_start;
-        return;
+          // Refresh border
+          VIDEO::brdnextframe = true;
+          ESPectrum::ts_start += esp_timer_get_time() - osd_start;
+          return;
+        }
+        // else: key falls through to extended keyboard polling below
       }
       // Reset keys
       if (Kdown && NextKey.LALT) {
@@ -1492,6 +1605,201 @@ IRAM_ATTR void ESPectrum::processKeyboard() {
       );
       bitWrite(PS2cols[7], 4,
                (!Kbd->isVKDown(fabgl::VK_B)) & (!Kbd->isVKDown(fabgl::VK_b)));
+
+#if !PICO_RP2040
+      // ── Profi extended keyboard ─────────────────────────────────────────
+      // Active when arch=Profi and extended keyboard mode is on.
+      //
+      // Mechanism (verified from profi_v10.rom bank 0 disasm):
+      //  - The ROM scanner (0x03A9) reads bit5 of each port 0xFE half-row into
+      //    RAM 0x99DA. Bit5 of row 6 (0xBFFE) is the "ALT" modifier (BIT 6,A at
+      //    0x1303). Held bit5 is asserted via extPort[6].
+      //  - When ALT is set, the decoded ZX key is remapped via the table at
+      //    ROM 0x365B: ALT + bare letter A..P → codes 0x75..0x84.
+      //
+      //  Matrix coords: rows are the 8 port-0xFE half-rows 0..7
+      //  (0xFEFE,0xFDFE,0xFBFE,0xF7FE,0xEFFE,0xDFFE,0xBFFE,0x7FFE);
+      //  CapsShift=(0,0), SymbolShift=(7,1).
+      //
+      //  TWO produce paths (verified via test cell-table 0x3427 + decode tables
+      //  0x0450/0x0478/0x04A0 + ALT-remap 0x365B):
+      //   (A) ALT held → bare letter remapped: A..J→F1-F10, K..P→nav (0x7F-0x84)
+      //   (B) NO ALT → CapsShift/SymShift combo decoded directly:
+      //         F11=Caps+Q(0x67) F12=Caps+W(0x68) ESC=Sym+1(0x1B) TAB=Sym+I(0x09)
+      //  Path-B keys MUST NOT assert ALT, or 0x365B would remap them.
+      if (Z80Ops::isProfi && Config::profi_ext_keys) {
+        // Path A — bare letter
+        bool f1  = Kbd->isVKDown(fabgl::VK_F1);
+        bool f2  = Kbd->isVKDown(fabgl::VK_F2);
+        bool f3  = Kbd->isVKDown(fabgl::VK_F3);
+        bool f4  = Kbd->isVKDown(fabgl::VK_F4);
+        bool f5  = Kbd->isVKDown(fabgl::VK_F5);
+        bool f6  = Kbd->isVKDown(fabgl::VK_F6);
+        bool f7  = Kbd->isVKDown(fabgl::VK_F7);
+        bool f8  = Kbd->isVKDown(fabgl::VK_F8);
+        bool f9  = Kbd->isVKDown(fabgl::VK_F9);
+        bool f10 = Kbd->isVKDown(fabgl::VK_F10);
+        bool kHome = Kbd->isVKDown(fabgl::VK_HOME);
+        bool kEnd  = Kbd->isVKDown(fabgl::VK_END);
+        bool kPgUp = Kbd->isVKDown(fabgl::VK_PAGEUP);
+        bool kPgDn = Kbd->isVKDown(fabgl::VK_PAGEDOWN);
+        bool kIns  = Kbd->isVKDown(fabgl::VK_INSERT);
+        bool kDel  = Kbd->isVKDown(fabgl::VK_DELETE);
+        // Arrows = CapsShift + 5/6/7/8 (ZX cursor keys; CAPS decode layer, no ALT)
+        bool kUp    = Kbd->isVKDown(fabgl::VK_UP);
+        bool kDown  = Kbd->isVKDown(fabgl::VK_DOWN);
+        bool kLeft  = Kbd->isVKDown(fabgl::VK_LEFT);
+        bool kRight = Kbd->isVKDown(fabgl::VK_RIGHT);
+        // SymShift symbol keys not in the base ZX matrix (Profi sym layer 0x3B97)
+        bool sMinus  = Kbd->isVKDown(fabgl::VK_MINUS);
+        bool sEqual  = Kbd->isVKDown(fabgl::VK_EQUALS);
+        bool sLBrk   = Kbd->isVKDown(fabgl::VK_LEFTBRACKET);
+        bool sRBrk   = Kbd->isVKDown(fabgl::VK_RIGHTBRACKET);
+        bool sBSlash = Kbd->isVKDown(fabgl::VK_BACKSLASH);
+        bool sSlash  = Kbd->isVKDown(fabgl::VK_SLASH);
+        bool sColon  = Kbd->isVKDown(fabgl::VK_COLON);
+        bool sQuote  = Kbd->isVKDown(fabgl::VK_QUOTE);
+        bool sSemi   = Kbd->isVKDown(fabgl::VK_SEMICOLON);
+        bool sComma  = Kbd->isVKDown(fabgl::VK_COMMA);   // Sym+N → ','
+        bool sPeriod = Kbd->isVKDown(fabgl::VK_PERIOD);  // Sym+M → '.'
+        bool kBS     = Kbd->isVKDown(fabgl::VK_BACKSPACE); // Caps+0 → BS
+
+        // Path B — Caps/Sym combo
+        bool f11  = Kbd->isVKDown(fabgl::VK_F11);
+        bool f12  = Kbd->isVKDown(fabgl::VK_F12);
+        bool kEsc = Kbd->isVKDown(fabgl::VK_ESCAPE);
+        bool kTab = Kbd->isVKDown(fabgl::VK_TAB);
+        bool kCaps = Kbd->isVKDown(fabgl::VK_CAPSLOCK);
+        bool lAlt = Kbd->isVKDown(fabgl::VK_LALT);   // left Alt  → Sym+Enter (0x69)
+        bool rAlt = Kbd->isVKDown(fabgl::VK_RALT);   // right Alt → Sym+Space (0x71)
+        bool altDown = lAlt || rAlt;
+
+        // extPort bit5 = Profi ext column. Bit5-of-row6 (0xBFFE) is the "ALT"
+        // modifier (ROM BIT 6,(0x99DA) at 0x114E). ALT makes the ROM remap a
+        // bare letter via table 0x3571: A..J → F1-F10 (0x75-0x7E),
+        // K..P → nav (0x7F-0x84). Without ALT the letters stay as A..P.
+        for (int i = 0; i < 8; i++) Ports::extPort[i] |= 0x20;
+        bool anyFkey = f1||f2||f3||f4||f5||f6||f7||f8||f9||f10;
+        bool anyNav  = kHome || kEnd || kPgUp || kPgDn || kIns || kDel;
+        // Direct Alt+letter combo: holding physical Alt + a normal letter that
+        // the 0x3571 table remaps (A..P) should yield the same F-key/nav code
+        // as the dedicated F-keys do — exactly like the real Profi keyboard.
+        // The letter is already placed in the matrix by the normal scan; we
+        // just add bit5 so the ROM remaps it. (A..J→F1-F10, K..P→nav.)
+        bool altLetter = altDown &&
+          (Kbd->isVKDown(fabgl::VK_A)||Kbd->isVKDown(fabgl::VK_a)||
+           Kbd->isVKDown(fabgl::VK_B)||Kbd->isVKDown(fabgl::VK_b)||
+           Kbd->isVKDown(fabgl::VK_C)||Kbd->isVKDown(fabgl::VK_c)||
+           Kbd->isVKDown(fabgl::VK_D)||Kbd->isVKDown(fabgl::VK_d)||
+           Kbd->isVKDown(fabgl::VK_E)||Kbd->isVKDown(fabgl::VK_e)||
+           Kbd->isVKDown(fabgl::VK_F)||Kbd->isVKDown(fabgl::VK_f)||
+           Kbd->isVKDown(fabgl::VK_G)||Kbd->isVKDown(fabgl::VK_g)||
+           Kbd->isVKDown(fabgl::VK_H)||Kbd->isVKDown(fabgl::VK_h)||
+           Kbd->isVKDown(fabgl::VK_I)||Kbd->isVKDown(fabgl::VK_i)||
+           Kbd->isVKDown(fabgl::VK_J)||Kbd->isVKDown(fabgl::VK_j)||
+           Kbd->isVKDown(fabgl::VK_K)||Kbd->isVKDown(fabgl::VK_k)||
+           Kbd->isVKDown(fabgl::VK_L)||Kbd->isVKDown(fabgl::VK_l)||
+           Kbd->isVKDown(fabgl::VK_M)||Kbd->isVKDown(fabgl::VK_m)||
+           Kbd->isVKDown(fabgl::VK_N)||Kbd->isVKDown(fabgl::VK_n)||
+           Kbd->isVKDown(fabgl::VK_O)||Kbd->isVKDown(fabgl::VK_o)||
+           Kbd->isVKDown(fabgl::VK_P)||Kbd->isVKDown(fabgl::VK_p));
+        // Bit5 (the 0x3571-remap modifier): for dedicated F1-F10/nav keys, and
+        // for a direct physical Alt+letter combo. NOT for Alt-alone (that lights
+        // the Alt cell via Sym+Enter/Space below; bit5 on row6 would corrupt it).
+        if (anyFkey || anyNav || altLetter)
+          Ports::extPort[6] &= ~0x20;
+
+        // Path A: bare letter (ROM decodes A=F1 … J=F10; K..P + ALT = nav)
+        if (f1)    PS2cols[1] &= ~0x01;   // A → (1,0)  F1
+        if (f2)    PS2cols[7] &= ~0x10;   // B → (7,4)  F2
+        if (f3)    PS2cols[0] &= ~0x08;   // C → (0,3)  F3
+        if (f4)    PS2cols[1] &= ~0x04;   // D → (1,2)  F4
+        if (f5)    PS2cols[2] &= ~0x04;   // E → (2,2)  F5
+        if (f6)    PS2cols[1] &= ~0x08;   // F → (1,3)  F6
+        if (f7)    PS2cols[1] &= ~0x10;   // G → (1,4)  F7
+        if (f8)    PS2cols[6] &= ~0x10;   // H → (6,4)  F8
+        if (f9)    PS2cols[5] &= ~0x04;   // I → (5,2)  F9
+        if (f10)   PS2cols[6] &= ~0x08;   // J → (6,3)  F10
+        if (kHome) PS2cols[6] &= ~0x04;   // K → (6,2)  HOME (0x7F)
+        if (kEnd)  PS2cols[6] &= ~0x02;   // L → (6,1)  END  (0x80)
+        if (kPgUp) PS2cols[7] &= ~0x04;   // M → (7,2)  PgUp (0x81)
+        if (kPgDn) PS2cols[7] &= ~0x08;   // N → (7,3)  PgDn (0x82)
+        if (kIns)  PS2cols[5] &= ~0x02;   // O → (5,1)  INS  (0x83)
+        if (kDel)  PS2cols[5] &= ~0x01;   // P → (5,0)  DEL  (0x84)
+
+        // Arrows = CapsShift + 5/6/7/8 (CAPS decode layer, no ALT)
+        //   LEFT=Caps+5(3,4) DOWN=Caps+6(4,4) UP=Caps+7(4,3) RIGHT=Caps+8(4,2)
+        if (kLeft)  { PS2cols[0] &= ~0x01; PS2cols[3] &= ~0x10; } // Caps+5 LEFT
+        if (kDown)  { PS2cols[0] &= ~0x01; PS2cols[4] &= ~0x10; } // Caps+6 DOWN
+        if (kUp)    { PS2cols[0] &= ~0x01; PS2cols[4] &= ~0x08; } // Caps+7 UP
+        if (kRight) { PS2cols[0] &= ~0x01; PS2cols[4] &= ~0x04; } // Caps+8 RIGHT
+
+        // Path B: shift-combo specials (hddboot decode tables 0x3B6F/97/BF).
+        //   F11=Sym+Q(0x67) F12=Sym+W(0x68) ESC=Caps+1(0x1B) TAB=Caps+I(0x09)
+        // The normal scanner maps VK_ESCAPE→Break (Caps+Space), so release the
+        // stray Space bit first so ESC decodes cleanly to 0x1B.
+        if ((kEsc || kTab) && !Kbd->isVKDown(fabgl::VK_SPACE))
+          PS2cols[7] |= 0x01;            // release Space (7,0) left by ESC=Break
+        // TAB: normal scan sets "Extended mode" = Caps+Sym; release stray SymShift.
+        if (kTab) PS2cols[7] |= 0x02;
+        // QUOTE: normal scan sets "Double quote" = Sym+P; release stray P (5,0).
+        if (sQuote) PS2cols[5] |= 0x01;
+        // CAPSLOCK: normal scan sets Caps+"2"; release stray "2" (3,1) so the
+        // CpLoc cell (code 0x70 = Caps+Sym) decodes cleanly.
+        if (kCaps) PS2cols[3] |= 0x02;
+        if (f11) { PS2cols[7] &= ~0x02; PS2cols[2] &= ~0x01; } // Sym+Q → F11 (0x67)
+        if (f12) { PS2cols[7] &= ~0x02; PS2cols[2] &= ~0x02; } // Sym+W → F12 (0x68)
+        if (kEsc) { PS2cols[0] &= ~0x01; PS2cols[3] &= ~0x01; } // Caps+1 → ESC (0x1B)
+        if (kTab) { PS2cols[0] &= ~0x01; PS2cols[5] &= ~0x04; } // Caps+I → TAB (0x09)
+        if (kCaps){ PS2cols[0] &= ~0x01; PS2cols[7] &= ~0x02; } // Caps+Sym → CpLoc (0x70)
+        // Alt cell (code 0x69) = SymShift + Enter. The bit5 modifier alone is
+        // stripped by the scanner (AND 0x1F at 0x0618) and never decodes to a
+        // code, so the test can't show it from extPort[6]; the real Profi Alt
+        // key closes Sym+Enter. Assert that so the Alt cell lights.
+        // Alt cell (Alt held alone, no remappable letter): L=Sym+Enter, R=Sym+Space.
+        // Skipped when altLetter — then Alt acts as the F-key/nav remap modifier.
+        if (lAlt && !altLetter) { PS2cols[7] &= ~0x02; PS2cols[6] &= ~0x01; } // → L-Alt (0x69)
+        if (rAlt && !altLetter) { PS2cols[7] &= ~0x02; PS2cols[7] &= ~0x01; } // → R-Alt (0x71)
+
+        // SymShift symbol keys (Profi sym layer): assert SymShift(7,1) + base key
+        if (sMinus)  { PS2cols[7] &= ~0x02; PS2cols[6] &= ~0x08; } // Sym+J → '-'
+        if (sEqual)  { PS2cols[7] &= ~0x02; PS2cols[6] &= ~0x02; } // Sym+L → '='
+        if (sLBrk)   { PS2cols[7] &= ~0x02; PS2cols[5] &= ~0x10; } // Sym+Y → '['
+        if (sRBrk)   { PS2cols[7] &= ~0x02; PS2cols[5] &= ~0x08; } // Sym+U → ']'
+        if (sBSlash) { PS2cols[7] &= ~0x02; PS2cols[1] &= ~0x04; } // Sym+D → '\'
+        if (sSlash)  { PS2cols[7] &= ~0x02; PS2cols[0] &= ~0x10; } // Sym+V → '/'
+        if (sColon)  { PS2cols[7] &= ~0x02; PS2cols[0] &= ~0x02; } // Sym+Z → ':'
+        if (sQuote)  { PS2cols[7] &= ~0x02; PS2cols[4] &= ~0x08; } // Sym+7 → '\''
+        if (sSemi)   { PS2cols[7] &= ~0x02; PS2cols[5] &= ~0x02; } // Sym+O → ';'
+
+        // Profi labels Ctrl/Shift opposite to ZX: cell "Ctrl"=CapsShift(0,0),
+        // cell "Shift"=SymShift(7,1). Normal scanner maps phys-Shift→CapsShift
+        // and phys-Ctrl→SymShift, so they appear swapped. In Ext mode drive
+        // these two bits from the swapped physical keys so cells match labels.
+        bool physCtrl  = Kbd->isVKDown(fabgl::VK_LCTRL)  || Kbd->isVKDown(fabgl::VK_RCTRL);
+        bool physShift = Kbd->isVKDown(fabgl::VK_LSHIFT) || Kbd->isVKDown(fabgl::VK_RSHIFT);
+        // Final authoritative value of the two shift bits, computed from ALL
+        // sources at once (the normal scanner's reversed phys-Shift→CapsShift /
+        // phys-Ctrl→SymShift is overridden here). A bit is asserted (cleared)
+        // if ANY consumer needs it; otherwise released.
+        //   CapsShift(0,0): phys Ctrl (swap), arrows, ESC, TAB, CapsLock
+        //   SymShift(7,1):  phys Shift (swap), F11, F12, CapsLock, all sym-symbols
+        bool anyArrow = kUp || kDown || kLeft || kRight;
+        // Disasm: CapsShift-alone→0x74→cell "Ctrl"; SymShift-alone→0x73→cell
+        // "Shift". So phys Ctrl → CapsShift, phys Shift → SymShift.
+        bool needCaps = physCtrl || anyArrow || kEsc || kTab || kCaps || kBS;
+        bool needSym  = physShift || f11 || f12 || kCaps || (altDown && !altLetter)
+                      || sMinus || sEqual || sLBrk || sRBrk || sBSlash
+                      || sSlash || sColon || sQuote || sSemi
+                      || sComma || sPeriod;
+        bitWrite(PS2cols[0], 0, !needCaps);
+        bitWrite(PS2cols[7], 1, !needSym);
+
+      } else {
+        // Not in extended mode — release all extended bits
+        for (int i = 0; i < 8; i++) Ports::extPort[i] = 0xFF;
+      }
+#endif
     }
   }
   if (r) {
@@ -1955,6 +2263,15 @@ void ESPectrum::loop() {
         VIDEO::framecnt = 0;
       }
     }
+#if !PICO_RP2040
+    // DS80: the stats overlay (F8) is only refreshed every 10 frames above, but the
+    // DS80 scan-time renderer + per-frame border fill repaint the whole framebuffer
+    // every frame — so the stats text would show for 1 frame then vanish for 9
+    // (flicker).  Re-draw the cached stats lines every frame while DS80 is active so
+    // they persist.  (Normal modes draw into the static border area, no flicker.)
+    if (profi_ds80_active && (VIDEO::OSD & 0x03) && (VIDEO::OSD & 0x04) == 0 && !CPU::paused)
+      OSD::drawStats();
+#endif
     // Flashing flag change (disabled when ULA+ palette is active)
 #if !PICO_RP2040
     if (!(VIDEO::flash_ctr++ & 0x0f) && !VIDEO::ulaplus_enabled)
@@ -1964,12 +2281,20 @@ void ESPectrum::loop() {
       VIDEO::flashing ^= 0x80;
 
     // Draw fdd led indicator in top-right corner
-    bool hasFdd = (Z80Ops::isPentagon || (Z80Ops::is128 && Z80Ops::isByte)) && Tape::tapeStatus != TAPE_LOADING
+    bool hasFdd = ((Z80Ops::isPentagon || Z80Ops::isProfi) || (Z80Ops::is128 && Z80Ops::isByte)) && Tape::tapeStatus != TAPE_LOADING
 #if !PICO_RP2040
         && !DivMMC::enabled
 #endif
         ;
+    // Indicator sits at x=312 — inside the DS80 right border band.  The "off" state
+    // erases it to the surrounding border colour so no square remains.
+    //   Normal mode: border byte = zxColor(borderColor, 0).
+    //   DS80 mode:   the band is filled with Palette[(~borderColor)&7] (inverse index,
+    //     per ProfiRenderer).  The Graphics remap maps a ZX index i → Palette[i&0xF],
+    //     so pass (~borderColor)&7 to land on the same byte and blend cleanly.
+    uint8_t led_off_col = zxColor(VIDEO::borderColor, 0);
 #if !PICO_RP2040
+    if (profi_ds80_active) led_off_col = (uint8_t)(~VIDEO::borderColor) & 0x07;
     if (MB02::enabled && (Config::mb02SoundLed & 1)) {
         // MB-02+ I/O skips the WD1793 command-dispatch paths that drive
         // rvmWD1793::led, so mirror the panel LED off the port-0x13 motor state.
@@ -1978,7 +2303,7 @@ void ESPectrum::loop() {
         if (mb02_led) {
             VIDEO::vga.fillRect(312, 3, 4, 4, zxColor(mb02_led == 2 ? 2 : 1, 1));
         } else {
-            VIDEO::vga.fillRect(312, 3, 4, 4, zxColor(VIDEO::borderColor, 0));
+            VIDEO::vga.fillRect(312, 3, 4, 4, led_off_col);
         }
     } else
 #endif
@@ -1986,7 +2311,7 @@ void ESPectrum::loop() {
         if (ESPectrum::fdd.led) {
             VIDEO::vga.fillRect(312, 3, 4, 4, zxColor(fdd.led == 2 ? 2 : 1, 1));
         } else {
-            VIDEO::vga.fillRect(312, 3, 4, 4, zxColor(VIDEO::borderColor, 0));
+            VIDEO::vga.fillRect(312, 3, 4, 4, led_off_col);
         }
     }
 

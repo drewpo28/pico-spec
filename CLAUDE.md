@@ -285,6 +285,7 @@ On RP2350, UART TX available via two funcsel:
   - Raw binaries: `python3 tools/z80disasm.py code.bin --org 0x8000`
   - API: `from tools.z80disasm import disasm_bytes, disasm_bytes_text`
   - Supports all Z80 prefixes: CB, DD, FD, ED, DD CB, FD CB (including undocumented)
+- [profi2png VGA detection fix](memory/profi2png_vga_detection.md) — max_byte>15 heuristic always fires for VGA std-mode (0xC0+ sync bits); fix: also require min_byte<0xC0.
 
 ## Test Files
 
