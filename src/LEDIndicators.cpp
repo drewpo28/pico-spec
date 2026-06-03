@@ -15,7 +15,7 @@
 #endif
 
 #if !PICO_RP2040
-extern "C" volatile bool hdmi_profi_ds80_active; // HDMI driver: DS80 packed-pair palette active
+extern "C" volatile bool profi_ds80_active; // defined in vga.c, set by both HDMI and VGA DS80 paths
 #endif
 
 namespace LED {
@@ -272,7 +272,7 @@ static inline uint8_t fgColor(Id i) {
     // DS80 mode: the framebuffer byte indexes the DS80 packed-pair conv_color
     // table, not the standard ZX palette.  Emit a solid-colour pair slot
     // (profi_pair_lookup[zx][zx]) so the LED glyph shows the intended colour.
-    if (hdmi_profi_ds80_active)
+    if (profi_ds80_active)
         return VIDEO::profi_pair_lookup[zx & 0x0F][zx & 0x0F];
 #endif
     return zx;

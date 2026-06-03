@@ -68,7 +68,7 @@ visit https://zxespectrum.speccy.org/contacto
 extern "C" void graphics_set_scanlines(bool enabled);
 extern "C" void graphics_set_dither(bool enabled);
 #if !PICO_RP2040
-extern "C" volatile bool hdmi_profi_ds80_active;
+extern "C" volatile bool profi_ds80_active;
 extern "C" const uint32_t profi_default_palette16[16];
 #endif
 #if !PICO_RP2040
@@ -730,7 +730,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
     // state directly.  The dtor re-arms activation only if the machine is still DS80.
     struct DS80Guard {
         bool was_active;
-        DS80Guard() : was_active(hdmi_profi_ds80_active) {
+        DS80Guard() : was_active(profi_ds80_active) {
             // Cancel any pending activation that arrived just before OSD opened
             // (avoids a spurious framebuffer-zeroing + geometry reset under the dialog).
             VIDEO::profi_ds80_activate_pending = false;
@@ -748,7 +748,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 // restoreProfiLivePalette() would call hdmi_set_profi_ds80_mode(true,…),
                 // RE-ENABLING DS80 packed-pair scanout over a non-DS80 framebuffer →
                 // shifted/garbled screen.  Skip it when we've left DS80.
-                if (hdmi_profi_ds80_active) {
+                if (profi_ds80_active) {
                     VIDEO::restoreProfiLivePalette(); // back to live DS80 pair palette
                     // DS80 renderer only rewrites the 256 content bytes per row, so any
                     // side-padding the dialog drew over stays dirty — re-blacken it.
@@ -762,9 +762,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             // Cancel any stray deferred flags from transitions during OSD.
             VIDEO::profi_ds80_activate_pending   = false;
             VIDEO::profi_ds80_deactivate_pending = false;
-            // Reset-during-OSD: hdmi_profi_ds80_active was cleared by ESPectrum::reset()
+            // Reset-during-OSD: profi_ds80_active was cleared by ESPectrum::reset()
             // directly.  Re-arm activation only if the machine is still DS80.
-            if (was_active && !hdmi_profi_ds80_active && VIDEO::isProfiDS80()) {
+            if (was_active && !profi_ds80_active && VIDEO::isProfiDS80()) {
                 VIDEO::profi_ds80_activate_pending = true;
             }
         }
@@ -4048,7 +4048,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                                 // so EndFrame won't fire to do it for us.
                                                 // applyProfiOSDPalette() reads the new flag and
                                                 // picks STD (conv_color swap) or DS80 (Graphics remap).
-                                                if (hdmi_profi_ds80_active) {
+                                                if (profi_ds80_active) {
                                                     VIDEO::restoreProfiLivePalette(); // clean slate
                                                     VIDEO::profi_ds80_osd_active = true;
                                                     VIDEO::applyProfiOSDPalette();

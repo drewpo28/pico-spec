@@ -76,7 +76,7 @@ void graphics_set_flashmode(bool flash_line, bool flash_frame);
 void graphics_set_scanlines(bool enabled);
 void graphics_set_dither(bool enabled);
 
-// Profi DS80 "packed nibble" mode.
+// Profi DS80 "packed nibble" mode — HDMI path.
 // active=true: takes palette snapshot, then writes TMDS pairs for each (ink,paper) entry
 //   in pair_lut[ink*16+paper] → conv_color safe slot. Also sets slot 255 = (black,black).
 //   pair_lut must be VIDEO::profi_pair_lookup[0][0] (flat 256-byte array, pre-built).
@@ -85,8 +85,15 @@ void graphics_set_dither(bool enabled);
 void hdmi_set_profi_ds80_mode(bool active,
                                const uint32_t *palette16_rgb888,
                                const uint8_t  *pair_lut);
-// Convenience: check if DS80 palette is currently active.
-extern volatile bool hdmi_profi_ds80_active;
+// Unified DS80 active flag — set by both hdmi_set_profi_ds80_mode and vga_set_profi_ds80_mode.
+extern volatile bool profi_ds80_active;
+
+// Profi DS80 "packed nibble" mode — VGA path.
+// Builds palette_vga_ds80[256]: slot → uint16_t(left_pixel, right_pixel).
+// active=false: clears profi_ds80_active so ISR falls back to standard palette.
+void vga_set_profi_ds80_mode(bool active,
+                              const uint32_t *palette16_rgb888,
+                              const uint8_t  *pair_lut);
 
 void draw_text(const char string[TEXTMODE_COLS + 1], uint32_t x, uint32_t y, uint8_t color, uint8_t bgcolor);
 void draw_window(const char title[TEXTMODE_COLS + 1], uint32_t x, uint32_t y, uint32_t width, uint32_t height);

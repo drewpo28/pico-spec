@@ -386,7 +386,7 @@ ex:
 
 
 #if !PICO_RP2040
-            if (hdmi_audio_enabled && !hdmi_profi_ds80_active) {
+            if (hdmi_audio_enabled && !profi_ds80_active) {
                 // DI packets on specific vblank lines (ISR fires on odd lines only).
                 // In DS80 mode audio writes are suppressed: slots 220-244 hold DS80
                 // pair TMDS data and must not be overwritten by audio TERC4 packets.
@@ -752,7 +752,7 @@ void graphics_set_palette(uint8_t i, uint32_t color888) {
 //
 //   The switch happens at vsync time (HDMI ISR honors a pending flag) so we
 //   never tear scanout mid-frame.
-volatile bool hdmi_profi_ds80_active = false;
+extern volatile bool profi_ds80_active; // defined in vga.c, shared with VGA path
 
 // Profi DS80 packed-pair palette setup.
 // active=true:
@@ -771,12 +771,12 @@ void hdmi_set_profi_ds80_mode(bool active,
     // active=true without args: skip
     // active=false: deactivate (skip if already inactive)
     if (active && (!palette16_rgb888 || !pair_lut)) return;
-    if (!active && !hdmi_profi_ds80_active) return;
+    if (!active && !profi_ds80_active) return;
 
     uint64_t *cc64 = (uint64_t *)conv_color;
     if (active) {
         // Snapshot only on first activation, not on refresh
-        if (!hdmi_profi_ds80_active) {
+        if (!profi_ds80_active) {
             for (int i = 0; i < 1240; i++) conv_color_std_snapshot[i] = conv_color[i];
             conv_color_std_snapshot_valid = true;
         }
@@ -820,12 +820,12 @@ void hdmi_set_profi_ds80_mode(bool active,
         cc64[255 * 2 + 0] = tmds16[0];
         cc64[255 * 2 + 1] = tmds16[0] ^ 0x0003ffffffffffffl;
 
-        hdmi_profi_ds80_active = true;
+        profi_ds80_active = true;
     } else {
         if (conv_color_std_snapshot_valid) {
             for (int i = 0; i < 1240; i++) conv_color[i] = conv_color_std_snapshot[i];
         }
-        hdmi_profi_ds80_active = false;
+        profi_ds80_active = false;
     }
 }
 

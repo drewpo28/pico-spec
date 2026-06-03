@@ -83,29 +83,45 @@ def main():
     print(f"reverse lut: {len(rev)} unique slots mapped")
 
     # Detect which video mode this framebuffer is in.
-    # DS80 hires packs a pair of pixels per byte as an HDMI "slot" index that
-    # spans a wide range (up to ~244, incl. the sync slots). A standard ZX
-    # screen (e.g. the debugger overlay, drawn in normal video mode) stores
-    # direct 16-colour palette indices, so every byte is 0..15.
-    max_byte = max(fb[:w * h])
-    is_ds80 = max_byte > 15
-    print(f"mode: {'DS80 pair-LUT' if is_ds80 else 'standard 16-colour'} "
-          f"(max fb byte = {max_byte})")
+    # DS80 hires: pair-slot bytes 0..254; border slots = 0 (always < 0xC0).
+    # Standard HDMI: ZX palette indices 0..15 (all <= 15).
+    # Standard VGA: renderer ORs 0xC0 sync-bits into every pixel, so all
+    #   bytes are >= 0xC0 (192).  max_byte > 15 always fires for VGA standard
+    #   mode — we must also require min_byte < 0xC0 to exclude VGA standard.
+    content = fb[:w * h]
+    min_byte = min(content)
+    max_byte = max(content)
+    is_ds80 = (min_byte < 0xC0) and (max_byte > 15)
+    if min_byte >= 0xC0:
+        mode_str = "standard VGA (all bytes have sync bits, not DS80)"
+    elif max_byte <= 15:
+        mode_str = "standard 16-colour (HDMI/other)"
+    else:
+        mode_str = "DS80 pair-LUT"
+    print(f"mode: {mode_str} (min={min_byte:#04x} max={max_byte:#04x})")
 
     if not is_ds80:
-        # Standard mode: each byte is a direct palette index; pixels are already
-        # square, so emit the framebuffer at native w×h (the full FullBorder
-        # picture, borders included). No pair-LUT, no row doubling.
+        # Standard mode: each byte is either a direct HDMI palette index (0..15)
+        # or a VGA pixel byte (vga6 | 0xC0). Emit native w×h without pair-LUT.
+        is_vga_std = (min_byte >= 0xC0)
         img = Image.new('RGB', (w, h))
         px = img.load()
         for y in range(h):
             row_off = y * w
             for x in range(w):
-                # HDMI ISR reads bytes with (x^2); undo it to get visual order.
                 fb_idx = x ^ 2
                 if fb_idx >= w:
                     fb_idx = x
-                px[x, y] = palette[fb[row_off + fb_idx] & 0x0F]
+                b = fb[row_off + fb_idx]
+                if is_vga_std:
+                    # Decode VGA 6-bit pixel: bits[5:4]=R, bits[3:2]=G, bits[1:0]=B (2-bit each)
+                    vga6 = b & 0x3F
+                    r = ((vga6 >> 4) & 3) * 85
+                    g = ((vga6 >> 2) & 3) * 85
+                    bv = (vga6 & 3) * 85
+                    px[x, y] = (r, g, bv)
+                else:
+                    px[x, y] = palette[b & 0x0F]
         img.save(out_path)
         print(f"saved {out_path} ({w}x{h})")
         return

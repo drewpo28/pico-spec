@@ -81,7 +81,7 @@ extern size_t getFreeHeap(void);
 
 #if !PICO_RP2040
 extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
-extern "C" volatile bool hdmi_profi_ds80_active;
+extern "C" volatile bool profi_ds80_active;
 #endif
 
 //=======================================================================================
@@ -559,7 +559,26 @@ extern int ram_pages, butter_pages, psram_pages, swap_pages;
 static void assign_ram(int i) {
   static size_t butter_remains = butter_psram_size();
   static size_t butter_idx = 0;
-  if (getFreeHeap() >= MEM_PG_SZ + MEM_REMAIN) {
+  // Profi DS80 hires color attr pages (56/58): on SPI-PSRAM-only boards the
+  // Profi BIOS selects bankLatch=56..63 (portDFFD[2:0]=7) causing sync() to
+  // hit these pages 50-100 times/frame → 11ms × 72 = 792ms/frame → 1 FPS.
+  // Fix: allocate as SRAM-backed (POINTER) so sync() returns the SRAM pointer
+  // instantly without any SPI DMA.  Also covers arch set to Profi at boot.
+  //
+  // Page 61: Profi CP/M's hot working page — evicted/reloaded ~1.2×/frame in
+  // steady state (observed as `[SPI] evict last_pg=61`).  Each swap is ~4ms of
+  // SPI PSRAM (read+write), which can't be batched away (1-bit SPI bandwidth).
+  // Give it an SRAM buffer AND pin() it so _sync() never evicts it → the swap
+  // disappears entirely.  Cost: one extra 16KB page (Profi only, leaves ~77KB
+  // heap free — well above gigascreen's lazy ~38KB prevFB malloc, and 128K mode
+  // is unaffected since this is arch=="Profi" gated).
+  bool force_sram = (Config::arch == "Profi") && (i == 56 || i == 58 || i == 61)
+                    && (butter_psram_size() == 0);
+  if (force_sram) {
+    MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, false); // unlocked → in pool
+    if (i == 61) MemESP::ram[i].pin(); // never evict the hot CP/M working page
+    ++ram_pages;
+  } else if (getFreeHeap() >= MEM_PG_SZ + MEM_REMAIN) {
     MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, false);
     ++ram_pages;
   } else {
@@ -1101,7 +1120,7 @@ void ESPectrum::reset(uint8_t romInUse) {
     // Clear framebuffer immediately after switching HDMI back to standard mode.
     // DS80 packed-pair slot values (0..254) in the framebuffer look like garbage
     // when re-read through the restored standard conv_color table.
-    // VIDEO::Reset() won't clear it (hdmi_profi_ds80_active is now false), so we
+    // VIDEO::Reset() won't clear it (profi_ds80_active is now false), so we
     // must do it here.  Fill with 0 = palette index BLACK in both standard and
     // DS80 modes.
     if (VIDEO::vga.frameBuffer) {
@@ -2235,7 +2254,7 @@ void ESPectrum::loop() {
     // every frame — so the stats text would show for 1 frame then vanish for 9
     // (flicker).  Re-draw the cached stats lines every frame while DS80 is active so
     // they persist.  (Normal modes draw into the static border area, no flicker.)
-    if (hdmi_profi_ds80_active && (VIDEO::OSD & 0x03) && (VIDEO::OSD & 0x04) == 0 && !CPU::paused)
+    if (profi_ds80_active && (VIDEO::OSD & 0x03) && (VIDEO::OSD & 0x04) == 0 && !CPU::paused)
       OSD::drawStats();
 #endif
     // Flashing flag change (disabled when ULA+ palette is active)
@@ -2260,7 +2279,7 @@ void ESPectrum::loop() {
     //     so pass (~borderColor)&7 to land on the same byte and blend cleanly.
     uint8_t led_off_col = zxColor(VIDEO::borderColor, 0);
 #if !PICO_RP2040
-    if (hdmi_profi_ds80_active) led_off_col = (uint8_t)(~VIDEO::borderColor) & 0x07;
+    if (profi_ds80_active) led_off_col = (uint8_t)(~VIDEO::borderColor) & 0x07;
     if (MB02::enabled && (Config::mb02SoundLed & 1)) {
         // MB-02+ I/O skips the WD1793 command-dispatch paths that drive
         // rvmWD1793::led, so mirror the panel LED off the port-0x13 motor state.

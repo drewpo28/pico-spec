@@ -55,6 +55,8 @@ visit https://zxespectrum.speccy.org/contacto
 extern uint32_t MEM_PG_CNT;
 extern uint8_t* PSRAM_DATA;
 extern uint8_t psram_pin;
+extern volatile uint32_t mem_spi_evict_count; // SPI PSRAM loads per frame
+extern volatile uint32_t mem_spi_evict_page;  // last evicted page index
 extern bool rp2350a;
 uint32_t butter_psram_size();
 extern uint8_t rx[4];
@@ -73,7 +75,8 @@ class mem_desc_t {
         uint32_t vram_off;
         mem_type_t mem_type;
         bool is_rom;
-        mem_desc_int_t() : p(0), vram_off(0), mem_type(POINTER), is_rom(false) {}
+        bool pinned;  // if true, _sync skips this entry (never evicted while pinned)
+        mem_desc_int_t() : p(0), vram_off(0), mem_type(POINTER), is_rom(false), pinned(false) {}
     };
     mem_desc_int_t* _int;
     uint8_t* to_vram(void);
@@ -95,6 +98,15 @@ public:
     inline uint8_t* direct(void) {
         return _int->p;
     }
+    // Force-load this SPI page from PSRAM into the pool without claiming a CPU
+    // bank slot.  Bank=255 is a sentinel: _sync checks plugged_in[0..3] only,
+    // so 255 is never matched → all 4 active bank pointers are checked (a page
+    // currently mapped into any CPU bank is safely skipped rather than evicted).
+    // Nop when already POINTER (page already in SRAM).  Called at DS80 activate
+    // to ensure the color-attr page is in SRAM for fast direct rendering.
+    inline void preload() { if (_int->mem_type != POINTER) _sync(255); }
+    inline mem_type_t memType(void) { return _int->mem_type; }
+    inline uint32_t   spiBase(void) { return _int->vram_off; }
     inline uint8_t* sync(uint8_t bank) {
         if (_int->mem_type != POINTER) {
             _sync(bank);
@@ -140,6 +152,11 @@ public:
             pages.push_back(*this);
         }
     }
+    // Mark this pool entry as pinned: _sync() skips it when looking for a
+    // victim to evict.  The page stays in the pool (pool size unchanged) so
+    // other banks can still find enough evictable slots.  Nop for non-pool pages.
+    inline void pin()   { _int->pinned = true;  }
+    inline void unpin() { _int->pinned = false; }
     inline void assign_rom(const uint8_t* p) { // TODO: prev?
         this->_int->p = (uint8_t*)p;
         this->_int->vram_off = 0;

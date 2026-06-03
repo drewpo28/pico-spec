@@ -909,11 +909,11 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         // races the DMA on core1 → TMDS corruption → picture disappears.
         // Set a flag; EndFrame() (always at vblank) will apply it safely.
         // Guard: only set pending if neither mode is already active/pending.
-        extern volatile bool hdmi_profi_ds80_active;
-        if (!hdmi_profi_ds80_active && !VIDEO::profi_ds80_activate_pending) {
+        extern volatile bool profi_ds80_active;
+        if (!profi_ds80_active && !VIDEO::profi_ds80_activate_pending) {
             VIDEO::profi_ds80_deactivate_pending = false; // cancel any pending off
             VIDEO::profi_ds80_activate_pending   = true;
-        } else if (hdmi_profi_ds80_active) {
+        } else if (profi_ds80_active) {
             // DS80 already active — cancel any spurious deactivation queued by a
             // preceding bit7=0 write in the same Z80 frame (e.g. sea-viewer does
             // OUT (#FD),0x00  ; "reset" portDFFD before reprogramming banks
@@ -931,8 +931,8 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         VIDEO::profi_clrmem = nullptr;
 #if !PICO_RP2040
         // DEFERRED: same race condition — defer deactivation to EndFrame vblank.
-        extern volatile bool hdmi_profi_ds80_active;
-        bool exiting_ds80 = hdmi_profi_ds80_active || VIDEO::profi_ds80_activate_pending;
+        extern volatile bool profi_ds80_active;
+        bool exiting_ds80 = profi_ds80_active || VIDEO::profi_ds80_activate_pending;
         if (exiting_ds80) {
             VIDEO::profi_ds80_activate_pending   = false; // cancel any pending on
             VIDEO::profi_ds80_deactivate_pending = true;

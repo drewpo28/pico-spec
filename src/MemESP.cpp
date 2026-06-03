@@ -42,6 +42,10 @@ std::list<mem_desc_t> mem_desc_t::pages;
 uint8_t* mem_desc_t::plugged_in[4] = { 0, 0, 0, 0 };
 uint32_t MEM_PG_CNT = 64;
 
+// Per-frame SPI PSRAM swap counters — reset each EndFrame, read in Debug::log.
+volatile uint32_t mem_spi_evict_count = 0;  // from_vram calls (SPI DMA loads)
+volatile uint32_t mem_spi_evict_page  = 0;  // last evicted page index
+
 static FIL f;
 static const char PAGEFILE[] = "/tmp/pico-spec.swap";
 
@@ -69,9 +73,7 @@ uint8_t* mem_desc_t::to_vram(void) {
     uint8_t* res = _int->p;
     uint32_t ba = _int->vram_off;
     if (psram_size() >= ba + MEM_PG_SZ) {
-        for (size_t i = 0; i < MEM_PG_SZ; i += 4) {
-            write32psram(ba + i, *(uint32_t*)(res + i));
-        }
+        psram_write_page(ba, res); // single SPI CS for full 16KB (32-bit PIO counters)
         _int->mem_type = PSRAM_SPI;
     } else {
         #ifdef PICO_DEFAULT_LED_PIN
@@ -93,9 +95,9 @@ void mem_desc_t::from_vram(uint8_t* p) {
     this->_int->p = p;
     uint32_t ba = _int->vram_off;
     if (psram_size() >= ba + MEM_PG_SZ) {
-        for (size_t i = 0; i < MEM_PG_SZ; i += 4) {
-            *(uint32_t*)(p + i) = read32psram(ba + i);
-        }
+        mem_spi_evict_count++;
+        mem_spi_evict_page = ba / MEM_PG_SZ;
+        psram_read_range(ba, p, MEM_PG_SZ); // 8-bit burst, proven stable
     } else {
         UINT br;
         FSIZE_t lba = ba;
@@ -136,7 +138,7 @@ void mem_desc_t::_write(uint16_t addr, uint8_t v) {
 void mem_desc_t::_sync(uint8_t bank) {
     for (auto it = pages.begin(); it != pages.end(); ++it) {
         mem_desc_t& page = *it;
-        if (page._int->mem_type == POINTER) {
+        if (page._int->mem_type == POINTER && !page._int->pinned) {
             for (uint8_t i = 0; i < 4; ++i) {
                 if (i != bank) {
                     if (page._int->p == plugged_in[i]) goto skip;

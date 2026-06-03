@@ -620,6 +620,14 @@ uint32_t read32psram(uint32_t addr32);
 void psram_id(uint8_t rx[8]);
 void writepsram(uint32_t addr32, uint8_t* b, size_t sz);
 void readpsram(uint8_t* b, uint32_t addr32, size_t sz);
+// Burst-read/write: 31/27 bytes per SPI transaction — ~7× less overhead vs per-4-byte loop
+void psram_read_range(uint32_t addr, uint8_t* dst, size_t total);
+void psram_write_range(uint32_t addr, const uint8_t* src, size_t total);
+// Single-transaction page transfer (32-bit PIO counter, ONE SPI CS assertion per 16KB).
+// ~3.5× faster than psram_read/write_range for full-page operations.
+void psram_read_page(uint32_t addr, uint8_t* dst);
+void psram_write_page(uint32_t addr, const uint8_t* src);
+void psram_page_selftest(uint32_t scratch_addr); // diagnostic, run once at init
 
 #ifdef __cplusplus
 }

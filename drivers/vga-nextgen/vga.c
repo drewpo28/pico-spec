@@ -82,6 +82,14 @@ static uint16_t palette_vga16[2][256] = { 0 };
 // Scanline dimmed palette: dithered at ~50% brightness for scanline effect
 static uint16_t palette_vga16_scanline[256] = { 0 };
 
+// Profi DS80 packed-pair palette: slot byte → uint16_t with two distinct VGA pixels.
+// Built by vga_set_profi_ds80_mode(); slot comes from profi_pair_lookup[p0][p1].
+// low byte = left pixel (p0), high byte = right pixel (p1) — PIO right-shifts out LSB first.
+// [0] = even scan lines, [1] = odd scan lines (Bayer 2×2 checkerboard dithering).
+static uint16_t palette_vga_ds80[2][256] = { { 0 } };
+// Unified DS80-active flag: set by both vga_set_profi_ds80_mode and hdmi_set_profi_ds80_mode.
+volatile bool profi_ds80_active = false;
+
 static uint text_buffer_width = 0;
 static uint text_buffer_height = 0;
 
@@ -265,12 +273,20 @@ if (!text_buffer) return;
     uint8_t* output_buffer_8bit;
     switch (graphics_mode) {
         case GRAPHICSMODE_DEFAULT: {
-            uint16_t* pal = (vga_scanlines && (screen_line & 1))
-                ? palette_vga16_scanline
-                : palette_vga16[screen_line & 1];
-            for  (int x = 0; x < width; ++x) {
-                register uint8_t idx = input_buffer_8bit[x ^ 2];
-                *output_buffer_16bit++ = pal[idx];
+            if (profi_ds80_active) {
+                uint16_t* pal = palette_vga_ds80[screen_line & 1];
+                for (int x = 0; x < width; ++x) {
+                    register uint8_t idx = input_buffer_8bit[x ^ 2];
+                    *output_buffer_16bit++ = pal[idx];
+                }
+            } else {
+                uint16_t* pal = (vga_scanlines && (screen_line & 1))
+                    ? palette_vga16_scanline
+                    : palette_vga16[screen_line & 1];
+                for (int x = 0; x < width; ++x) {
+                    register uint8_t idx = input_buffer_8bit[x ^ 2];
+                    *output_buffer_16bit++ = pal[idx];
+                }
             }
             break;
         }
@@ -526,6 +542,56 @@ void vga_set_palette_entry_solid(uint8_t i, uint32_t color888) {
     b2 = (dim & 0xff) / 85;
     vga6 = (r2 << 4) | (g2 << 2) | b2;
     palette_vga16_scanline[i] = ((vga6 << 8) | vga6) & 0x3f3f | palette16_mask;
+}
+
+// Build VGA DS80 packed-pair palette from the 16-color Profi palette and pair_lut.
+// pair_lut is profi_pair_lookup[0][0] (flat 256-byte): pair_lut[p0*16+p1] = slot.
+// Each slot byte maps to a uint16_t: low byte = VGA pixel for p0 (left),
+// high byte = VGA pixel for p1 (right). PIO right-shifts LSB first → correct order.
+// Two tables (even/odd scan lines) implement Bayer 2×2 checkerboard dithering:
+//   p0 is always at even screen x, p1 at odd screen x.
+//   vga_rgb888_dither() gives: even_pair=low(even_x,even_y)/high(odd_x,even_y),
+//                               odd_pair =low(even_x,odd_y) /high(odd_x,odd_y).
+void vga_set_profi_ds80_mode(bool active,
+                              const uint32_t *palette16_rgb888,
+                              const uint8_t  *pair_lut) {
+    if (active && palette16_rgb888 && pair_lut) {
+        // Dithered VGA pixel values for each of 16 Profi colors.
+        uint8_t vga_even_left[16];   // even scan-line, left  pixel (even screen x)
+        uint8_t vga_even_right[16];  // even scan-line, right pixel (odd screen x)
+        uint8_t vga_odd_left[16];    // odd scan-line,  left  pixel
+        uint8_t vga_odd_right[16];   // odd scan-line,  right pixel
+        for (int i = 0; i < 16; i++) {
+            uint16_t ep, op;
+            vga_rgb888_dither(palette16_rgb888[i], &ep, &op);
+            vga_even_left[i]  = ep & 0x3F;
+            vga_even_right[i] = (ep >> 8) & 0x3F;
+            vga_odd_left[i]   = op & 0x3F;
+            vga_odd_right[i]  = (op >> 8) & 0x3F;
+        }
+        // Initialise all slots to (black, black) so unused/border slots are safe.
+        uint16_t black_pair = palette16_mask;
+        for (int s = 0; s < 256; s++) {
+            palette_vga_ds80[0][s] = black_pair;
+            palette_vga_ds80[1][s] = black_pair;
+        }
+        // Fill every (p0, p1) combination that has a valid slot.
+        // written[] guard: for merged slots (paper=8 → paper=0 for ink≤5), the first
+        // pair wins so paper=0's colour is used — matches hdmi_set_profi_ds80_mode().
+        bool written[256] = { false };
+        for (int p0 = 0; p0 < 16; p0++) {
+            for (int p1 = 0; p1 < 16; p1++) {
+                uint8_t slot = pair_lut[p0 * 16 + p1];
+                if (written[slot]) continue;
+                written[slot] = true;
+                palette_vga_ds80[0][slot] = (((uint16_t)vga_even_right[p1] << 8) | vga_even_left[p0]) | palette16_mask;
+                palette_vga_ds80[1][slot] = (((uint16_t)vga_odd_right[p1]  << 8) | vga_odd_left[p0])  | palette16_mask;
+            }
+        }
+        profi_ds80_active = true;
+    } else {
+        profi_ds80_active = false;
+    }
 }
 
 void graphics_set_bgcolor_hdmi(uint32_t color888);

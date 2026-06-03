@@ -62,6 +62,8 @@ extern "C" void hdmi_reinit(void);
 extern "C" void vga_reinit(void);
 #if !PICO_RP2040
 extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
+extern "C" void vga_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
+extern "C" volatile bool profi_ds80_active;
 extern "C" volatile uint hdmi_current_line;
 #endif
 // Place hot video functions in SRAM instead of XIP flash
@@ -119,6 +121,10 @@ int VIDEO::tStatesScreen;
 int VIDEO::tStatesBorder;
 uint8_t* VIDEO::grmem;
 uint8_t* VIDEO::profi_clrmem = nullptr;
+#if !PICO_RP2040
+uint32_t VIDEO::profi_clr_spi_base = 0xFFFFFFFFu;
+extern "C" uint8_t  read8psram(uint32_t addr32);
+#endif
 
 #if !PICO_RP2040
 // Profi DS80 packed-pair framebuffer in butter PSRAM.
@@ -229,7 +235,10 @@ void VIDEO::applyProfiOSDPalette() {
         for (int i = 0; i < 16; i++) profi_palette_saved[i] = profi_palette_live[i];
         profi_palette_saved_valid = true;
         for (int i = 0; i < 16; i++) profi_palette_live[i] = profi_default_palette16[i];
-        hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+        if (SELECT_VGA)
+            vga_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+        else
+            hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
         rebuildDS80ColorLut();
     }
 #endif
@@ -242,7 +251,10 @@ void VIDEO::restoreProfiLivePalette() {
     if (profi_palette_saved_valid) {
         for (int i = 0; i < 16; i++) profi_palette_live[i] = profi_palette_saved[i];
         profi_palette_saved_valid = false;
-        hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+        if (SELECT_VGA)
+            vga_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+        else
+            hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
         rebuildDS80ColorLut();
     }
 #endif
@@ -287,8 +299,7 @@ void VIDEO::profiPaletteWrite(uint8_t index, uint8_t profi_color) {
 #if !PICO_RP2040
     // Only honor palette writes when DS80 mode is active — avoids corrupting
     // defaults from incidental port-0x7E writes during BIOS startup setup.
-    extern volatile bool hdmi_profi_ds80_active;
-    if (!hdmi_profi_ds80_active) return;
+    if (!profi_ds80_active) return;
     uint8_t idx = index & 0x0F;
     uint32_t newRgb = profi_color_to_rgb888(profi_color);
     profi_palette_live[idx] = newRgb;
@@ -1744,24 +1755,23 @@ void VIDEO::Reset() {
     // we're entering non-DS80 mode (e.g. after F11 reset from service menu).
     //
     // Two cases that must both be handled:
-    //   A) hdmi_profi_ds80_active=true  → HDMI is in DS80 mode, must deactivate.
-    //   B) hdmi_profi_ds80_active=false AND profi_ds80_activate_pending=true →
+    //   A) profi_ds80_active=true  → HDMI is in DS80 mode, must deactivate.
+    //   B) profi_ds80_active=false AND profi_ds80_activate_pending=true →
     //      DS80 was requested (port write) but EndFrame hasn't processed it yet.
     //      Without clearing activate_pending here, the very next EndFrame after
     //      reset fires the activate handler → DS80 HDMI active on a machine now
     //      running standard Profi code → standard palette bytes interpreted as
     //      DS80 packed-pairs → fine vertical colour stripes on every pixel pair.
     {
-        extern volatile bool hdmi_profi_ds80_active;
         bool ds80_should_be_active = (Config::arch == "Profi") && (Ports::portDFFD & 0x80);
-        Debug::log("[VRESET] portDFFD=0x%02X hdmi_ds80=%d act=%d deact=%d should=%d",
-            (int)Ports::portDFFD, (int)hdmi_profi_ds80_active,
+        Debug::log("[VRESET] portDFFD=0x%02X ds80=%d act=%d deact=%d should=%d",
+            (int)Ports::portDFFD, (int)profi_ds80_active,
             (int)profi_ds80_activate_pending, (int)profi_ds80_deactivate_pending,
             (int)ds80_should_be_active);
         if (!ds80_should_be_active) {
             // Always kill any pending activation — prevents case B above.
             profi_ds80_activate_pending = false;
-            if (hdmi_profi_ds80_active) {
+            if (profi_ds80_active) {
                 // Case A: schedule deactivation; pre-fill with 0xFF so DS80 HDMI
                 // shows clean black for the one frame until EndFrame processes it.
                 // (0xFF = slot 255 = black/black in DS80 mode per hdmi.c line 810-811)
@@ -2595,11 +2605,13 @@ IRAM_ATTR void VIDEO::EndFrame() {
     // must run during blanking.
     // ----------------------------------------------------------------
     {
-        extern volatile bool hdmi_profi_ds80_active;
         if (profi_ds80_activate_pending) {
             profi_ds80_activate_pending   = false;
             profi_palette_dirty           = false; // palette included in activate
-            hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+            if (SELECT_VGA)
+                vga_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+            else
+                hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
             // Enable the Graphics-layer ZX→DS80 colour remap for the whole DS80 session
             // (not just OSD): any vga.* draw with a standard ZX index (FDD indicator,
             // LED legend, OSD, …) is then mapped to the correct solid DS80 pair slot.
@@ -2616,9 +2628,18 @@ IRAM_ATTR void VIDEO::EndFrame() {
             grmem = MemESP::videoLatch ? MemESP::ram[6].direct() : MemESP::ram[4].direct();
             {
                 uint32_t clrPg = MemESP::videoLatch ? 58u : 56u;
+                // preload(): on SPI-PSRAM boards, the color page may have been evicted
+                // to SPI during the ROM's 1024K test.  Force it back into SRAM so
+                // profi_clrmem is a valid direct() pointer for fast rendering.
+                MemESP::ram[clrPg].preload(); // load into SRAM if in SPI PSRAM
+                MemESP::ram[clrPg].pin();    // prevent eviction: bankLatch sync() hits
+                                             // page 58 72×/frame on SPI-PSRAM boards
                 extern int ram_pages, butter_pages, psram_pages, swap_pages;
                 int totPg = ram_pages + butter_pages + psram_pages + swap_pages;
                 profi_clrmem = ((int)clrPg < totPg) ? MemESP::ram[clrPg].direct() : nullptr;
+                profi_clr_spi_base = 0xFFFFFFFFu;
+                if (!profi_clrmem && MemESP::ram[clrPg].memType() == mem_type_t::PSRAM_SPI)
+                    profi_clr_spi_base = MemESP::ram[clrPg].spiBase();
             }
             tStatesScreen -= (int)lin_end * (int)tStatesPerLine;
             lin_end  = 0;
@@ -2638,7 +2659,10 @@ IRAM_ATTR void VIDEO::EndFrame() {
         } else if (profi_ds80_deactivate_pending) {
             profi_ds80_deactivate_pending = false;
             Debug::log("[EF] DS80 deactivate: grmem=%p clrmem=%p", grmem, profi_clrmem);
-            hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
+            if (SELECT_VGA)
+                vga_set_profi_ds80_mode(false, nullptr, nullptr);
+            else
+                hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
             Graphics8BitPalette::ds80_active = false; // leave DS80 → raw ZX indices again
             // Clear framebuffer: DS80 packed-pair slot values look like garbage
             // when re-interpreted through the standard HDMI conv_color table.
@@ -2649,6 +2673,7 @@ IRAM_ATTR void VIDEO::EndFrame() {
             // Restore standard Profi (non-DS80) geometry.
             grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
             profi_clrmem = nullptr;
+            MemESP::ram[MemESP::videoLatch ? 58u : 56u].unpin(); // restore normal eviction
             {
                 bool isFB    = VIDEO::isFullBorderMode();
                 bool isFB240 = VIDEO::isFullBorder240();
@@ -2665,13 +2690,14 @@ IRAM_ATTR void VIDEO::EndFrame() {
     }
 
     // Profi palette refresh — immediately after mode-switch handling, while
-    // still guaranteed to be in HDMI blanking window (ESPectrum_vsync fires
-    // at v_active, and we are only a few μs in at this point).
+    // still guaranteed to be in blanking window (ESPectrum_vsync fires at v_active).
     {
-        extern volatile bool hdmi_profi_ds80_active;
-        if (profi_palette_dirty && hdmi_profi_ds80_active
+        if (profi_palette_dirty && profi_ds80_active
             && !profi_ds80_activate_pending && !profi_ds80_deactivate_pending) {
-            hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+            if (SELECT_VGA)
+                vga_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+            else
+                hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
             profi_palette_dirty = false;
         }
     }
@@ -2682,8 +2708,7 @@ IRAM_ATTR void VIDEO::EndFrame() {
     // current border colour each frame (frame-accurate; side borders are per-line).
     // 640×480 (yres=240) has no vertical border band → nothing to do.
     {
-        extern volatile bool hdmi_profi_ds80_active;
-        if (hdmi_profi_ds80_active && vga.frameBuffer && (int)vga.yres >= 288) {
+        if (profi_ds80_active && vga.frameBuffer && (int)vga.yres >= 288) {
             // Border colour = Palette[(~borderIndex) & 7] (inverse index — see renderer).
             uint8_t bidx = (uint8_t)(~VIDEO::borderColor) & 0x07;
             uint8_t bbyte = profi_pair_lookup[bidx][bidx];
@@ -2709,6 +2734,23 @@ IRAM_ATTR void VIDEO::EndFrame() {
                     memset(row, bbyte, vga.xres);
                 }
             }
+        }
+    }
+
+    // SPI PSRAM swap diagnostics: log eviction count once every 60 frames.
+    {
+        static uint32_t evict_log_frame = 0;
+        static uint32_t evict_accum = 0;
+        static uint32_t evict_last_page = 0;
+        evict_accum  += mem_spi_evict_count;
+        evict_last_page = mem_spi_evict_page;
+        mem_spi_evict_count = 0;
+        if (++evict_log_frame >= 60) {
+            evict_log_frame = 0;
+            if (evict_accum)
+                Debug::log("[SPI] evict/60f=%u last_pg=%u (%.1f/frame)",
+                           evict_accum, evict_last_page, evict_accum / 60.0f);
+            evict_accum = 0;
         }
     }
 
@@ -2984,7 +3026,7 @@ IRAM_ATTR void VIDEO::TopBorder() {
             brdcol_cnt = brdcol_start;
             lastBrdTstate += tStatesPerLine - brdcol_end;
 
-            if (brdlin_cnt == lin_end) {
+            if (brdlin_cnt >= lin_end) {
                 DrawBorder = &MiddleBorder;
                 MiddleBorder();
                 return;

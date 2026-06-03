@@ -1,8 +1,8 @@
 set pagination off
 # Dump Profi DS80 framebuffer and decoding tables.
-# Requires hdmi_profi_ds80_active == 1 for meaningful content,
+# Requires profi_ds80_active == 1 for meaningful content,
 # but dumps unconditionally so you can run it any time.
-printf "hdmi_profi_ds80_active: %d\n", hdmi_profi_ds80_active
+printf "profi_ds80_active: %d\n", profi_ds80_active
 
 set $w = VIDEO::vga.xres
 set $h = VIDEO::vga.yres
@@ -13,7 +13,7 @@ printf "screenshot profi: %dx%d fb=%p\n", $w, $h, $fb0
 # Layout per row: 32-byte black pad | 256-byte content (packed pairs) | 32-byte pad
 dump binary memory /tmp/picospec_profi_fb.bin $fb0 ($fb0 + $w * $h)
 
-# Pair lookup table: uint8_t[16][16], row-major [ink][paper] → HDMI slot index
+# Pair lookup table: uint8_t[16][16], row-major [ink][paper] → DS80 slot index
 dump binary memory /tmp/picospec_profi_lut.bin \
     &VIDEO::profi_pair_lookup \
     ((char*)(&VIDEO::profi_pair_lookup) + 256)
