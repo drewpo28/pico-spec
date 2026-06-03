@@ -4036,6 +4036,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     break;
                                 } else if (opt_p == 2) {
                                     // XT keyboard toggle (Yes/No submenu) — level 3
+                                    // Remind the user it can also be toggled live via the hotkey.
+                                    osdCenteredMsg(Config::lang
+                                        ? " Atajo: Alt+~ alterna teclado XT "
+                                        : " Hotkey Alt+~ toggles XT keyboard ", LEVEL_WARN, 3000);
                                     menu_level = 3;
                                     menu_curopt = 1;
                                     menu_saverect = true;
