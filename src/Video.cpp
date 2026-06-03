@@ -1407,7 +1407,6 @@ void VIDEO::changeMode() {
                 else video_mode = 1;
                 break;
             case Config::VM_720x480_60: video_mode = 7; break;
-            case Config::VM_720x576_60: video_mode = 8; break;
             case Config::VM_720x576_50:
                 if (Config::arch == "48K") video_mode = 5;
                 else if (Config::arch == "128K" || Config::arch == "ALF") video_mode = 6;
@@ -1424,7 +1423,6 @@ void VIDEO::changeMode() {
                 else video_mode = 1;
                 break;
             case Config::VM_720x480_60: video_mode = 7; break;
-            case Config::VM_720x576_60: video_mode = 8; break;
             case Config::VM_720x576_50:
                 if (Config::arch == "48K") video_mode = 5;
                 else if (Config::arch == "128K" || Config::arch == "ALF") video_mode = 6;
@@ -1698,9 +1696,6 @@ void VIDEO::Reset() {
             case Config::VM_720x480_60:
                 video_mode = 7;
                 break;
-            case Config::VM_720x576_60:
-                video_mode = 8;
-                break;
             case Config::VM_720x576_50:
                 if (Config::arch == "48K") video_mode = 5;
                 else if (Config::arch == "128K" || Config::arch == "ALF") video_mode = 6;
@@ -1725,9 +1720,6 @@ void VIDEO::Reset() {
                 break;
             case Config::VM_720x480_60:
                 video_mode = 7;
-                break;
-            case Config::VM_720x576_60:
-                video_mode = 8;
                 break;
             case Config::VM_720x576_50:
                 if (Config::arch == "48K") video_mode = 5;

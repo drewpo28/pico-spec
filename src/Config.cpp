@@ -648,12 +648,19 @@ void Config::load() {
             nvs_get_b("half_border", hb, sts);
             nvs_get_b("full_border_60", fb60, sts);
             nvs_get_i("hdmi_video_mode", old_mode, sts);
-            Config::hdmi_video_mode = hb ? VM_720x480_60 : fb60 ? VM_720x576_60 : fb ? VM_720x576_50 : (old_mode > 0 ? VM_640x480_50 : VM_640x480_60);
+            // 720x576@60 was removed (non-working) — old fb60 maps to 720x576@50
+            Config::hdmi_video_mode = hb ? VM_720x480_60 : (fb60 || fb) ? VM_720x576_50 : (old_mode > 0 ? VM_640x480_50 : VM_640x480_60);
+        } else if (Config::hdmi_video_mode > VM_720x576_50) {
+            // Remap configs saved before 720x576@60 removal: old enum 4 (@50) -> 3, old 3 (@60) handled below
+            Config::hdmi_video_mode = VM_720x576_50;
         }
         if (!nvs_get_u8("vga_vmode", Config::vga_video_mode, sts)) {
             int old_mode = 0;
             nvs_get_i("vga_video_mode", old_mode, sts);
             Config::vga_video_mode = old_mode > 0 ? VM_640x480_50 : VM_640x480_60;
+        } else if (Config::vga_video_mode > VM_720x576_50) {
+            // Remap configs saved before 720x576@60 removal
+            Config::vga_video_mode = VM_720x576_50;
         }
         nvs_get_b("v_sync_enabled", v_sync_enabled, sts);
         #if PICO_RP2350

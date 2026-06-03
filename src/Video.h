@@ -280,7 +280,7 @@ public:
   }
   static bool isFullBorderMode() { return activeVideoMode() >= Config::VM_720x480_60; }
   static bool isFullBorder240()  { return activeVideoMode() == Config::VM_720x480_60; }
-  static bool isFullBorder288()  { return activeVideoMode() >= Config::VM_720x576_60; }
+  static bool isFullBorder288()  { return activeVideoMode() >= Config::VM_720x576_50; }
 
   static bool gigascreen_enabled;
   static uint8_t gigascreen_auto_countdown;

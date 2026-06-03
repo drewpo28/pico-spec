@@ -720,7 +720,6 @@ static const char *MENU_VIDEO[2] = { MENU_VIDEO_EN, MENU_VIDEO_ES };
     "640x480@60\t[6]\n"\
     "640x480@50\t[5]\n"\
     "720x480@60\t[H]\n"\
-    "720x576@60!\t[X]\n"\
     "720x576@50\t[F]\n"
 
 #define MENU_VIDEO_MODE_ES \
@@ -728,7 +727,6 @@ static const char *MENU_VIDEO[2] = { MENU_VIDEO_EN, MENU_VIDEO_ES };
     "640x480@60\t[6]\n"\
     "640x480@50\t[5]\n"\
     "720x480@60\t[H]\n"\
-    "720x576@60!\t[X]\n"\
     "720x576@50\t[F]\n"
 #endif
 

@@ -307,7 +307,6 @@ void OSD::drawOSD(bool bottom_info) {
             case Config::VM_640x480_60: vmname = "640x480@60Hz"; break;
             case Config::VM_640x480_50: vmname = "640x480@50Hz"; break;
             case Config::VM_720x480_60: vmname = "720x480@60Hz"; break;
-            case Config::VM_720x576_60: vmname = "720x576@60Hz"; break;
             case Config::VM_720x576_50: vmname = "720x576@50Hz"; break;
             default:                    vmname = "unknown";      break;
         }
@@ -3225,14 +3224,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 uint8_t dummy_vm = 0;
                                 uint8_t &curVideoMode = dummy_vm;
 #endif
-                                // cur_sel maps directly to VM_* enum: 0=640x480@60, 1=640x480@50, 2=720x480@60, 3=720x576@60, 4=720x576@50
+                                // cur_sel maps directly to VM_* enum: 0=640x480@60, 1=640x480@50, 2=720x480@60, 3=720x576@50
                                 uint8_t cur_sel = curVideoMode;
                                 opt_menu.replace(opt_menu.find("[6",0),2, cur_sel == 0 ? "[*" : "[ ");
                                 opt_menu.replace(opt_menu.find("[5",0),2, cur_sel == 1 ? "[*" : "[ ");
                             #if !PICO_RP2040
                                 opt_menu.replace(opt_menu.find("[H",0),2, cur_sel == 2 ? "[*" : "[ ");
-                                opt_menu.replace(opt_menu.find("[X",0),2, cur_sel == 3 ? "[*" : "[ ");
-                                opt_menu.replace(opt_menu.find("[F",0),2, cur_sel == 4 ? "[*" : "[ ");
+                                opt_menu.replace(opt_menu.find("[F",0),2, cur_sel == 3 ? "[*" : "[ ");
                             #endif
                                 uint8_t opt2 = menuRun(opt_menu);
                                 if (opt2) {
@@ -8540,7 +8538,6 @@ void OSD::EmulatorInfo() {
             case Config::VM_640x480_60: vmname = "640x480@60"; break;
             case Config::VM_640x480_50: vmname = "640x480@50"; break;
             case Config::VM_720x480_60: vmname = "720x480@60"; break;
-            case Config::VM_720x576_60: vmname = "720x576@60"; break;
             case Config::VM_720x576_50: vmname = "720x576@50"; break;
             default:                    vmname = "unknown";    break;
         }
