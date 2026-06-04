@@ -37,6 +37,7 @@ option(SND_PORT_TRACE "Enable per-port I/O histogram (sound-DAC port hunting)" O
 option(PERF_TRACE "Enable per-60-frame CPU/HDMI/FPS performance logging" OFF)
 option(GS_PERF_TRACE "Enable General Sound per-second perf counters (GS.cpp)" OFF)
 option(GS_DEBUG_TRACE "Enable General Sound port-IO trace ring + auto-dumps (~50 KB SRAM)" OFF)
+option(ZIFI_TRACE "Enable ZiFi (ESP-01S WiFi NIC) port/UART tracing" ON)
 
 # Per-board Debug-Probe UART toggles (logging over UART). Declared here together;
 # the board-specific `if(<board>_DBG_UART)` blocks below consume them (they call
@@ -44,7 +45,7 @@ option(GS_DEBUG_TRACE "Enable General Sound port-IO trace ring + auto-dumps (~50
 # Each enables stdio over the board's Debug-Probe header — see the block for pins.
 set(MURM1_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1) — moves KBD to GP16/GP17, disables NESPAD")
 set(PICO_PC_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on DBG1 header GP0/GP1 (PICO_PC)")
-set(PICO_DV_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
+set(PICO_DV_DBG_UART ON CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
 set(ZERO_DBG_UART    OFF CACHE BOOL "Enable Debug Probe UART0 on GP16/GP13 (ZERO)")
 set(ZERO2_DBG_UART   OFF  CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO2)")
 
@@ -318,26 +319,11 @@ else ()
     target_compile_definitions(${PROJECT_NAME} PRIVATE PROFI_PORT_TRACE=0)
 endif ()
 
-# Per-port I/O histogram for hunting unknown sound-DAC ports (see Ports.cpp
-# `#if SND_PORT_TRACE`). Dumps W/R counts per low address byte every ~5 s.
-if (SND_PORT_TRACE)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE SND_PORT_TRACE=1)
+# ZiFi port/UART tracing (see ZiFi.cpp / ZiFiAT.cpp `#if ZIFI_TRACE`).
+if (ZIFI_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_TRACE=1)
 else ()
-    target_compile_definitions(${PROJECT_NAME} PRIVATE SND_PORT_TRACE=0)
-endif ()
-
-# Per-60-frame performance logging (see Video.cpp `#if PERF_TRACE`).
-if (PERF_TRACE)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE PERF_TRACE=1)
-else ()
-    target_compile_definitions(${PROJECT_NAME} PRIVATE PERF_TRACE=0)
-endif ()
-
-# halt2int floating-bus probe trace (see Ports.cpp `#if HALT2INT_TRACE`).
-if (HALT2INT_TRACE)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE HALT2INT_TRACE=1)
-else ()
-    target_compile_definitions(${PROJECT_NAME} PRIVATE HALT2INT_TRACE=0)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_TRACE=0)
 endif ()
 
 if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
@@ -395,6 +381,12 @@ endif()
 # To enable UART backend, pass -DZIFI_TX_PIN=<gpio> -DZIFI_RX_PIN=<gpio> to cmake.
 # Example (ZERO2, UART1 on GPIO 20/21):
 #   cmake -DZERO2=1 -DZIFI_TX_PIN=20 -DZIFI_RX_PIN=21 ..
+# Per-board defaults (overridable on the command line):
+#   PICO_DV: GP0/GP1 = UART0 TX/RX (freed from PS/2 KBD, which moved to GP14/15).
+if (PICO_DV AND NOT DEFINED ZIFI_TX_PIN)
+    set(ZIFI_TX_PIN 0)
+    set(ZIFI_RX_PIN 1)
+endif()
 # Error if ZIFI_TX_PIN and MIDI_TX_PIN share the same UART instance.
 if (ZIFI_TX_PIN AND NOT PICO_PLATFORM STREQUAL "rp2040")
     target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_TX_PIN=${ZIFI_TX_PIN})
@@ -572,8 +564,8 @@ ELSEIF(PICO_DV)
     # Note: GP20 is also LOAD_WAV_PIO default — auto-remapped to GP3 when UART enabled.
     if(PICO_DV_DBG_UART)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
-        set(PICO_DV_LOAD_WAV_PIO 3)  # GP20 taken by UART → use FREE pin
-        set(MIDI_TX_PIN 3) # GP21 taken by UART → use FREE pin
+        set(PICO_DV_LOAD_WAV_PIO 255)  # GP20 taken by UART → use FREE pin
+        set(MIDI_TX_PIN 255) # GP21 taken by UART → use FREE pin
     else()
         set(PICO_DV_LOAD_WAV_PIO 20)
         set(MIDI_TX_PIN 21)
@@ -588,9 +580,9 @@ ELSEIF(PICO_DV)
 
         PICO_DV=1
 
-        # DBG1 1/2
-        KBD_CLOCK_PIN=0
-        KBD_DATA_PIN=1
+        # PS/2 keyboard (moved from GP0/1 → GP14/15; GP0/1 freed for ZiFi UART0)
+        KBD_CLOCK_PIN=14
+        KBD_DATA_PIN=15
 
         LOAD_WAV_PIO=${PICO_DV_LOAD_WAV_PIO}
 

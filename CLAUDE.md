@@ -158,15 +158,15 @@ On RP2350, UART TX available via two funcsel:
 
 | GPIO | Function | Cat | Notes |
 |------|----------|-----|-------|
-| 0 | KBD_CLOCK | REASSIGN | |
-| 1 | KBD_DATA | REASSIGN | |
+| 0 | ZiFi UART0 TX | REASSIGN | freed from KBD; UART0 TX funcsel 2 |
+| 1 | ZiFi UART0 RX | REASSIGN | freed from KBD; UART0 RX funcsel 2 |
 | 2 | — | FREE | |
 | 3 | — | FREE | |
 | 4 | — | FREE | |
 | 5 | SD SCK | FIXED | SPI1 PCB |
 | 6-13 | VGA/HDMI (8 pins) | FIXED | Display base=6; NES_CLK=8, NES_LAT=9 conflict! |
-| 14 | — | FREE | |
-| 15 | — | FREE | |
+| 14 | KBD_CLOCK | REASSIGN | moved from GP0 for ZiFi |
+| 15 | KBD_DATA | REASSIGN | moved from GP1 for ZiFi |
 | 16 | — | FREE | |
 | 17 | — | FREE | |
 | 18 | SD MOSI | FIXED | SPI1 PCB |

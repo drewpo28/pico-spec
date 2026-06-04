@@ -146,7 +146,9 @@ void __not_in_flash("zifi") ZiFi::write(uint8_t hi, uint8_t data) {
             if ((data & 0xF8) == 0xF0) {
                 // SET API mode: 11110mmm
                 api_mode = data & 0x07;
+#if ZIFI_TRACE
                 Debug::log("ZiFi CR: SET API mode=%d", api_mode);
+#endif
             } else if (data <= 0x03) {
                 // CLRFIFO: bit0=clear in, bit1=clear out
                 if (data & 0x01) { zifi_in_head  = zifi_in_tail  = 0; }

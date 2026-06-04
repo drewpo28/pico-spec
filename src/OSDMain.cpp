@@ -5590,6 +5590,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         OSD::osdCenteredMsg(MSG_WIFI_CFG_RELOADED[Config::lang], LEVEL_INFO, 2000);
                     }
                     else if (net_opt == 5) { // ZiFi NIC toggle
+                        // Child submenu — MUST run at menu_level 2, not 1. At level 1 its
+                        // saverect draw overwrites prev_y[1] with a shifted-down y, so the
+                        // Network menu redraws lower while the old copy lingers (ghost/dup).
+                        menu_level = 2;
                         menu_saverect = true;
                         menu_curopt = Config::zifi_enabled + 1;
                         uint8_t zn = menuRun(MENU_ZIFI_NIC[Config::lang]);
