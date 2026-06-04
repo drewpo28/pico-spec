@@ -19,17 +19,41 @@ static bool psram_page_ready = false;
 #define MAX_PSRAM (16ul << 20)
 
 static uint32_t __psram_sz = 0;
+
+// Read a 32-bit word, tolerating the known flaky-first-transaction after the
+// 0x66/0x99 reset (see init_psram): a single read can come back garbage, so
+// confirm with a second read and trust agreement.
+static uint32_t psram_read32_stable(uint32_t addr) {
+    uint32_t a = psram_read32(&psram_spi, addr);
+    uint32_t b = psram_read32(&psram_spi, addr);
+    return (a == b) ? a : psram_read32(&psram_spi, addr);
+}
+
+// Size the chip by address-aliasing: a chip of size S ignores address bits
+// above log2(S), so a write at offset S wraps onto offset 0.  We plant a canary
+// at offset 0, then for each candidate boundary write a DIFFERENT value there
+// and check whether the canary at 0 got clobbered (→ wrapped → that boundary is
+// the size) AND that the boundary itself reads back what we wrote (→ a genuine
+// cell, not a corrupted transaction).  Returns the chip size in bytes.
 static uint32_t _psram_size() {
 #ifdef PSRAM
-    int32_t res = 0;
-    for (res = ITE_PSRAM; res < MAX_PSRAM; res += ITE_PSRAM) {
-        psram_write32(&psram_spi, res, res);
-        if (res != psram_read32(&psram_spi, res)) {
-            res -= ITE_PSRAM;
+    const uint32_t CANARY = 0xA5A5A5A5u;
+    psram_write32(&psram_spi, 0, CANARY);
+    if (psram_read32_stable(0) != CANARY) return 0; // no PSRAM responding
+
+    for (uint32_t res = ITE_PSRAM; res < MAX_PSRAM; res += ITE_PSRAM) {
+        // Use a value that is distinct from CANARY and from `res` itself.
+        uint32_t marker = res ^ 0x5A5A5A5Au;
+        psram_write32(&psram_spi, res, marker);
+        bool boundary_ok = (psram_read32_stable(res) == marker);
+        bool canary_kept = (psram_read32_stable(0) == CANARY);
+        if (!boundary_ok || !canary_kept) {
+            // `res` either wrapped onto 0 (canary clobbered) or is unreadable →
+            // it is past the end of the chip.  Size = this boundary.
             return res;
         }
     }
-    return res - psram_read32(&psram_spi, ITE_PSRAM) + ITE_PSRAM;
+    return MAX_PSRAM;
 #else
     return 0;
 #endif
