@@ -65,6 +65,17 @@ extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16,
 extern "C" void vga_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
 extern "C" volatile bool profi_ds80_active;
 extern "C" volatile uint hdmi_current_line;
+
+#ifndef VGA_HDMI
+// Profi DS80 packed-pair display mode is implemented entirely inside the VGA/HDMI
+// drivers (which SOFTTV/TFT/TV builds do not link).  These symbols are still
+// referenced from shared code on the (never-taken) DS80 code paths, so provide
+// fallbacks here: profi_ds80_active stays false → every DS80 branch is dead, and
+// the mode-switch entry points become no-ops.
+extern "C" volatile bool profi_ds80_active = false;
+extern "C" void hdmi_set_profi_ds80_mode(bool, const uint32_t *, const uint8_t *) {}
+extern "C" void vga_set_profi_ds80_mode(bool, const uint32_t *, const uint8_t *) {}
+#endif
 #endif
 // Place hot video functions in SRAM instead of XIP flash
 #undef IRAM_ATTR
@@ -218,6 +229,22 @@ void VIDEO::rebuildDS80ColorLut() {
 #if !PICO_RP2040
 static uint32_t profi_palette_saved[16];
 static bool     profi_palette_saved_valid = false;
+
+// Apply/clear the Profi DS80 packed-pair display mode on whichever video driver is
+// compiled in.  DS80 relies on the VGA/HDMI driver's conv_color pair-slot machinery
+// (and SELECT_VGA to pick between the two) — neither exists under SOFTTV/TFT, where
+// there is no DS80 output path, so this is a no-op for those builds.
+static inline void profi_ds80_driver_set(bool active, const uint32_t *palette16, const uint8_t *pair_lut) {
+#ifdef VGA_HDMI
+    extern bool SELECT_VGA;
+    if (SELECT_VGA)
+        vga_set_profi_ds80_mode(active, palette16, pair_lut);
+    else
+        hdmi_set_profi_ds80_mode(active, palette16, pair_lut);
+#else
+    (void)active; (void)palette16; (void)pair_lut;
+#endif
+}
 #endif
 
 // OSD palette override for DS80.  The Graphics-layer ZX→DS80 colour remap
@@ -241,10 +268,7 @@ void VIDEO::applyProfiOSDPalette() {
         for (int i = 0; i < 16; i++) profi_palette_saved[i] = profi_palette_live[i];
         profi_palette_saved_valid = true;
         for (int i = 0; i < 16; i++) profi_palette_live[i] = profi_default_palette16[i];
-        if (SELECT_VGA)
-            vga_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
-        else
-            hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+        profi_ds80_driver_set(true, profi_palette_live, &profi_pair_lookup[0][0]);
         rebuildDS80ColorLut();
     }
 #endif
@@ -257,10 +281,7 @@ void VIDEO::restoreProfiLivePalette() {
     if (profi_palette_saved_valid) {
         for (int i = 0; i < 16; i++) profi_palette_live[i] = profi_palette_saved[i];
         profi_palette_saved_valid = false;
-        if (SELECT_VGA)
-            vga_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
-        else
-            hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+        profi_ds80_driver_set(true, profi_palette_live, &profi_pair_lookup[0][0]);
         rebuildDS80ColorLut();
     }
 #endif
@@ -2614,10 +2635,7 @@ IRAM_ATTR void VIDEO::EndFrame() {
         if (profi_ds80_activate_pending) {
             profi_ds80_activate_pending   = false;
             profi_palette_dirty           = false; // palette included in activate
-            if (SELECT_VGA)
-                vga_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
-            else
-                hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+            profi_ds80_driver_set(true, profi_palette_live, &profi_pair_lookup[0][0]);
             // Enable the Graphics-layer ZX→DS80 colour remap for the whole DS80 session
             // (not just OSD): any vga.* draw with a standard ZX index (FDD indicator,
             // LED legend, OSD, …) is then mapped to the correct solid DS80 pair slot.
@@ -2665,10 +2683,7 @@ IRAM_ATTR void VIDEO::EndFrame() {
         } else if (profi_ds80_deactivate_pending) {
             profi_ds80_deactivate_pending = false;
             Debug::log("[EF] DS80 deactivate: grmem=%p clrmem=%p", grmem, profi_clrmem);
-            if (SELECT_VGA)
-                vga_set_profi_ds80_mode(false, nullptr, nullptr);
-            else
-                hdmi_set_profi_ds80_mode(false, nullptr, nullptr);
+            profi_ds80_driver_set(false, nullptr, nullptr);
             Graphics8BitPalette::ds80_active = false; // leave DS80 → raw ZX indices again
             // Clear framebuffer: DS80 packed-pair slot values look like garbage
             // when re-interpreted through the standard HDMI conv_color table.
@@ -2700,10 +2715,7 @@ IRAM_ATTR void VIDEO::EndFrame() {
     {
         if (profi_palette_dirty && profi_ds80_active
             && !profi_ds80_activate_pending && !profi_ds80_deactivate_pending) {
-            if (SELECT_VGA)
-                vga_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
-            else
-                hdmi_set_profi_ds80_mode(true, profi_palette_live, &profi_pair_lookup[0][0]);
+            profi_ds80_driver_set(true, profi_palette_live, &profi_pair_lookup[0][0]);
             profi_palette_dirty = false;
         }
     }

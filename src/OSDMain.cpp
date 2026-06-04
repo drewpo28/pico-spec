@@ -3711,12 +3711,18 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 // Profi needs PSRAM (DS80 hires framebuffer in PSRAM); without it
                 // the emulation is pointless, so hide the entry on SD-only boards.
                 // It also needs RP2350 (RP2040 has no DS80 hires support), so it is
-                // hidden on RP2040 regardless of PSRAM.
+                // hidden on RP2040 regardless of PSRAM.  The DS80 hires mode lives
+                // entirely in the VGA/HDMI drivers, so it is also hidden on non-VGA/HDMI
+                // builds (TFT/SOFTTV/TV).
                 // Stripping "Profi" keeps indices of the items before it stable;
                 // any trailing item (ALF) shifts up by one and is keyed off the
                 // computed last index below.  show_profi gates both the menu entry
                 // and the arch_num==8 branch so the indices stay consistent.
-#if PICO_RP2040
+#if PICO_RP2040 || !defined(VGA_HDMI)
+                // RP2040 has no DS80 hires support; non-VGA/HDMI builds (TFT/SOFTTV/TV)
+                // do not link the DS80 packed-pair display mode (the set_profi_ds80_mode
+                // entry points are no-op stubs there — see Video.cpp), so Profi would
+                // run without its defining hires mode. Hide it on those builds.
                 const bool show_profi = false;
 #else
                 const bool show_profi = has_psram;
