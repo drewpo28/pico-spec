@@ -40,7 +40,7 @@ option(PROFI_PORT_TRACE "Enable 0x7FFD/0xDFFD paging-port write tracing" OFF)
 # Each enables stdio over the board's Debug-Probe header — see the block for pins.
 set(MURM1_DBG_UART   OFF  CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1) — moves KBD to GP16/GP17, disables NESPAD")
 set(PICO_PC_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on DBG1 header GP0/GP1 (PICO_PC)")
-set(PICO_DV_DBG_UART ON CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
+set(PICO_DV_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
 set(ZERO_DBG_UART    OFF CACHE BOOL "Enable Debug Probe UART0 on GP16/GP13 (ZERO)")
 set(ZERO2_DBG_UART   OFF  CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO2)")
 
@@ -51,7 +51,8 @@ set(ZERO2_DBG_UART   OFF  CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZER
 # set(TFT_INV ON)
 # set(ILI9341 ON)
 # set(ST7789 ON)
-# set(SOFTTV ON) 
+# set(SOFTTV ON)
+# set(PSRAM OFF)  #For Testing Only
 
 # Display output (default: VGA_HDMI; override with -D flags, e.g. cmake -DSOFTTV=ON)
 if(NOT VGA_HDMI AND NOT SOFTTV AND NOT TFT AND NOT ILI9341 AND NOT TV)
@@ -60,7 +61,7 @@ endif()
 set(NO_ALF 1)
 
 set(CPU_MHZ 378)
-set (PORT_VERSION "1.2.18")
+set (PORT_VERSION "1.2.19")
 string(LENGTH "${PORT_VERSION}" PORT_VERSION_LEN)
 
 # Target board (default: PICO_PC; override with -D flags, e.g. cmake -DMURM2=ON)
@@ -136,6 +137,13 @@ ELSE()
     set(CONFIG_BOARD_TAG "m1${BOARD_CHIP_TAG}")
     set (BUTTER_PSRAM_GPIO 19)
 ENDIF()
+
+# PSRAM kill-switch: only when set(PSRAM OFF) is explicitly uncommented above
+# (an undefined/unset PSRAM leaves PSRAM enabled). Forces the butter PSRAM CS to
+# GPIO 255 (no valid pin) so the driver treats PSRAM as absent on every board.
+if(PSRAM STREQUAL "OFF")
+    set(BUTTER_PSRAM_GPIO 255)
+endif()
 
 set(OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE}")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
@@ -769,6 +777,12 @@ ELSE()
         # PSRAM_MUTEX=1
         PSRAM_SPINLOCK=1
         PSRAM_ASYNC=1
+
+        # SPI clock ceiling for size probe + access. 126 MHz (default) at
+        # sys_clk=378 gave clkdiv=1.5 → ~126 MHz SCK, too fast for this board's
+        # APS6404 8 MB chip: reads past the 1 MB boundary corrupt and the size
+        # probe truncated to 1 MB. 63 MHz (clkdiv=3.0) is well within spec.
+        PSRAM_MAX_SCK_MHZ=63
 
         PSRAM_PIN_CS=18
         PSRAM_PIN_SCK=19

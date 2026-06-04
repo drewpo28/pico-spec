@@ -938,6 +938,9 @@ static void __not_in_flash_func(psram_retiming)() {
                           divisor << QMI_M1_TIMING_CLKDIV_LSB;
 }
 uint32_t __not_in_flash_func(butter_psram_size)() {
+#if BUTTER_PSRAM_GPIO == 255
+    return 0;   // PSRAM disabled via CMake kill-switch (set(PSRAM OFF))
+#else
     if (BUTTER_PSRAM_SIZE != -1) return BUTTER_PSRAM_SIZE;
     for(register int i = MB8; i < MB16; i += 4096)
         PSRAM_DATA[i] = 16;
@@ -954,6 +957,7 @@ uint32_t __not_in_flash_func(butter_psram_size)() {
     }
     BUTTER_PSRAM_SIZE = res << 20;
     return BUTTER_PSRAM_SIZE;
+#endif
 }
 void __no_inline_not_in_flash_func(psram_init)(uint cs_pin) {
     gpio_set_function(cs_pin, GPIO_FUNC_XIP_CS1);
@@ -1154,9 +1158,13 @@ int main() {
 #if PICO_RP2350
     rp2350a = (*((io_ro_32*)(SYSINFO_BASE + SYSINFO_PACKAGE_SEL_OFFSET)) & 1);
     #ifdef BUTTER_PSRAM_GPIO
+    #if BUTTER_PSRAM_GPIO == 255
+        psram_pin = 255;   // PSRAM disabled via CMake kill-switch (set(PSRAM OFF))
+    #else
         psram_pin = rp2350a ? BUTTER_PSRAM_GPIO : 47;
         psram_init(psram_pin);
         butter_psram_size();
+    #endif
     #endif
     exception_set_exclusive_handler(HARDFAULT_EXCEPTION, sigbus);
 #endif
@@ -1166,6 +1174,7 @@ int main() {
     nespad_begin(clock_get_hz(clk_sys) / 1000, NES_GPIO_CLK, NES_GPIO_DATA, NES_GPIO_LAT);
 #endif
 
+#if !defined(BUTTER_PSRAM_GPIO) || BUTTER_PSRAM_GPIO != 255   // skip when PSRAM kill-switch on (set(PSRAM OFF))
 #if PICO_RP2350
     if (butter_psram_size() == 0 || psram_pin != PSRAM_PIN_SCK) {
 #endif
@@ -1174,6 +1183,7 @@ int main() {
     #endif
 #if PICO_RP2350
     }
+#endif
 #endif
     Debug::log("main: psram init done");
     // send kbd reset only after initial process passed
@@ -1265,7 +1275,7 @@ int main() {
 #ifndef PICO_RP2040
         flash_timings(Config::cpu_mhz);
 #endif
-#if PICO_RP2350 && defined(BUTTER_PSRAM_GPIO)
+#if PICO_RP2350 && defined(BUTTER_PSRAM_GPIO) && BUTTER_PSRAM_GPIO != 255
         psram_retiming();
 #endif
     }
