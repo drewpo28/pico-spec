@@ -1067,12 +1067,12 @@ static void process_gp_feed_2320(uint8_t instance, uint8_t const* report, uint16
     }
 
     static bool prev_x = false, prev_y = false, prev_l = false, prev_r = false;
-    // FEED:2320 button remap (cyclic): Y->Z, C->Y, Z->C. X unchanged.
-    // btn_y = physical Y, btn_r = physical C, btn_l = physical Z.
+    // FEED:2320 button remap (identity). Physical bit assignment deduced from hw:
+    // physical Y = btn_l, physical C = btn_y, physical Z = btn_r. X unchanged.
     if (btn_x != prev_x) { kbdPushData(fabgl::VirtualKey::VK_JOY_X, btn_x); prev_x = btn_x; }
-    if (btn_y != prev_y) { kbdPushData(fabgl::VirtualKey::VK_JOY_Z, btn_y); prev_y = btn_y; }
-    if (btn_r != prev_r) { kbdPushData(fabgl::VirtualKey::VK_JOY_Y, btn_r); prev_r = btn_r; }
-    if (btn_l != prev_l) { kbdPushData(fabgl::VirtualKey::VK_JOY_C, btn_l); prev_l = btn_l; }
+    if (btn_l != prev_l) { kbdPushData(fabgl::VirtualKey::VK_JOY_Y, btn_l); prev_l = btn_l; }
+    if (btn_y != prev_y) { kbdPushData(fabgl::VirtualKey::VK_JOY_C, btn_y); prev_y = btn_y; }
+    if (btn_r != prev_r) { kbdPushData(fabgl::VirtualKey::VK_JOY_Z, btn_r); prev_r = btn_r; }
 
     gamepad1_bits.up     = up;
     gamepad1_bits.down   = down;
