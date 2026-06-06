@@ -282,6 +282,26 @@ inline void MemESP::writebyte(uint16_t addr, uint8_t data)
     // but the HDD CP/M boot is not implemented and that patch hung the boot.
     // We boot CP/M from floppy; the IDE HDD remains accessible as a data drive
     // from within CP/M via the Profi IDE ports — so no 0x801A patch here.
+#if PROFI_PORT_TRACE
+    // Intercept writes to the currently-displayed DS80 page (colour or pixel).
+    // Fires when the Z80 writes to the page the VGA/HDMI renderer is reading from.
+    {
+        extern uint8_t* ds80_dbg_clrmem;
+        extern uint8_t* ds80_dbg_grmem;
+        extern int      ds80_dbg_wr_cnt;
+        if ((ds80_dbg_clrmem && p == ds80_dbg_clrmem) ||
+            (ds80_dbg_grmem  && p == ds80_dbg_grmem)) {
+            if (ds80_dbg_wr_cnt < 30) {
+                bool is_clr = (ds80_dbg_clrmem && p == ds80_dbg_clrmem);
+                // _ds80_dbg_get_pc() is defined in Ports.cpp (which includes z80.h).
+                extern uint16_t _ds80_dbg_get_pc(void);
+                Debug::log("[WR→DISPLAY_%s] a=%04X d=%02X PC=%04X #%d",
+                    is_clr ? "CLR" : "PIX", addr, data,
+                    _ds80_dbg_get_pc(), ++ds80_dbg_wr_cnt);
+            }
+        }
+    }
+#endif
     p[addr & 0x3fff] = data;
 }
 

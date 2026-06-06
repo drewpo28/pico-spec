@@ -234,20 +234,14 @@ static void process_gp_0810_0001(uint8_t instance, uint8_t const* report, uint16
 // therefore report_desc = NULL, desc_len = 0
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_report, uint16_t desc_len)
 {
-  printf("HID device address = %d, instance = %d is mounted\r\n", dev_addr, instance);
-
   // Interface protocol (hid_interface_protocol_enum_t)
   const char* protocol_str[] = { "None", "Keyboard", "Mouse" };
   uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
-
-  printf("HID Interface Protocol = %s\r\n", protocol_str[itf_protocol]);
 
   uint16_t vid = 0, pid = 0;
   tuh_vid_pid_get(dev_addr, &vid, &pid);
   hid_info[instance].vid = vid;
   hid_info[instance].pid = pid;
-  Debug::log("HID mount: addr=%u inst=%u VID=%04X PID=%04X proto=%u desc_len=%u",
-             dev_addr, instance, vid, pid, itf_protocol, desc_len);
 
   if (instance < CFG_TUH_HID) {
     hid_snap_t& s = hid_snap[instance];
@@ -276,8 +270,6 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
   if ( itf_protocol == HID_ITF_PROTOCOL_NONE )
   {
     hid_info[instance].report_count = tuh_hid_parse_report_descriptor(hid_info[instance].report_info, MAX_REPORT, desc_report, desc_len);
-    printf("HID has %u reports \r\n", hid_info[instance].report_count);
-    Debug::log("HID generic: %u reports", hid_info[instance].report_count);
 
     // Fallback: some pads (DS4/DS5, long composite descriptors) trip the
     // stock tinyusb parser and return 0 reports. Re-parse with the RIP
@@ -292,16 +284,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
           hid_info[instance].report_info[i].usage_page = rip_info[i].usage_page;
         }
         hid_info[instance].report_count = n;
-        Debug::log("HID RIP fallback: recovered %u reports", n);
       }
-    }
-
-    for (uint8_t i = 0; i < hid_info[instance].report_count; i++) {
-      Debug::log("  rpt[%u]: id=%u usage_page=%04X usage=%04X",
-                 i,
-                 hid_info[instance].report_info[i].report_id,
-                 hid_info[instance].report_info[i].usage_page,
-                 hid_info[instance].report_info[i].usage);
     }
   }
 

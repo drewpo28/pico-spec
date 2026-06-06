@@ -569,9 +569,41 @@ static void assign_ram(int i) {
   // butter/QSPI-XIP boards are excluded: forcing these into SRAM there gave no
   // IDL gain (the bottleneck is the whole Z80 working set in XIP, not the color
   // pages), so don't waste 48KB SRAM.
-  bool force_sram = (Config::arch == "Profi") && (i == 56 || i == 58 || i == 61)
+  //
+  // +2 extra LRU pool buffers (60, 40 = 32KB): during DS80 only one slot is
+  // otherwise evictable (56/58 pinned, 61 free), so HC's CP/M bank-switch
+  // trampoline (OUT 0x7FFD/0xDFFD) ping-pongs read-only code banks through it
+  // → ~70 SPI reloads/frame.  These two unpinned SRAM buffers join the pool as
+  // extra LRU lines (sync/_sync reuse them across pages, every page's data is
+  // preserved in PSRAM on evict → no loss of the 1024K capacity).  Drops the
+  // thrash to ~1.4/frame.  Page indices must be MID-range: forcing the TOP
+  // pages (62/63) corrupts Profi-1024K boot (system data lives there); 40/60
+  // are safe.  The initial index is otherwise irrelevant — the LRU repurposes
+  // the buffer for whatever working set is hot.
+  //
+  // Pages 56 and 58 are the DS80 color-attribute pages (videoLatch=0 → 56,
+  // videoLatch=1 → 58).  They must be permanently SRAM-resident (locked=true,
+  // never in the evictable pool) so profi_clrmem is always a valid direct()
+  // pointer regardless of what the Z80 banks into the 56-63 range via DFFD
+  // group 7.  The previous approach (pin one, leave the other in the pool)
+  // let the LRU evict the unpinned color page when the game (e.g. SINGLEWAR)
+  // used DFFD group 7 for banking → profi_clrmem → null → mono/garbage frame.
+  // With locked=true: no pin/unpin/preload needed in the render path → the
+  // HDMI/VGA renderer never stalls on SPI DMA → no sync loss.
+  //
+  // Page 59 is added as a 4th LRU pool slot (alongside 61/60/40) to compensate
+  // for removing 56/58 from the pool, keeping HC/CP/M at ~1.4 evicts/frame.
+  // (Tested safe: 59 is mid-range, not top-page system data like 62/63.)
+  bool force_sram_locked = (Config::arch == "Profi")
+                           && (i == 56 || i == 58)
+                           && (butter_psram_size() == 0);
+  bool force_sram = (Config::arch == "Profi")
+                    && (i == 61 || i == 60)
                     && (butter_psram_size() == 0);
-  if (force_sram) {
+  if (force_sram_locked) {
+    MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, true); // LOCKED: permanent SRAM
+    ++ram_pages;
+  } else if (force_sram) {
     MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, false); // unlocked → in pool
     ++ram_pages;
   } else if (getFreeHeap() >= MEM_PG_SZ + MEM_REMAIN) {

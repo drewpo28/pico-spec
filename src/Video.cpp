@@ -132,6 +132,16 @@ int VIDEO::tStatesScreen;
 int VIDEO::tStatesBorder;
 uint8_t* VIDEO::grmem;
 uint8_t* VIDEO::profi_clrmem = nullptr;
+
+// DS80 write-to-display-page interceptor (PROFI_PORT_TRACE only).
+// writebyte() in MemESP.h compares ramCurrent[slot] against these to detect
+// when the Z80 writes into the currently-displayed pixel or colour page.
+#if PROFI_PORT_TRACE
+extern uint8_t* ds80_dbg_clrmem;
+extern uint8_t* ds80_dbg_grmem;
+extern int      ds80_dbg_wr_cnt;
+#endif
+
 #if !PICO_RP2040
 uint32_t VIDEO::profi_clr_spi_base = 0xFFFFFFFFu;
 extern "C" uint8_t  read8psram(uint32_t addr32);
@@ -473,6 +483,19 @@ static unsigned int col_end;
 static unsigned int video_rest;
 static unsigned int video_opcode_rest;
 static unsigned int curline;
+
+#if !PICO_RP2040
+// DS80 per-frame display-page latch (UnrealSpeccy rend_profi model).
+// The Kings Valley CP/M game flips videoLatch (0x7FFD bit3) hundreds of times per
+// display frame, so reading the live grmem/profi_clrmem per scanline (ZXMAK2 beam
+// model) interleaves pages 4/6 across the screen → horizontal stripes.
+// UnrealSpeccy instead picks the page ONCE per frame (base = p7FFD bit3 ? page6:page4)
+// and renders all 240 lines from it.  We mirror that: latch these at the first content
+// line (curline==0) and use them for the entire frame; mid-frame Z80 flips only change
+// the live grmem/profi_clrmem, which we pick up at the next frame's line 0.
+static uint8_t* ds80_frame_grmem  = nullptr;
+static uint8_t* ds80_frame_clrmem = nullptr;
+#endif
 
 static unsigned int bmpOffset;  // offset for bitmap in graphic memory
 static unsigned int attOffset;  // offset for attrib in graphic memory
@@ -1214,6 +1237,7 @@ static bool ensureMainFB(int lines, int stride) {
 }
 
 static bool ensurePrevFB(int lines, int stride) {
+    if (Config::arch == "Profi") return true; // Gigascreen not available for Profi
     size_t want = fbPrevBytes(lines, stride);
     if (sharedFB_prev && sharedFB_prev_size == want) return true;
     if (sharedFB_prev) { free(sharedFB_prev); sharedFB_prev = nullptr; sharedFB_prev_size = 0; }
@@ -2210,6 +2234,16 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
         uint32_t pixCoff = 2048 * (line >> 6) + 256 * (line & 7) + ((line & 0x38) << 2);
         unsigned int end_col = coldraw_cnt < 32u ? coldraw_cnt : 32u;
         unsigned int start_col = end_col - loopCount;
+        // Latch the display pages ONCE at the start of the frame (UnrealSpeccy rend_profi
+        // model): all 240 lines render from the page selected at line 0, so mid-frame
+        // videoLatch flips don't tear the current frame.  Also (re)latch if null (first
+        // frame after activation).
+        if ((line == 0 && start_col == 0) || ds80_frame_grmem == nullptr) {
+            ds80_frame_grmem  = grmem;
+            ds80_frame_clrmem = profi_clrmem;
+        }
+        uint8_t* fgrmem  = ds80_frame_grmem;
+        uint8_t* fclrmem = ds80_frame_clrmem;
         //
         // Row layout: pad_l bytes of border, then 256 content bytes (with (k^2) pre-swap
         // for the ISR's x^2 read pattern), then pad_r bytes of border.
@@ -2254,10 +2288,10 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             }
         }
         for (unsigned int j = start_col; j < end_col; j++) {
-            uint8_t bmpEven = grmem[pixCoff + j + 8192];
-            uint8_t bmpOdd  = grmem[pixCoff + j];
-            uint8_t rawE = profi_clrmem ? profi_clrmem[pixCoff + j + 8192] : 0x07;
-            uint8_t rawO = profi_clrmem ? profi_clrmem[pixCoff + j]        : 0x07;
+            uint8_t bmpEven = fgrmem[pixCoff + j + 8192];
+            uint8_t bmpOdd  = fgrmem[pixCoff + j];
+            uint8_t rawE = fclrmem ? fclrmem[pixCoff + j + 8192] : 0x07;
+            uint8_t rawO = fclrmem ? fclrmem[pixCoff + j]        : 0x07;
             uint8_t inkE = (rawE & 0x07) | ((rawE & 0x40) >> 3);
             uint8_t papE = ((rawE & 0x38) >> 3) | ((rawE & 0x80) >> 4);
             uint8_t inkO = (rawO & 0x07) | ((rawO & 0x40) >> 3);
@@ -2649,21 +2683,19 @@ IRAM_ATTR void VIDEO::EndFrame() {
             // force borderColor=0 here: that would invert to Palette[7] = light grey.)
             // Apply DS80 geometry: full 240-line screen, no border.
             // (Mirrors Reset() DS80 branch; skips palette/pair-lookup re-init.)
+            ds80_frame_grmem = nullptr; // force re-latch of display page on next frame
             grmem = MemESP::videoLatch ? MemESP::ram[6].direct() : MemESP::ram[4].direct();
             {
                 uint32_t clrPg = MemESP::videoLatch ? 58u : 56u;
-                // preload(): on SPI-PSRAM boards, the color page may have been evicted
-                // to SPI during the ROM's 1024K test.  Force it back into SRAM so
-                // profi_clrmem is a valid direct() pointer for fast rendering.
-                MemESP::ram[clrPg].preload(); // load into SRAM if in SPI PSRAM
-                MemESP::ram[clrPg].pin();    // prevent eviction: bankLatch sync() hits
-                                             // page 58 72×/frame on SPI-PSRAM boards
-                extern int ram_pages, butter_pages, psram_pages, swap_pages;
-                int totPg = ram_pages + butter_pages + psram_pages + swap_pages;
-                profi_clrmem = ((int)clrPg < totPg) ? MemESP::ram[clrPg].direct() : nullptr;
+                // Pages 56 and 58 are locked (assign_ram locked=true): permanently
+                // SRAM-resident, never in the evictable pool, direct() is always
+                // valid — no preload/pin/precheck needed.
+                profi_clrmem = MemESP::ram[clrPg].direct();
                 profi_clr_spi_base = 0xFFFFFFFFu;
-                if (!profi_clrmem && MemESP::ram[clrPg].memType() == mem_type_t::PSRAM_SPI)
-                    profi_clr_spi_base = MemESP::ram[clrPg].spiBase();
+#if PROFI_PORT_TRACE
+                ds80_dbg_grmem  = grmem;
+                ds80_dbg_clrmem = profi_clrmem;
+#endif
             }
             tStatesScreen -= (int)lin_end * (int)tStatesPerLine;
             lin_end  = 0;
@@ -2677,9 +2709,10 @@ IRAM_ATTR void VIDEO::EndFrame() {
                 for (int _y = 0; _y < (int)vga.yres; _y++)
                     if (vga.frameBuffer[_y]) memset(vga.frameBuffer[_y], 0, vga.xres);
             }
-            Debug::log("[DS80] activate: tStScreen=%d grmem=%p clrmem=%p videoLatch=%d ram4=%p ram6=%p",
-                       tStatesScreen, grmem, profi_clrmem, (int)MemESP::videoLatch,
-                       MemESP::ram[4].direct(), MemESP::ram[6].direct());
+            Debug::log("[DS80] activate: tStScreen=%d grmem=%p clrmem=%p (SRAM=%d) videoLatch=%d",
+                       tStatesScreen, grmem, profi_clrmem,
+                       (profi_clrmem && (uintptr_t)profi_clrmem < 0x11000000u),
+                       (int)MemESP::videoLatch);
         } else if (profi_ds80_deactivate_pending) {
             profi_ds80_deactivate_pending = false;
             Debug::log("[EF] DS80 deactivate: grmem=%p clrmem=%p", grmem, profi_clrmem);
@@ -2694,7 +2727,6 @@ IRAM_ATTR void VIDEO::EndFrame() {
             // Restore standard Profi (non-DS80) geometry.
             grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
             profi_clrmem = nullptr;
-            MemESP::ram[MemESP::videoLatch ? 58u : 56u].unpin(); // restore normal eviction
             {
                 bool isFB    = VIDEO::isFullBorderMode();
                 bool isFB240 = VIDEO::isFullBorder240();
@@ -2753,6 +2785,29 @@ IRAM_ATTR void VIDEO::EndFrame() {
                 }
             }
         }
+    }
+
+// DS80 framebuffer diagnostic: log framebuffer bytes and latched pointers every 60 frames.
+    // This tells us whether the renderer is filling the framebuffer correctly.
+    {
+#if !PICO_RP2040
+        static uint32_t ds80_diag_frame = 0;
+        if (profi_ds80_active && ++ds80_diag_frame >= 60) {
+            ds80_diag_frame = 0;
+            const int ds80_voff = (vga.yres >= 288) ? 24 : 0;
+            const int pad_l     = ((int)vga.xres - 256) / 2;
+            // Log latched pointers and 8 framebuffer bytes from content row 0.
+            uint8_t* row0 = vga.frameBuffer ? (uint8_t*)vga.frameBuffer[ds80_voff]     : nullptr;
+            uint8_t* row1 = vga.frameBuffer ? (uint8_t*)vga.frameBuffer[ds80_voff+120] : nullptr;
+            if (row0 && row1)
+                Debug::log("[DS80D] grmem=%p clrmem=%p vl=%d fb[%d][%d..%d]=%02X%02X%02X%02X fb[%d]=%02X%02X%02X%02X",
+                    ds80_frame_grmem, ds80_frame_clrmem, (int)MemESP::videoLatch,
+                    ds80_voff, pad_l, pad_l+3,
+                    row0[pad_l], row0[pad_l+1], row0[pad_l+2], row0[pad_l+3],
+                    ds80_voff+120,
+                    row1[pad_l], row1[pad_l+1], row1[pad_l+2], row1[pad_l+3]);
+        }
+#endif
     }
 
     // SPI PSRAM swap diagnostics: log eviction count once every 60 frames.

@@ -76,6 +76,18 @@ extern "C" const uint32_t profi_default_palette16[16];
 #define PROFI_PORT_TRACE 0
 #endif
 
+#if PROFI_PORT_TRACE
+// Pointers to the CURRENT display pages (updated whenever profi_clrmem/grmem change).
+// writebyte() compares ramCurrent[slot] against these to detect writes to display pages.
+uint8_t* ds80_dbg_clrmem = nullptr;  // display color-attribute page (56 or 58)
+uint8_t* ds80_dbg_grmem  = nullptr;  // display pixel page (4 or 6)
+int      ds80_dbg_wr_cnt = 0;        // reset each frame so we always capture first write
+
+// Helper so MemESP.h writebyte() can read the Z80 PC without pulling
+// in Z80_JLS/z80.h (which would create circular include chains via MemESP.h).
+uint16_t _ds80_dbg_get_pc(void) { return Z80::getRegPC(); }
+#endif
+
 // IDE_PORT_TRACE (PROFI IDE/HDD port tracing) is defined by CMake (default 0).
 // Undefined → 0 in #if, so no fallback #define is needed here.
 
@@ -896,6 +908,22 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         MemESP::ramCurrent[1] = MemESP::ram[5].direct();
         MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(3);
       }
+#if PROFI_PORT_TRACE
+      // Log when a DS80 video page (4/6/56/58) is mapped into the Z80 address space.
+      {
+        uint32_t bl = MemESP::bankLatch;
+        if (bl == 4 || bl == 6 || bl == 56 || bl == 58) {
+          bool vl = MemESP::videoLatch;
+          bool sco = bitRead(data, 3);
+          // slot: SCO=1 → bankLatch at 0x4000 (slot1); SCO=0 → bankLatch at 0xC000 (slot3)
+          char slot = sco ? '1' : '3';
+          // Is this the DISPLAY page (currently being rendered from)?
+          bool disp = (!vl && (bl == 4 || bl == 56)) || (vl && (bl == 6 || bl == 58));
+          Debug::log("[DFFD] bl=%u slot%c vl=%u %s PC=%04X",
+              bl, slot, vl, disp ? "DISPLAY-PAGE!" : "write-buf", Z80::getRegPC());
+        }
+      }
+#endif
       // bit7: hires mode switches screen pages 5/7 → 4/6; color attrs from pages 58/56
       if (data & 0x80) {
         VIDEO::grmem     = MemESP::videoLatch ? MemESP::ram[6].direct()  : MemESP::ram[4].direct();
@@ -1648,6 +1676,19 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       } else {
         MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(3);
       }
+#if PROFI_PORT_TRACE
+      if (Config::arch == "Profi" && (portDFFD & 0x80)) {
+        uint32_t bl = MemESP::bankLatch;
+        if (bl == 4 || bl == 6 || bl == 56 || bl == 58) {
+          bool vl = MemESP::videoLatch; // current (not yet updated for bit3)
+          bool sco = portDFFD & 0x08;
+          char slot = sco ? '1' : '3';
+          bool disp = (!vl && (bl == 4 || bl == 56)) || (vl && (bl == 6 || bl == 58));
+          Debug::log("[7FFD] bl=%u slot%c vl=%u %s PC=%04X",
+              bl, slot, vl, disp ? "DISPLAY-PAGE!" : "write-buf", Z80::getRegPC());
+        }
+      }
+#endif
       { uint8_t prevLatch = MemESP::romLatch;
         MemESP::romLatch = bitRead(data, 4);
         if (!ia && !ESPectrum::trdos) {
@@ -1663,6 +1704,13 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
           uint32_t clrPage = MemESP::videoLatch ? 58 : 56;
           uint32_t totPages = ram_pages + butter_pages + psram_pages + swap_pages;
           VIDEO::profi_clrmem = (clrPage < totPages) ? MemESP::ram[clrPage].direct() : nullptr;
+#if PROFI_PORT_TRACE
+          Debug::log("[DS80 FLIP] vl=%u dispPx=%u dispClr=%u PC=%04X",
+              MemESP::videoLatch, MemESP::videoLatch ? 6u : 4u, clrPage, Z80::getRegPC());
+          ds80_dbg_wr_cnt = 0;
+          ds80_dbg_grmem  = VIDEO::grmem;
+          ds80_dbg_clrmem = VIDEO::profi_clrmem;
+#endif
         } else {
           VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
           if (Config::arch == "Profi") VIDEO::profi_clrmem = nullptr;
