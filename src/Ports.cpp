@@ -598,6 +598,17 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
 
       switch (address & 0xe3) {
       case 0x03:
+        // Port #1F is shared: WD1793 status register AND the standard Kempston
+        // joystick (decodes A5=0). With a raw disk mounted (e.g. TD0/Pro CP/M
+        // images stay mounted while a game runs), this FDC branch shadowed the
+        // Kempston read below and broke the joystick. Per Karabas-Pro manual
+        // p.24 the FDC owns #1F only when CPM=1 (DOS=0) — i.e. an active loader
+        // context: TR-DOS ROM paged in or Profi CP/M mode. Otherwise (a running
+        // game polling the joystick) let it fall through to the Kempston block.
+        if (Config::joystick == JOY_KEMPSTON && !ESPectrum::trdos &&
+            !(Config::arch == "Profi" && (portDFFD & 0x20)))
+          break;
+        // fallthrough — FDC owns #1F in loader/CP-M context
       case 0x23:
       case 0x43:
       case 0x63:
