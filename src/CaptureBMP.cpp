@@ -69,11 +69,12 @@ void CaptureToBmp()
         return;
     }
 
-    static const char scrdir[] = CONFIG_DIR DISK_SCR_DIR;
+    static const char scrdir[] = DISK_SCR_DIR;
 
-    // Create dir if it doesn't exist
+    // Create dir (and its /spec parent) if it doesn't exist
     FILINFO stat_buf;
     if (f_stat(scrdir, &stat_buf) != FR_OK) {
+        f_mkdir(SPEC_DIR_ROOT);
         if (f_mkdir(scrdir) != FR_OK) {
             printf("Capture BMP: problem creating capture dir\n");
             delete[] linebuf;
@@ -104,7 +105,7 @@ void CaptureToBmp()
     sprintf((char *)filename,"ESP%.5d.bmp",bmpnumber);
 
     // Full filename. Save only to SD.
-    char fullfn[32];
+    char fullfn[48];
     snprintf(fullfn, sizeof(fullfn), "%s/%s", scrdir, filename);
 
     // open file for writing

@@ -442,7 +442,7 @@ static string getDefaultSnapshotName() {
 static string getSlotName(uint8_t slotnumber) {
     char persistfinfo[sizeof(DISK_PSNA_FILE) + 7];
     sprintf(persistfinfo, DISK_PSNA_FILE "%u.esp", slotnumber);
-    string finfo = FileUtils::MountPoint + DISK_PSNA_DIR + "/" + persistfinfo;
+    string finfo = string(DISK_PSNA_DIR) + "/" + persistfinfo;
     FIL* f = fopen2(finfo.c_str(), FA_READ);
     if (!f) return "";
     char buf[64];
@@ -464,8 +464,8 @@ static void persistDelete(uint8_t slotnumber) {
     char persistfinfo[sizeof(DISK_PSNA_FILE) + 7];
     sprintf(persistfname, DISK_PSNA_FILE "%u.sna", slotnumber);
     sprintf(persistfinfo, DISK_PSNA_FILE "%u.esp", slotnumber);
-    string fsna  = FileUtils::MountPoint + DISK_PSNA_DIR + "/" + persistfname;
-    string finfo = FileUtils::MountPoint + DISK_PSNA_DIR + "/" + persistfinfo;
+    string fsna  = string(DISK_PSNA_DIR) + "/" + persistfname;
+    string finfo = string(DISK_PSNA_DIR) + "/" + persistfinfo;
     f_unlink(fsna.c_str());
     f_unlink(finfo.c_str());
 }
@@ -492,7 +492,7 @@ static void persistRename(uint8_t slotnumber, uint8_t opt2) {
 
     char persistfinfo[sizeof(DISK_PSNA_FILE) + 7];
     sprintf(persistfinfo, DISK_PSNA_FILE "%u.esp", slotnumber);
-    string finfo = FileUtils::MountPoint + DISK_PSNA_DIR + "/" + persistfinfo;
+    string finfo = string(DISK_PSNA_DIR) + "/" + persistfinfo;
 
     // Read existing arch + romset lines
     FIL* f = fopen2(finfo.c_str(), FA_READ);
@@ -568,7 +568,7 @@ static bool persistSave(uint8_t slotnumber, uint8_t opt2, bool quicksave = false
     char persistfinfo[sizeof(DISK_PSNA_FILE) + 7];
     sprintf(persistfname, DISK_PSNA_FILE "%u.sna", slotnumber);
     sprintf(persistfinfo, DISK_PSNA_FILE "%u.esp", slotnumber);
-    string finfo = FileUtils::MountPoint + DISK_PSNA_DIR + "/" + persistfinfo;
+    string finfo = string(DISK_PSNA_DIR) + "/" + persistfinfo;
 
     string slotName;
 
@@ -605,7 +605,7 @@ static bool persistSave(uint8_t slotnumber, uint8_t opt2, bool quicksave = false
     fputs((Config::arch + "\n" + Config::romSet + "\n" + slotName + "\n").c_str(), *f);
     fclose2(f);
 
-    string fsna = FileUtils::MountPoint + DISK_PSNA_DIR + "/" + persistfname;
+    string fsna = string(DISK_PSNA_DIR) + "/" + persistfname;
     if (!FileSNA::save(fsna)) {
         OSD::osdCenteredMsg(OSD_PSNA_SAVE_ERR, LEVEL_ERROR, 5000);
     }
@@ -641,12 +641,12 @@ static bool persistLoad(uint8_t slotnumber)
     sprintf(persistfname, DISK_PSNA_FILE "%u.sna", slotnumber);
     sprintf(persistfinfo, DISK_PSNA_FILE "%u.esp", slotnumber);
 
-    if (!FileSNA::isPersistAvailable(FileUtils::MountPoint + DISK_PSNA_DIR + "/" + persistfname)) {
+    if (!FileSNA::isPersistAvailable(string(DISK_PSNA_DIR) + "/" + persistfname)) {
         OSD::osdCenteredMsg(OSD_PSNA_NOT_AVAIL, LEVEL_INFO);
         return false;
     } else {
         // Read info file
-        string finfo = FileUtils::MountPoint + DISK_PSNA_DIR + "/" + persistfinfo;
+        string finfo = string(DISK_PSNA_DIR) + "/" + persistfinfo;
         FIL* f = fopen2(finfo.c_str(), FA_READ);
         if (!f) {
             OSD::osdCenteredMsg(OSD_PSNA_LOAD_ERR, LEVEL_WARN);
@@ -660,13 +660,13 @@ static bool persistLoad(uint8_t slotnumber)
         string persist_romset = buf;
         fclose2(f);
 
-        if (!LoadSnapshot(FileUtils::MountPoint + DISK_PSNA_DIR + "/" + persistfname, persist_arch, persist_romset)) {
+        if (!LoadSnapshot(string(DISK_PSNA_DIR) + "/" + persistfname, persist_arch, persist_romset)) {
             OSD::osdCenteredMsg(OSD_PSNA_LOAD_ERR, LEVEL_WARN);
             return false;
         }
         else
         {
-            Config::ram_file = FileUtils::MountPoint + DISK_PSNA_DIR + "/" + persistfname;
+            Config::ram_file = string(DISK_PSNA_DIR) + "/" + persistfname;
             Config::last_ram_file = Config::ram_file;
         }
     }

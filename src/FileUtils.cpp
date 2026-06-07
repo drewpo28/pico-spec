@@ -155,12 +155,10 @@ void FileUtils::initFileSystem() {
     if (SDReady) {
         f_mkdir("/tmp");
         mkdirParents(CONFIG_DIR);
-        f_mkdir(CONFIG_DIR DISK_ROM_DIR);
-        f_mkdir(CONFIG_DIR DISK_SNA_DIR);
-        f_mkdir(CONFIG_DIR DISK_TAP_DIR);
-        f_mkdir(CONFIG_DIR DISK_DSK_DIR);
-        f_mkdir(CONFIG_DIR DISK_SCR_DIR);
-        f_mkdir(CONFIG_DIR DISK_PSNA_DIR);
+        // User data (snapshots/screenshots) lives under visible /spec root.
+        f_mkdir(SPEC_DIR_ROOT);
+        f_mkdir(DISK_SCR_DIR);
+        f_mkdir(DISK_PSNA_DIR);
         mkdirParents(CONFIG_DIR_BOARD);
     }
 }
