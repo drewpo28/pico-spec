@@ -12,6 +12,7 @@ namespace LED {
         FDD,           // Floppy: Beta-128 / TR-DOS or MB-02+
         SD,            // DivMMC / esxDOS
         ZCTRL,         // Z-Controller
+        IDE,           // IDE/HDD (NEMO / PROFI)
         // Audio
         BEEPER,        // ULA bit 4 speaker
         AY,            // AY-3-8912

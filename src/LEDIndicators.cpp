@@ -9,6 +9,7 @@
 #include "DivMMC.h"
 #include "MB02.h"
 #include "Midi.h"
+#include "IDE.h"
 #ifdef USE_GS
 #include "GS/GS.h"
 #endif
@@ -67,6 +68,15 @@ static const uint8_t SPRITE[COUNT][8] = {
        X......X
        XXXXXXXX */
                    { 0x7F, 0x81, 0xBD, 0x89, 0x91, 0xBD, 0x81, 0xFF },
+    /* IDE      — letters H and D (3px + 1px gap + 3px)
+       X.X.XX.
+       X.X.X.X
+       X.X.X.X
+       XXX.X.X
+       X.X.X.X
+       X.X.X.X
+       X.X.XX. */
+                   { 0xAC, 0xAA, 0xAA, 0xEA, 0xAA, 0xAA, 0xAC, 0x00 },
     // Audio
     /* BEEPER   — speaker icon: driver + cone + waves
        ...X...
@@ -195,6 +205,7 @@ bool isVisible(Id i) {
 #if !PICO_RP2040
         case SD:       return Config::esxdos != 0 || DivMMC::enabled;
         case ZCTRL:    return Config::zcontroller || DivMMC::zc_enabled;
+        case IDE:      return ::IDE::present();
         case FDD:      return Config::betadisk || Config::mb02 != 0 || MB02::enabled;
         case MIDI:     return Config::midi > 0;
         case SAA:      return Config::SAA1099;
@@ -208,7 +219,7 @@ bool isVisible(Id i) {
         case ULAPLUS:    return Config::ulaplus;
         case GIGASCREEN: return Config::gigascreen_enabled;
 #else
-        case SD: case ZCTRL: case MIDI:
+        case SD: case ZCTRL: case IDE: case MIDI:
         case SAA: case TIMEX: case DMA: case GS:
         case ULAPLUS: case GIGASCREEN: return false;
         case FDD:      return Config::betadisk;

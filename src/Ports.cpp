@@ -284,12 +284,12 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   // line keeps ESPectrum::trdos permanently asserted (not real TR-DOS paging),
   // so the !trdos rule is bypassed there.
   if (IDE::scheme == IDE::NEMO && !(address & 6) && (Z80Ops::isProfi || !ESPectrum::trdos)) {
-    if (address & 1) { LED::touchR(LED::SD); return IDE::read_latch(); } // A0=1: high-byte latch
+    if (address & 1) { LED::touchR(LED::IDE); return IDE::read_latch(); } // A0=1: high-byte latch
     if ((address & 0x18) == 0x08 && (address & 0xE0) == 0xC0) {          // control / alt-status
-      LED::touchR(LED::SD); return IDE::read8(8);
+      LED::touchR(LED::IDE); return IDE::read8(8);
     }
     if ((address & 0x18) == 0x10) {                                      // register window
-      LED::touchR(LED::SD);
+      LED::touchR(LED::IDE);
       uint8_t reg = (address >> 5) & 7;
       return (reg == 0) ? IDE::read_data_low() : IDE::read8(reg);
     }
@@ -473,7 +473,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         uint8_t reg = (address >> 8) & 7;
         if ((p1 & 0x9F) == 0x8B) {
           if (p1 & 0x40) {                             // CS1 (A6=1): data/registers
-            LED::touchR(LED::SD);
+            LED::touchR(LED::IDE);
             uint8_t rv;
             if (p1 & 0x20)                             // A5=1 = #xxEB: HIGH byte latch
               rv = IDE::read_latch();
@@ -491,7 +491,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
           // (mirror of the status register). MBOOTHDD reads/writes #06AB with A5=0,
           // so do NOT gate on A5 here.
           if (reg == 6) {
-            LED::touchR(LED::SD);
+            LED::touchR(LED::IDE);
             uint8_t rv = IDE::read8(7);                  // altstatus == status
 #if IDE_PORT_TRACE
             Debug::log("[IDE RD] pc=%04X port=%02X reg=%d val=%02X CS3-altstatus",
@@ -1072,12 +1072,12 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // SYSEN line keeps ESPectrum::trdos permanently asserted, so the !trdos rule
   // (authentic NEMO is outside TR-DOS) is bypassed there.
   if (IDE::scheme == IDE::NEMO && !(address & 6) && (Z80Ops::isProfi || !ESPectrum::trdos)) {
-    if (address & 1) { LED::touchW(LED::SD); IDE::write_latch(data); return; } // A0=1: high latch
+    if (address & 1) { LED::touchW(LED::IDE); IDE::write_latch(data); return; } // A0=1: high latch
     if ((address & 0x18) == 0x08 && (address & 0xE0) == 0xC0) {                // control
-      LED::touchW(LED::SD); IDE::write8(8, data); return;
+      LED::touchW(LED::IDE); IDE::write8(8, data); return;
     }
     if ((address & 0x18) == 0x10) {                                           // register window
-      LED::touchW(LED::SD);
+      LED::touchW(LED::IDE);
       uint8_t reg = (address >> 5) & 7;
       if (reg == 0) IDE::write_data_low(data); else IDE::write8(reg, data);
       return;
@@ -1378,7 +1378,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
                      Z80::getRegPC(), (unsigned)p1, reg, data);
 #endif
           if (p1 & 0x40) {                           // CS1 (A6=1): data/registers
-            LED::touchW(LED::SD);
+            LED::touchW(LED::IDE);
             if (!(p1 & 0x20)) {                      // A5=0 = #xxCB: HIGH byte latch
               IDE::write_latch(data);
               return;
@@ -1394,7 +1394,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
           // MBOOTHDD issues the ATA soft-reset via OUT (#06AB),A — port 0xAB has
           // A5=0, so do NOT gate on A5 (the old `p1&0x20` check dropped the reset).
           if (reg == 6) {
-            LED::touchW(LED::SD);
+            LED::touchW(LED::IDE);
             IDE::write8(8, data);
             return;
           }
