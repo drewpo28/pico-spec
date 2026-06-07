@@ -285,6 +285,11 @@ public:
   static bool gigascreen_enabled;
   static uint8_t gigascreen_auto_countdown;
 
+  // Profi has no Gigascreen (incompatible video path). Force it off and free
+  // the 52 KB prev-FB. Safe to call when arch is not Profi (no-op). Called both
+  // at boot (VIDEO::Init) and on a runtime switch into Profi.
+  static void disableGigascreenForProfi();
+
   // Timex SCLD video modes
 #if !PICO_RP2040
   static uint8_t timex_port_ff;   // bits 0-5 of port 0xFF

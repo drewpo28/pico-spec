@@ -1323,6 +1323,20 @@ bool GsSubsys::apply() {
     }
     return true;
 }
+
+void VIDEO::disableGigascreenForProfi() {
+    if (Config::arch != "Profi") return; // only Profi is incompatible
+    // Clear the persisted/live enable flags so nothing re-arms it (Auto mode
+    // checks gigascreen_onoff; force it Off too) and free the prev-FB.
+    Config::gigascreen_enabled = false;
+    VIDEO::gigascreen_enabled  = false;
+    Config::gigascreen_onoff   = 0; // Off — also disarms Auto countdown
+    VIDEO::gigascreen_auto_countdown = 0;
+    GsSubsys::request(false);
+    GsSubsys::apply();
+}
+#else
+void VIDEO::disableGigascreenForProfi() {} // RP2040: Gigascreen never allocated, Profi hidden
 #endif
 
 void VIDEO::Init() {
@@ -1360,6 +1374,9 @@ void VIDEO::Init() {
         free(sharedFB_arr1); sharedFB_arr1 = nullptr;
         free(sharedFB_main); sharedFB_main = nullptr; sharedFB_main_size = 0;
     }
+    // If we boot into Profi, Gigascreen is incompatible: clear the flags so the
+    // prev-FB is never allocated below (and any stale NVS enable is dropped).
+    disableGigascreenForProfi();
     // Pre-allocate prev framebuffer if Gigascreen is enabled at boot,
     // BEFORE the heap fragments.
     if (sharedFB_main && Config::gigascreen_enabled) {

@@ -4198,6 +4198,16 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::betadisk = true;
                                     OSD::osdCenteredMsg("Betadisk enabled", LEVEL_INFO, 1500);
                                 }
+#if !PICO_RP2040
+                                // Switching into Profi: Gigascreen is incompatible —
+                                // turn it off and free its 52 KB prev-FB before saving
+                                // so the Off-state persists across reboots. Config::arch
+                                // is already committed above (pref_arch=="Last" path).
+                                if (Config::arch == "Profi" && Config::gigascreen_enabled) {
+                                    VIDEO::disableGigascreenForProfi();
+                                    OSD::osdCenteredMsg("Gigascreen disabled", LEVEL_INFO, 1500);
+                                }
+#endif
                                 Config::save();
 #if !PICO_RP2040
                                 // Profi on SPI-PSRAM boards needs its hires colour
