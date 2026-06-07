@@ -1716,7 +1716,33 @@ void rvmWD1793Reset(rvmWD1793 *wd) {
 #endif
 }
 
+bool rvmWD1793AllocTrackBuf(rvmWD1793 *wd) {
+#if !PICO_RP2040
+    if (wd->diskTrackBuf) return true;
+    wd->diskTrackBuf = (uint8_t *)malloc(DISK_TRACK_BUF_SZ);
+    return wd->diskTrackBuf != nullptr;
+#else
+    return true;
+#endif
+}
+
+void rvmWD1793FreeTrackBuf(rvmWD1793 *wd) {
+#if !PICO_RP2040
+    if (wd->diskTrackBuf) { free(wd->diskTrackBuf); wd->diskTrackBuf = nullptr; }
+    wd->diskLoadedCyl = -1;
+    wd->diskLoadedSide = -1;
+    wd->diskTrackLen = 0;
+    wd->diskDirty = false;
+#endif
+}
+
 bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string& Filename) {
+
+#if !PICO_RP2040
+    // Ensure the track buffer exists before a disk can be loaded into it.
+    // (The MB-02 drive's buffer is released when MB-02 is disabled.)
+    if (!rvmWD1793AllocTrackBuf(wd)) { Debug::led_blink(); return false; }
+#endif
 
     // Close any open disk in this unit
     wdDiskEject(wd,UnitNum);
@@ -2297,8 +2323,8 @@ void udiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     }
 
     uint16_t tlen = disk->udiTrackLengths[trkIdx];
-    if (tlen > sizeof(wd->diskTrackBuf))
-        tlen = sizeof(wd->diskTrackBuf);
+    if (tlen > DISK_TRACK_BUF_SZ)
+        tlen = DISK_TRACK_BUF_SZ;
 
     UINT br;
     f_lseek(disk->Diskfile, disk->udiTrackOffsets[trkIdx]);
@@ -2488,7 +2514,7 @@ void fdiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     if (freeSpace < 0) { imageSize += -freeSpace; freeSpace = 0; }
 
     // Clamp to buffer size
-    int bufSize = (int)sizeof(wd->diskTrackBuf);
+    int bufSize = (int)DISK_TRACK_BUF_SZ;
     if (imageSize > bufSize) imageSize = bufSize;
 
     uint8_t *buf = wd->diskTrackBuf;
@@ -2708,7 +2734,7 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     while (synchroPulseLen < 3) { synchroPulseLen++; imageSize += secCount * 2; }
     if (freeSpace < 0) { imageSize += -freeSpace; freeSpace = 0; }
 
-    int bufSize = (int)sizeof(wd->diskTrackBuf);
+    int bufSize = (int)DISK_TRACK_BUF_SZ;
     if (imageSize > bufSize) imageSize = bufSize;
 
     uint8_t *buf = wd->diskTrackBuf;
@@ -2776,7 +2802,7 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     wd->diskLoadedSide = (int)side;
 #if FDD_PORT_TRACE
     Debug::log("[TD0] built trk cyl=%d side=%d: imageSize=%d trkLen=%d bufSize=%d trkdatalen=%d gaps[1=%d s=%d 2=%d 3=%d pulse=%d]",
-               (int)cyl, (int)side, imageSize, (int)pos, (int)sizeof(wd->diskTrackBuf),
+               (int)cyl, (int)side, imageSize, (int)pos, (int)DISK_TRACK_BUF_SZ,
                trkdatalen, firstSpaceLen, synchroSpaceLen, secondSpaceLen, thirdSpaceLen, synchroPulseLen);
 #endif
 }
@@ -2801,7 +2827,7 @@ void mbdLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
 
     // Build synthetic MFM track image (same approach as fdiLoadTrack)
     // Read each sector directly into diskTrackBuf to avoid large stack allocation
-    int imageSize = (int)sizeof(wd->diskTrackBuf);
+    int imageSize = (int)DISK_TRACK_BUF_SZ;
     uint8_t *buf = wd->diskTrackBuf;
     int pos = 0;
 

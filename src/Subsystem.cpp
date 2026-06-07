@@ -266,6 +266,11 @@ bool Mb02Subsys::apply() {
         Config::mb02 = 0;
         MB02::init();   // teardown path (Config::mb02==0)
         free(MB02::page0_composite); MB02::page0_composite = nullptr;
+        // Release the MB-02 drive's MFM track buffer (~12.5 KB) and eject its
+        // disks so we don't hold a buffer for a powered-off interface.
+        for (int i = 0; i < 4; i++)
+            if (ESPectrum::mb02_fdd.disk[i]) wdDiskEject(&ESPectrum::mb02_fdd, i);
+        rvmWD1793FreeTrackBuf(&ESPectrum::mb02_fdd);
     }
     return true;
 }

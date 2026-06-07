@@ -286,6 +286,11 @@ typedef struct
 
 #define WD177XSTEPSTATES 112 // 112 states -> 14 states per bit
 
+// Size of the per-drive MFM track buffer (UDI/FDI/MBD). Formerly an inline
+// array; now heap-allocated (see rvmWD1793AllocTrackBuf) so the second
+// MB-02 drive can release its 12.5 KB when MB-02 is disabled.
+#define DISK_TRACK_BUF_SZ 12800
+
 typedef struct
 {
     uint32_t state, stepState, next;
@@ -337,7 +342,7 @@ typedef struct
     uint8_t fdd_clicks;  // Pending step clicks count
 
 #if !PICO_RP2040
-    uint8_t diskTrackBuf[12800];  // MFM track buffer for UDI/FDI/MBD
+    uint8_t* diskTrackBuf;        // MFM track buffer (DISK_TRACK_BUF_SZ); heap-allocated
     uint16_t diskTrackLen;        // length of current track
     int diskLoadedCyl;            // loaded cylinder (-1 = none)
     int diskLoadedSide;           // loaded side
@@ -358,6 +363,10 @@ void rvmWD1793Write(rvmWD1793 *wd, uint8_t a, uint8_t v);
 uint8_t rvmWD1793Read(rvmWD1793 *wd, uint8_t a);
 void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps);
 void rvmWD1793Reset(rvmWD1793 *wd);
+// Allocate the MFM track buffer (idempotent). Returns false on OOM. RP2350 only.
+bool rvmWD1793AllocTrackBuf(rvmWD1793 *wd);
+// Release the MFM track buffer (safe if already null). RP2350 only.
+void rvmWD1793FreeTrackBuf(rvmWD1793 *wd);
 bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string& Filename);
 uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control);
 void wdDiskEject(rvmWD1793 *wd, unsigned char UnitNum);

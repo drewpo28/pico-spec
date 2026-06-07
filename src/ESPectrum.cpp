@@ -1080,6 +1080,12 @@ void ESPectrum::setup() {
   // Init disk controller
   Debug::log("setup: WD1793 reset begin");
   Debug::log2SD("setup: WD1793 reset begin");
+#if !PICO_RP2040
+  // Primary Betadisk drive always needs its track buffer. The MB-02 drive's
+  // buffer is allocated/freed on demand via Mb02Subsys (saves ~12.5 KB SRAM
+  // while MB-02 is disabled, which is the default).
+  rvmWD1793AllocTrackBuf(&fdd);
+#endif
   rvmWD1793Reset(&fdd);
   Debug::log("setup: WD1793 reset done");
   Debug::log2SD("setup: WD1793 reset done");
