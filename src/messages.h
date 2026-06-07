@@ -475,11 +475,13 @@ static const char *MENU_TRDOS_ROM_TITLE[2] = { "TR-DOS ROM\n", "TR-DOS ROM\n" };
 #define MENU_TRDOS_ROM_SEL_EN \
     "5.03\t[ ]\n"\
     "5.04TM\t[ ]\n"\
-    "5.05D\t[ ]\n"
+    "5.05D\t[ ]\n"\
+    "Custom\t[ ]\n"
 #define MENU_TRDOS_ROM_SEL_ES \
     "5.03\t[ ]\n"\
     "5.04TM\t[ ]\n"\
-    "5.05D\t[ ]\n"
+    "5.05D\t[ ]\n"\
+    "Custom\t[ ]\n"
 static const char *MENU_TRDOS_ROM_SEL[2] = { MENU_TRDOS_ROM_SEL_EN, MENU_TRDOS_ROM_SEL_ES };
 
 // Drive submenu — the Write Protect row is filled in (toggle marker) at runtime.

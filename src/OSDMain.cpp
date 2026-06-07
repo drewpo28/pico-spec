@@ -2052,6 +2052,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             switch (Config::trdosBios) {
                                                 case 0: MemESP::rom[4].assign_rom(gb_rom_4_trdos_503); break;
                                                 case 1: MemESP::rom[4].assign_rom(gb_rom_4_trdos_504tm); break;
+                                                case 3: MemESP::rom[4].assign_rom(gb_rom_4_trdos_custom); break;
                                                 default: MemESP::rom[4].assign_rom(gb_rom_4_trdos_505d); break;
                                             }
                                         }
@@ -9115,14 +9116,18 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
             fclose2(f);
             return false;
         }
-        switch (Config::trdosBios) {
-            case 0: rom = gb_rom_4_trdos_503; break;
-            case 1: rom = gb_rom_4_trdos_504tm; break;
-            default: rom = gb_rom_4_trdos_505d; break;
-        }
+        // Always flash into the dedicated custom slot and select it, so the
+        // factory 5.03/5.04TM/5.05D images are never overwritten and the new
+        // ROM is active after reboot (mirrors 48K -> "48Kcs").
+        rom = gb_rom_4_trdos_custom;
+        Config::trdosBios = 3;
         max_rom_size = 16ul << 10;
         dlgTitle += " TRDOS ";
-        Config::arch = "Pentagon";
+        // TR-DOS ROM (rom[4]) is independent of the active machine and now
+        // works with any of them, so we must NOT force Config::arch here —
+        // doing so would yank the user out of their current machine into
+        // Pentagon after the post-flash reboot. The custom slot is re-bound
+        // unconditionally by Config::requestMachine() regardless of arch.
     }
     else if ( arch == 7 ) {
         if( bytesfirmware > (32ul << 10) ) {

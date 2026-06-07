@@ -284,6 +284,7 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
     switch (Config::trdosBios) {
         case 0: MemESP::rom[4].assign_rom(gb_rom_4_trdos_503); break;
         case 1: MemESP::rom[4].assign_rom(gb_rom_4_trdos_504tm); break;
+        case 3: MemESP::rom[4].assign_rom(gb_rom_4_trdos_custom); break;
         default: MemESP::rom[4].assign_rom(gb_rom_4_trdos_505d); break;
     }
 }
