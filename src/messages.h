@@ -760,6 +760,22 @@ static const char *MENU_ASPECT[2] = { MENU_ASPECT_EN, MENU_ASPECT_ES };
 
 static const char *MENU_SCANLINES[2] = { "Scanlines\n", "Scanlines\n" };
 
+// Scanlines: Off + 4 brightness levels (dark -> light). Level 2 is the default
+// (matches the legacy single-darkness look). Selection marker is [*]/[ ].
+#define MENU_SCANLINES_SEL_EN \
+    "Off\t[0]\n"\
+    "1 Darkest\t[1]\n"\
+    "2 Dark (default)\t[2]\n"\
+    "3 Light\t[3]\n"\
+    "4 Lightest\t[4]\n"
+#define MENU_SCANLINES_SEL_ES \
+    "Off\t[0]\n"\
+    "1 Mas oscuro\t[1]\n"\
+    "2 Oscuro (predet.)\t[2]\n"\
+    "3 Claro\t[3]\n"\
+    "4 Mas claro\t[4]\n"
+static const char *MENU_SCANLINES_SEL[2] = { MENU_SCANLINES_SEL_EN, MENU_SCANLINES_SEL_ES };
+
 static const char *MENU_VSYNC[2] = { "V-Sync\n", "V-Sync\n" };
 
 static const char *MENU_GIGASCREEN[2] = { "Gigascreen\n", "Gigascreen\n" };

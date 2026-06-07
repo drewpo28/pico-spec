@@ -65,7 +65,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Midi.h"
 #include "MidiSynth.h"
 #include "kbd_img.h"
-extern "C" void graphics_set_scanlines(bool enabled);
+extern "C" void graphics_set_scanlines(uint8_t level);
 extern "C" void graphics_set_dither(bool enabled);
 #if !PICO_RP2040
 extern "C" volatile bool profi_ds80_active;
@@ -3389,21 +3389,19 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             menu_saverect = true;
                             while (1) {
                                 string opt_menu = MENU_SCANLINES[Config::lang];
-                                opt_menu += MENU_YESNO[Config::lang];
-                                uint8_t prev_opt = Config::scanlines;
-                                if (prev_opt) {
-                                    opt_menu.replace(opt_menu.find("[Y",0),2,"[*");
-                                    opt_menu.replace(opt_menu.find("[N",0),2,"[ ");
-                                } else {
-                                    opt_menu.replace(opt_menu.find("[Y",0),2,"[ ");
-                                    opt_menu.replace(opt_menu.find("[N",0),2,"[*");
+                                opt_menu += MENU_SCANLINES_SEL[Config::lang];
+                                uint8_t prev_opt = Config::scanlines; // 0=Off, 1..4=level
+                                // Mark the active level: rows are [0]..[4], matching the value
+                                for (uint8_t lv = 0; lv <= 4; ++lv) {
+                                    char tag[3] = { '[', (char)('0' + lv), 0 };
+                                    size_t at = opt_menu.find(tag, 0);
+                                    if (at != string::npos)
+                                        opt_menu.replace(at, 2, (lv == prev_opt) ? "[*" : "[ ");
                                 }
                                 uint8_t opt2 = menuRun(opt_menu);
                                 if (opt2) {
-                                    if (opt2 == 1)
-                                        Config::scanlines = 1;
-                                    else
-                                        Config::scanlines = 0;
+                                    // Rows 1..5 map to levels 0..4
+                                    Config::scanlines = opt2 - 1;
 
                                     if (Config::scanlines != prev_opt) {
                                         Config::save();
@@ -8615,7 +8613,9 @@ void OSD::EmulatorInfo() {
             " Scanlines      : %s\n"
             " Render         : %s\n"
             " Palette        : %s\n",
-            Config::scanlines ? "On" : "Off",
+            Config::scanlines ? (Config::scanlines == 1 ? "Lvl 1" :
+                                 Config::scanlines == 2 ? "Lvl 2" :
+                                 Config::scanlines == 3 ? "Lvl 3" : "Lvl 4") : "Off",
             Config::render ? "Snow effect" : "Standard",
             VIDEO::paletteName(Config::palette));
 #if !PICO_RP2040

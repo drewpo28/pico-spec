@@ -23,6 +23,9 @@ extern enum graphics_mode_t graphics_mode;
 
 // Scanlines mode: when enabled, every other physical line is dark
 static bool hdmi_scanlines = false;
+// Scanline brightness level: 0=off, 1=darkest .. 4=lightest. Level 2 is the
+// legacy 0x202020 look and the default. Drives the gray of IDX_SCANLINE.
+static uint8_t hdmi_scanline_level = 2;
 
 // Bayer 2x2 dither: when enabled, alternates each pixel's palette index between
 // idx and idx|0x40 according to (y^x) parity. Only safe when active palette
@@ -81,6 +84,15 @@ static uint32_t irq_inx = 0;
 #define IDX_DI_PREAMBLE     (220)
 #define IDX_DI_GUARD        (221)
 #define IDX_DI_DATA_BASE    (222)   // 222..237 (16 entries for 32 pixel clocks)
+
+// Per-level scanline gray (RGB888). Index by level 1..4, dark -> light.
+// Level 2 == 0x202020 == the legacy look and the default. [0] unused.
+static const uint32_t hdmi_scanline_gray_lut[5] = {
+    0x202020, 0x101010, 0x202020, 0x404040, 0x606060
+};
+static inline uint32_t hdmi_scanline_gray(void) {
+    return hdmi_scanline_gray_lut[(hdmi_scanline_level <= 4) ? hdmi_scanline_level : 2];
+}
 
 #if !PICO_RP2040
 // HDMI audio state
@@ -503,8 +515,8 @@ static inline bool hdmi_init() {
     //255 - цвет фона
     graphics_set_palette(255, palette[255]);
 
-    // Scanline color: dark gray RGB888
-    graphics_set_palette(IDX_SCANLINE, 0x202020);
+    // Scanline color: gray RGB888 for the current brightness level
+    graphics_set_palette(IDX_SCANLINE, hdmi_scanline_gray());
 
     //240-243 служебные данные(синхра) напрямую вносим в массив -конвертер
     uint64_t* conv_color64 = (uint64_t *)conv_color;
@@ -913,8 +925,15 @@ void graphics_set_bgcolor_hdmi(uint32_t color888) //определяем зар�
     graphics_set_palette(255, color888);
 };
 
-void hdmi_set_scanlines(bool enabled) {
-    hdmi_scanlines = enabled;
+void hdmi_set_scanlines(uint8_t level) {
+    if (level > 4) level = 4;
+    hdmi_scanlines = (level != 0);
+    // Off keeps the previous brightness so toggling back is cheap; a real level
+    // change re-tints the scanline palette index live (no mode switch needed).
+    if (level != 0 && level != hdmi_scanline_level) {
+        hdmi_scanline_level = level;
+        graphics_set_palette(IDX_SCANLINE, hdmi_scanline_gray());
+    }
 }
 
 void hdmi_set_dither(bool enabled) {

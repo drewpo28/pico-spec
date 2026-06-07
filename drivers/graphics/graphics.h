@@ -73,7 +73,7 @@ void graphics_set_bgcolor(uint32_t color888);
 
 void graphics_set_flashmode(bool flash_line, bool flash_frame);
 
-void graphics_set_scanlines(bool enabled);
+void graphics_set_scanlines(uint8_t level);
 void graphics_set_dither(bool enabled);
 
 // Profi DS80 "packed nibble" mode — HDMI path.
