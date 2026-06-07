@@ -2418,9 +2418,13 @@ void fdiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     if (secCount > 0)
         f_read(disk->Diskfile, secHdrs, secCount * 7, &br);
 
-    // Calculate total data length to determine gap sizes (ZXMAK2 algorithm)
+    // Calculate total data length to determine gap sizes (ZXMAK2 algorithm).
+    // Same pass also finds the [minOff, maxEnd) extent of all sector data within
+    // the track-data block, so the whole block can be read in ONE SD transaction
+    // (vs one f_lseek+f_read per sector — ~16 SPI transactions at ~1.4ms each).
     int imageSize = 6250;
     int trkdatalen = 0;
+    uint32_t dataMinOff = 0xFFFFFFFF, dataMaxEnd = 0;
     for (int s = 0; s < secCount; s++) {
         uint8_t *sh = &secHdrs[s * 7];
         uint8_t flags = sh[4];
@@ -2429,9 +2433,23 @@ void fdiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
         if (!(flags & 0x40)) { // has data area
             trkdatalen += 4;   // A1 + FB + 2 bytes CRC
             trkdatalen += slen;
+            uint32_t off = sh[5] | (sh[6] << 8);
+            if (off < dataMinOff) dataMinOff = off;
+            if (off + (uint32_t)slen > dataMaxEnd) dataMaxEnd = off + (uint32_t)slen;
         } else {
             slen = 0;
         }
+    }
+
+    // Bulk-read the whole track-data block once into a scratch buffer. Sectors
+    // then memcpy from RAM instead of hitting the SD card individually. Falls back
+    // to per-sector f_read if the span exceeds the scratch buffer (rare).
+    static uint8_t fdiSecDataBuf[8192];
+    bool bulkOK = false;
+    if (dataMaxEnd > dataMinOff && (dataMaxEnd - dataMinOff) <= sizeof(fdiSecDataBuf)) {
+        f_lseek(disk->Diskfile, disk->fdiDataOffset + trkDataOffset + dataMinOff);
+        f_read(disk->Diskfile, fdiSecDataBuf, dataMaxEnd - dataMinOff, &br);
+        bulkOK = true;
     }
 
     // Dynamic gap sizing (ZXMAK2: distribute free space across gaps)
@@ -2525,13 +2543,19 @@ void fdiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
             uint8_t dataMark = (flags & 0x80) ? 0xF8 : 0xFB;
             if (pos < imageSize) buf[pos++] = dataMark;
 
-            // Sector data from file
+            // Sector data: copy from the bulk-read scratch buffer (fast path), or
+            // fall back to an individual SD read if the bulk read was skipped.
             int slen = 128 << (secN & 3);
             uint32_t filePos = disk->fdiDataOffset + trkDataOffset + secDataOff;
             int toRead = slen;
             if (pos + toRead > imageSize) toRead = imageSize - pos;
-            f_lseek(disk->Diskfile, filePos);
-            f_read(disk->Diskfile, buf + pos, toRead, &br);
+            if (bulkOK && secDataOff >= dataMinOff &&
+                (uint32_t)(secDataOff - dataMinOff) + (uint32_t)toRead <= (dataMaxEnd - dataMinOff)) {
+                memcpy(buf + pos, fdiSecDataBuf + (secDataOff - dataMinOff), toRead);
+            } else {
+                f_lseek(disk->Diskfile, filePos);
+                f_read(disk->Diskfile, buf + pos, toRead, &br);
+            }
             pos += toRead;
 
             // Data CRC

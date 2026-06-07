@@ -59,6 +59,10 @@ uint32_t CPU::tstates = 0;
 int32_t CPU::prev_tstates = 0;
 uint32_t CPU::tstates_diff = 0;
 
+// Frame timing accumulators (µs); read+reset in VIDEO::EndFrame diagnostic.
+volatile uint32_t cpu_frame_us  = 0;  // total CPU::loop() time (incl. FDC)
+volatile uint32_t fdd_step_us   = 0;  // time inside rvmWD1793Step only
+
 uint64_t CPU::global_tstates = 0;
 uint32_t CPU::statesInFrame = 0;
 uint32_t CPU::tstates_frame = 0;
@@ -235,9 +239,11 @@ IRAM_ATTR void CPU::step() {
 
 
 IRAM_ATTR void CPU::loop() {
+    uint64_t _loop_t0 = time_us_64();
     bool pbbp = CPU::portBasedBP;
     if (paused || pbbp) {
         VIDEO::EndFrame();
+        cpu_frame_us += (uint32_t)(time_us_64() - _loop_t0);
         return;
     }
     int nbp = Config::numPcBP;
@@ -281,9 +287,13 @@ IRAM_ATTR void CPU::loop() {
 
     if ((ESPectrum::fdd.control & (kRVMWD177XHLD | kRVMWD177XHLT)) != 0)
     {
+        uint64_t _fdd_t0 = time_us_64();
         rvmWD1793Step(&ESPectrum::fdd, CPU::tstates_diff / WD177XSTEPSTATES); // FDD
+        fdd_step_us += (uint32_t)(time_us_64() - _fdd_t0);
     }
     CPU::tstates_diff = CPU::tstates_diff % WD177XSTEPSTATES;
+
+    cpu_frame_us += (uint32_t)(time_us_64() - _loop_t0);
 
     global_tstates += statesInFrame; // increase global Tstates
     tstates_frame = tstates;

@@ -88,6 +88,11 @@ int      ds80_dbg_wr_cnt = 0;        // reset each frame so we always capture fi
 uint16_t _ds80_dbg_get_pc(void) { return Z80::getRegPC(); }
 #endif
 
+// Per-frame port-call counters — read and reset in VIDEO::EndFrame diagnostic.
+uint32_t Ports::port7ffd_cnt  = 0;
+uint32_t Ports::portdffd_cnt  = 0;
+volatile uint32_t Ports::fdd_ports_us = 0;
+
 // IDE_PORT_TRACE (PROFI IDE/HDD port tracing) is defined by CMake (default 0).
 // Undefined → 0 in #if, so no fallback #define is needed here.
 
@@ -170,8 +175,11 @@ IRAM_ATTR void Ports::FDDStep(bool force) {
   CPU::tstates_diff += p_states - CPU::prev_tstates;
 
   if (force ||
-      ((ESPectrum::fdd.control & (kRVMWD177XHLD | kRVMWD177XHLT)) != 0))
+      ((ESPectrum::fdd.control & (kRVMWD177XHLD | kRVMWD177XHLT)) != 0)) {
+    uint64_t _t0 = time_us_64();
     rvmWD1793Step(&ESPectrum::fdd, CPU::tstates_diff / WD177XSTEPSTATES); // FDD
+    fdd_ports_us += (uint32_t)(time_us_64() - _t0);
+  }
 
   CPU::tstates_diff = CPU::tstates_diff % WD177XSTEPSTATES;
 
@@ -868,6 +876,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // bit [6]: map bank2 to page 6
   // bit [7]: hires video mode — screen at RAM page 4/6 instead of 5/7
   if (Config::arch == "Profi" && address == 0xDFFD) {
+    ++Ports::portdffd_cnt;
     LED::touchW(LED::RAM);
     // Per ZXMAK2 MemoryProfi1024: DFFD writes are NOT gated by paging lock.
     // norom (bit 4) clears lock unconditionally.
@@ -1619,6 +1628,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // for banking, not #7FFD. Letting #7FFD writes through here corrupts
   // videoLatch/pagingLock and produces a black screen on ALF.
   if ((!Z80Ops::is48) && !Z80Ops::isALF && ((address & 0x8002) == 0)) { // 8002 !-> 7FFD
+    ++Ports::port7ffd_cnt;
     LED::touchW(LED::RAM);
 #if PROFI_PORT_TRACE
     if (Config::arch == "Profi") {

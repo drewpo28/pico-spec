@@ -495,6 +495,9 @@ static unsigned int curline;
 // the live grmem/profi_clrmem, which we pick up at the next frame's line 0.
 static uint8_t* ds80_frame_grmem  = nullptr;
 static uint8_t* ds80_frame_clrmem = nullptr;
+// SRAM snapshot of the 16 KB clrmem page (pages 56/58).  Lives at file scope so
+// EndFrame (vblank) can populate it before the rasterizer runs.
+static uint8_t ds80_clr_sram[16384];
 #endif
 
 static unsigned int bmpOffset;  // offset for bitmap in graphic memory
@@ -2238,12 +2241,18 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
         // model): all 240 lines render from the page selected at line 0, so mid-frame
         // videoLatch flips don't tear the current frame.  Also (re)latch if null (first
         // frame after activation).
+        // clrmem snapshot: colour attrs (pages 56/58) live in butter XIP PSRAM.
+        // Direct access → ~15k scattered XIP reads/frame, each a potential cache-miss
+        // stall mid-scanline.  Snapshot the whole 16 KB page into SRAM once at line 0
+        // (one sequential, cache-friendly burst) and render colour from SRAM.
+        // grmem (pages 4/6) is already in SRAM — left as-is.
         if ((line == 0 && start_col == 0) || ds80_frame_grmem == nullptr) {
             ds80_frame_grmem  = grmem;
             ds80_frame_clrmem = profi_clrmem;
         }
         uint8_t* fgrmem  = ds80_frame_grmem;
-        uint8_t* fclrmem = ds80_frame_clrmem;
+        // ds80_clr_sram is populated in EndFrame (vblank) — always SRAM, always valid.
+        uint8_t* fclrmem = ds80_frame_clrmem ? ds80_clr_sram : nullptr;
         //
         // Row layout: pad_l bytes of border, then 256 content bytes (with (k^2) pre-swap
         // for the ISR's x^2 read pattern), then pad_r bytes of border.
@@ -2302,21 +2311,21 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             bool in_stats = skip_stats_row && (pbase + 8 > 168) && (pbase < 312);
             if (fb_row && !in_stats) {
                 // 16 source pixels per col → 8 packed bytes at content offset pad_l + j*8.
-                // Pre-apply (k^2) swap so ISR reads in correct order: store v[k] at pbase+(k^2).
-                // Even src byte (8 px): pairs (bit7,bit6), (bit5,bit4), (bit3,bit2), (bit1,bit0)
-                for (int k = 0; k < 4; k++) {
-                    int sh = 6 - k * 2;
-                    uint8_t p0 = ((bmpEven >> (sh + 1)) & 1) ? inkE : papE;
-                    uint8_t p1 = ((bmpEven >> sh) & 1) ? inkE : papE;
-                    fb_row[pbase + (k ^ 2)] = profi_pair_lookup[p0][p1];
-                }
-                // Odd src byte (8 px), packed in next 4 bytes.
-                for (int k = 0; k < 4; k++) {
-                    int sh = 6 - k * 2;
-                    uint8_t p0 = ((bmpOdd >> (sh + 1)) & 1) ? inkO : papO;
-                    uint8_t p1 = ((bmpOdd >> sh) & 1) ? inkO : papO;
-                    fb_row[pbase + 4 + (k ^ 2)] = profi_pair_lookup[p0][p1];
-                }
+                // Pre-apply (k^2) swap so ISR reads in correct order.
+                // Physical byte layout after k^2: [k=2,k=3,k=0,k=1] at pbase+[0,1,2,3].
+                // Pack into two aligned uint32_t writes (4× fewer SRAM transactions than
+                // 8 individual byte writes, reducing core0 bus contention with video DMA).
+                // pbase is always 4-byte aligned (pad_l divisible by 4, j*8 divisible by 8).
+                uint8_t e0 = profi_pair_lookup[((bmpEven>>3)&1)?inkE:papE][((bmpEven>>2)&1)?inkE:papE]; // k=2 → +0
+                uint8_t e1 = profi_pair_lookup[((bmpEven>>1)&1)?inkE:papE][((bmpEven>>0)&1)?inkE:papE]; // k=3 → +1
+                uint8_t e2 = profi_pair_lookup[((bmpEven>>7)&1)?inkE:papE][((bmpEven>>6)&1)?inkE:papE]; // k=0 → +2
+                uint8_t e3 = profi_pair_lookup[((bmpEven>>5)&1)?inkE:papE][((bmpEven>>4)&1)?inkE:papE]; // k=1 → +3
+                *(uint32_t*)(fb_row + pbase) = (uint32_t)e0 | ((uint32_t)e1<<8) | ((uint32_t)e2<<16) | ((uint32_t)e3<<24);
+                uint8_t o0 = profi_pair_lookup[((bmpOdd>>3)&1)?inkO:papO][((bmpOdd>>2)&1)?inkO:papO]; // k=2 → +4
+                uint8_t o1 = profi_pair_lookup[((bmpOdd>>1)&1)?inkO:papO][((bmpOdd>>0)&1)?inkO:papO]; // k=3 → +5
+                uint8_t o2 = profi_pair_lookup[((bmpOdd>>7)&1)?inkO:papO][((bmpOdd>>6)&1)?inkO:papO]; // k=0 → +6
+                uint8_t o3 = profi_pair_lookup[((bmpOdd>>5)&1)?inkO:papO][((bmpOdd>>4)&1)?inkO:papO]; // k=1 → +7
+                *(uint32_t*)(fb_row + pbase + 4) = (uint32_t)o0 | ((uint32_t)o1<<8) | ((uint32_t)o2<<16) | ((uint32_t)o3<<24);
             }
             // Advance lineptr32 to keep std fb cursor in sync with standard renderer stride.
             lineptr32 += 2;
@@ -2692,6 +2701,10 @@ IRAM_ATTR void VIDEO::EndFrame() {
                 // valid — no preload/pin/precheck needed.
                 profi_clrmem = MemESP::ram[clrPg].direct();
                 profi_clr_spi_base = 0xFFFFFFFFu;
+                // Snapshot the 16 KB clrmem page into SRAM here (vblank) so the
+                // rasterizer never touches XIP PSRAM during active scan.
+                if (profi_clrmem)
+                    memcpy(ds80_clr_sram, profi_clrmem, sizeof(ds80_clr_sram));
 #if PROFI_PORT_TRACE
                 ds80_dbg_grmem  = grmem;
                 ds80_dbg_clrmem = profi_clrmem;
@@ -2752,6 +2765,12 @@ IRAM_ATTR void VIDEO::EndFrame() {
         }
     }
 
+    // DS80 clrmem snapshot refresh (vblank): copy page 56/58 → SRAM buffer so the
+    // rasterizer reads sequential SRAM throughout active scan (no mid-frame XIP stalls).
+    // Done every frame so Z80 writes to page 56/58 are visible on the next frame.
+    if (profi_ds80_active && profi_clrmem && !profi_ds80_activate_pending)
+        memcpy(ds80_clr_sram, profi_clrmem, sizeof(ds80_clr_sram));
+
     // DS80 720×576 top/bottom border bands: the scan-time renderer only writes the
     // 240 content lines (fb rows DS80_BORDER_TOP..+239), so the top rows 0..TOP-1 and
     // the bottom rows TOP+240..yres-1 are never touched by it.  Fill them with the
@@ -2790,24 +2809,49 @@ IRAM_ATTR void VIDEO::EndFrame() {
 // DS80 framebuffer diagnostic: log framebuffer bytes and latched pointers every 60 frames.
     // This tells us whether the renderer is filling the framebuffer correctly.
     {
-#if !PICO_RP2040
-        static uint32_t ds80_diag_frame = 0;
-        if (profi_ds80_active && ++ds80_diag_frame >= 60) {
-            ds80_diag_frame = 0;
-            const int ds80_voff = (vga.yres >= 288) ? 24 : 0;
-            const int pad_l     = ((int)vga.xres - 256) / 2;
-            // Log latched pointers and 8 framebuffer bytes from content row 0.
-            uint8_t* row0 = vga.frameBuffer ? (uint8_t*)vga.frameBuffer[ds80_voff]     : nullptr;
-            uint8_t* row1 = vga.frameBuffer ? (uint8_t*)vga.frameBuffer[ds80_voff+120] : nullptr;
-            if (row0 && row1)
-                Debug::log("[DS80D] grmem=%p clrmem=%p vl=%d fb[%d][%d..%d]=%02X%02X%02X%02X fb[%d]=%02X%02X%02X%02X",
-                    ds80_frame_grmem, ds80_frame_clrmem, (int)MemESP::videoLatch,
-                    ds80_voff, pad_l, pad_l+3,
-                    row0[pad_l], row0[pad_l+1], row0[pad_l+2], row0[pad_l+3],
-                    ds80_voff+120,
-                    row1[pad_l], row1[pad_l+1], row1[pad_l+2], row1[pad_l+3]);
+// #if !PICO_RP2040
+//         static uint32_t ds80_diag_frame = 0;
+//         if (profi_ds80_active && ++ds80_diag_frame >= 60) {
+//             ds80_diag_frame = 0;
+//             const int ds80_voff = (vga.yres >= 288) ? 24 : 0;
+//             const int pad_l     = ((int)vga.xres - 256) / 2;
+//             // Log latched pointers and 8 framebuffer bytes from content row 0.
+//             uint8_t* row0 = vga.frameBuffer ? (uint8_t*)vga.frameBuffer[ds80_voff]     : nullptr;
+//             uint8_t* row1 = vga.frameBuffer ? (uint8_t*)vga.frameBuffer[ds80_voff+120] : nullptr;
+//             if (row0 && row1)
+//                 Debug::log("[DS80D] grmem=%p clrmem=%p vl=%d fb[%d][%d..%d]=%02X%02X%02X%02X fb[%d]=%02X%02X%02X%02X",
+//                     ds80_frame_grmem, ds80_frame_clrmem, (int)MemESP::videoLatch,
+//                     ds80_voff, pad_l, pad_l+3,
+//                     row0[pad_l], row0[pad_l+1], row0[pad_l+2], row0[pad_l+3],
+//                     ds80_voff+120,
+//                     row1[pad_l], row1[pad_l+1], row1[pad_l+2], row1[pad_l+3]);
+//         }
+// #endif
+    }
+
+    // Frame-timing diagnostic: average CPU::loop() time, logged every 60 frames.
+    if (Config::arch == "Profi") {
+        extern volatile uint32_t cpu_frame_us;
+        extern volatile uint32_t hdmi_irq_max_gap_us;
+        static uint32_t port_log_frame = 0;
+        static uint32_t cpu_accum = 0, cpu_max = 0, gap_max = 0;
+        static uint64_t wall_t0 = 0;   // wall-clock at window start (real frame-rate)
+        cpu_accum += cpu_frame_us;
+        if (cpu_frame_us > cpu_max) cpu_max = cpu_frame_us;
+        if (hdmi_irq_max_gap_us > gap_max) gap_max = hdmi_irq_max_gap_us;
+        hdmi_irq_max_gap_us = 0;
+        cpu_frame_us = 0;
+        if (++port_log_frame >= 60) {
+            uint64_t now = time_us_64();
+            float fps = wall_t0 ? (60.0f * 1000000.0f / (float)(now - wall_t0)) : 0.0f;
+            wall_t0 = now;
+            port_log_frame = 0;
+            // realFPS = actual core0 frame rate. If v_sync locks to HDMI it equals the
+            // mode's refresh (~50.08Hz); if it drifts, the tear-band drifts.
+            Debug::log("[PERF] 60f: cpu=%.1fms (max %.1fms) hdmiGapMax=%uus realFPS=%.2f",
+                cpu_accum / 60000.0f, cpu_max / 1000.0f, (unsigned)gap_max, fps);
+            cpu_accum = cpu_max = gap_max = 0;
         }
-#endif
     }
 
     // SPI PSRAM swap diagnostics: log eviction count once every 60 frames.

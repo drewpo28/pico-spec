@@ -594,12 +594,25 @@ static void assign_ram(int i) {
   // Page 59 is added as a 4th LRU pool slot (alongside 61/60/40) to compensate
   // for removing 56/58 from the pool, keeping HC/CP/M at ~1.4 evicts/frame.
   // (Tested safe: 59 is mid-range, not top-page system data like 62/63.)
+  //
+  // RP2040 (ZERO/MURM): DS80 is not available, and heap budget is only ~181KB
+  // with MEM_REMAIN=96KB reserved for the framebuffer.  The extended LRU pool
+  // (3 extra pages = 48KB more) leaves insufficient contiguous heap for the
+  // ~77KB framebuffer allocation → OOM panic.  Use the original 3-page set
+  // {56,58,61} on RP2040; the locked-SRAM DS80 requirement is RP2350-only.
+#if PICO_RP2040
+  bool force_sram_locked = false; // DS80 not available on RP2040
+  bool force_sram = (Config::arch == "Profi")
+                    && (i == 56 || i == 58 || i == 61)
+                    && (butter_psram_size() == 0);
+#else
   bool force_sram_locked = (Config::arch == "Profi")
                            && (i == 56 || i == 58)
                            && (butter_psram_size() == 0);
   bool force_sram = (Config::arch == "Profi")
-                    && (i == 61 || i == 60)
+                    && (i == 61 || i == 60 || i == 40 || i == 41)
                     && (butter_psram_size() == 0);
+#endif
   if (force_sram_locked) {
     MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, true); // LOCKED: permanent SRAM
     ++ram_pages;

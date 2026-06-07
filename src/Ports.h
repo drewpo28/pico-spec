@@ -63,6 +63,12 @@ public:
     static uint8_t portDFFD;
     static uint8_t portEFF7; // Extended feature register (Profi CP/M uses bit 1=EFF7_512)
 
+    // Per-frame port-call counters; read+reset in VIDEO::EndFrame diagnostic.
+    static uint32_t port7ffd_cnt;
+    static uint32_t portdffd_cnt;
+    // Time spent in Ports::FDDStep (rvmWD1793Step calls from port handlers).
+    static volatile uint32_t fdd_ports_us;
+
 #if !PICO_RP2040
     // KR580VI53 (Intel 8253 PIT) — Byte computer sound synthesizer
     struct PIT8253Channel {
