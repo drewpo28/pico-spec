@@ -1690,7 +1690,8 @@ void rvmWD1793Reset(rvmWD1793 *wd) {
 #if !PICO_RP2040
   // Flush modified UDI/FDI track to SD before resetting (avoid data loss)
   if (wd->diskDirty && wd->diskLoadedCyl >= 0) {
-    rvmwdDisk *disk = wd->disk[wd->diskS];
+    int lu = (wd->diskLoadedUnit >= 0) ? wd->diskLoadedUnit : wd->diskS;
+    rvmwdDisk *disk = wd->disk[lu];
     if (disk && disk->Diskfile) {
       if (disk->IsUDIFile) {
         int trkIdx = wd->diskLoadedCyl * disk->sides + wd->diskLoadedSide;
@@ -1708,6 +1709,7 @@ void rvmWD1793Reset(rvmWD1793 *wd) {
   }
   wd->diskLoadedCyl = -1;
   wd->diskLoadedSide = -1;
+  wd->diskLoadedUnit = -1;
   wd->diskTrackLen = 0;
   wd->diskDirty = false;
   wd->fdiTstates = 0;
@@ -1731,6 +1733,7 @@ void rvmWD1793FreeTrackBuf(rvmWD1793 *wd) {
     if (wd->diskTrackBuf) { free(wd->diskTrackBuf); wd->diskTrackBuf = nullptr; }
     wd->diskLoadedCyl = -1;
     wd->diskLoadedSide = -1;
+    wd->diskLoadedUnit = -1;
     wd->diskTrackLen = 0;
     wd->diskDirty = false;
 #endif
@@ -2295,7 +2298,10 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
 
 #if !PICO_RP2040
 static void udiFlushTrack(rvmWD1793 *wd) {
-    rvmwdDisk *disk = wd->disk[wd->diskS];
+    // Flush targets the unit whose track is in the buffer, not the currently
+    // selected drive — they differ when a drive switch triggers the flush.
+    int u = (wd->diskLoadedUnit >= 0) ? wd->diskLoadedUnit : wd->diskS;
+    rvmwdDisk *disk = wd->disk[u];
     if (!disk || wd->diskLoadedCyl < 0) return;
     int trkIdx = wd->diskLoadedCyl * disk->sides + wd->diskLoadedSide;
     if (trkIdx < 0 || trkIdx >= 168) return;
@@ -2308,7 +2314,8 @@ static void udiFlushTrack(rvmWD1793 *wd) {
 }
 
 void udiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
-    if ((int)cyl == wd->diskLoadedCyl && (int)side == wd->diskLoadedSide)
+    if ((int)cyl == wd->diskLoadedCyl && (int)side == wd->diskLoadedSide
+        && wd->diskS == wd->diskLoadedUnit)
         return;
 
     // Flush modified track back to file before switching tracks
@@ -2333,6 +2340,7 @@ void udiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     wd->diskTrackLen = tlen;
     wd->diskLoadedCyl = (int)cyl;
     wd->diskLoadedSide = (int)side;
+    wd->diskLoadedUnit = wd->diskS;
 }
 
 // VG93/WD1793 CRC-CCITT (same algorithm as ZXMAK2 CrcVg93)
@@ -2346,7 +2354,8 @@ static uint16_t vgCrc(uint16_t crc, uint8_t byte) {
 // Flush modified FDI track buffer back to FDI file.
 // Parses MFM buffer to find sector data and writes it back at original FDI file offsets.
 static void fdiFlushTrack(rvmWD1793 *wd) {
-    rvmwdDisk *disk = wd->disk[wd->diskS];
+    int u = (wd->diskLoadedUnit >= 0) ? wd->diskLoadedUnit : wd->diskS;
+    rvmwdDisk *disk = wd->disk[u];
     if (!disk || !disk->IsFDIFile || wd->diskLoadedCyl < 0) { wd->diskDirty = false; return; }
 
     int trkIdx = wd->diskLoadedCyl * disk->sides + wd->diskLoadedSide;
@@ -2415,7 +2424,8 @@ static void fdiFlushTrack(rvmWD1793 *wd) {
 // Generate MFM track image from FDI sector data (ZXMAK2 approach).
 // Called on demand when cylinder/side changes, same as udiLoadTrack.
 void fdiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
-    if ((int)cyl == wd->diskLoadedCyl && (int)side == wd->diskLoadedSide)
+    if ((int)cyl == wd->diskLoadedCyl && (int)side == wd->diskLoadedSide
+        && wd->diskS == wd->diskLoadedUnit)
         return;
 
     // Flush any pending writes before loading new track
@@ -2607,6 +2617,7 @@ void fdiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     wd->diskTrackLen = pos;
     wd->diskLoadedCyl = (int)cyl;
     wd->diskLoadedSide = (int)side;
+    wd->diskLoadedUnit = wd->diskS;
 }
 
 // Generate MFM track image from a TD0 (Teledisk) track record. The record is
@@ -2615,7 +2626,8 @@ void fdiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
 // but decodes each sector's data (raw/pattern/RLE) from the TD0 stream.
 // Read-only: writes are silently dropped by rvmwdDiskStep (writeprotect=1).
 void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
-    if ((int)cyl == wd->diskLoadedCyl && (int)side == wd->diskLoadedSide)
+    if ((int)cyl == wd->diskLoadedCyl && (int)side == wd->diskLoadedSide
+        && wd->diskS == wd->diskLoadedUnit)
         return;
 
     rvmwdDisk *disk = wd->disk[wd->diskS];
@@ -2800,6 +2812,7 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     wd->diskTrackLen = pos;
     wd->diskLoadedCyl = (int)cyl;
     wd->diskLoadedSide = (int)side;
+    wd->diskLoadedUnit = wd->diskS;
 #if FDD_PORT_TRACE
     Debug::log("[TD0] built trk cyl=%d side=%d: imageSize=%d trkLen=%d bufSize=%d trkdatalen=%d gaps[1=%d s=%d 2=%d 3=%d pulse=%d]",
                (int)cyl, (int)side, imageSize, (int)pos, (int)DISK_TRACK_BUF_SZ,
@@ -2810,7 +2823,8 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
 // Generate MFM track image from MBD raw sector dump (MB-02+ BS-DOS format).
 // MBD is a simple linear layout: tracks × sides × sectors × sectorSize bytes.
 void mbdLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
-    if ((int)cyl == wd->diskLoadedCyl && (int)side == wd->diskLoadedSide)
+    if ((int)cyl == wd->diskLoadedCyl && (int)side == wd->diskLoadedSide
+        && wd->diskS == wd->diskLoadedUnit)
         return;
 
     // Flush any pending writes before loading new track
@@ -2914,13 +2928,15 @@ void mbdLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     wd->diskTrackLen = pos;
     wd->diskLoadedCyl = (int)cyl;
     wd->diskLoadedSide = (int)side;
+    wd->diskLoadedUnit = wd->diskS;
 }
 
 // Flush modified MBD track buffer back to file
 static void mbdFlushTrack(rvmWD1793 *wd) {
     if (!wd->diskDirty || wd->diskLoadedCyl < 0) return;
 
-    rvmwdDisk *disk = wd->disk[wd->diskS];
+    int u = (wd->diskLoadedUnit >= 0) ? wd->diskLoadedUnit : wd->diskS;
+    rvmwdDisk *disk = wd->disk[u];
     if (!disk || !disk->IsMBDFile || disk->writeprotect) {
         wd->diskDirty = false;
         return;
@@ -3235,7 +3251,9 @@ void wdDiskEject(rvmWD1793 *wd, unsigned char UnitNum) {
 
     if (wd->disk[UnitNum]->Diskfile != NULL) {
 #if !PICO_RP2040
-        if (wd->diskDirty && wd->diskS == UnitNum) {
+        // Flush only if the buffer actually holds this unit's dirty track.
+        // (diskLoadedUnit, not diskS — they differ after a drive switch.)
+        if (wd->diskDirty && wd->diskLoadedUnit == (int)UnitNum) {
             if (wd->disk[UnitNum]->IsUDIFile) udiFlushTrack(wd);
             else if (wd->disk[UnitNum]->IsFDIFile) fdiFlushTrack(wd);
             else if (wd->disk[UnitNum]->IsMBDFile) mbdFlushTrack(wd);

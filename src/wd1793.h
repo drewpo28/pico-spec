@@ -346,6 +346,7 @@ typedef struct
     uint16_t diskTrackLen;        // length of current track
     int diskLoadedCyl;            // loaded cylinder (-1 = none)
     int diskLoadedSide;           // loaded side
+    int diskLoadedUnit;           // drive unit whose track is in diskTrackBuf (-1 = none)
     bool diskDirty;              // track buffer modified, needs flush to file
 
     // FDI find_marker support (ZXMAK2-style)
