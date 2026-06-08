@@ -887,6 +887,8 @@ static const char *MENU_RGTIMINGS[2] = { "R.G. Timings\n" , "Timings R.G.\n"};
 
 static const char *MENU_LEDINDICATORS[2] = { "LED indicators\n" , "Indicadores LED\n"};
 
+static const char *MENU_SDLEDBLINK[2] = { "SD card LED\n" , "LED tarjeta SD\n"};
+
 
 #if PICO_RP2040
 #define MENU_AUDIO_EN "Audio\n"\
@@ -941,7 +943,8 @@ static const char *MENU_GS_CLOCK_SEL[2]  = {
     "Kempston joystick port\t>\n"\
     "Throttling\t>\n"\
     "Hot Keys\t>\n"\
-    "LED indicators\t>\n"
+    "LED indicators\t>\n"\
+    "SD card LED\t>\n"
 #define MENU_OTHER_ES "Otros\n"\
     "Temporizaci" "\xA2" "n ULA\t>\n"\
     "48K Issue 2\t>\n"\
@@ -950,7 +953,8 @@ static const char *MENU_GS_CLOCK_SEL[2]  = {
     "Puerto Kempston joystick\t>\n"\
     "Aceleraci" "\xA2" "n\t>\n"\
     "Teclas rapidas\t>\n"\
-    "Indicadores LED\t>\n"
+    "Indicadores LED\t>\n"\
+    "LED tarjeta SD\t>\n"
 static const char *MENU_OTHER[2] = { MENU_OTHER_EN, MENU_OTHER_ES };
 
 #ifdef PICO_RP2040

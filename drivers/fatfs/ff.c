@@ -23,6 +23,14 @@
 #include "ff.h"			/* Basic definitions and declarations of API */
 #include "diskio.h"		/* Declarations of MAI */
 
+/* Onboard-LED blink hooks (pico-spec). Defined in drivers/sdcard/sdcard.c.
+ * Forward-declared here to keep ff.c free of extra include paths. Emulator-
+ * internal scratch files (under "/tmp/") are tagged at open so their I/O does
+ * not blink the SD-activity LED. */
+extern void sdcard_led_tag(const void *fp, const char *path);
+extern void sdcard_led_untag(const void *fp);
+extern void sdcard_led_set_active(const void *fp);
+
 /*--------------------------------------------------------------------------
 
    Module Private Definitions
@@ -3806,6 +3814,7 @@ FRESULT f_open (
 	DIR dj;
 	FATFS *fs;
 	DEF_NAMEBUFF
+	const TCHAR* orig_path = path;	/* Saved before mount_volume() consumes the drive prefix */
 
 
 	if (!fp) return FR_INVALID_OBJECT;	/* Reject null pointer */
@@ -3983,6 +3992,8 @@ FRESULT f_open (
 
 	if (res != FR_OK) fp->obj.fs = 0;	/* Invalidate file object on error */
 
+	if (res == FR_OK) sdcard_led_tag(fp, orig_path);	/* No LED blink for /tmp/ scratch */
+
 	LEAVE_FF(fs, res);
 }
 
@@ -4012,6 +4023,7 @@ FRESULT f_read (
 	res = validate(&fp->obj, &fs);				/* Check validity of the file object */
 	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) LEAVE_FF(fs, res);	/* Check validity */
 	if (!(fp->flag & FA_READ)) LEAVE_FF(fs, FR_DENIED); /* Check access mode */
+	sdcard_led_set_active(fp);					/* LED stays dark if this FIL is /tmp/ scratch */
 	remain = fp->obj.objsize - fp->fptr;
 	if (btr > remain) btr = (UINT)remain;		/* Truncate btr by remaining bytes */
 
@@ -4113,6 +4125,7 @@ FRESULT f_write (
 	res = validate(&fp->obj, &fs);			/* Check validity of the file object */
 	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) LEAVE_FF(fs, res);	/* Check validity */
 	if (!(fp->flag & FA_WRITE)) LEAVE_FF(fs, FR_DENIED);	/* Check access mode */
+	sdcard_led_set_active(fp);				/* LED stays dark if this FIL is /tmp/ scratch */
 
 	/* Check fptr wrap-around (file size cannot reach 4 GiB at FAT volume) */
 	if ((!FF_FS_EXFAT || fs->fs_type != FS_EXFAT) && (DWORD)(fp->fptr + btw) < (DWORD)fp->fptr) {
@@ -4223,6 +4236,7 @@ FRESULT f_sync (
 	FATFS *fs;
 
 
+	sdcard_led_set_active(fp);		/* LED stays dark if this FIL is /tmp/ scratch */
 	res = validate(&fp->obj, &fs);	/* Check validity of the file object */
 	if (res == FR_OK) {
 		if (fp->flag & FA_MODIFIED) {	/* Is there any change to the file? */
@@ -4303,6 +4317,7 @@ FRESULT f_close (
 	FRESULT res;
 	FATFS *fs;
 
+	sdcard_led_set_active(fp);			/* f_sync below may flush; keep LED dark for /tmp/ */
 #if !FF_FS_READONLY
 	res = f_sync(fp);					/* Flush cached data */
 	if (res == FR_OK)
@@ -4321,6 +4336,7 @@ FRESULT f_close (
 #endif
 		}
 	}
+	sdcard_led_untag(fp);				/* Free the tag slot for this FIL */
 	return res;
 }
 

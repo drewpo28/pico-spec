@@ -35,6 +35,7 @@ string   Config::last_ram_file = NO_RAM_FILE;
 bool     Config::loaded = false;
 bool     Config::slog_on = false;
 bool     Config::ledIndicators = false;
+bool     Config::sdLedBlink = false;
 const bool     Config::aspect_16_9 = false;
 ///uint8_t  Config::esp32rev = 0;
 uint8_t  Config::lang = 0;
@@ -511,6 +512,7 @@ void Config::load() {
         nvs_get_b("rightSpace", rightSpace, sts);
         nvs_get_b("wasd", wasd, sts);
         nvs_get_b("ledIndicators", ledIndicators, sts);
+        nvs_get_b("sdLedBlink", sdLedBlink, sts);
         // Load typed breakpoints array
         for (int i = 0; i < MAX_BREAKPOINTS; i++) {
             breakPoints[i] = {0xFFFF, BP_NONE};
@@ -813,6 +815,7 @@ void Config::save() {
     nvs_set_str(buf,"debug_log", Debug::log_enabled ? "true" : "false");
     nvs_set_str(buf,"flashload", flashload ? "true" : "false");
     nvs_set_str(buf,"ledIndicators", ledIndicators ? "true" : "false");
+    nvs_set_str(buf,"sdLedBlink", sdLedBlink ? "true" : "false");
     nvs_set_str(buf,"tape_player", tape_player ? "true" : "false");
     nvs_set_str(buf,"profi_ext_keys", profi_ext_keys ? "true" : "false");
     nvs_set_str(buf,"profi_ds80_osd_pal", profi_ds80_std_palette_osd ? "true" : "false");

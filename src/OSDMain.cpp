@@ -52,6 +52,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "MemESP.h"
 #include "Tape.h"
 #include "LEDIndicators.h"
+#include "sdcard.h"
 #include "ZipExtract.h"
 #include "pwm_audio.h"
 #include "Z80_JLS/z80.h"
@@ -5127,6 +5128,38 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             menu_saverect = false;
                                         } else {
                                             menu_curopt = 8;
+                                            menu_level = 2;
+                                            break;
+                                        }
+                                    }
+                                }
+                                else if (options_num == 9) {
+                                    // SD card LED (onboard GPIO 25) ON/OFF
+                                    menu_level = 3;
+                                    menu_curopt = 1;
+                                    menu_saverect = true;
+                                    while (1) {
+                                        string opt_menu = MENU_SDLEDBLINK[Config::lang];
+                                        opt_menu += MENU_YESNO[Config::lang];
+                                        bool prev_opt = Config::sdLedBlink;
+                                        if (prev_opt) {
+                                            opt_menu.replace(opt_menu.find("[Y",0),2,"[*");
+                                            opt_menu.replace(opt_menu.find("[N",0),2,"[ ");
+                                        } else {
+                                            opt_menu.replace(opt_menu.find("[Y",0),2,"[ ");
+                                            opt_menu.replace(opt_menu.find("[N",0),2,"[*");
+                                        }
+                                        uint8_t opt2 = menuRun(opt_menu);
+                                        if (opt2 == 1 || opt2 == 2) {
+                                            Config::sdLedBlink = (opt2 == 1);
+                                            if (Config::sdLedBlink != prev_opt) {
+                                                sdcard_set_led_blink(Config::sdLedBlink);
+                                                Config::save();
+                                            }
+                                            menu_curopt = opt2;
+                                            menu_saverect = false;
+                                        } else {
+                                            menu_curopt = 9;
                                             menu_level = 2;
                                             break;
                                         }

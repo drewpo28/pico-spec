@@ -426,6 +426,84 @@ void disk_invalidate (void)
 
 
 /*-----------------------------------------------------------------------*/
+/* Onboard LED blink on physical SD access (GPIO 25)                      */
+/* Flag is owned by C++ Config; mirrored here via sdcard_set_led_blink()  */
+/* to avoid pulling Config.h (C++) into this C translation unit.          */
+/*-----------------------------------------------------------------------*/
+
+/* Registry of open FIL* whose I/O must NOT blink the LED. A file is tagged at
+ * f_open time when its path is emulator-internal scratch (under "/tmp/"): swap
+ * files, save_rect, zip/csw/td0/idx temporaries. f_read/f_write announce which
+ * FIL they are serving via sdcard_led_set_active(); sd_led() then stays dark for
+ * tagged files. FatFS calls are serial (single-threaded, non-reentrant), so a
+ * single "active" pointer is sufficient and never leaks across an error exit.
+ * Tiny fixed table (no heap) — only a couple of /tmp/ files are ever open. */
+#define SD_LED_MAX_TAGGED 8
+static const void *sd_led_tagged[SD_LED_MAX_TAGGED] = {0};
+static const void *sd_led_active = 0;	/* FIL* currently being read/written */
+
+static int sd_led_path_is_internal(const char *path)
+{
+	if (!path) return 0;
+	/* Skip an optional logical-drive prefix like "0:" */
+	if (path[0] && path[1] == ':') path += 2;
+	while (*path == '/') path++;
+	return path[0]=='t' && path[1]=='m' && path[2]=='p' && path[3]=='/';
+}
+
+void sdcard_led_tag(const void *fp, const char *path)
+{
+	if (!sd_led_path_is_internal(path)) return;
+	for (int i = 0; i < SD_LED_MAX_TAGGED; i++) {
+		if (sd_led_tagged[i] == 0 || sd_led_tagged[i] == fp) {
+			sd_led_tagged[i] = fp;
+			return;
+		}
+	}
+	/* Table full: skip. Worst case the LED blinks for one extra scratch
+	 * file until a slot frees — harmless. */
+}
+
+void sdcard_led_untag(const void *fp)
+{
+	if (sd_led_active == fp) sd_led_active = 0;
+	for (int i = 0; i < SD_LED_MAX_TAGGED; i++)
+		if (sd_led_tagged[i] == fp) { sd_led_tagged[i] = 0; return; }
+}
+
+void sdcard_led_set_active(const void *fp)
+{
+	sd_led_active = fp;
+}
+
+#ifdef PICO_DEFAULT_LED_PIN
+static volatile int sd_led_blink_enabled = 0;
+
+void sdcard_set_led_blink(int enable)
+{
+	sd_led_blink_enabled = enable ? 1 : 0;
+	if (!enable) gpio_put(PICO_DEFAULT_LED_PIN, 0);
+}
+
+static int sd_led_active_is_tagged(void)
+{
+	if (!sd_led_active) return 0;
+	for (int i = 0; i < SD_LED_MAX_TAGGED; i++)
+		if (sd_led_tagged[i] == sd_led_active) return 1;
+	return 0;
+}
+
+static inline void sd_led(int on)
+{
+	if (sd_led_blink_enabled && !sd_led_active_is_tagged())
+		gpio_put(PICO_DEFAULT_LED_PIN, on);
+}
+#else
+void sdcard_set_led_blink(int enable) { (void)enable; }
+static inline void sd_led(int on) { (void)on; }
+#endif
+
+/*-----------------------------------------------------------------------*/
 /* Read sector(s)                                                        */
 /*-----------------------------------------------------------------------*/
 
@@ -440,6 +518,8 @@ DRESULT disk_read (
 	if (Stat & STA_NOINIT) return RES_NOTRDY;	/* Check if drive is ready */
 
 	if (!(CardType & CT_BLOCK)) sector *= 512;	/* LBA ot BA conversion (byte addressing cards) */
+
+	sd_led(1);
 
 	if (count == 1) {	/* Single sector read */
 		if ((send_cmd(CMD17, sector) == 0)	/* READ_SINGLE_BLOCK */
@@ -457,6 +537,8 @@ DRESULT disk_read (
 		}
 	}
 	deselect();
+
+	sd_led(0);
 
 	return count ? RES_ERROR : RES_OK;	/* Return result */
 }
@@ -530,6 +612,8 @@ DRESULT disk_write (
 
 	if (!_select()) return RES_NOTRDY;
 
+	sd_led(1);
+
 	if (count == 1) {	/* Single sector write */
 		if ((send_cmd(CMD24, sector) == 0)	/* WRITE_BLOCK */
 			&& xmit_datablock(buff, 0xFE)) {
@@ -547,6 +631,8 @@ DRESULT disk_write (
 		}
 	}
 	deselect();
+
+	sd_led(0);
 
 	return count ? RES_ERROR : RES_OK;	/* Return result */
 }

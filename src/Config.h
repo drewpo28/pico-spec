@@ -84,6 +84,7 @@ public:
     static uint8_t  esp32rev;
     static bool     slog_on;
     static bool     ledIndicators;
+    static bool     sdLedBlink;     // blink onboard LED (GPIO 25) on physical SD card access
     const static bool     aspect_16_9; /// TODO:
     static uint8_t  lang;
     static bool     AY48;

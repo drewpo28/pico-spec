@@ -42,6 +42,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Config.h"
 #include "ESPectrum.h"
 #include "FileUtils.h"
+#include "sdcard.h"
 #include "MemESP.h"
 #include "OSDMain.h"
 #include "Ports.h"
@@ -656,6 +657,7 @@ void ESPectrum::setup() {
   Config::initHotkeys(); // fill hotkey defaults even without SD
   if (FileUtils::fsMount)
     Config::load();
+  sdcard_set_led_blink(Config::sdLedBlink); // onboard LED blink on SD access
   VIDEO::loadCustomPalettes();
   Debug::log("setup: Config loaded");
   Debug::log2SD("setup: Config loaded, arch=%s romSet=%s", Config::arch.c_str(), Config::romSet.c_str());
