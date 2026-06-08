@@ -2847,6 +2847,7 @@ IRAM_ATTR void VIDEO::EndFrame() {
     }
 
     // Frame-timing diagnostic: average CPU::loop() time, logged every 60 frames.
+#if PERF_TRACE
     if (Config::arch == "Profi") {
         extern volatile uint32_t cpu_frame_us;
         extern volatile uint32_t hdmi_irq_max_gap_us;
@@ -2870,6 +2871,7 @@ IRAM_ATTR void VIDEO::EndFrame() {
             cpu_accum = cpu_max = gap_max = 0;
         }
     }
+#endif // PERF_TRACE
 
     // SPI PSRAM swap diagnostics: log eviction count once every 60 frames.
     {

@@ -33,14 +33,15 @@ option(ZERO2 "RP2350-PiZero" OFF)
 option(IDE_PORT_TRACE "Enable PROFI IDE/HDD port access tracing" OFF)
 option(FDD_PORT_TRACE "Enable WD1793 (ВГ93) FDD command/port tracing" OFF)
 option(PROFI_PORT_TRACE "Enable 0x7FFD/0xDFFD paging-port write tracing" OFF)
+option(PERF_TRACE "Enable per-60-frame CPU/HDMI/FPS performance logging" OFF)
 
 # Per-board Debug-Probe UART toggles (logging over UART). Declared here together;
 # the board-specific `if(<board>_DBG_UART)` blocks below consume them (they call
 # pico_enable_stdio_uart() + remap pins, which needs the target to exist first).
 # Each enables stdio over the board's Debug-Probe header — see the block for pins.
-set(MURM1_DBG_UART   OFF  CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1) — moves KBD to GP16/GP17, disables NESPAD")
+set(MURM1_DBG_UART   ON  CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1) — moves KBD to GP16/GP17, disables NESPAD")
 set(PICO_PC_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on DBG1 header GP0/GP1 (PICO_PC)")
-set(PICO_DV_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
+set(PICO_DV_DBG_UART ON CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
 set(ZERO_DBG_UART    OFF CACHE BOOL "Enable Debug Probe UART0 on GP16/GP13 (ZERO)")
 set(ZERO2_DBG_UART   OFF  CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO2)")
 
@@ -298,6 +299,13 @@ if (PROFI_PORT_TRACE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE PROFI_PORT_TRACE=1)
 else ()
     target_compile_definitions(${PROJECT_NAME} PRIVATE PROFI_PORT_TRACE=0)
+endif ()
+
+# Per-60-frame performance logging (see Video.cpp `#if PERF_TRACE`).
+if (PERF_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PERF_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PERF_TRACE=0)
 endif ()
 
 if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
@@ -780,8 +788,9 @@ ELSE()
 
         # SPI clock ceiling for size probe + access. 126 MHz (default) at
         # sys_clk=378 gave clkdiv=1.5 → ~126 MHz SCK, too fast for this board's
-        # APS6404 8 MB chip: reads past the 1 MB boundary corrupt and the size
-        # probe truncated to 1 MB. 63 MHz (clkdiv=3.0) is well within spec.
+        # APS6404 8 MB chip: a boot block-integrity self-test measured ~930 KB of
+        # 1 MB corrupted (badPages=60/64) and the size probe flapped between 8 MB
+        # and 1 MB. 63 MHz (clkdiv=3.0) is reliable (8 MB, zero corruption).
         PSRAM_MAX_SCK_MHZ=63
 
         PSRAM_PIN_CS=18
