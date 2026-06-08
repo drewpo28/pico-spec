@@ -90,7 +90,7 @@ extern "C" uint8_t* __not_in_flash_func(getLineBuffer)(int line) {
     return (uint8_t*)VIDEO::vga.frameBuffer[line];
 }
 
-extern "C" void ESPectrum_vsync() {
+extern "C" void __not_in_flash_func(ESPectrum_vsync)() {
     ESPectrum::v_sync = true;
 }
 
@@ -2258,17 +2258,18 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
         // model): all 240 lines render from the page selected at line 0, so mid-frame
         // videoLatch flips don't tear the current frame.  Also (re)latch if null (first
         // frame after activation).
-        // clrmem snapshot: colour attrs (pages 56/58) live in butter XIP PSRAM.
-        // Direct access → ~15k scattered XIP reads/frame, each a potential cache-miss
-        // stall mid-scanline.  Snapshot the whole 16 KB page into SRAM once at line 0
-        // (one sequential, cache-friendly burst) and render colour from SRAM.
         // grmem (pages 4/6) is already in SRAM — left as-is.
         if ((line == 0 && start_col == 0) || ds80_frame_grmem == nullptr) {
             ds80_frame_grmem  = grmem;
             ds80_frame_clrmem = profi_clrmem;
+            // Refresh snapshot at the START of each active scan so Z80 writes made
+            // since vblank (e.g. ROM service-menu attr init over multiple frames) are
+            // captured immediately.  One sequential burst here; renderer reads SRAM
+            // for all remaining lines without scattered XIP stalls.
+            if (profi_clrmem)
+                memcpy(ds80_clr_sram, profi_clrmem, sizeof(ds80_clr_sram));
         }
         uint8_t* fgrmem  = ds80_frame_grmem;
-        // ds80_clr_sram is populated in EndFrame (vblank) — always SRAM, always valid.
         uint8_t* fclrmem = ds80_frame_clrmem ? ds80_clr_sram : nullptr;
         //
         // Row layout: pad_l bytes of border, then 256 content bytes (with (k^2) pre-swap
@@ -2781,12 +2782,6 @@ IRAM_ATTR void VIDEO::EndFrame() {
             profi_palette_dirty = false;
         }
     }
-
-    // DS80 clrmem snapshot refresh (vblank): copy page 56/58 → SRAM buffer so the
-    // rasterizer reads sequential SRAM throughout active scan (no mid-frame XIP stalls).
-    // Done every frame so Z80 writes to page 56/58 are visible on the next frame.
-    if (profi_ds80_active && profi_clrmem && !profi_ds80_activate_pending)
-        memcpy(ds80_clr_sram, profi_clrmem, sizeof(ds80_clr_sram));
 
     // DS80 720×576 top/bottom border bands: the scan-time renderer only writes the
     // 240 content lines (fb rows DS80_BORDER_TOP..+239), so the top rows 0..TOP-1 and

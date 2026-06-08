@@ -276,8 +276,8 @@ volatile uint32_t hdmi_irq_max_gap_us = 0;
 static void __scratch_x("hdmi_driver") dma_handler_HDMI() {
     static uint32_t inx_buf_dma;
     static uint line = 0;
-    static uint32_t last_irq_us = 0;
     {
+        static uint32_t last_irq_us = 0;
         uint32_t now = time_us_32();
         uint32_t gap = now - last_irq_us;
         last_irq_us = now;
@@ -837,33 +837,33 @@ void hdmi_set_profi_ds80_mode(bool active,
         }
 
         uint64_t tmds16[16];
-        // Per-color TMDS disparity: (number_of_1s - number_of_0s) across all 3 channels.
-        // Needed to choose correct pixel-1 encoding for DC balance (see below).
-        int tmds_disp[16];
+        // Per-channel TMDS values (10-bit) and per-channel disparity (ones×2 - 10).
+        // Separate R/G/B disparity is critical: for colors like bright-red (+8,-8,-8)
+        // and bright-green (-8,+8,-8), the combined disparity is same-sign (-8×-8=+64)
+        // but individual channels need OPPOSITE complement decisions — using a single
+        // combined use_compl would leave R and G at ±16, causing sync loss.
+        uint R_raw[16], G_raw[16], B_raw[16];
+        int disp_R[16], disp_G[16], disp_B[16];
         for (int p = 0; p < 16; p++) {
             uint32_t c = palette16_rgb888[p] & 0x00ffffff;
             uint R = tmds_encoder((c >> 16) & 0xff);
             uint G = tmds_encoder((c >>  8) & 0xff);
             uint B = tmds_encoder( c        & 0xff);
+            R_raw[p] = R; G_raw[p] = G; B_raw[p] = B;
             tmds16[p] = get_ser_diff_data(R, G, B);
-            tmds_disp[p] = (__builtin_popcount(R & 0x3FF) +
-                            __builtin_popcount(G & 0x3FF) +
-                            __builtin_popcount(B & 0x3FF)) * 2 - 30;
+            disp_R[p] = (int)__builtin_popcount(R & 0x3FF) * 2 - 10;
+            disp_G[p] = (int)__builtin_popcount(G & 0x3FF) * 2 - 10;
+            disp_B[p] = (int)__builtin_popcount(B & 0x3FF) * 2 - 10;
         }
         // Write all unique slots referenced by pair_lut.
         // pixel-0 = ink  (first  HDMI pixel clock of the pair)
         // pixel-1 = paper (second HDMI pixel clock of the pair)
         //
-        // DC balance strategy: choose pixel-1 encoding to minimise net pair disparity.
-        // The XOR complement of TMDS(X) has disparity ≈ -disp(X).  For each pair:
-        //  - Same-sign disparity (ink & paper both dark or both bright):
-        //    Use complement for paper → disp_ink + (-disp_paper) ≈ 0.
-        //  - Opposite-sign disparity (e.g. black ink on white paper):
-        //    disp_ink + disp_paper ≈ 0 already; complement would flip paper to the
-        //    same sign as ink, making the total WORSE (e.g. -24 + (-24) = -48).
-        //    Skip complement → net disparity ≈ 0.
-        // Same-color pairs (ink == paper after normalisation) always hit the same-sign
-        // branch, giving the standard pixel-doubled DC-balanced encoding.
+        // DC balance: for each channel independently, complement paper's data bits 0-7
+        // (via ^ 0xFF on the 10-bit TMDS value) when ink and paper have same-sign
+        // disparity on that channel.  Channels with opposite-sign disparity are already
+        // balanced without complementing.  Per-channel decisions are passed to
+        // get_ser_diff_data, which assembles the 64-bit differential pair normally.
         //
         // pair_lut normalises paper=8 → paper=0 (bright-black bg = black bg), so
         // (ink, paper=8) shares the slot of (ink, paper=0).  The written[] guard
@@ -878,18 +878,18 @@ void hdmi_set_profi_ds80_mode(bool active,
                 if (!written[slot]) {
                     written[slot] = true;
                     cc64[slot * 2 + 0] = tmds16[ink];
-                    // Same-sign disparity: complement cancels → use it.
-                    // Opposite-sign: raw paper already cancels ink → no complement.
-                    bool use_compl = (tmds_disp[ink] * tmds_disp[paper] >= 0);
-                    cc64[slot * 2 + 1] = use_compl
-                        ? (tmds16[paper] ^ 0x0003ffffffffffffl)
-                        : tmds16[paper];
+                    // Per-channel complement: flip data bits 0-7 when same-sign disparity.
+                    uint R_p = R_raw[paper] ^ ((disp_R[ink] * disp_R[paper] >= 0) ? 0xFF : 0);
+                    uint G_p = G_raw[paper] ^ ((disp_G[ink] * disp_G[paper] >= 0) ? 0xFF : 0);
+                    uint B_p = B_raw[paper] ^ ((disp_B[ink] * disp_B[paper] >= 0) ? 0xFF : 0);
+                    cc64[slot * 2 + 1] = get_ser_diff_data(R_p, G_p, B_p);
                 }
             }
         }
         // Slot 255: border fill byte — must be (black, black).
+        // Black: all channels disp=-8 (same-sign self) → complement all channels.
         cc64[255 * 2 + 0] = tmds16[0];
-        cc64[255 * 2 + 1] = tmds16[0] ^ 0x0003ffffffffffffl;
+        cc64[255 * 2 + 1] = get_ser_diff_data(R_raw[0]^0xFF, G_raw[0]^0xFF, B_raw[0]^0xFF);
 
         __dmb(); // ensure all conv_color writes are visible to core1 before flag is set
         profi_ds80_active = true;
