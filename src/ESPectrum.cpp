@@ -592,15 +592,13 @@ static void assign_ram(int i) {
   // With locked=true: no pin/unpin/preload needed in the render path → the
   // HDMI/VGA renderer never stalls on SPI DMA → no sync loss.
   //
-  // Page 59 is added as a 4th LRU pool slot (alongside 61/60/40) to compensate
-  // for removing 56/58 from the pool, keeping HC/CP/M at ~1.4 evicts/frame.
-  // (Tested safe: 59 is mid-range, not top-page system data like 62/63.)
+  // Profi CP/M pool layout (RP2350, SPI-PSRAM only):
+  //   Locked SRAM (pinned, never evicted): pages 58, 59 — DS80 colour/pixel data
+  //   LRU pool (3 evictable slots):        pages 40, 60, 61 — CP/M working set
+  //   All other pages:                     SPI PSRAM (loaded on demand)
   //
-  // RP2040 (ZERO/MURM): DS80 is not available, and heap budget is only ~181KB
-  // with MEM_REMAIN=96KB reserved for the framebuffer.  The extended LRU pool
-  // (3 extra pages = 48KB more) leaves insufficient contiguous heap for the
-  // ~77KB framebuffer allocation → OOM panic.  Use the original 3-page set
-  // {56,58,61} on RP2040; the locked-SRAM DS80 requirement is RP2350-only.
+  // RP2040 (ZERO/MURM): DS80 not available; heap budget ~181KB with MEM_REMAIN=96KB
+  // reserved for framebuffer. Use 3-page set {56,58,61} on RP2040.
 #if PICO_RP2040
   bool force_sram_locked = false; // DS80 not available on RP2040
   bool force_sram = (Config::arch == "Profi")
@@ -611,7 +609,7 @@ static void assign_ram(int i) {
                            && (i == 56 || i == 58)
                            && (butter_psram_size() == 0);
   bool force_sram = (Config::arch == "Profi")
-                    && (i == 61 || i == 60 || i == 40 || i == 41)
+                    && (i == 61 || i == 60 || i == 40)
                     && (butter_psram_size() == 0);
 #endif
   if (force_sram_locked) {

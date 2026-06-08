@@ -4210,18 +4210,26 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #endif
                                 Config::save();
 #if !PICO_RP2040
-                                // Profi on SPI-PSRAM boards needs its hires colour
-                                // pages 56/58/61 backed by SRAM (see assign_ram()).
-                                // That backing is decided once in setup() from the
-                                // boot arch, and ESPectrum::reset() does NOT re-assign
-                                // it.  So a runtime switch INTO Profi from another arch
-                                // leaves 56/58/61 in SPI PSRAM (direct()==null) → DS80
-                                // colour memory invalid → screen never switches.  Config
-                                // is already saved as Profi above, so reboot: setup()
-                                // re-backs the pages with arch=Profi, exactly like a
-                                // cold boot into Profi (which works).
-                                if (arch == "Profi" && butter_psram_size() == 0
-                                    && MemESP::ram[56].memType() != mem_type_t::POINTER) {
+                                // Profi on SPI-PSRAM boards (no butter PSRAM) needs its
+                                // hires colour/working pages 56/58/61/60/40 backed by
+                                // SRAM (see assign_ram()) — ~80 KB total.  That backing
+                                // is decided once in setup() from the boot arch, and
+                                // ESPectrum::reset() does NOT re-assign or free it.  So
+                                // ANY switch that crosses the Profi boundary must reboot
+                                // so setup() re-lays out memory:
+                                //  - entering Profi: 56/58/61/60/40 still in SPI PSRAM
+                                //    (direct()==null) → DS80 colour memory invalid →
+                                //    screen never switches.
+                                //  - leaving Profi: the 80 KB of forced-SRAM page buffers
+                                //    would stay allocated and unused on the new machine.
+                                // ram[56].memType()==POINTER iff the Profi forced-SRAM
+                                // layout is currently in effect, so reboot whenever that
+                                // disagrees with the desired arch.  Config is already
+                                // saved above, so setup() re-backs pages for the new arch.
+                                bool profiSramLayout =
+                                    (MemESP::ram[56].memType() == mem_type_t::POINTER);
+                                if (butter_psram_size() == 0
+                                    && (arch == "Profi") != profiSramLayout) {
                                     OSD::esp_hard_reset();
                                     return;
                                 }

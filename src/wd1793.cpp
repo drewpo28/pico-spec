@@ -39,6 +39,7 @@ THE SOFTWARE.
 #include "Z80_JLS/z80.h"
 #if !PICO_RP2040
 #include "td0.h"
+#include "psram_spi.h"
 extern size_t getContiguousHeap(void);
 #endif
 
@@ -2639,9 +2640,6 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
         return;
     }
 
-    // Read this track's full record from the SD stream into the per-track
-    // scratch buffer (sized to the largest record at insert), then parse it
-    // exactly as the old in-RAM path did, with p rebased to 0.
     uint8_t *img = disk->td0TrackBuf;
     uint32_t fileOff = disk->fdiTrackHdrOffsets[trkIdx];
     uint32_t strmSize = (uint32_t)f_size(disk->td0Stream);
@@ -2653,8 +2651,8 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     uint32_t imgLen = (uint32_t)br;
     uint32_t p = 0;
 #if FDD_PORT_TRACE
-    Debug::log("[TD0] load trk cyl=%d side=%d idx=%d off=%u want=%u read=%u",
-               (int)cyl, (int)side, trkIdx, (unsigned)fileOff, (unsigned)want, (unsigned)br);
+    Debug::log("[TD0] load trk cyl=%d side=%d idx=%d off=%u want=%u",
+               (int)cyl, (int)side, trkIdx, (unsigned)fileOff, (unsigned)want);
 #endif
 
     if (p + 4 > imgLen) { wd->diskTrackLen = 0; wd->fdiSectorCount = 0; return; }
@@ -2840,10 +2838,28 @@ void mbdLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     uint32_t trackOffset = ((uint32_t)cyl * disk->sides + side) * spt * secSize;
 
     // Build synthetic MFM track image (same approach as fdiLoadTrack)
-    // Read each sector directly into diskTrackBuf to avoid large stack allocation
+    // Bulk-read all sector data first: one f_lseek + one f_read for the whole
+    // track (spt * secSize bytes), staged at the end of diskTrackBuf.
+    // This reduces N separate CMD18(2)+STOP SPI transactions to one CMD18(N*2).
+    // Safety: MFM build grows from pos=0; staging occupies the high end.
+    // Per-sector MFM overhead (framing, gaps, CRCs) is ~102 bytes, so:
+    //   max MFM = spt*(102+secSize); raw staging = spt*secSize.
+    // Only use bulk path when both fit in DISK_TRACK_BUF_SZ.
     int imageSize = (int)DISK_TRACK_BUF_SZ;
     uint8_t *buf = wd->diskTrackBuf;
     int pos = 0;
+
+    uint32_t totalRawSize = (uint32_t)spt * (uint32_t)secSize;
+    uint32_t maxMFMSize   = (uint32_t)spt * (102u + (uint32_t)secSize);
+    bool bulk_ok = (maxMFMSize + totalRawSize <= (uint32_t)DISK_TRACK_BUF_SZ);
+    uint8_t *rawStage = bulk_ok ? (buf + DISK_TRACK_BUF_SZ - (int)totalRawSize) : nullptr;
+
+    UINT br;
+    if (bulk_ok) {
+        // One seek + one read for all sector data; FatFS issues CMD18(count) internally.
+        f_lseek(disk->Diskfile, trackOffset);
+        f_read(disk->Diskfile, rawStage, totalRawSize, &br);
+    }
 
     // Gap sizes for HD MFM (approximate standard values)
     int gap1Len = 10;      // gap before each sector ID
@@ -2852,7 +2868,6 @@ void mbdLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     int gap2Len = 22;      // gap between ID and data
     int gap3Len = 30;      // gap after data
 
-    UINT br;
     for (int sec = 0; sec < spt && sec < 32; sec++) {
         // Gap 1
         for (int i = 0; i < gap1Len && pos < imageSize; i++) buf[pos++] = 0x4E;
@@ -2900,12 +2915,16 @@ void mbdLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
         for (int i = 0; i < syncPulseLen && pos < imageSize; i++) buf[pos++] = 0xA1;
         if (pos < imageSize) buf[pos++] = 0xFB; // data mark
 
-        // Read sector data directly from file into track buffer
+        // Copy sector data from staging area (bulk-read) or read individually.
         int toRead = secSize;
         if (pos + toRead > imageSize) toRead = imageSize - pos;
-        uint32_t fileOffset = trackOffset + sec * secSize;
-        f_lseek(disk->Diskfile, fileOffset);
-        f_read(disk->Diskfile, buf + pos, toRead, &br);
+        if (bulk_ok) {
+            memcpy(buf + pos, rawStage + sec * secSize, (size_t)toRead);
+        } else {
+            uint32_t fileOffset = trackOffset + (uint32_t)sec * (uint32_t)secSize;
+            f_lseek(disk->Diskfile, fileOffset);
+            f_read(disk->Diskfile, buf + pos, (UINT)toRead, &br);
+        }
         pos += toRead;
 
         // Data CRC

@@ -184,9 +184,6 @@ public:
   static uint8_t* grmem;
   static uint8_t* profi_clrmem;   // Profi hires color attr page (56 or 58), NULL if in SPI PSRAM
 #if !PICO_RP2040
-  // When profi_clrmem is NULL (page evicted to SPI), this holds the SPI base offset
-  // for read8psram fallback.  0xFFFFFFFF = not applicable.
-  static uint32_t profi_clr_spi_base;
 #endif
 #if !PICO_RP2040
   // pair_lookup[ink][paper] → safe HDMI palette index (avoids sync range 220-244, border 255).

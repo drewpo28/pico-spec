@@ -143,7 +143,6 @@ extern int      ds80_dbg_wr_cnt;
 #endif
 
 #if !PICO_RP2040
-uint32_t VIDEO::profi_clr_spi_base = 0xFFFFFFFFu;
 extern "C" uint8_t  read8psram(uint32_t addr32);
 #endif
 
@@ -496,8 +495,11 @@ static unsigned int curline;
 static uint8_t* ds80_frame_grmem  = nullptr;
 static uint8_t* ds80_frame_clrmem = nullptr;
 // SRAM snapshot of the 16 KB clrmem page (pages 56/58).  Lives at file scope so
-// EndFrame (vblank) can populate it before the rasterizer runs.
-static uint8_t ds80_clr_sram[16384];
+// EndFrame (vblank) can populate it before the rasterizer runs.  Allocated from
+// heap only when arch==Profi (see VIDEO::Reset) so non-Profi machines reclaim the
+// 16 KB; freed when leaving Profi.
+#define DS80_CLR_SRAM_SIZE 16384
+static uint8_t* ds80_clr_sram = nullptr;
 #endif
 
 static unsigned int bmpOffset;  // offset for bitmap in graphic memory
@@ -1734,7 +1736,14 @@ void VIDEO::Reset() {
         init_profi_pair_lookup();
         // Reset live palette to defaults on machine reset
         profiPaletteReset();
-
+        // DS80 clrmem SRAM snapshot is Profi-only — allocate lazily so non-Profi
+        // machines keep the 16 KB.  (butter-PSRAM boards switch arch without a reboot,
+        // so the matching free() in the else branch reclaims it when leaving Profi.)
+        if (!ds80_clr_sram)
+            ds80_clr_sram = (uint8_t*)malloc(DS80_CLR_SRAM_SIZE);
+    } else if (ds80_clr_sram) {
+        free(ds80_clr_sram);
+        ds80_clr_sram = nullptr;
     }
 #endif
 
@@ -2266,8 +2275,8 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             // since vblank (e.g. ROM service-menu attr init over multiple frames) are
             // captured immediately.  One sequential burst here; renderer reads SRAM
             // for all remaining lines without scattered XIP stalls.
-            if (profi_clrmem)
-                memcpy(ds80_clr_sram, profi_clrmem, sizeof(ds80_clr_sram));
+            if (profi_clrmem && ds80_clr_sram)
+                memcpy(ds80_clr_sram, profi_clrmem, DS80_CLR_SRAM_SIZE);
         }
         uint8_t* fgrmem  = ds80_frame_grmem;
         uint8_t* fclrmem = ds80_frame_clrmem ? ds80_clr_sram : nullptr;
@@ -2718,11 +2727,10 @@ IRAM_ATTR void VIDEO::EndFrame() {
                 // SRAM-resident, never in the evictable pool, direct() is always
                 // valid — no preload/pin/precheck needed.
                 profi_clrmem = MemESP::ram[clrPg].direct();
-                profi_clr_spi_base = 0xFFFFFFFFu;
                 // Snapshot the 16 KB clrmem page into SRAM here (vblank) so the
                 // rasterizer never touches XIP PSRAM during active scan.
-                if (profi_clrmem)
-                    memcpy(ds80_clr_sram, profi_clrmem, sizeof(ds80_clr_sram));
+                if (profi_clrmem && ds80_clr_sram)
+                    memcpy(ds80_clr_sram, profi_clrmem, DS80_CLR_SRAM_SIZE);
 #if PROFI_PORT_TRACE
                 ds80_dbg_grmem  = grmem;
                 ds80_dbg_clrmem = profi_clrmem;
@@ -2845,25 +2853,37 @@ IRAM_ATTR void VIDEO::EndFrame() {
 #if PERF_TRACE
     if (Config::arch == "Profi") {
         extern volatile uint32_t cpu_frame_us;
+        extern volatile uint32_t fdd_step_us;   // time in end-of-frame rvmWD1793Step
         extern volatile uint32_t hdmi_irq_max_gap_us;
         static uint32_t port_log_frame = 0;
         static uint32_t cpu_accum = 0, cpu_max = 0, gap_max = 0;
-        static uint64_t wall_t0 = 0;   // wall-clock at window start (real frame-rate)
+        static uint32_t fdd_step_accum = 0, fdd_step_max = 0;
+        static uint32_t fdd_ports_accum = 0, fdd_ports_max = 0;
+        static uint64_t wall_t0 = 0;
         cpu_accum += cpu_frame_us;
         if (cpu_frame_us > cpu_max) cpu_max = cpu_frame_us;
+        fdd_step_accum += fdd_step_us;
+        if (fdd_step_us > fdd_step_max) fdd_step_max = fdd_step_us;
+        fdd_ports_accum += Ports::fdd_ports_us;
+        if (Ports::fdd_ports_us > fdd_ports_max) fdd_ports_max = Ports::fdd_ports_us;
         if (hdmi_irq_max_gap_us > gap_max) gap_max = hdmi_irq_max_gap_us;
         hdmi_irq_max_gap_us = 0;
         cpu_frame_us = 0;
+        fdd_step_us = 0;
+        Ports::fdd_ports_us = 0;
         if (++port_log_frame >= 60) {
             uint64_t now = time_us_64();
             float fps = wall_t0 ? (60.0f * 1000000.0f / (float)(now - wall_t0)) : 0.0f;
             wall_t0 = now;
             port_log_frame = 0;
-            // realFPS = actual core0 frame rate. If v_sync locks to HDMI it equals the
-            // mode's refresh (~50.08Hz); if it drifts, the tear-band drifts.
-            Debug::log("[PERF] 60f: cpu=%.1fms (max %.1fms) hdmiGapMax=%uus realFPS=%.2f",
-                cpu_accum / 60000.0f, cpu_max / 1000.0f, (unsigned)gap_max, fps);
+            Debug::log("[PERF] 60f: cpu=%.1fms (max %.1fms) fdd_step=%.1fms (max %.1fms) fdd_ports=%.1fms (max %.1fms) hdmiGapMax=%uus realFPS=%.2f",
+                cpu_accum / 60000.0f, cpu_max / 1000.0f,
+                fdd_step_accum / 60000.0f, fdd_step_max / 1000.0f,
+                fdd_ports_accum / 60000.0f, fdd_ports_max / 1000.0f,
+                (unsigned)gap_max, fps);
             cpu_accum = cpu_max = gap_max = 0;
+            fdd_step_accum = fdd_step_max = 0;
+            fdd_ports_accum = fdd_ports_max = 0;
         }
     }
 #endif // PERF_TRACE
