@@ -5884,6 +5884,7 @@ void OSD::showLedLegend() {
         { LED::FDD,       "Floppy/TR-DOS"   },
         { LED::SD,        "DivMMC/esxDOS"   },
         { LED::ZCTRL,     "Z-Controller"    },
+        { LED::IDE,       "IDE/HDD"         },
         { LED::BEEPER,    "Beeper"          },
         { LED::AY,        "AY-3-8912"       },
         { LED::COVOX,     "Covox DAC"       },
