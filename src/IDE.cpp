@@ -281,21 +281,20 @@ bool IDE::createImage(const char* path, uint32_t megabytes,
         return false;
     }
 
-    // Zero-fill in 16 KB chunks. RP2350-only (IDE is #if !PICO_RP2040), heap OK.
-    const uint32_t CHUNK = 16 * 1024;
-    uint8_t* zbuf = (uint8_t*)calloc(CHUNK, 1);
-    if (!zbuf) { f_close(&f); f_unlink(path); return false; }
+    // Zero-fill 512 bytes at a time using the existing sector buffer (already
+    // allocated). Avoids a 16 KB heap allocation that fails on tight-RAM boards.
+    if (!buffer) buffer = (uint8_t*)calloc(512, 1);
+    if (!buffer) { f_close(&f); f_unlink(path); return false; }
+    memset(buffer, 0, 512);
 
     uint64_t total    = (uint64_t)megabytes * 1024u * 1024u;
     uint32_t totalSec = (uint32_t)(total / 512);
     bool ok = true;
-    for (uint64_t off = 0; off < total; off += CHUNK) {
-        uint32_t n = (total - off) < CHUNK ? (uint32_t)(total - off) : CHUNK;
+    for (uint32_t sec = 0; sec < totalSec; sec++) {
         UINT bw;
-        if (f_write(&f, zbuf, n, &bw) != FR_OK || bw != n) { ok = false; break; }
-        if (progress) progress((uint32_t)((off + n) / 512), totalSec);
+        if (f_write(&f, buffer, 512, &bw) != FR_OK || bw != 512) { ok = false; break; }
+        if (progress) progress(sec + 1, totalSec);
     }
-    free(zbuf);
     f_close(&f);
     if (!ok) { f_unlink(path); Debug::log("IDE: createImage write failed"); return false; }
     Debug::log("IDE: created %s (%u MB)", path, (unsigned)megabytes);

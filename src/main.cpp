@@ -1278,6 +1278,13 @@ int main() {
 #if PICO_RP2350 && defined(BUTTER_PSRAM_GPIO) && BUTTER_PSRAM_GPIO != 255
         psram_retiming();
 #endif
+        // Recalculate PIO SPI PSRAM clkdiv for the now-active sys_clk.
+        // init_psram() ran at boot-time 378 MHz; if Config::cpu_mhz differs
+        // (e.g. 504 MHz) the frozen clkdiv=1.5 drives SCK at 168 MHz — above
+        // the 133 MHz spec.  Always re-apply to get a clean integer divider.
+#ifdef PSRAM
+        psram_update_clkdiv();
+#endif
     }
 
     sem_init(&vga_start_semaphore, 0, 1);

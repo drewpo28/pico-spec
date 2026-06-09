@@ -786,11 +786,11 @@ ELSE()
         PSRAM_SPINLOCK=1
         PSRAM_ASYNC=1
 
-        # SPI clock ceiling for size probe + access. 126 MHz (default) at
-        # sys_clk=378 gave clkdiv=1.5 → ~126 MHz SCK, too fast for this board's
-        # APS6404 8 MB chip: a boot block-integrity self-test measured ~930 KB of
-        # 1 MB corrupted (badPages=60/64) and the size probe flapped between 8 MB
-        # and 1 MB. 63 MHz (clkdiv=3.0) is reliable (8 MB, zero corruption).
+        # SPI clock ceiling. At 126 MHz (default) sys_clk=378 gives clkdiv=1.5 —
+        # a fractional divider that makes SCK jitter and corrupts this board's
+        # APS6404 8 MB chip (~930 KB/1 MB bad at boot, size probe flaps 8M↔1M).
+        # 63 MHz forces clkdiv=3.0 (integer, clean waveform) — zero corruption.
+        # psram_update_clkdiv() keeps it at 63 MHz after CPU overclock too.
         PSRAM_MAX_SCK_MHZ=63
 
         PSRAM_PIN_CS=18

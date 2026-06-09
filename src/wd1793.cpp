@@ -40,7 +40,6 @@ THE SOFTWARE.
 #if !PICO_RP2040
 #include "td0.h"
 #include "psram_spi.h"
-extern size_t getContiguousHeap(void);
 #endif
 
 static bool sclConvertToTRD(rvmWD1793 *wd);
@@ -1910,8 +1909,6 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         d0->sclDataOffset = 0;
         d0->td0Stream = nullptr;
         d0->td0OwnsStream = false;
-        d0->td0TrackBuf = nullptr;
-        d0->td0TrackBufCap = 0;
 
         bool packed = (magic[0] == 't');
 
@@ -1924,12 +1921,6 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         FSIZE_t fsize = f_size(d0->Diskfile);
         if (fsize <= 12) { wdDiskEject(wd, UnitNum); Debug::led_blink(); return false; }
 
-        // SDK's malloc wraps with check_alloc → panic on OOM, so we gate the
-        // one transient allocation (the *packed* payload, which is small)
-        // behind getContiguousHeap() with a safety margin.
-        const size_t kHeapSafety = 4 * 1024;
-        uint32_t rawLen = (uint32_t)(fsize - 12);
-
         // The decompressed stream lives on the SD card. For packed images we
         // write it to a per-unit temp file; for unpacked images we read it
         // straight out of Diskfile (after the 12-byte header). td0Base is the
@@ -1937,23 +1928,17 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         FIL *strm;
         uint32_t td0Base;
         if (packed) {
-            if ((size_t)rawLen + kHeapSafety > getContiguousHeap()) {
-                wdDiskEject(wd, UnitNum); Debug::led_blink(); return false;
-            }
-            uint8_t *raw = (uint8_t *)malloc(rawLen);
-            f_lseek(d0->Diskfile, 12);
-            f_read(d0->Diskfile, raw, rawLen, &br);
-
             char tmpPath[24];
             snprintf(tmpPath, sizeof(tmpPath), "/tmp/.td0_u%u.tmp", (unsigned)UnitNum);
             FIL *tf = fopen2(tmpPath, FA_WRITE | FA_CREATE_ALWAYS);
-            if (!tf) { free(raw); wdDiskEject(wd, UnitNum); Debug::led_blink(); return false; }
+            if (!tf) { wdDiskEject(wd, UnitNum); Debug::led_blink(); return false; }
 
-            // Stream-decompress the LZH payload straight to the temp file; the
-            // full image is never resident in RAM. The sink reports a write
-            // failure (disk full / IO error) by setting *ctx.failed.
+            // Stream-decompress from the TD0 file directly into a temp file.
+            // td0_unpack_lzh_from_file reads the packed input via a 512-byte
+            // staging window (inside the static LzhState) — no malloc(rawLen).
+            f_lseek(d0->Diskfile, 12);
             struct Td0Sink { FIL *f; bool failed; uint32_t written; } sinkCtx = { tf, false, 0 };
-            uint32_t decLen = td0_unpack_lzh_stream(raw, rawLen,
+            uint32_t decLen = td0_unpack_lzh_from_file(d0->Diskfile,
                 [](void *ctx, const unsigned char *buf, unsigned len) -> bool {
                     Td0Sink *s = (Td0Sink *)ctx;
                     UINT bw = 0;
@@ -1962,13 +1947,12 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
                     s->written += bw;
                     return true;
                 }, &sinkCtx);
-            free(raw);
             f_sync(tf);
             uint32_t tfSize = (uint32_t)f_size(tf);
 
 #if FDD_PORT_TRACE
-            Debug::log("[TD0] unpack u%d: rawLen=%u decLen=%u written=%u tempSize=%u %s",
-                       (int)UnitNum, (unsigned)rawLen, (unsigned)decLen,
+            Debug::log("[TD0] unpack u%d: decLen=%u written=%u tempSize=%u %s",
+                       (int)UnitNum, (unsigned)decLen,
                        (unsigned)sinkCtx.written, (unsigned)tfSize,
                        sinkCtx.failed ? "WRITE-FAILED!" : "ok");
 #endif
@@ -2016,7 +2000,7 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
 
         // Walk track records to record offsets, geometry, and the largest
         // track-record byte span (used to size the per-track scratch buffer).
-        uint32_t maxCyl = 0, maxHead = 0, maxRecLen = 0;
+        uint32_t maxCyl = 0, maxHead = 0;
         for (int i = 0; i < 168; i++) d0->fdiTrackHdrOffsets[i] = 0xFFFFFFFF;
 
         int trkScanned = 0;
@@ -2053,7 +2037,6 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
                 p += 2 + dlen;                 // length field + encoded block
             }
             uint32_t recLen = p - recPos;
-            if (recLen > maxRecLen) maxRecLen = recLen;
 
             // Temporary keyed store (cyl*2+side); remapped after we know sides.
             int tmpIdx = cyl * 2 + side;
@@ -2076,20 +2059,13 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
             }
         }
 #if FDD_PORT_TRACE
-        Debug::log("[TD0] scan done: %d tracks, maxRecLen=%u, lastP=%u",
-                   trkScanned, (unsigned)maxRecLen, (unsigned)p);
+        Debug::log("[TD0] scan done: %d tracks, lastP=%u",
+                   trkScanned, (unsigned)p);
 #endif
 
         // Allocate the per-track scratch buffer sized to the largest track
         // record (typically a few KB — far below the old whole-image buffer).
-        if (maxRecLen == 0) { wdDiskEject(wd, UnitNum); Debug::led_blink(); return false; }
-        uint32_t bufCap = maxRecLen;
-        if ((size_t)bufCap + kHeapSafety > getContiguousHeap()) {
-            wdDiskEject(wd, UnitNum); Debug::led_blink(); return false;
-        }
-        d0->td0TrackBuf = (uint8_t *)malloc(bufCap);
-        if (!d0->td0TrackBuf) { wdDiskEject(wd, UnitNum); Debug::led_blink(); return false; }
-        d0->td0TrackBufCap = bufCap;
+        if (trkScanned == 0) { wdDiskEject(wd, UnitNum); Debug::led_blink(); return false; }
 
         uint8_t cyls  = (uint8_t)(maxCyl + 1);
         uint8_t sides = (uint8_t)(maxHead + 1);
@@ -2633,61 +2609,68 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
 
     rvmwdDisk *disk = wd->disk[wd->diskS];
     int trkIdx = cyl * disk->sides + side;
-    if (trkIdx < 0 || trkIdx >= 168 || !disk->td0Stream || !disk->td0TrackBuf
+    if (trkIdx < 0 || trkIdx >= 168 || !disk->td0Stream
         || disk->fdiTrackHdrOffsets[trkIdx] == 0xFFFFFFFF) {
         wd->diskTrackLen = 0;
         wd->fdiSectorCount = 0;
         return;
     }
 
-    uint8_t *img = disk->td0TrackBuf;
-    uint32_t fileOff = disk->fdiTrackHdrOffsets[trkIdx];
-    uint32_t strmSize = (uint32_t)f_size(disk->td0Stream);
-    uint32_t want = strmSize - fileOff;
-    if (want > disk->td0TrackBufCap) want = disk->td0TrackBufCap;
+    // Static per-sector staging: holds one sector's encoded TD0 data at a time.
+    // Covers up to a 1 KB raw sector (method byte + 1024 data bytes). No heap
+    // allocation needed — td0TrackBuf removed to avoid fragmentation OOM on
+    // re-mount.
+    static uint8_t g_td0_enc_sec[2048];
+
+    uint32_t filePos = disk->fdiTrackHdrOffsets[trkIdx];
     UINT br = 0;
-    f_lseek(disk->td0Stream, fileOff);
-    f_read(disk->td0Stream, img, want, &br);
-    uint32_t imgLen = (uint32_t)br;
-    uint32_t p = 0;
+    f_lseek(disk->td0Stream, filePos);
 #if FDD_PORT_TRACE
-    Debug::log("[TD0] load trk cyl=%d side=%d idx=%d off=%u want=%u",
-               (int)cyl, (int)side, trkIdx, (unsigned)fileOff, (unsigned)want);
+    Debug::log("[TD0] load trk cyl=%d side=%d idx=%d filePos=%u",
+               (int)cyl, (int)side, trkIdx, (unsigned)filePos);
 #endif
 
-    if (p + 4 > imgLen) { wd->diskTrackLen = 0; wd->fdiSectorCount = 0; return; }
-    int secCount = img[p];
+    // Read the 4-byte track header: secCount, cyl, side, crc
+    uint8_t thdr[4];
+    f_read(disk->td0Stream, thdr, 4, &br);
+    if (br < 4) { wd->diskTrackLen = 0; wd->fdiSectorCount = 0; return; }
+    int secCount = thdr[0];
     if (secCount > 32) secCount = 32;
-    p += 4; // skip track header (secs, cyl, side, crc)
+    filePos += 4;
 
-    // First pass: estimate track data length for dynamic gap sizing (same model
-    // as fdiLoadTrack). We must walk sector records; remember each sector's
-    // decoded geometry + a pointer to its encoded data block for pass two.
+    // First pass: stream sector headers from the file, recording per-sector
+    // geometry and the file offset of each sector's encoded data block.
+    // No large heap buffer — td0TrackBuf replaced by per-sector f_lseek+f_read.
     struct TD0Sec {
         uint8_t c, h, r, n, flags;
         uint16_t secSize;
-        const uint8_t *enc; // points at method byte, or null if no data
-        uint16_t encLen;    // bytes including method byte
-        bool present;       // false -> skip (NO_ID / NO_DATA / NO_DATA2)
+        uint32_t encFileOff; // file offset of encoded data (method byte first)
+        uint16_t encLen;     // bytes including method byte; 0 if no data
+        bool present;        // false -> no data (NO_DATA / NO_DATA2 flag)
     } secs[32];
 
     int kept = 0;
     int trkdatalen = 0;
-    for (int s = 0; s < secCount && p + 6 <= imgLen; s++) {
-        uint8_t sc = img[p], sh = img[p + 1], sr = img[p + 2], sn = img[p + 3];
-        uint8_t flags = img[p + 4];
-        p += 6;
+    for (int s = 0; s < secCount; s++) {
+        uint8_t shdr[6];
+        f_read(disk->td0Stream, shdr, 6, &br);
+        if (br < 6) break;
+        filePos += 6;
 
+        uint8_t sc = shdr[0], sh = shdr[1], sr = shdr[2], sn = shdr[3];
+        uint8_t flags = shdr[4];
         bool hasData = !(flags & (TD0_SEC_NO_DATA | TD0_SEC_NO_DATA2));
-        const uint8_t *enc = nullptr;
+        uint32_t encFileOff = 0;
         uint16_t encLen = 0;
         if (hasData) {
-            if (p + 2 > imgLen) break;
-            encLen = img[p] | (img[p + 1] << 8);
-            p += 2;
-            enc = img + p;
-            if (p + encLen > imgLen) { encLen = (uint16_t)(imgLen - p); }
-            p += encLen;
+            uint8_t dl[2];
+            f_read(disk->td0Stream, dl, 2, &br);
+            if (br < 2) break;
+            encLen = dl[0] | (dl[1] << 8);
+            filePos += 2;
+            encFileOff = filePos;
+            filePos += encLen;
+            if (encLen > 0) f_lseek(disk->td0Stream, filePos); // skip encoded data
         }
         // Sectors with no ID field are skipped (no header to expose to the FDC).
         if (flags & TD0_SEC_NO_ID) continue;
@@ -2695,7 +2678,7 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
         TD0Sec &d = secs[kept];
         d.c = sc; d.h = sh; d.r = sr; d.n = sn; d.flags = flags;
         d.secSize = (uint16_t)(128 << (sn & 3));
-        d.enc = enc; d.encLen = encLen;
+        d.encFileOff = encFileOff; d.encLen = encLen;
         d.present = hasData;
 
         trkdatalen += 2 + 6;       // A1 + FE + CHRN + CRC
@@ -2786,9 +2769,15 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
             int slen = d.secSize;
             int avail = imageSize - pos;
             int toEmit = (slen <= avail) ? slen : avail;
-            if (toEmit > 0 && d.enc && d.encLen > 0)
-                td0_decode_sector(d.enc, d.encLen, slen, buf + pos);
-            else if (toEmit > 0)
+            if (toEmit > 0 && d.encLen > 0) {
+                // Fetch this sector's encoded data from the file on demand.
+                uint16_t readLen = d.encLen < (uint16_t)sizeof(g_td0_enc_sec)
+                                   ? d.encLen : (uint16_t)sizeof(g_td0_enc_sec);
+                UINT br2 = 0;
+                f_lseek(disk->td0Stream, d.encFileOff);
+                f_read(disk->td0Stream, g_td0_enc_sec, readLen, &br2);
+                td0_decode_sector(g_td0_enc_sec, (uint16_t)br2, slen, buf + pos);
+            } else if (toEmit > 0)
                 memset(buf + pos, 0, toEmit);
             pos += toEmit;
 
@@ -3294,11 +3283,6 @@ void wdDiskEject(rvmWD1793 *wd, unsigned char UnitNum) {
         }
         wd->disk[UnitNum]->td0Stream = NULL;
         wd->disk[UnitNum]->td0OwnsStream = false;
-        if (wd->disk[UnitNum]->td0TrackBuf) {
-            free(wd->disk[UnitNum]->td0TrackBuf);
-            wd->disk[UnitNum]->td0TrackBuf = NULL;
-        }
-        wd->disk[UnitNum]->td0TrackBufCap = 0;
     }
 #endif
 

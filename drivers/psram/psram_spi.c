@@ -63,6 +63,29 @@ uint32_t psram_size() {
     return __psram_sz;
 }
 
+#ifndef PSRAM_MAX_SCK_MHZ
+#define PSRAM_MAX_SCK_MHZ 126
+#endif
+
+// Recalculate and apply the PIO clock divider after a sys_clk change.
+// Must be called whenever sys_clk changes (e.g. after Config::cpu_mhz switch) so
+// the actual SCK stays at PSRAM_MAX_SCK_MHZ rather than scaling with sys_clk.
+// Rounds clkdiv to the nearest integer to avoid fractional-divider jitter on the
+// SCK waveform (e.g. at 504 MHz: round(504/252)=2 → SCK=126 MHz, integer and clean;
+// at 378 MHz: round(378/252)=2 → SCK=94.5 MHz, clean but slower — accept the step).
+void __not_in_flash_func(psram_update_clkdiv)(void) {
+#ifdef PSRAM
+    if (!__psram_sz) return; // PSRAM not present
+    float sys_mhz = (float)clock_get_hz(clk_sys) / 1e6f;
+    float clkdiv_f = sys_mhz / (PSRAM_MAX_SCK_MHZ * 2.0f);
+    // Round to nearest integer to guarantee a clean duty cycle.
+    float clkdiv = (float)(int)(clkdiv_f + 0.5f);
+    if (clkdiv < 1.0f) clkdiv = 1.0f;
+    pio_sm_set_clkdiv(psram_spi.pio, psram_spi.sm, clkdiv);
+    pio_sm_clkdiv_restart(psram_spi.pio, psram_spi.sm);
+#endif
+}
+
 uint32_t init_psram() {
 #ifdef PSRAM
 #ifdef SOFTTV
@@ -83,7 +106,12 @@ uint32_t init_psram() {
         float sys_mhz = (float)clock_get_hz(clk_sys) / 1e6f;
         _clkdiv = sys_mhz / (PSRAM_MAX_SCK_MHZ * 2.0f);
         if (_clkdiv < 1.0f) _clkdiv = 1.0f;
-        psram_spi = psram_spi_init_clkdiv(psram_pio, -1, _clkdiv, false);
+        // At SCK > 83 MHz the PSRAM datasheet requires reading on the falling edge.
+        // The fudge program adds an extra synchronization clock and samples on the
+        // falling edge — use it by default when the target frequency exceeds this
+        // threshold, and fall back to non-fudge only if the size probe fails.
+        _fudge = (PSRAM_MAX_SCK_MHZ > 83);
+        psram_spi = psram_spi_init_clkdiv(psram_pio, -1, _clkdiv, _fudge);
     }
     // The first SPI transaction after the chip's 0x66/0x99 reset comes back garbage
     // (observed: read of 1 MB boundary returns 0x180000 instead of 0x100000), which
@@ -96,12 +124,15 @@ uint32_t init_psram() {
     __psram_sz = _psram_size();
 #ifndef PSRAM_NO_FUGE
     if ( !__psram_sz ) {
-        psram_spi_uninit(psram_spi, false);
-        psram_spi = psram_spi_init_clkdiv(psram_pio, -1, _clkdiv, true);
-        _fudge = true;
+        // Size probe failed — retry with the opposite fudge setting.
+        psram_spi_uninit(psram_spi, _fudge);
+        _fudge = !_fudge;
+        psram_spi = psram_spi_init_clkdiv(psram_pio, -1, _clkdiv, _fudge);
+        busy_wait_us(150);
+        { volatile uint32_t warmup = psram_read32(&psram_spi, 0); (void)warmup; }
         __psram_sz = _psram_size();
         if ( !__psram_sz ) {
-            psram_spi_uninit(psram_spi, true);
+            psram_spi_uninit(psram_spi, _fudge);
         }
     }
 #endif
@@ -406,12 +437,12 @@ psram_spi_inst_t psram_spi_init_clkdiv(PIO pio, int sm, float clkdiv, bool fudge
     spi.spinlock = spin_lock_init(spin_id);
 #endif
 
-    gpio_set_drive_strength(PSRAM_PIN_CS, GPIO_DRIVE_STRENGTH_4MA);
-    gpio_set_drive_strength(PSRAM_PIN_SCK, GPIO_DRIVE_STRENGTH_4MA);
-    gpio_set_drive_strength(PSRAM_PIN_MOSI, GPIO_DRIVE_STRENGTH_4MA);
-    /* gpio_set_slew_rate(PSRAM_PIN_CS, GPIO_SLEW_RATE_FAST); */
-    /* gpio_set_slew_rate(PSRAM_PIN_SCK, GPIO_SLEW_RATE_FAST); */
-    /* gpio_set_slew_rate(PSRAM_PIN_MOSI, GPIO_SLEW_RATE_FAST); */
+    gpio_set_drive_strength(PSRAM_PIN_CS,   GPIO_DRIVE_STRENGTH_8MA);
+    gpio_set_drive_strength(PSRAM_PIN_SCK,  GPIO_DRIVE_STRENGTH_8MA);
+    gpio_set_drive_strength(PSRAM_PIN_MOSI, GPIO_DRIVE_STRENGTH_8MA);
+    gpio_set_slew_rate(PSRAM_PIN_CS,   GPIO_SLEW_RATE_FAST);
+    gpio_set_slew_rate(PSRAM_PIN_SCK,  GPIO_SLEW_RATE_FAST);
+    gpio_set_slew_rate(PSRAM_PIN_MOSI, GPIO_SLEW_RATE_FAST);
 
     pio_spi_psram_cs_init(spi.pio, spi.sm, spi.offset, 8 /*n_bits*/, clkdiv, fudge, PSRAM_PIN_CS, PSRAM_PIN_MOSI, PSRAM_PIN_MISO);
 

@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "ff.h"
 
 // TD0 sector header flags (byte 4 of each sector record).
 // No ID address field was present; header is fabricated.
@@ -38,6 +39,12 @@ unsigned td0_unpack_lzh(const unsigned char *src, unsigned size, unsigned char *
 // aborts / the input is exhausted).
 typedef bool (*td0_sink_fn)(void *ctx, const unsigned char *buf, unsigned len);
 unsigned td0_unpack_lzh_stream(const unsigned char *src, unsigned size, td0_sink_fn sink, void *ctx);
+
+// File-streaming variant: like td0_unpack_lzh_stream but reads the packed
+// input directly from `f` (must be positioned at the first compressed byte)
+// using a 512-byte staging window inside the static LZH state.  No malloc
+// required — eliminates the large rawLen heap allocation for packed TD0.
+unsigned td0_unpack_lzh_from_file(FIL *f, td0_sink_fn sink, void *ctx);
 
 // Decode one sector's encoded data block into a flat sector buffer.
 //   encData    : points at the encoding-method byte (first byte of the

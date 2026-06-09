@@ -178,8 +178,6 @@ typedef struct
     FIL* td0Stream;          // file to stream track records from (Diskfile or temp)
     bool td0OwnsStream;      // true if td0Stream is a temp file we must close+unlink
     std::string td0TempPath; // temp file path to unlink on eject (if owned)
-    uint8_t* td0TrackBuf;    // per-track scratch buffer (sized to largest track record)
-    uint32_t td0TrackBufCap; // capacity of td0TrackBuf
 #endif
 } rvmwdDisk;
 

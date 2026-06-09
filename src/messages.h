@@ -976,6 +976,7 @@ static const char *MENU_OTHER[2] = { MENU_OTHER_EN, MENU_OTHER_ES };
     "Board Info\n"\
     "Emulator Info\n"\
     "HID devices\n"\
+    "Speed Test\t>\n"\
     "Overclock (!)\t>\n"
 #define MENU_HARDWARE_ES \
     "Hardware\n"\
@@ -983,8 +984,25 @@ static const char *MENU_OTHER[2] = { MENU_OTHER_EN, MENU_OTHER_ES };
     "Info placa\n"\
     "Info emulador\n"\
     "Disp. HID\n"\
+    "Test velocidad\t>\n"\
     "Overclock (!)\t>\n"
 static const char *MENU_HARDWARE[2] = { MENU_HARDWARE_EN, MENU_HARDWARE_ES };
+
+#define MENU_SPEEDTEST_EN \
+    "Speed Test\n"\
+    "CPU MIPS\n"\
+    "SRAM R/W\n"\
+    "PSRAM\n"\
+    "SD Card\n"\
+    "All tests\n"
+#define MENU_SPEEDTEST_ES \
+    "Test velocidad\n"\
+    "CPU MIPS\n"\
+    "SRAM L/E\n"\
+    "PSRAM\n"\
+    "Tarjeta SD\n"\
+    "Todos\n"
+static const char *MENU_SPEEDTEST[2] = { MENU_SPEEDTEST_EN, MENU_SPEEDTEST_ES };
 
 #define MENU_OVERCLOCK_EN \
     "Overclock\n"\

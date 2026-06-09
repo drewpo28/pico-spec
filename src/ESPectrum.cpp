@@ -609,7 +609,7 @@ static void assign_ram(int i) {
                            && (i == 56 || i == 58)
                            && (butter_psram_size() == 0);
   bool force_sram = (Config::arch == "Profi")
-                    && (i == 61 || i == 60 || i == 40)
+                    && (i == 61 || i == 60 || i == 40 || i == 41)
                     && (butter_psram_size() == 0);
 #endif
   if (force_sram_locked) {
@@ -775,6 +775,14 @@ void ESPectrum::setup() {
     // counted in ram_pages — keep that behaviour.
     ram_pages += 4;
     ram_pages += 2;
+    // Add pages 1,2,3 to the LRU pool using their existing static SRAM buffers.
+    // Without this the pool is empty on SPI-PSRAM and SWAP-only boards (pages 8+
+    // are assign_vram/PSRAM_SPI, never pooled), so _sync() can never find an
+    // eviction victim → MB-02 SRAM sync(0) returns NULL → applyMapping() falls
+    // back to ROM → BS-DOS crashes on every page switch.
+    MemESP::ram[1].assign_ram(MemESP::ram[1].direct(), 1, false);
+    MemESP::ram[2].assign_ram(MemESP::ram[2].direct(), 2, false);
+    MemESP::ram[3].assign_ram(MemESP::ram[3].direct(), 3, false);
 #endif
     Debug::log("setup: ext_ram: pages 0-7 done, freeHeap=%u", getFreeHeap());
     for (size_t i = 8; i < (MEM_PG_CNT + 2); ++i) {

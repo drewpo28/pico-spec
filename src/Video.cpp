@@ -1736,10 +1736,14 @@ void VIDEO::Reset() {
         init_profi_pair_lookup();
         // Reset live palette to defaults on machine reset
         profiPaletteReset();
-        // DS80 clrmem SRAM snapshot is Profi-only — allocate lazily so non-Profi
-        // machines keep the 16 KB.  (butter-PSRAM boards switch arch without a reboot,
-        // so the matching free() in the else branch reclaims it when leaving Profi.)
-        if (!ds80_clr_sram)
+        // DS80 clrmem snapshot: needed only when pages 56/58 live in XIP butter PSRAM.
+        // On those boards a direct ISR read hits the XIP cache and may stall hundreds of
+        // cycles on a miss — corrupting HDMI timing. The snapshot converts one sequential
+        // burst (vblank) into fast SRAM reads for every scanline.
+        // On SPI-PSRAM/SWAP boards pages 56/58 are force_sram_locked (regular heap SRAM),
+        // so ds80_frame_clrmem is already a plain SRAM pointer — no snapshot needed,
+        // saving 16 KB on the memory-constrained boards that need it most.
+        if (!ds80_clr_sram && butter_psram_size() > 0)
             ds80_clr_sram = (uint8_t*)malloc(DS80_CLR_SRAM_SIZE);
     } else if (ds80_clr_sram) {
         free(ds80_clr_sram);
@@ -2279,7 +2283,10 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
                 memcpy(ds80_clr_sram, profi_clrmem, DS80_CLR_SRAM_SIZE);
         }
         uint8_t* fgrmem  = ds80_frame_grmem;
-        uint8_t* fclrmem = ds80_frame_clrmem ? ds80_clr_sram : nullptr;
+        // ds80_clr_sram is only allocated on butter-PSRAM boards (XIP cache stall risk);
+        // on SPI-PSRAM/SWAP boards it is null and ds80_frame_clrmem (force_sram_locked
+        // SRAM pointer) is used directly — no stall risk, saves 16 KB heap.
+        uint8_t* fclrmem = ds80_frame_clrmem ? (ds80_clr_sram ? ds80_clr_sram : ds80_frame_clrmem) : nullptr;
         //
         // Row layout: pad_l bytes of border, then 256 content bytes (with (k^2) pre-swap
         // for the ISR's x^2 read pattern), then pad_r bytes of border.

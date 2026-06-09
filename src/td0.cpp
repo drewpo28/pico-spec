@@ -5,6 +5,7 @@
 // adaptive-Huffman + LZSS used by Teledisk's "advanced compression".
 
 #include "td0.h"
+#include "ff.h"
 #include <string.h>
 
 // ---------------------------------------------------------------- sectors
@@ -156,6 +157,12 @@ const int MAX_FREQ = 0x8000;              // tree-rebuild threshold
 struct LzhState {
     const unsigned char *packed_ptr;
     const unsigned char *packed_end;
+    // File-streaming source: when packed_file is non-null, readChar refills
+    // packed_filebuf from the file instead of returning EOF.  Lets packed TD0
+    // decompress without any large malloc — just a 512-byte staging window.
+    FIL  *packed_file;
+    bool  input_eof;
+    unsigned char packed_filebuf[512];
 
     unsigned short freq[T + 1];
     short prnt[T + N_CHAR];
@@ -172,6 +179,14 @@ static LzhState g_lzh; // ~10 KB; static keeps it off the stack (RP2350 SRAM ok)
 int readChar(LzhState &st)
 {
     if (st.packed_ptr < st.packed_end) return *st.packed_ptr++;
+    if (st.packed_file) {
+        UINT br = 0;
+        f_read(st.packed_file, st.packed_filebuf, sizeof(st.packed_filebuf), &br);
+        if (!br) { st.input_eof = true; return -1; }
+        st.packed_ptr = st.packed_filebuf;
+        st.packed_end = st.packed_filebuf + br;
+        return *st.packed_ptr++;
+    }
     return -1;
 }
 
@@ -308,6 +323,8 @@ unsigned td0_unpack_lzh(const unsigned char *src, unsigned size, unsigned char *
     LzhState &st = g_lzh;
     st.packed_ptr = src;
     st.packed_end = src + size;
+    st.packed_file = nullptr;
+    st.input_eof   = false;
 
     int i, j, k, c;
     unsigned count = 0;
@@ -338,6 +355,8 @@ unsigned td0_unpack_lzh_stream(const unsigned char *src, unsigned size, td0_sink
     LzhState &st = g_lzh;
     st.packed_ptr = src;
     st.packed_end = src + size;
+    st.packed_file = nullptr;
+    st.input_eof   = false;
 
     int i, j, k, c;
     unsigned total = 0;
@@ -378,3 +397,62 @@ unsigned td0_unpack_lzh_stream(const unsigned char *src, unsigned size, td0_sink
     if (op && !sink(ctx, out, op)) return total;
     return total;
 }
+
+// File-streaming variant: decompress an LZH-packed TD0 payload reading
+// directly from `f` (positioned at the first byte of the packed data).
+// No malloc needed — the compressed data is consumed via a 512-byte staging
+// window inside g_lzh, eliminating the large rawLen allocation.
+unsigned td0_unpack_lzh_from_file(FIL *f, td0_sink_fn sink, void *ctx)
+{
+    LzhState &st = g_lzh;
+    st.packed_ptr  = st.packed_filebuf; // empty staging buffer initially
+    st.packed_end  = st.packed_filebuf;
+    st.packed_file = f;
+    st.input_eof   = false;
+
+    // StartHuff initialises text_buf[0..N-F-1] with spaces but leaves the
+    // tail [N-F..N+F-2] untouched.  On the first call that tail is zero from
+    // BSS; on subsequent calls it holds data from the previous run.  The
+    // Teledisk compressor assumes zeros there (its own BSS), so mismatches
+    // corrupt the first few back-references → garbled first track → load fail.
+    memset(st.text_buf + (N - F), 0, sizeof(st.text_buf) - (N - F));
+
+    int i, j, k, c;
+    unsigned total = 0;
+    StartHuff(st);
+
+    unsigned char out[2048];
+    unsigned op = 0;
+
+    while (!st.input_eof) {
+        c = DecodeChar(st);
+        if (st.input_eof) break;
+        if (c < 256) {
+            out[op++] = (unsigned char)c;
+            st.text_buf[st.r++] = (unsigned char)c;
+            st.r &= (N - 1);
+            total++;
+        } else {
+            i = (st.r - DecodePosition(st) - 1) & (N - 1);
+            j = c - 255 + THRESHOLD;
+            for (k = 0; k < j; k++) {
+                c = st.text_buf[(i + k) & (N - 1)];
+                out[op++] = (unsigned char)c;
+                st.text_buf[st.r++] = (unsigned char)c;
+                st.r &= (N - 1);
+                total++;
+                if (op == sizeof(out)) {
+                    if (!sink(ctx, out, op)) return total;
+                    op = 0;
+                }
+            }
+        }
+        if (op >= sizeof(out) - 1) {
+            if (!sink(ctx, out, op)) return total;
+            op = 0;
+        }
+    }
+    if (op) sink(ctx, out, op);
+    return total;
+}
+

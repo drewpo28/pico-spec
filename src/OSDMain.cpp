@@ -5314,7 +5314,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         menu_curopt = 4;
                         menu_saverect = false;
                     }
-                    else if (hw_opt == 5) {
+                    else if (hw_opt == 6) {
                         // Overclock submenu — warn user
                         osdCenteredMsg(Config::lang ? "Peligroso! Puede no arrancar!" : "Dangerous! Board may not boot!", LEVEL_WARN, 2000);
                         menu_level = 2;
@@ -5494,11 +5494,17 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                             }
                             else {
-                                menu_curopt = 3;
+                                menu_curopt = 6;
                                 menu_level = 1;
                                 break;
                             }
                         }
+                    }
+                    else if (hw_opt == 5) {
+                        // Speed Test
+                        OSD::SpeedTest();
+                        menu_curopt = 5;
+                        menu_saverect = false;
                     }
                     else {
                         menu_curopt = 9;
@@ -9324,6 +9330,255 @@ progressDialog(OSD_FIRMW[Config::lang],OSD_FIRMW_END[Config::lang],100,1);
     // Firmware written: reboot
     OSD::esp_hard_reset();
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Speed Test
+// ---------------------------------------------------------------------------
+void OSD::SpeedTest() {
+    menu_level = 2;
+    menu_curopt = 1;
+    menu_saverect = true;
+
+    while (1) {
+        uint8_t st_opt = menuRun(MENU_SPEEDTEST[Config::lang]);
+        if (st_opt == 0) break;
+
+        const bool do_cpu   = (st_opt == 1 || st_opt == 5);
+        const bool do_sram  = (st_opt == 2 || st_opt == 5);
+        const bool do_psram = (st_opt == 3 || st_opt == 5);
+        const bool do_sd    = (st_opt == 4 || st_opt == 5);
+
+        const char* title = Config::lang ? "Test velocidad" : "Speed Test";
+
+        float cpu_mips = 0.0f;
+        float sram_rd = 0.0f, sram_wr = 0.0f;
+        float spi_rd = 0.0f, spi_wr = 0.0f;
+        float qspi_rd = 0.0f, qspi_wr = 0.0f;
+        float sd_rd = 0.0f, sd_wr = 0.0f;
+        bool sd_ok = false;
+
+        const bool has_spi  = psram_size() > 0;
+        const bool has_qspi = butter_psram_size() > 0;
+
+        // --- CPU MIPS ---
+        if (do_cpu) {
+            progressDialog(title, "CPU MIPS...", 0, 0);
+            const int BATCH = 10000;
+            uint32_t acc = 1;
+            uint32_t iters = 0;
+            uint64_t t0 = time_us_64();
+            do {
+                for (int i = 0; i < BATCH; i++)
+                    acc = acc * 1664525u + 1013904223u;
+                iters += BATCH;
+            } while (time_us_64() - t0 < 500000ULL);
+            volatile uint32_t _sink = acc; (void)_sink;
+            uint64_t elapsed = time_us_64() - t0;
+            // 2 integer ops per iteration (mul + add)
+            cpu_mips = (float)iters * 2.0f / (float)elapsed;
+            progressDialog(title, "", 100, 1);
+            progressDialog("", "", 0, 2);
+        }
+
+        // --- SRAM R/W ---
+        // osd_info_buf used as scratch; results saved in floats before we refill it
+        if (do_sram) {
+            char (&scratch)[OSD_INFO_BUF_SZ] = osd_info_buf;
+            uint64_t t0, elapsed;
+            uint32_t total;
+
+            progressDialog(title, "SRAM write...", 0, 0);
+            total = 0;
+            t0 = time_us_64();
+            do {
+                memset(scratch, 0xAA, OSD_INFO_BUF_SZ);
+                total += OSD_INFO_BUF_SZ;
+            } while (time_us_64() - t0 < 300000ULL);
+            elapsed = time_us_64() - t0;
+            sram_wr = (float)total / (float)elapsed;
+
+            progressDialog(title, "SRAM read...", 50, 1);
+            uint32_t acc = 0;
+            total = 0;
+            t0 = time_us_64();
+            do {
+                const uint32_t *p32 = (const uint32_t *)scratch;
+                for (int i = 0; i < OSD_INFO_BUF_SZ / 4; i++) acc += p32[i];
+                total += OSD_INFO_BUF_SZ;
+            } while (time_us_64() - t0 < 300000ULL);
+            volatile uint32_t _sink = acc; (void)_sink;
+            elapsed = time_us_64() - t0;
+            sram_rd = (float)total / (float)elapsed;
+
+            progressDialog(title, "", 100, 1);
+            progressDialog("", "", 0, 2);
+        }
+
+        // --- PSRAM ---
+        if (do_psram) {
+            // SPI PSRAM — burst via psram_write_range / psram_read_range
+            if (has_spi) {
+                char (&burst)[OSD_INFO_BUF_SZ] = osd_info_buf;
+                uint64_t t0, elapsed;
+                uint32_t total;
+
+                progressDialog(title, "SPI PSRAM wr...", 0, 0);
+                total = 0;
+                t0 = time_us_64();
+                do {
+                    psram_write_range(0, (const uint8_t*)burst, OSD_INFO_BUF_SZ);
+                    total += OSD_INFO_BUF_SZ;
+                } while (time_us_64() - t0 < 500000ULL);
+                elapsed = time_us_64() - t0;
+                spi_wr = (float)total / (float)elapsed;
+
+                progressDialog(title, "SPI PSRAM rd...", 50, 1);
+                total = 0;
+                t0 = time_us_64();
+                do {
+                    psram_read_range(0, (uint8_t*)burst, OSD_INFO_BUF_SZ);
+                    total += OSD_INFO_BUF_SZ;
+                } while (time_us_64() - t0 < 500000ULL);
+                elapsed = time_us_64() - t0;
+                spi_rd = (float)total / (float)elapsed;
+
+                progressDialog(title, "", 100, 1);
+                progressDialog("", "", 0, 2);
+            }
+            // QSPI/butter PSRAM — memory-mapped, use memset + sum loop
+            if (has_qspi) {
+                extern uint8_t* PSRAM_DATA;
+                const uint32_t TEST_SZ = 0x10000u; // 64KB
+                uint32_t sz = (uint32_t)butter_psram_size() < TEST_SZ
+                            ? (uint32_t)butter_psram_size() : TEST_SZ;
+                uint64_t t0, elapsed;
+                uint32_t total;
+
+                progressDialog(title, "QSPI PSRAM wr...", 0, 0);
+                total = 0;
+                t0 = time_us_64();
+                do {
+                    memset(PSRAM_DATA, 0xAA, sz);
+                    total += sz;
+                } while (time_us_64() - t0 < 300000ULL);
+                elapsed = time_us_64() - t0;
+                qspi_wr = (float)total / (float)elapsed;
+
+                progressDialog(title, "QSPI PSRAM rd...", 50, 1);
+                uint32_t acc = 0;
+                total = 0;
+                t0 = time_us_64();
+                do {
+                    for (uint32_t i = 0; i < sz; i++) acc += PSRAM_DATA[i];
+                    total += sz;
+                } while (time_us_64() - t0 < 300000ULL);
+                volatile uint32_t _sink = acc; (void)_sink;
+                elapsed = time_us_64() - t0;
+                qspi_rd = (float)total / (float)elapsed;
+
+                progressDialog(title, "", 100, 1);
+                progressDialog("", "", 0, 2);
+            }
+        }
+
+        // --- SD Card ---
+        if (do_sd) {
+            if (FileUtils::fsMount) {
+                static uint8_t sd_buf[512];
+                const char* BENCH_FILE = "/bench.tmp";
+                FIL f;
+                UINT bw, br;
+
+                progressDialog(title, "SD write...", 0, 0);
+                memset(sd_buf, 0x55, sizeof(sd_buf));
+                if (f_open(&f, BENCH_FILE, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+                    uint64_t t0 = time_us_64();
+                    uint32_t total = 0;
+                    while (time_us_64() - t0 < 2000000ULL && total < 512u * 1024u) {
+                        if (f_write(&f, sd_buf, sizeof(sd_buf), &bw) != FR_OK) break;
+                        total += bw;
+                    }
+                    uint64_t elapsed = time_us_64() - t0;
+                    f_close(&f);
+                    if (elapsed > 0 && total > 0) {
+                        sd_wr = (float)total / (float)elapsed;
+                        sd_ok = true;
+                    }
+                }
+
+                progressDialog(title, "SD read...", 50, 1);
+                if (f_open(&f, BENCH_FILE, FA_READ) == FR_OK) {
+                    uint64_t t0 = time_us_64();
+                    uint32_t total = 0;
+                    while (f_read(&f, sd_buf, sizeof(sd_buf), &br) == FR_OK && br > 0)
+                        total += br;
+                    uint64_t elapsed = time_us_64() - t0;
+                    f_close(&f);
+                    if (elapsed > 0 && total > 0)
+                        sd_rd = (float)total / (float)elapsed;
+                }
+                f_unlink(BENCH_FILE);
+
+                progressDialog(title, "", 100, 1);
+                progressDialog("", "", 0, 2);
+            }
+        }
+
+        // --- Build result text ---
+        char (&buf)[OSD_INFO_BUF_SZ] = osd_info_buf;
+        int pos = 0;
+
+        if (do_cpu) {
+            uint32_t cpu_mhz = clock_get_hz(clk_sys) / 1000000u;
+            pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                " CPU     : %u MHz\n"
+                " MIPS    : %.1f\n\n",
+                (unsigned)cpu_mhz, cpu_mips);
+        }
+        if (do_sram) {
+            pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                " SRAM rd : %.1f MB/s\n"
+                " SRAM wr : %.1f MB/s\n\n",
+                sram_rd, sram_wr);
+        }
+        if (do_psram) {
+            if (!has_spi && !has_qspi) {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " PSRAM   : N/A\n\n");
+            }
+            if (has_spi) {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " SPI PSRAM rd: %.1f MB/s\n"
+                    " SPI PSRAM wr: %.1f MB/s\n\n",
+                    spi_rd, spi_wr);
+            }
+            if (has_qspi) {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " QSPI PSRAM rd: %.2f MB/s\n"
+                    " QSPI PSRAM wr: %.2f MB/s\n\n",
+                    qspi_rd, qspi_wr);
+            }
+        }
+        if (do_sd) {
+            if (!FileUtils::fsMount) {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " SD      : No card\n\n");
+            } else if (sd_ok) {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " SD rd   : %.2f MB/s\n"
+                    " SD wr   : %.2f MB/s\n\n",
+                    sd_rd, sd_wr);
+            } else {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " SD      : Error\n\n");
+            }
+        }
+
+        showTextDialog(title, buf);
+        menu_curopt = st_opt;
+        menu_saverect = false;
+    }
 }
 
 void OSD::progressDialog(const string& title, const string& msg, int percent, int action) {
