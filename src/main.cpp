@@ -1023,13 +1023,34 @@ extern "C" void sigbus_handler(uint32_t *frame) {
     static int count = 0;
     if (++count > 3) return;
     uint32_t pc   = frame[6];
+#ifndef PICO_RP2040
+    // CFSR/BFAR only exist on Cortex-M3+ (not M0+)
     uint32_t cfsr = *(volatile uint32_t*)0xE000ED28u;
     uint32_t bfar = *(volatile uint32_t*)0xE000ED38u;
     printf("SIGBUS[%d]: PC=%08x CFSR=%08x BFAR=%08x\n",
            count, (unsigned)pc, (unsigned)cfsr, (unsigned)bfar);
+#else
+    printf("SIGBUS[%d]: PC=%08x\n", count, (unsigned)pc);
+#endif
 }
 // Naked trampoline: pass the stacked exception frame to sigbus_handler.
 // EXC_RETURN bit 2: 0 = MSP, 1 = PSP was active when the fault fired.
+#ifdef PICO_RP2040
+// Cortex-M0+: no IT blocks, TST only register form, high-reg immediates forbidden.
+void __attribute__((naked)) sigbus(void) {
+    __asm volatile (
+        "movs r0, #4\n"
+        "mov  r1, lr\n"
+        "tst  r0, r1\n"       // Z=1 if bit2(LR)=0 → MSP
+        "bne  1f\n"
+        "mrs  r0, msp\n"
+        "b    sigbus_handler\n"
+        "1:\n"
+        "mrs  r0, psp\n"
+        "b    sigbus_handler\n"
+    );
+}
+#else
 void __attribute__((naked)) sigbus(void) {
     __asm volatile (
         "tst    lr, #4\n"
@@ -1039,6 +1060,7 @@ void __attribute__((naked)) sigbus(void) {
         "b      sigbus_handler\n"
     );
 }
+#endif
 void __attribute__((naked, noreturn)) __printflike(1, 0) dummy_panic(__unused const char *fmt, ...) {
     printf("*** PANIC ***\n");
     if (fmt)

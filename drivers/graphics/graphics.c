@@ -261,8 +261,8 @@ void graphics_set_dither(bool enabled) {
     hdmi_set_dither(enabled);
 }
 #else
-void graphics_set_scanlines(bool enabled) {
-    (void)enabled;
+void graphics_set_scanlines(uint8_t level) {
+    (void)level;
 }
 #ifdef HDMI
 extern void hdmi_set_dither(bool enabled);
