@@ -131,20 +131,34 @@ IRAM_ATTR uint8_t Ports::getFloatBusData48() {
   unsigned int currentTstates = CPU::tstates;
 
   unsigned int line = (currentTstates / 224) - 64;
-  if (line >= 192)
+  if (line >= 192) {
+#if HALT2INT_TRACE
+    Debug::log("[FLOAT] ts=%u line=%d(off) -> 0xFF (lt=%u IntEnd=%d)",
+               currentTstates, (int)line, (unsigned)CPU::latetiming, (int)CPU::IntEnd);
+#endif
     return 0xFF;
+  }
 
   unsigned char halfpix = (currentTstates % 224) - 3;
-  if ((halfpix >= 125) || (halfpix & 0x04))
+  if ((halfpix >= 125) || (halfpix & 0x04)) {
+#if HALT2INT_TRACE
+    Debug::log("[FLOAT] ts=%u line=%u halfpix=%u -> 0xFF (lt=%u)",
+               currentTstates, line, (unsigned)halfpix, (unsigned)CPU::latetiming);
+#endif
     return 0xFF;
+  }
 
   int hpoffset = (halfpix >> 2) + ((halfpix >> 1) & 0x01);
-  ;
 
-  if (halfpix & 0x01)
-    return (VIDEO::grmem[VIDEO::offAtt[line] + hpoffset]);
-
-  return (VIDEO::grmem[VIDEO::offBmp[line] + hpoffset]);
+  uint8_t fbdata = (halfpix & 0x01)
+                       ? VIDEO::grmem[VIDEO::offAtt[line] + hpoffset]
+                       : VIDEO::grmem[VIDEO::offBmp[line] + hpoffset];
+#if HALT2INT_TRACE
+  Debug::log("[FLOAT] ts=%u line=%u halfpix=%u hpoff=%d %s byte=%02X (lt=%u)",
+             currentTstates, line, (unsigned)halfpix, hpoffset,
+             (halfpix & 0x01) ? "ATT" : "BMP", fbdata, (unsigned)CPU::latetiming);
+#endif
+  return fbdata;
 }
 
 IRAM_ATTR uint8_t Ports::getFloatBusData128() {
@@ -625,6 +639,16 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
           break;
         goto fdc_sys_status;
       case 0xe3:
+        // Port #FF is the Beta128 SYS register ONLY when the TR-DOS ROM is
+        // paged in (real Beta128 decodes its FDC ports only while its ROM is
+        // active). With a raw disk merely mounted but TR-DOS not paged (e.g. a
+        // 48K program running with an FDI/UDI image still mounted), #FF must
+        // float — otherwise IN A,(0xFF) returns FDC status (~0x00) instead of
+        // the floating bus, breaking floating-bus reads (games + halt2int's
+        // Float test → "Unknown"). On Profi trdos is permanently asserted
+        // (SYSEN), so its SYS-register path is unaffected.
+        if (!ESPectrum::trdos)
+          break;
         // Port #FF (and #FF-family) is the SYS register only in the standard
         // scheme (CPM=0). In CP/M the SYS register is at #BF/#3F and the
         // #FF-family belongs to extended periphery (IDE etc.) — see the write
@@ -706,6 +730,10 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       }
     }
     if (!(Z80Ops::isPentagon || Z80Ops::isProfi)) {
+#if HALT2INT_TRACE
+      if (address == 0xFFFF)
+        Debug::log("[FLOAT-IN] addr=%04X ts=%u ia=%d", address, CPU::tstates, (int)ia);
+#endif
       data = getFloatBusData();
       if ((!Z80Ops::is48) && !Z80Ops::isALF && ((address & 0x8002) == 0)) {
         LED::touchR(LED::RAM);

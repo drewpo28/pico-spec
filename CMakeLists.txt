@@ -308,6 +308,13 @@ else ()
     target_compile_definitions(${PROJECT_NAME} PRIVATE PERF_TRACE=0)
 endif ()
 
+# halt2int floating-bus probe trace (see Ports.cpp `#if HALT2INT_TRACE`).
+if (HALT2INT_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE HALT2INT_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE HALT2INT_TRACE=0)
+endif ()
+
 if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
 target_compile_options(${PROJECT_NAME} PUBLIC
         -Wno-error=suggest-attribute=format
