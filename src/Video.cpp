@@ -3417,8 +3417,10 @@ void SaveRectT::restore_last() {
         y = read16psram(pos); pos += 2;
         w = read16psram(pos); pos += 2;
         h = read16psram(pos); pos += 2;
-        if (!w || !h) return;
-        for (size_t line = y; line < (size_t)y + h; ++line) {
+        if (!w || !h || y >= (uint16_t)VIDEO::vga.yres) return;
+        size_t line_end_p = (size_t)y + h;
+        if (line_end_p > (size_t)VIDEO::vga.yres) line_end_p = VIDEO::vga.yres;
+        for (size_t line = y; line < line_end_p; ++line) {
             readpsram(VIDEO::vga.frameBuffer[line] + x, pos, w);
             pos += w;
         }
@@ -3446,11 +3448,13 @@ void SaveRectT::restore_last() {
         f_read(&f, &y, 2, &br);
         f_read(&f, &w, 2, &br);
         f_read(&f, &h, 2, &br);
-        if (!w || !h) {
+        if (!w || !h || y >= (uint16_t)VIDEO::vga.yres) {
             f_close(&f);
             return;
         }
-        for (size_t line = y; line < y + h; ++line) {
+        size_t line_end = (size_t)y + h;
+        if (line_end > (size_t)VIDEO::vga.yres) line_end = VIDEO::vga.yres;
+        for (size_t line = y; line < line_end; ++line) {
             f_read(&f, VIDEO::vga.frameBuffer[line] + x, w, &br);
         }
         f_close(&f);
@@ -3461,8 +3465,10 @@ void SaveRectT::restore_last() {
         memcpy(&y, p, 2); p += 2;
         memcpy(&w, p, 2); p += 2;
         memcpy(&h, p, 2); p += 2;
-        if (!w || !h) return;
-        for (size_t line = y; line < y + h; ++line) {
+        if (!w || !h || y >= (uint16_t)VIDEO::vga.yres) return;
+        size_t line_end_r = (size_t)y + h;
+        if (line_end_r > (size_t)VIDEO::vga.yres) line_end_r = VIDEO::vga.yres;
+        for (size_t line = y; line < line_end_r; ++line) {
             memcpy(VIDEO::vga.frameBuffer[line] + x, p, w);
             p += w;
         }
@@ -3474,37 +3480,41 @@ void SaveRectT::restore_last() {
 }
 
 void SaveRectT::store_ram(const void* p, size_t sz) {
-    if (offsets.empty()) {
-        offsets.push_back(0);
-    }
+    if (offsets.empty()) offsets.push_back(0);
     size_t off = offsets.back();
-    if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) return; // skip — no LFN scratch room
+    // Always push so restore_ram can pop correctly without UB.
+    // Use sentinel (size_t)-1 when the write is skipped.
+    if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) {
+        offsets.push_back((size_t)-1);
+        return;
+    }
+    // Static FIL: same 580-byte stack-overflow guard as save() / restore_last().
+    static FIL f;
+    if (f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) {
+        offsets.push_back((size_t)-1);
+        return;
+    }
     UINT bw;
-    FIL f;
-    if (f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) return;
     f_lseek(&f, off);
     f_write(&f, p, sz, &bw);
     f_close(&f);
+    offsets.push_back(off + sz);
 }
 
 void SaveRectT::restore_ram(void* p, size_t sz) {
-    if (offsets.empty()) return;
+    if (offsets.size() < 2) {
+        if (offsets.empty()) offsets.push_back(0);
+        return;
+    }
+    size_t top = offsets.back();
     offsets.pop_back();
-    size_t off = offsets.back();
-    if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) {
-        if (offsets.empty()) offsets.push_back(0);
-        return;
-    }
-    UINT br;
-    FIL f;
-    if (f_open(&f, "/tmp/save_rect.tmp", FA_READ) != FR_OK) {
-        if (offsets.empty()) offsets.push_back(0);
-        return;
-    }
+    if (top == (size_t)-1) return; // store_ram skipped the write — nothing to restore
+    size_t off = offsets.back();   // position where store_ram wrote the data
+    if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) return;
+    static FIL f;
+    if (f_open(&f, "/tmp/save_rect.tmp", FA_READ) != FR_OK) return;
     f_lseek(&f, off);
+    UINT br;
     f_read(&f, p, sz, &br);
     f_close(&f);
-    if (offsets.empty()) {
-        offsets.push_back(0);
-    }
 }

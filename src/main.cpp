@@ -1018,9 +1018,26 @@ uint8_t* PSRAM_DATA = (uint8_t*)0;
 uint32_t __not_in_flash_func(butter_psram_size)() { return 0; }
 #endif
 
-void sigbus(void) {
-    printf("SIGBUS exception caught...\n");
-    // reset_usb_boot(0, 0);
+// C linkage so the naked-asm `b sigbus_handler` resolves without mangling.
+extern "C" void sigbus_handler(uint32_t *frame) {
+    static int count = 0;
+    if (++count > 3) return;
+    uint32_t pc   = frame[6];
+    uint32_t cfsr = *(volatile uint32_t*)0xE000ED28u;
+    uint32_t bfar = *(volatile uint32_t*)0xE000ED38u;
+    printf("SIGBUS[%d]: PC=%08x CFSR=%08x BFAR=%08x\n",
+           count, (unsigned)pc, (unsigned)cfsr, (unsigned)bfar);
+}
+// Naked trampoline: pass the stacked exception frame to sigbus_handler.
+// EXC_RETURN bit 2: 0 = MSP, 1 = PSP was active when the fault fired.
+void __attribute__((naked)) sigbus(void) {
+    __asm volatile (
+        "tst    lr, #4\n"
+        "ite    eq\n"
+        "mrseq  r0, msp\n"
+        "mrsne  r0, psp\n"
+        "b      sigbus_handler\n"
+    );
 }
 void __attribute__((naked, noreturn)) __printflike(1, 0) dummy_panic(__unused const char *fmt, ...) {
     printf("*** PANIC ***\n");
