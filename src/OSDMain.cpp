@@ -128,7 +128,7 @@ extern int ram_pages, butter_pages, psram_pages, swap_pages;
 
 // Shared buffer for HWInfo/ChipInfo/BoardInfo/EmulatorInfo (never called concurrently)
 #define OSD_INFO_BUF_SZ 1536
-static char osd_info_buf[OSD_INFO_BUF_SZ];
+static char osd_info_buf[OSD_INFO_BUF_SZ] __attribute__((aligned(4)));
 
 uint8_t OSD::cols;                     // Maximum columns
 uint8_t OSD::tab_col;                  // Tab stop column
@@ -9388,11 +9388,15 @@ void OSD::SpeedTest() {
             uint64_t t0, elapsed;
             uint32_t total;
 
+            typedef uint32_t __attribute__((may_alias)) u32a;
+
             progressDialog(title, "SRAM write...", 0, 0);
             total = 0;
             t0 = time_us_64();
             do {
-                memset(scratch, 0xAA, OSD_INFO_BUF_SZ);
+                char *p = scratch;
+                for (uint32_t a = 0; a < OSD_INFO_BUF_SZ; a += 4)
+                    *(u32a *)(p + a) = a;
                 total += OSD_INFO_BUF_SZ;
             } while (time_us_64() - t0 < 300000ULL);
             elapsed = time_us_64() - t0;
@@ -9403,8 +9407,9 @@ void OSD::SpeedTest() {
             total = 0;
             t0 = time_us_64();
             do {
-                const uint32_t *p32 = (const uint32_t *)scratch;
-                for (int i = 0; i < OSD_INFO_BUF_SZ / 4; i++) acc += p32[i];
+                const char *p = scratch;
+                for (uint32_t a = 0; a < OSD_INFO_BUF_SZ; a += 4)
+                    acc ^= *(const u32a *)(p + a);
                 total += OSD_INFO_BUF_SZ;
             } while (time_us_64() - t0 < 300000ULL);
             volatile uint32_t _sink = acc; (void)_sink;
@@ -9466,14 +9471,16 @@ void OSD::SpeedTest() {
                 qspi_wr = (float)total / (float)elapsed;
 
                 progressDialog(title, "QSPI PSRAM rd...", 50, 1);
-                uint32_t acc = 0;
                 total = 0;
                 t0 = time_us_64();
                 do {
-                    for (uint32_t i = 0; i < sz; i++) acc += PSRAM_DATA[i];
-                    total += sz;
+                    const uint32_t *p32 = (const uint32_t *)PSRAM_DATA;
+                    uint32_t a;
+                    for (a = 0; a < sz / 4; a++) {
+                        if (p32[a] != 0xAAAAAAAAu) break;
+                    }
+                    total += a * 4;
                 } while (time_us_64() - t0 < 300000ULL);
-                volatile uint32_t _sink = acc; (void)_sink;
                 elapsed = time_us_64() - t0;
                 qspi_rd = (float)total / (float)elapsed;
 
