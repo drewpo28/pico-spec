@@ -980,8 +980,13 @@ IRAM_ATTR void Z80::check_trdos() {
                 // For Profi: TR-DOS is accessed from bank 0 (SYS ROM), bank 2 (128K compat ROM), or bank 3 (SOS ROM) via 0x3Dxx.
                 // newSRAM=true means slot 0 is a RAM page (Pentagon Hidden RAM), not the stock 48K ROM — skip TR-DOS automap.
                 // For Profi: ZXMAK2 MemoryProfi1024.BusReadMem3D00_M1 triggers DOSEN only when IsRom48 — i.e. SOS bank3 (Sinclair OS). Not from SYS (0), TR-DOS (1), or 128K (2).
+                // ...and only when ROM is actually mapped at slot 0: with NOROM
+                // (DFFD bit4, page0ram) the CPU sees RAM at 0x0000-0x3FFF, so a
+                // program legitimately running code at 0x3Dxx (Kings Valley CP/M
+                // keeps a routine + stack there) must NOT trigger the automap —
+                // it used to swap page0 for TR-DOS ROM mid-game and crash it.
                 if ((Z80Ops::is48 && MemESP::romInUse == 0) ||
-                    (Config::arch == "Profi" && MemESP::romInUse == 3 && !MemESP::newSRAM) ||
+                    (Config::arch == "Profi" && MemESP::romInUse == 3 && !MemESP::newSRAM && !MemESP::page0ram) ||
                     (!Z80Ops::is48 && Config::arch != "Profi" && MemESP::romInUse == 1 && !MemESP::newSRAM)) {
                     // Profi uses its own TR-DOS in ROM bank 1; others use the external TR-DOS ROM (bank 4)
                     uint8_t dosBank = (Config::arch == "Profi") ? 1 : 4;

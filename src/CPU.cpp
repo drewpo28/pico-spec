@@ -190,7 +190,7 @@ void CPU::reset() {
         Z80Ops::is1024 = false;
         Z80Ops::isProfi = true;
         // Set emulation loop sync target
-        ESPectrum::target = MICROS_PER_FRAME_PENTAGON;
+        ESPectrum::target = MICROS_PER_FRAME_PROFI;
     } else { // if (Config::arch == "Pentagon") - by default
         Z80Ops::isByte = false;
         Z80Ops::is48 = false;

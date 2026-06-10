@@ -1680,7 +1680,19 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       }
     }
 #endif
-    if (!MemESP::pagingLock) {
+    // 48K paging-lock gate (7FFD bit5). Mirror UnrealSpeccy io.cpp set_banks
+    // entry: the lock is RE-EVALUATED on every write, not a sticky flag.
+    // Pentagon-1024 (not notMore128) and Profi with NOROM(DFFD.4) bypass the
+    // lock entirely, so a CP/M bank-switch routine that writes 7FFD with bit5
+    // set is never silently dropped (caused level-load freezes / wrong banks).
+    bool blocked = MemESP::pagingLock;
+    if (blocked) {
+      if (Z80Ops::is1024 && !MemESP::notMore128)
+        blocked = false; // Pentagon-1024 unlocked
+      else if (Z80Ops::isProfi && (portDFFD & 0x10))
+        blocked = false; // Profi NOROM → paging always live
+    }
+    if (!blocked) {
       uint8_t D5 = bitRead(data, 5);
       if (Z80Ops::is1024) {
         MemESP::pagingLock = MemESP::notMore128 ? D5 : 0;

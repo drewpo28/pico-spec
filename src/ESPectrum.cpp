@@ -981,7 +981,7 @@ void ESPectrum::setup() {
     }
 #endif
 
-  if (Config::arch == "48K") {
+  if (Config::arch == "48K" || Config::arch == "Profi") {
     samplesPerFrame = ESP_AUDIO_SAMPLES_48;
     audioOverSampleDivider = ESP_AUDIO_OVERSAMPLES_DIV_48;
     audioAYDivider = ESP_AUDIO_AY_DIV_48;
