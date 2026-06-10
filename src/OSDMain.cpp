@@ -9997,6 +9997,10 @@ static const char *MENU_JOYSELKEY[2] = { MENU_JOYSELKEY_EN, MENU_JOYSELKEY_ES };
     "Down\n"\
     "A\n"\
     "B\n"\
+    "C\n"\
+    "X\n"\
+    "Y\n"\
+    "Z\n"\
     "Start\n"\
     "Select\n"
 
@@ -10148,6 +10152,18 @@ case fabgl::VK_DPAD_SELECT:
     return " Joy.Sel ";
 case fabgl::VK_DPAD_START:
     return "Joy.Start";
+case fabgl::VK_JOY_C:
+    return "  Joy.C  ";
+case fabgl::VK_JOY_X:
+    return "  Joy.X  ";
+case fabgl::VK_JOY_Y:
+    return "  Joy.Y  ";
+case fabgl::VK_JOY_Z:
+    return "  Joy.Z  ";
+case fabgl::VK_JOY_L2:
+    return "  Joy.L2 ";
+case fabgl::VK_JOY_R2:
+    return "  Joy.R2 ";
 case fabgl::VK_HOME:
     return "  Home   ";
 case fabgl::VK_END:
@@ -10200,19 +10216,21 @@ default:
 
 }
 
-unsigned int joyControl[12][3]={
-    {34,55,zxColor(0,0)}, // Left
-    {87,55,zxColor(0,0)}, // Right
-    {63,30,zxColor(0,0)}, // Up
-    {63,78,zxColor(0,0)}, // Down
-    {49,109,zxColor(0,0)}, // Start
+unsigned int joyControl[14][3]={
+    {34,55,zxColor(0,0)},   // Left
+    {87,55,zxColor(0,0)},   // Right
+    {63,30,zxColor(0,0)},   // Up
+    {63,78,zxColor(0,0)},   // Down
+    {49,109,zxColor(0,0)},  // Start
     {136,109,zxColor(0,0)}, // Mode
-    {145,69,zxColor(0,0)}, // A
-    {205,69,zxColor(0,0)}, // B
-    {265,69,zxColor(0,0)}, // C
-    {145,37,zxColor(0,0)}, // X
-    {205,37,zxColor(0,0)}, // Y
-    {265,37,zxColor(0,0)} // Z
+    {142,17,zxColor(0,0)},  // A (circle left of A cell)
+    {222,17,zxColor(0,0)},  // B
+    {142,65,zxColor(0,0)},  // C
+    {142,41,zxColor(0,0)},  // X
+    {222,41,zxColor(0,0)},  // Y
+    {222,65,zxColor(0,0)},  // Z
+    {142,89,zxColor(0,0)},  // L2 (circle left of L2 cell)
+    {222,89,zxColor(0,0)}   // R2
 };
 
 void DrawjoyControls(unsigned short x, unsigned short y) {
@@ -10252,38 +10270,50 @@ void DrawjoyControls(unsigned short x, unsigned short y) {
     // Text A
     VIDEO::vga.setTextColor( joyControl[6][2],zxColor(7, 1));
     VIDEO::vga.setCursor(x + joyControl[6][0], y + joyControl[6][1]);
-    VIDEO::vga.circle(x + joyControl[6][0] + 3, y + joyControl[6][1] + 3, 6,  joyControl[6][2]);
+    VIDEO::vga.circle(x + joyControl[6][0] + 3, y + joyControl[6][1] + 3, 8,  joyControl[6][2]);
     VIDEO::vga.print("A");
 
     // Text B
     VIDEO::vga.setTextColor(joyControl[7][2],zxColor(7, 1));
     VIDEO::vga.setCursor(x + joyControl[7][0], y + joyControl[7][1]);
-    VIDEO::vga.circle(x + joyControl[7][0] + 3, y + joyControl[7][1] + 3, 6,  joyControl[7][2]);
+    VIDEO::vga.circle(x + joyControl[7][0] + 3, y + joyControl[7][1] + 3, 8,  joyControl[7][2]);
     VIDEO::vga.print("B");
 
     // Text C
     VIDEO::vga.setTextColor(joyControl[8][2],zxColor(7, 1));
     VIDEO::vga.setCursor(x + joyControl[8][0], y + joyControl[8][1]);
-    VIDEO::vga.circle(x + joyControl[8][0] + 3, y + joyControl[8][1] + 3, 6, joyControl[8][2]);
+    VIDEO::vga.circle(x + joyControl[8][0] + 3, y + joyControl[8][1] + 3, 8, joyControl[8][2]);
     VIDEO::vga.print("C");
 
     // Text X
     VIDEO::vga.setTextColor(joyControl[9][2],zxColor(7, 1));
     VIDEO::vga.setCursor(x + joyControl[9][0], y + joyControl[9][1]);
-    VIDEO::vga.circle(x + joyControl[9][0] + 3, y + joyControl[9][1] + 3, 6, joyControl[9][2]);
+    VIDEO::vga.circle(x + joyControl[9][0] + 3, y + joyControl[9][1] + 3, 8, joyControl[9][2]);
     VIDEO::vga.print("X");
 
     // Text Y
     VIDEO::vga.setTextColor(joyControl[10][2],zxColor(7, 1));
     VIDEO::vga.setCursor(x + joyControl[10][0], y + joyControl[10][1]);
-    VIDEO::vga.circle(x + joyControl[10][0] + 3, y + joyControl[10][1] + 3, 6, joyControl[10][2]);
+    VIDEO::vga.circle(x + joyControl[10][0] + 3, y + joyControl[10][1] + 3, 8, joyControl[10][2]);
     VIDEO::vga.print("Y");
 
     // Text Z
     VIDEO::vga.setTextColor(joyControl[11][2],zxColor(7, 1));
     VIDEO::vga.setCursor(x + joyControl[11][0], y + joyControl[11][1]);
-    VIDEO::vga.circle(x + joyControl[11][0] + 3, y + joyControl[11][1] + 3, 6, joyControl[11][2]);
+    VIDEO::vga.circle(x + joyControl[11][0] + 3, y + joyControl[11][1] + 3, 8, joyControl[11][2]);
     VIDEO::vga.print("Z");
+
+    // Text L2
+    VIDEO::vga.setTextColor(joyControl[12][2], zxColor(7, 1));
+    VIDEO::vga.setCursor(x + joyControl[12][0] - 3, y + joyControl[12][1]);
+    VIDEO::vga.circle(x + joyControl[12][0] + 3, y + joyControl[12][1] + 3, 8, joyControl[12][2]);
+    VIDEO::vga.print("L2");
+
+    // Text R2
+    VIDEO::vga.setTextColor(joyControl[13][2], zxColor(7, 1));
+    VIDEO::vga.setCursor(x + joyControl[13][0] - 3, y + joyControl[13][1]);
+    VIDEO::vga.circle(x + joyControl[13][0] + 3, y + joyControl[13][1] + 3, 8, joyControl[13][2]);
+    VIDEO::vga.print("R2");
 
 }
 
@@ -10595,21 +10625,23 @@ void OSD::hotkeyDialog() {
 
 void OSD::joyDialog(void) {
 
-    int joyDropdown[14][7]={
-        {7,65,-1,1,2,3,0}, // Left
-        {67,65,0,-1,2,3,0}, // Right
-        {37,17,-1,9,-1,0,0}, // Up
-        {37,89,-1,6,0,4,0}, // Down
-        {37,121,-1,5,3,-1,0}, // Start
-        {121,121,4,12,6,-1,0}, // Mode
-        {121,89,3,7,9,5,0}, // A
-        {181,89,6,8,10,12,0}, // B
-        {241,89,7,-1,11,13,0}, // C
-        {121,17,2,10,-1,6,0}, // X
-        {181,17,9,11,-1,7,0}, // Y
-        {241,17,10,-1,-1,8,0}, // Z
-        {181,121,5,13,7,-1,0}, // Ok
-        {241,121,12,-1,8,-1,0} // Test
+    int joyDropdown[16][7]={
+        {7, 65,-1, 1, 2, 3, 0},   // 0=Left   (right→Right, up→Up, down→Down)
+        {67,65, 0, 9, 2, 3, 0},   // 1=Right  (left→Left, right→X, up→Up, down→Down)
+        {37,17,-1, 6,-1, 0, 0},   // 2=Up     (right→A, down→Left)
+        {37,89,-1, 8, 0, 4, 0},   // 3=Down   (right→C, up→Left, down→Start)
+        {37,121,-1, 5, 3,-1, 0},  // 4=Start  (right→Mode, up→Down)
+        {121,121,4,14, 1,-1, 0},  // 5=Mode   (left→Start, right→Ok, up→Right)
+        {157,17, 2, 7,-1, 9, 0},  // 6=A      (left→Up, right→B, down→X)
+        {237,17, 6,-1,-1,10, 0},  // 7=B      (left→A, down→Y)
+        {157,65, 3,11, 9,12, 0},  // 8=C      (left→Down, right→Z, up→X, down→L2)
+        {157,41, 1,10, 6, 8, 0},  // 9=X      (left→Right, right→Y, up→A, down→C)
+        {237,41, 9,-1, 7,11, 0},  // 10=Y     (left→X, up→B, down→Z)
+        {237,65, 8,-1,10,13, 0},  // 11=Z     (left→C, up→Y, down→R2)
+        {157,89, 3,13, 8,14, 0},  // 12=L2    (left→Down, right→R2, up→C, down→Ok)
+        {237,89,12,-1,11,15, 0},  // 13=R2    (left→L2, up→Z, down→Test)
+        {181,121, 5,15,12,-1, 0}, // 14=Ok    (left→Mode, right→Test, up→L2)
+        {241,121,14,-1,13,-1, 0}  // 15=Test  (left→Ok, up→R2)
     };
 
     string keymenu = MENU_JOYSELKEY[Config::lang];
@@ -10629,7 +10661,7 @@ void OSD::joyDialog(void) {
     int curDropDown = 2;
     uint8_t joyDialogMode = 0; // 0 -> Define, 1 -> Test
 
-    const unsigned short h = (OSD_FONT_H * 18) + 2;
+    const unsigned short h = (OSD_FONT_H * 17) + 2;
     const unsigned short y = scrAlignCenterY(h) - 8;
 
     const unsigned short w = (50 * OSD_FONT_W) + 2;
@@ -10661,11 +10693,11 @@ void OSD::joyDialog(void) {
     }
 
     // Read joy definition into joyDropdown
-    for (int n = 0; n < 12; ++n)
+    for (int n = 0; n < 14; ++n)
         joyDropdown[n][6] = Config::joydef[n];
 
     // Draw Joy DropDowns
-    for (int n = 0; n < 12; ++n) {
+    for (int n = 0; n < 14; ++n) {
         VIDEO::vga.rect(x + joyDropdown[n][0] - 2, y + joyDropdown[n][1] - 2, 58, 12, zxColor(0, 0));
         if (n == curDropDown)
             VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
@@ -10677,9 +10709,9 @@ void OSD::joyDialog(void) {
 
     // Draw dialog buttons
     VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(7, 1));
-    VIDEO::vga.setCursor(x + joyDropdown[12][0], y + joyDropdown[12][1]);
+    VIDEO::vga.setCursor(x + joyDropdown[14][0], y + joyDropdown[14][1]);
     VIDEO::vga.print("   Ok    ");
-    VIDEO::vga.setCursor(x + joyDropdown[13][0], y + joyDropdown[13][1]);
+    VIDEO::vga.setCursor(x + joyDropdown[15][0], y + joyDropdown[15][1]);
     VIDEO::vga.print(" JoyTest ");
     DrawjoyControls(x, y);
 
@@ -10693,39 +10725,39 @@ void OSD::joyDialog(void) {
         if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
             ESPectrum::PS2Controller.keyboard()->getNextVirtualKey(&Nextkey);
             if(!Nextkey.down) continue;
-            if (is_left(Nextkey.vk)) {
+            if (is_left(Nextkey.vk) || Nextkey.vk == fabgl::VK_F9) {
                 if (joyDialogMode == 0 && joyDropdown[curDropDown][2] >= 0) {
                     VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(7, 1));
                     VIDEO::vga.setCursor(x + joyDropdown[curDropDown][0], y + joyDropdown[curDropDown][1]);
-                    if (curDropDown < 12)
+                    if (curDropDown < 14)
                         VIDEO::vga.print(vkToText(joyDropdown[curDropDown][6]).c_str());
                     else
-                        VIDEO::vga.print(curDropDown == 12 ? "   Ok    " : " JoyTest ");
+                        VIDEO::vga.print(curDropDown == 14 ? "   Ok    " : " JoyTest ");
                     curDropDown = joyDropdown[curDropDown][2];
                     VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
                     VIDEO::vga.setCursor(x + joyDropdown[curDropDown][0], y + joyDropdown[curDropDown][1]);
-                    if (curDropDown < 12)
+                    if (curDropDown < 14)
                         VIDEO::vga.print(vkToText(joyDropdown[curDropDown][6]).c_str());
                     else
-                        VIDEO::vga.print(curDropDown == 12 ? "   Ok    " : " JoyTest ");
+                        VIDEO::vga.print(curDropDown == 14 ? "   Ok    " : " JoyTest ");
                     click();
                 }
             } else
-            if (is_right(Nextkey.vk)) {
+            if (is_right(Nextkey.vk) || Nextkey.vk == fabgl::VK_F10) {
                 if (joyDialogMode == 0 && joyDropdown[curDropDown][3] >= 0) {
                     VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(7, 1));
                     VIDEO::vga.setCursor(x + joyDropdown[curDropDown][0], y + joyDropdown[curDropDown][1]);
-                    if (curDropDown < 12)
+                    if (curDropDown < 14)
                         VIDEO::vga.print(vkToText(joyDropdown[curDropDown][6]).c_str());
                     else
-                        VIDEO::vga.print(curDropDown == 12 ? "   Ok    " : " JoyTest ");
+                        VIDEO::vga.print(curDropDown == 14 ? "   Ok    " : " JoyTest ");
                     curDropDown = joyDropdown[curDropDown][3];
                     VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
                     VIDEO::vga.setCursor(x + joyDropdown[curDropDown][0], y + joyDropdown[curDropDown][1]);
-                    if (curDropDown < 12)
+                    if (curDropDown < 14)
                         VIDEO::vga.print(vkToText(joyDropdown[curDropDown][6]).c_str());
                     else
-                        VIDEO::vga.print(curDropDown == 12 ? "   Ok    " : " JoyTest ");
+                        VIDEO::vga.print(curDropDown == 14 ? "   Ok    " : " JoyTest ");
                     click();
                 }
             } else
@@ -10733,17 +10765,17 @@ void OSD::joyDialog(void) {
                 if (joyDialogMode == 0 && joyDropdown[curDropDown][4] >= 0) {
                     VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(7, 1));
                     VIDEO::vga.setCursor(x + joyDropdown[curDropDown][0], y + joyDropdown[curDropDown][1]);
-                    if (curDropDown < 12)
+                    if (curDropDown < 14)
                         VIDEO::vga.print(vkToText(joyDropdown[curDropDown][6]).c_str());
                     else
-                        VIDEO::vga.print(curDropDown == 12 ? "   Ok    " : " JoyTest ");
+                        VIDEO::vga.print(curDropDown == 14 ? "   Ok    " : " JoyTest ");
                     curDropDown = joyDropdown[curDropDown][4];
                     VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
                     VIDEO::vga.setCursor(x + joyDropdown[curDropDown][0], y + joyDropdown[curDropDown][1]);
-                    if (curDropDown < 12)
+                    if (curDropDown < 14)
                         VIDEO::vga.print(vkToText(joyDropdown[curDropDown][6]).c_str());
                     else
-                        VIDEO::vga.print(curDropDown == 12 ? "   Ok    " : " JoyTest ");
+                        VIDEO::vga.print(curDropDown == 14 ? "   Ok    " : " JoyTest ");
                     click();
                 }
             } else
@@ -10751,23 +10783,23 @@ void OSD::joyDialog(void) {
                 if (joyDialogMode == 0 && joyDropdown[curDropDown][5] >= 0) {
                     VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(7, 1));
                     VIDEO::vga.setCursor(x + joyDropdown[curDropDown][0], y + joyDropdown[curDropDown][1]);
-                    if (curDropDown < 12)
+                    if (curDropDown < 14)
                         VIDEO::vga.print(vkToText(joyDropdown[curDropDown][6]).c_str());
                     else
-                        VIDEO::vga.print(curDropDown == 12 ? "   Ok    " : " JoyTest ");
+                        VIDEO::vga.print(curDropDown == 14 ? "   Ok    " : " JoyTest ");
                     curDropDown = joyDropdown[curDropDown][5];
                     VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
                     VIDEO::vga.setCursor(x + joyDropdown[curDropDown][0], y + joyDropdown[curDropDown][1]);
-                    if (curDropDown < 12)
+                    if (curDropDown < 14)
                         VIDEO::vga.print(vkToText(joyDropdown[curDropDown][6]).c_str());
                     else
-                        VIDEO::vga.print(curDropDown == 12 ? "   Ok    " : " JoyTest ");
+                        VIDEO::vga.print(curDropDown == 14 ? "   Ok    " : " JoyTest ");
                     click();
                 }
             } else
             if (is_enter(Nextkey.vk)) {
                 if (joyDialogMode == 0) {
-                    if (curDropDown>=0 && curDropDown<12) {
+                    if (curDropDown>=0 && curDropDown<14) {
                         click();
                         // Launch assign menu
                         menu_curopt = 1;
@@ -10802,6 +10834,15 @@ void OSD::joyDialog(void) {
                                             joyDropdown[curDropDown][6] = fabgl::VK_SPACE;
                                         } else
                                         if (opt2 == 5) {
+                                            joyDropdown[curDropDown][6] = fabgl::VK_BACKSPACE;
+                                        } else
+                                        if (opt2 == 6) {
+                                            joyDropdown[curDropDown][6] = fabgl::VK_KP_0;
+                                        } else
+                                        if (opt2 == 7) {
+                                            joyDropdown[curDropDown][6] = fabgl::VK_KP_PERIOD;
+                                        } else
+                                        if (opt2 == 8) {
                                             joyDropdown[curDropDown][6] = fabgl::VK_NONE;
                                         }
                                     } else
@@ -10848,12 +10889,24 @@ void OSD::joyDialog(void) {
                                             joyDropdown[curDropDown][6] = fabgl::VirtualKey::VK_DPAD_ALTFIRE;
                                         } else
                                         if (opt2 == 7) {
-                                            joyDropdown[curDropDown][6] = fabgl::VirtualKey::VK_DPAD_START;
+                                            joyDropdown[curDropDown][6] = fabgl::VirtualKey::VK_JOY_C;
                                         } else
                                         if (opt2 == 8) {
+                                            joyDropdown[curDropDown][6] = fabgl::VirtualKey::VK_JOY_X;
+                                        } else
+                                        if (opt2 == 9) {
+                                            joyDropdown[curDropDown][6] = fabgl::VirtualKey::VK_JOY_Y;
+                                        } else
+                                        if (opt2 == 10) {
+                                            joyDropdown[curDropDown][6] = fabgl::VirtualKey::VK_JOY_Z;
+                                        } else
+                                        if (opt2 == 11) {
+                                            joyDropdown[curDropDown][6] = fabgl::VirtualKey::VK_DPAD_START;
+                                        } else
+                                        if (opt2 == 12) {
                                             joyDropdown[curDropDown][6] = fabgl::VirtualKey::VK_DPAD_SELECT;
                                         }
-                                        if (joytype == JOY_FULLER)
+                                        if (joytype == JOY_FULLER && opt2 <= 6)
                                             joyDropdown[curDropDown][6] += 6;
                                     }
                                     VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
@@ -10865,12 +10918,12 @@ void OSD::joyDialog(void) {
                             menu_curopt = opt;
                         }
                     } else
-                    if (curDropDown == 12) {
+                    if (curDropDown == 14) {
                         // Ok button
 
                         // Check if there are changes and ask to save them
                         bool changed = false;
-                        for (int n = 0; n < 12; ++n) {
+                        for (int n = 0; n < 14; ++n) {
                             if (Config::joydef[n] != joyDropdown[n][6]) {
                                 changed = true;
                                 break;
@@ -10882,7 +10935,7 @@ void OSD::joyDialog(void) {
                             string msg = OSD_DLG_JOYSAVE[Config::lang];
                             uint8_t res = OSD::msgDialog(title,msg);
                             if (res == DLG_YES) {
-                                for (int n = 0; n < 12; ++n) {
+                                for (int n = 0; n < 14; ++n) {
                                     Config::joydef[n] = joyDropdown[n][6];
                                 }
                                 Config::save();
@@ -10899,19 +10952,28 @@ void OSD::joyDialog(void) {
                             break;
                         }
                     } else
-                    if (curDropDown == 13) {
+                    if (curDropDown == 15) {
                         // Enable joyTest
                         joyDialogMode = 1;
-                        for (int n = 0; n < 12; ++n) {
+                        for (int n = 0; n < 14; ++n) {
                             Config::joydef[n] = joyDropdown[n][6];
                         }
                         Config::save(); /// TODO: revert support
                         joyTestExitCount = 0;
                         VIDEO::vga.setTextColor(zxColor(4, 1), zxColor(5, 1));
-                        VIDEO::vga.setCursor(x + joyDropdown[13][0], y + joyDropdown[13][1]);
+                        VIDEO::vga.setCursor(x + joyDropdown[15][0], y + joyDropdown[15][1]);
                         VIDEO::vga.print(" JoyTest ");
                         click();
                     }
+                }
+            } else
+            if (Nextkey.vk == fabgl::VK_DELETE) {
+                if (joyDialogMode == 0 && curDropDown < 14) {
+                    click();
+                    joyDropdown[curDropDown][6] = fabgl::VK_NONE;
+                    VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
+                    VIDEO::vga.setCursor(x + joyDropdown[curDropDown][0], y + joyDropdown[curDropDown][1]);
+                    VIDEO::vga.print(vkToText(fabgl::VK_NONE).c_str());
                 }
             } else
             if (Nextkey.vk == fabgl::VK_ESCAPE) {
@@ -10920,9 +10982,9 @@ void OSD::joyDialog(void) {
                         // Disable joyTest
                         joyDialogMode = 0;
                         VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
-                        VIDEO::vga.setCursor(x + joyDropdown[13][0], y + joyDropdown[13][1]);
+                        VIDEO::vga.setCursor(x + joyDropdown[15][0], y + joyDropdown[15][1]);
                         VIDEO::vga.print(" JoyTest ");
-                        for (int n = 0; n < 12; n++)
+                        for (int n = 0; n < 14; n++)
                             joyControl[n][2] = zxColor(0,0);
                         DrawjoyControls(x,y);
                         click();
@@ -10942,7 +11004,7 @@ void OSD::joyDialog(void) {
 
         // Joy Test Mode: Check joy status and color controls
         if (joyDialogMode) {
-            for (int n = fabgl::VK_JOY_RIGHT; n <= fabgl::VK_JOY_Z; n++) {
+            for (int n = fabgl::VK_JOY_RIGHT; n <= fabgl::VK_JOY_R2; n++) {
                 int m = 0; // index in joyControl
                 switch (n) {
                     case fabgl::VK_JOY_RIGHT: m = 1; break;
@@ -10957,6 +11019,8 @@ void OSD::joyDialog(void) {
                     case fabgl::VK_JOY_X: m = 9; break;
                     case fabgl::VK_JOY_Y: m = 10; break;
                     case fabgl::VK_JOY_Z: m = 11; break;
+                    case fabgl::VK_JOY_L2: m = 12; break;
+                    case fabgl::VK_JOY_R2: m = 13; break;
                 }
                 if (ESPectrum::PS2Controller.keyboard()->isVKDown((fabgl::VirtualKey) n))
                     joyControl[m][2] = zxColor(4,1);

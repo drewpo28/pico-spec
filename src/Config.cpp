@@ -70,7 +70,7 @@ int Config::numMemWriteBP = 0;
 int Config::numMemReadBP = 0;
 
 uint8_t  Config::joystick = JOY_KEMPSTON;
-uint16_t Config::joydef[12] = {
+uint16_t Config::joydef[14] = {
     fabgl::VK_DPAD_LEFT,  // 0
     fabgl::VK_DPAD_RIGHT, // 1
     fabgl::VK_DPAD_UP,    // 2
@@ -80,9 +80,11 @@ uint16_t Config::joydef[12] = {
     fabgl::VK_DPAD_FIRE,  // 6 A
     fabgl::VK_DPAD_ALTFIRE,//7 B
     fabgl::VK_NONE,       // 8 C
-    fabgl::VK_NONE,       // 9  X
+    fabgl::VK_JOY_X,      // 9  X → Kempston bit 6
     fabgl::VK_NONE,       // 10 Y
-    fabgl::VK_NONE        // 11 Z
+    fabgl::VK_NONE,       // 11 Z
+    fabgl::VK_NONE,       // 12 L2
+    fabgl::VK_NONE        // 13 R2
 };
 
 uint8_t  Config::AluTiming = 0;
@@ -564,7 +566,7 @@ void Config::load() {
         nvs_get_u8("joystick", Config::joystick, sts);
 
         // Read joystick definition
-        for (int n = 0; n < 12; ++n) {
+        for (int n = 0; n < 14; ++n) {
             char joykey[16];
             snprintf(joykey, 16, "joydef%02u", n);
             // printf("%s\n",joykey);
@@ -833,7 +835,7 @@ void Config::save() {
     }
     nvs_set_u8(buf,"joystick", Config::joystick);
     // Write joystick definition
-    for (int n = 0; n < 12; ++n) {
+    for (int n = 0; n < 14; ++n) {
         char joykey[16];
         snprintf(joykey, 16, "joydef%02u", n);
         nvs_set_u16(buf, joykey, Config::joydef[n]);
@@ -1036,7 +1038,7 @@ void Config::clearPendingVideoMode() {
 }
 
 void Config::setJoyMap(uint8_t joytype) {
-    for (int n = 0; n < 12; n++) joydef[n] = fabgl::VK_NONE;
+    for (int n = 0; n < 14; n++) joydef[n] = fabgl::VK_NONE;
     // Ask to overwrite map with default joytype values
     string title = "Joystick";
     string msg = OSD_DLG_SETJOYMAPDEFAULTS[Config::lang];
@@ -1051,6 +1053,7 @@ void Config::setJoyMap(uint8_t joytype) {
             joydef[4] = fabgl::VK_DPAD_START;
             joydef[5] = fabgl::VK_DPAD_SELECT;
             joydef[7] = fabgl::VK_DPAD_ALTFIRE;
+            joydef[9] = fabgl::VK_JOY_X;
         }
         Config::save();
     }

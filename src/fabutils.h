@@ -1487,6 +1487,8 @@ enum VirtualKey {
   VK_JOY_X,
   VK_JOY_Y,
   VK_JOY_Z,
+  VK_JOY_L2,
+  VK_JOY_R2,
 
   VK_DPAD_RIGHT,
   VK_DPAD_LEFT,

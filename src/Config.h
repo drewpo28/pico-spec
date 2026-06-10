@@ -185,7 +185,7 @@ public:
         }
     }
     static uint8_t  joystick;
-    static uint16_t joydef[12];
+    static uint16_t joydef[14];
     static uint8_t  AluTiming;
     static uint8_t  ayConfig;
     static uint8_t  turbosound;

@@ -1500,10 +1500,51 @@ IRAM_ATTR void ESPectrum::processKeyboard() {
         Ports::port[0x7f] = 0xff;
 
       if (Config::joystick == JOY_KEMPSTON) {
-        for (int i = fabgl::VK_JOY_RIGHT; i <= fabgl::VK_JOY_C; i++)
+        // Kempston 8-bit: 0=right,1=left,2=down,3=up,4=A/fire,5=B/altfire,6=X,7=Start.
+        // The 4 direction codes always drive their own bit. Extra buttons (A,B,C,X,Y,Z,L2,R2)
+        // are aliased via joydef slots 6..13: joydef[slot] gives the target action which
+        // is resolved to a Kempston bit by the switch below.
+        // directions: fixed bit = code - VK_JOY_RIGHT (0..3)
+        for (int i = fabgl::VK_JOY_RIGHT; i <= fabgl::VK_JOY_UP; i++)
           if (Kbd->isVKDown((fabgl::VirtualKey)i))
-            bitWrite(Ports::port[Config::kempstonPort], i - fabgl::VK_JOY_RIGHT,
-                     1);
+            bitWrite(Ports::port[Config::kempstonPort], i - fabgl::VK_JOY_RIGHT, 1);
+        // extra buttons A,B,C,X,Y,Z,L2,R2 -> joydef slots 6..13
+        static const fabgl::VirtualKey extraRaw[8] = {
+          fabgl::VK_JOY_A, fabgl::VK_JOY_B, fabgl::VK_JOY_C, fabgl::VK_JOY_X,
+          fabgl::VK_JOY_Y, fabgl::VK_JOY_Z, fabgl::VK_JOY_L2, fabgl::VK_JOY_R2
+        };
+        for (int e = 0; e < 8; e++) {
+          if (!Kbd->isVKDown(extraRaw[e])) continue;
+          // Resolve the target action for this physical button from its joydef slot.
+          // Only VK_JOY_* / VK_DPAD_FIRE|ALTFIRE targets drive a Kempston bit here;
+          // VK_NONE or a keyboard key means this pad button does nothing on Kempston
+          // (a keyboard target is handled by joyMap as a key press instead).
+          uint16_t target = Config::joydef[6 + e];
+          int bit = -1;
+          switch (target) {
+            case fabgl::VK_JOY_RIGHT:
+            case fabgl::VK_DPAD_RIGHT:   bit = 0; break;
+            case fabgl::VK_JOY_LEFT:
+            case fabgl::VK_DPAD_LEFT:    bit = 1; break;
+            case fabgl::VK_JOY_DOWN:
+            case fabgl::VK_DPAD_DOWN:    bit = 2; break;
+            case fabgl::VK_JOY_UP:
+            case fabgl::VK_DPAD_UP:      bit = 3; break;
+            case fabgl::VK_JOY_A:
+            case fabgl::VK_DPAD_FIRE:    bit = 4; break;
+            case fabgl::VK_JOY_B:
+            case fabgl::VK_DPAD_ALTFIRE: bit = 5; break;
+            case fabgl::VK_JOY_X:        bit = 6; break;
+            case fabgl::VK_JOY_START:
+            case fabgl::VK_DPAD_START:   bit = 7; break;
+            default: break;
+          }
+          if (bit >= 0)
+            bitWrite(Ports::port[Config::kempstonPort], bit, 1);
+        }
+        // Start is not in extraRaw (it flows via joydef[4] → VK_JOY_START separately)
+        if (Kbd->isVKDown(fabgl::VK_JOY_START))
+          bitWrite(Ports::port[Config::kempstonPort], 7, 1);
       } else if (Config::joystick == JOY_FULLER) { // Fuller
         if (Kbd->isVKDown(fabgl::VK_JOY_RIGHT)) {
           bitWrite(Ports::port[0x7f], 3, 0);
