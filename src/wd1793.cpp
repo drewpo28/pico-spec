@@ -1039,6 +1039,12 @@ case kRVMWD177XWriteTrack: {
 
 IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
 
+#if !PICO_RP2040
+  // Hoisted out of the per-byte loop: arch/CPM-bit/fastmode can't change
+  // while the Z80 is suspended inside this call.
+  const bool profi_cpm = (Ports::portDFFD & 0x20) && Config::arch == "Profi";
+#endif
+
   for (;steps > 0; steps--) {
 
 #if !PICO_RP2040
@@ -1054,7 +1060,7 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
     // Mirrors pentevo's per-byte ts_byte pacing (S_READ → S_WAIT → S_READ).
     // Gated to Profi CP/M + non-fastmode so TR-DOS / FDI / UDI byte loops and
     // fastmode bulk transfers are unaffected.
-    if (Config::arch == "Profi" && (Ports::portDFFD & 0x20) && !wd->fastmode &&
+    if (profi_cpm && !wd->fastmode &&
         (wd->control & kRVMWD177XDRQ) &&
         (wd->stepState == kRVMWD177XStepReadByte ||
          wd->stepState == kRVMWD177XStepWriteByte)) {
@@ -1125,7 +1131,7 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
         // Treat Type I steps as fastmode in this case.
 #if !PICO_RP2040
         bool profi_cpm_typeI =
-            (Config::arch == "Profi" && (Ports::portDFFD & 0x20)
+            (profi_cpm
              && wd->disk[wd->diskS]
              && (wd->disk[wd->diskS]->IsProFile || wd->disk[wd->diskS]->IsFDIFile
                  || wd->disk[wd->diskS]->IsTD0File)
@@ -2274,6 +2280,11 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
 }
 
 #if !PICO_RP2040
+// Shared staging buffer for raw-format track loads (FDI/TD0): the whole
+// track's sector data is fetched in ONE SD multi-block read instead of one
+// SPI transaction per sector (~1.4 ms each on plain SPI cards).
+static uint8_t g_rawTrkDataBuf[8192];
+
 static void udiFlushTrack(rvmWD1793 *wd) {
     // Flush targets the unit whose track is in the buffer, not the currently
     // selected drive — they differ when a drive switch triggers the flush.
@@ -2457,11 +2468,10 @@ void fdiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     // Bulk-read the whole track-data block once into a scratch buffer. Sectors
     // then memcpy from RAM instead of hitting the SD card individually. Falls back
     // to per-sector f_read if the span exceeds the scratch buffer (rare).
-    static uint8_t fdiSecDataBuf[8192];
     bool bulkOK = false;
-    if (dataMaxEnd > dataMinOff && (dataMaxEnd - dataMinOff) <= sizeof(fdiSecDataBuf)) {
+    if (dataMaxEnd > dataMinOff && (dataMaxEnd - dataMinOff) <= sizeof(g_rawTrkDataBuf)) {
         f_lseek(disk->Diskfile, disk->fdiDataOffset + trkDataOffset + dataMinOff);
-        f_read(disk->Diskfile, fdiSecDataBuf, dataMaxEnd - dataMinOff, &br);
+        f_read(disk->Diskfile, g_rawTrkDataBuf, dataMaxEnd - dataMinOff, &br);
         bulkOK = true;
     }
 
@@ -2564,7 +2574,7 @@ void fdiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
             if (pos + toRead > imageSize) toRead = imageSize - pos;
             if (bulkOK && secDataOff >= dataMinOff &&
                 (uint32_t)(secDataOff - dataMinOff) + (uint32_t)toRead <= (dataMaxEnd - dataMinOff)) {
-                memcpy(buf + pos, fdiSecDataBuf + (secDataOff - dataMinOff), toRead);
+                memcpy(buf + pos, g_rawTrkDataBuf + (secDataOff - dataMinOff), toRead);
             } else {
                 f_lseek(disk->Diskfile, filePos);
                 f_read(disk->Diskfile, buf + pos, toRead, &br);
@@ -2616,10 +2626,9 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
         return;
     }
 
-    // Static per-sector staging: holds one sector's encoded TD0 data at a time.
-    // Covers up to a 1 KB raw sector (method byte + 1024 data bytes). No heap
-    // allocation needed — td0TrackBuf removed to avoid fragmentation OOM on
-    // re-mount.
+    // Per-sector staging for the fallback path (track record > 8 KB): holds
+    // one sector's encoded TD0 data at a time, up to a 1 KB raw sector
+    // (method byte + 1024 data bytes). Static — no heap fragmentation.
     static uint8_t g_td0_enc_sec[2048];
 
     uint32_t filePos = disk->fdiTrackHdrOffsets[trkIdx];
@@ -2638,9 +2647,22 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     if (secCount > 32) secCount = 32;
     filePos += 4;
 
-    // First pass: stream sector headers from the file, recording per-sector
-    // geometry and the file offset of each sector's encoded data block.
-    // No large heap buffer — td0TrackBuf replaced by per-sector f_lseek+f_read.
+    // Speculative bulk read: TD0 sector records (header + encoded data) are
+    // laid out contiguously, so stage the whole track record in one SD
+    // multi-block read. Pieces that fall outside the staging buffer (track
+    // record > 8 KB, rare) fall back to per-sector f_lseek+f_read below.
+    uint32_t spanStart = filePos;
+    UINT bulkLen = 0;
+    {
+        FSIZE_t rem = f_size(disk->td0Stream) - spanStart;
+        UINT want = (rem > (FSIZE_t)sizeof(g_rawTrkDataBuf))
+                    ? (UINT)sizeof(g_rawTrkDataBuf) : (UINT)rem;
+        f_read(disk->td0Stream, g_rawTrkDataBuf, want, &bulkLen);
+    }
+
+    // First pass: parse sector headers (from the staging buffer when covered),
+    // recording per-sector geometry and the file offset of each sector's
+    // encoded data block.
     struct TD0Sec {
         uint8_t c, h, r, n, flags;
         uint16_t secSize;
@@ -2653,8 +2675,13 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     int trkdatalen = 0;
     for (int s = 0; s < secCount; s++) {
         uint8_t shdr[6];
-        f_read(disk->td0Stream, shdr, 6, &br);
-        if (br < 6) break;
+        if (filePos - spanStart + 6 <= bulkLen) {
+            memcpy(shdr, g_rawTrkDataBuf + (filePos - spanStart), 6);
+        } else {
+            f_lseek(disk->td0Stream, filePos);
+            f_read(disk->td0Stream, shdr, 6, &br);
+            if (br < 6) break;
+        }
         filePos += 6;
 
         uint8_t sc = shdr[0], sh = shdr[1], sr = shdr[2], sn = shdr[3];
@@ -2664,13 +2691,17 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
         uint16_t encLen = 0;
         if (hasData) {
             uint8_t dl[2];
-            f_read(disk->td0Stream, dl, 2, &br);
-            if (br < 2) break;
+            if (filePos - spanStart + 2 <= bulkLen) {
+                memcpy(dl, g_rawTrkDataBuf + (filePos - spanStart), 2);
+            } else {
+                f_lseek(disk->td0Stream, filePos);
+                f_read(disk->td0Stream, dl, 2, &br);
+                if (br < 2) break;
+            }
             encLen = dl[0] | (dl[1] << 8);
             filePos += 2;
             encFileOff = filePos;
             filePos += encLen;
-            if (encLen > 0) f_lseek(disk->td0Stream, filePos); // skip encoded data
         }
         // Sectors with no ID field are skipped (no header to expose to the FDC).
         if (flags & TD0_SEC_NO_ID) continue;
@@ -2770,13 +2801,19 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
             int avail = imageSize - pos;
             int toEmit = (slen <= avail) ? slen : avail;
             if (toEmit > 0 && d.encLen > 0) {
-                // Fetch this sector's encoded data from the file on demand.
-                uint16_t readLen = d.encLen < (uint16_t)sizeof(g_td0_enc_sec)
-                                   ? d.encLen : (uint16_t)sizeof(g_td0_enc_sec);
-                UINT br2 = 0;
-                f_lseek(disk->td0Stream, d.encFileOff);
-                f_read(disk->td0Stream, g_td0_enc_sec, readLen, &br2);
-                td0_decode_sector(g_td0_enc_sec, (uint16_t)br2, slen, buf + pos);
+                if (d.encFileOff - spanStart + d.encLen <= bulkLen) {
+                    // Encoded data already staged by the bulk read.
+                    td0_decode_sector(g_rawTrkDataBuf + (d.encFileOff - spanStart),
+                                      d.encLen, slen, buf + pos);
+                } else {
+                    // Fetch this sector's encoded data from the file on demand.
+                    uint16_t readLen = d.encLen < (uint16_t)sizeof(g_td0_enc_sec)
+                                       ? d.encLen : (uint16_t)sizeof(g_td0_enc_sec);
+                    UINT br2 = 0;
+                    f_lseek(disk->td0Stream, d.encFileOff);
+                    f_read(disk->td0Stream, g_td0_enc_sec, readLen, &br2);
+                    td0_decode_sector(g_td0_enc_sec, (uint16_t)br2, slen, buf + pos);
+                }
             } else if (toEmit > 0)
                 memset(buf + pos, 0, toEmit);
             pos += toEmit;
@@ -3024,6 +3061,22 @@ IRAM_ATTR uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control) {
       if (seek)
         return disk->s;
 
+      // Idle rotation (Type I stepping, command-start delay, motor idle): no
+      // data transfer is in progress, so don't fetch track data — a long seek
+      // would otherwise load EVERY intermediate cylinder from SD (~5.6 ms
+      // each, 400+ ms per seek = the Profi CP/M loading FPS collapse). Keep
+      // the index-pulse timing running against the last loaded track length.
+      if (wd->stepState <= kRVMWD177XStepWaiting) {
+          uint32_t tl = wd->diskTrackLen ? wd->diskTrackLen : 6250;
+          if (disk->indx != 0xffffffff && disk->indx >= tl) {
+              disk->indx = 0xffffffff;
+              disk->indexDelay = 25;
+              return disk->s;
+          }
+          disk->indx++;
+          return disk->s;
+      }
+
       // Load track before checking length.
       // Don't reload track if an active command is reading/writing bytes
       {
@@ -3065,6 +3118,22 @@ IRAM_ATTR uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control) {
       if (seek)
         return disk->s;
 
+      // Idle rotation (Type I stepping, command-start delay, motor idle): no
+      // data transfer is in progress, so don't fetch track data — a long seek
+      // would otherwise load EVERY intermediate cylinder from SD (~5.6 ms
+      // each, 400+ ms per seek = the Profi CP/M loading FPS collapse). Keep
+      // the index-pulse timing running against the last loaded track length.
+      if (wd->stepState <= kRVMWD177XStepWaiting) {
+          uint32_t tl = wd->diskTrackLen ? wd->diskTrackLen : 6250;
+          if (disk->indx != 0xffffffff && disk->indx >= tl) {
+              disk->indx = 0xffffffff;
+              disk->indexDelay = 25;
+              return disk->s;
+          }
+          disk->indx++;
+          return disk->s;
+      }
+
       {
         uint8_t loadSide = wd->side;
         bool activeCmd = (wd->stepState == kRVMWD177XStepReadByte
@@ -3099,6 +3168,22 @@ IRAM_ATTR uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control) {
 
       if (seek)
         return disk->s;
+
+      // Idle rotation (Type I stepping, command-start delay, motor idle): no
+      // data transfer is in progress, so don't fetch track data — a long seek
+      // would otherwise load EVERY intermediate cylinder from SD (~5.6 ms
+      // each, 400+ ms per seek = the Profi CP/M loading FPS collapse). Keep
+      // the index-pulse timing running against the last loaded track length.
+      if (wd->stepState <= kRVMWD177XStepWaiting) {
+          uint32_t tl = wd->diskTrackLen ? wd->diskTrackLen : 6250;
+          if (disk->indx != 0xffffffff && disk->indx >= tl) {
+              disk->indx = 0xffffffff;
+              disk->indexDelay = 25;
+              return disk->s;
+          }
+          disk->indx++;
+          return disk->s;
+      }
 
       {
         uint8_t loadSide = wd->side;
@@ -3140,6 +3225,22 @@ IRAM_ATTR uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control) {
 
       if (seek)
         return disk->s;
+
+      // Idle rotation (Type I stepping, command-start delay, motor idle): no
+      // data transfer is in progress, so don't fetch track data — a long seek
+      // would otherwise load EVERY intermediate cylinder from SD (~5.6 ms
+      // each, 400+ ms per seek = the Profi CP/M loading FPS collapse). Keep
+      // the index-pulse timing running against the last loaded track length.
+      if (wd->stepState <= kRVMWD177XStepWaiting) {
+          uint32_t tl = wd->diskTrackLen ? wd->diskTrackLen : 6250;
+          if (disk->indx != 0xffffffff && disk->indx >= tl) {
+              disk->indx = 0xffffffff;
+              disk->indexDelay = 25;
+              return disk->s;
+          }
+          disk->indx++;
+          return disk->s;
+      }
 
       {
         uint8_t loadSide = wd->side;
