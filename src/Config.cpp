@@ -95,6 +95,12 @@ uint8_t  Config::turbosound = 3; // BOTH
 uint8_t  Config::turbosound = 0; // OFF
 #endif
 uint8_t  Config::covox = 0; // NONE
+uint8_t  Config::soundrive = 2; // AUTO: on for Profi, off elsewhere
+
+bool Config::soundriveEnabled() {
+    return Config::soundrive == 1 ||
+           (Config::soundrive == 2 && Config::arch == "Profi");
+}
 uint8_t  Config::gs_enabled = 0;  // 0=OFF, 1=ON
 uint8_t  Config::gs_ram_size = 2; // 0=512K, 1=1M, 2=2M
 uint8_t  Config::gs_clock = 1;    // 0=12MHz 1=13MHz 2=14MHz 3=20MHz 4=24MHz
@@ -580,6 +586,9 @@ void Config::load() {
         nvs_get_u8("ayConfig", Config::ayConfig, sts);
         nvs_get_u8("turbosound", Config::turbosound, sts);
         nvs_get_u8("covox", Config::covox, sts);
+        if (Config::covox > 2) Config::covox = 0; // migrate short-lived covox==3 SounDrive mode
+        nvs_get_u8("soundrive", Config::soundrive, sts);
+        if (Config::soundrive > 2) Config::soundrive = 2;
         nvs_get_u8("gs_enabled", Config::gs_enabled, sts);
         nvs_get_u8("gs_ram_size", Config::gs_ram_size, sts);
         nvs_get_u8("gs_clock", Config::gs_clock, sts);
@@ -858,6 +867,7 @@ void Config::save() {
     nvs_set_u8(buf,"ayConfig", Config::ayConfig);
     nvs_set_u8(buf,"turbosound", Config::turbosound);
     nvs_set_u8(buf,"covox", Config::covox);
+    nvs_set_u8(buf,"soundrive", Config::soundrive);
     nvs_set_u8(buf,"gs_enabled", Config::gs_enabled);
     nvs_set_u8(buf,"gs_ram_size", Config::gs_ram_size);
     nvs_set_u8(buf,"gs_clock", Config::gs_clock);

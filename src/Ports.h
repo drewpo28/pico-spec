@@ -59,6 +59,10 @@ public:
     static void dmaOutput(uint16_t address, uint8_t data);
     static uint8_t dmaInput(uint16_t address);
 
+    // SounDrive (Config::covox==3) DAC latches: #0F,#1F,#3F (left), #4F,#5F
+    // (right), #FB (both). Mixed to mono into the covox buffer. Cleared on reset.
+    static uint8_t sndriveLatch[6];
+
     static uint8_t portAFF7;
     static uint8_t portDFFD;
     static uint8_t portEFF7; // Extended feature register (Profi CP/M uses bit 1=EFF7_512)
@@ -68,6 +72,16 @@ public:
     static uint32_t portdffd_cnt;
     // Time spent in Ports::FDDStep (rvmWD1793Step calls from port handlers).
     static volatile uint32_t fdd_ports_us;
+
+#if SND_PORT_TRACE
+    // Per-port I/O histograms (index = low address byte) for hunting unknown
+    // sound-DAC ports. Filled in input()/output(), dumped + cleared every
+    // ~5 s from the main loop via sndTraceDump().
+    static uint32_t sndTraceWr[256];
+    static uint32_t sndTraceRd[256];
+    static uint8_t  sndTraceLastVal[256];
+    static void sndTraceDump();
+#endif
 
 #if !PICO_RP2040
     // KR580VI53 (Intel 8253 PIT) — Byte computer sound synthesizer

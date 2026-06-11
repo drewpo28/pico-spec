@@ -227,7 +227,7 @@ bool isVisible(Id i) {
         case TAPE:     return true;
         case AY:       return Config::AY48 || !Z80Ops::is48;
         case BEEPER:   return true;
-        case COVOX:    return Config::covox != 0;
+        case COVOX:    return Config::covox != 0 || Config::soundriveEnabled();
         case RAM:   return !Z80Ops::is48;
         case KEMPJOY:  return Config::joystick == JOY_KEMPSTON;
         case KEMPMOUSE:return true;

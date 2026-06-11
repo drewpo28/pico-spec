@@ -117,6 +117,7 @@ uint8_t Ports::speaker_values[8] = {0, 19, 34, 53, 97, 101, 130, 134};
 uint8_t Ports::port[128];
 uint8_t Ports::extPort[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 uint8_t Ports::port254 = 0;
+uint8_t Ports::sndriveLatch[6] = {0, 0, 0, 0, 0, 0};
 uint8_t Ports::portAFF7 = 0;
 uint8_t Ports::portDFFD = 0;
 uint8_t Ports::portEFF7 = 0;
@@ -125,6 +126,36 @@ Ports::PIT8253Channel Ports::pitChannels[3] = {};
 #endif
 
 uint8_t (*Ports::getFloatBusData)() = &Ports::getFloatBusData48;
+
+#if SND_PORT_TRACE
+uint32_t Ports::sndTraceWr[256];
+uint32_t Ports::sndTraceRd[256];
+uint8_t  Ports::sndTraceLastVal[256];
+// Not IRAM: called once per ~5 s from the main loop. Prints every port (by low
+// address byte) touched since the previous dump, then clears the histograms.
+void Ports::sndTraceDump() {
+    char buf[512];
+    int pos = snprintf(buf, sizeof(buf), "SNDTRC bank=%d rom=%d DFFD=%02X W:",
+                       (int)MemESP::bankLatch, (int)MemESP::romLatch, portDFFD);
+    for (int p = 0; p < 256; p++) {
+        if (!sndTraceWr[p]) continue;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, " %02X=%lu(%02X)",
+                        p, (unsigned long)sndTraceWr[p], sndTraceLastVal[p]);
+        sndTraceWr[p] = 0;
+        if (pos > (int)sizeof(buf) - 16) break;
+    }
+    Debug::log("%s\n", buf);
+    pos = snprintf(buf, sizeof(buf), "SNDTRC R:");
+    for (int p = 0; p < 256; p++) {
+        if (!sndTraceRd[p]) continue;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, " %02X=%lu",
+                        p, (unsigned long)sndTraceRd[p]);
+        sndTraceRd[p] = 0;
+        if (pos > (int)sizeof(buf) - 16) break;
+    }
+    Debug::log("%s\n", buf);
+}
+#endif
 
 IRAM_ATTR uint8_t Ports::getFloatBusData48() {
 
@@ -246,6 +277,9 @@ inline static size_t extendedZxRamPages() {
 
 IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   uint8_t data;
+#if SND_PORT_TRACE
+  sndTraceRd[address & 0xFF]++;
+#endif
   if (Config::numPortReadBP > 0 && Config::hasBreakPoint(address, Config::BP_PORT_READ))
     CPU::portBasedBP = true;
   uint8_t rambank = address >> 14;
@@ -847,6 +881,10 @@ static inline void profiFdcSysWrite(uint8_t data) {
 
 IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   int Audiobit;
+#if SND_PORT_TRACE
+  sndTraceWr[address & 0xFF]++;
+  sndTraceLastVal[address & 0xFF] = data;
+#endif
   if (Config::numPortWriteBP > 0 && Config::hasBreakPoint(address, Config::BP_PORT_WRITE))
     CPU::portBasedBP = true;
   uint8_t rambank = address >> 14;
@@ -1227,14 +1265,49 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       }
     }
 #endif
-    // Karabas-Pro manual p.36: Covox #FB gate is "DOS=0 & CPM=0" — in CP/M
-    // mode #FB is reassigned to extended periphery.
+    // Covox #FB: on real Profi this is an external DAC decoding only A7:0=#FB,
+    // NOT gated by CPM — Profi CP/M games (Single Warrior) stream samples to #FB
+    // with DFFD bit5 set. (Karabas-Pro gates its internal Covox by DOS=0&CPM=0,
+    // but that manual doesn't apply to Profi.)
     int covox = Config::covox;
-    bool profi_cpm = (Config::arch == "Profi" && (portDFFD & 0x20));
-    if ((covox == 1 && a8 == 0xFB && !profi_cpm) || (covox == 2 && a8 == 0xDD)) {
+    if ((covox == 1 && a8 == 0xFB) || (covox == 2 && a8 == 0xDD)) {
       LED::touchW(LED::COVOX);
       ESPectrum::lastCovoxVal = data;
       ESPectrum::CovoxGetSample();
+    }
+    // SounDrive: five 8-bit DAC latches — #0F/#1F/#3F mix left, #4F/#5F right,
+    // #FB both (Karabas-Pro manual p.36). Config::soundrive: 1=On, 2=Auto
+    // (Profi only). The ports are shared with the WD1793: real hardware gates
+    // SounDrive CS by DOS=0, and Profi CP/M periphery mode (DFFD bit5) decodes
+    // the FDC there too — so the ports act as DACs only outside both modes.
+    // Single Warrior loads its disk with CPM=1, then streams 7.6 kHz menu PCM
+    // to #3F/#5F with CPM=0 and trdos=0. Downmixed to mono into the covox
+    // buffer; return so the writes never reach the FDC block
+    // (out_has_raw_disk would route them to WD1793 regs).
+    else if ((Config::soundrive == 1 ||
+              (Config::soundrive == 2 && Z80Ops::isProfi)) &&
+             !ESPectrum::trdos && !(Z80Ops::isProfi && (portDFFD & 0x20))) {
+      int8_t slot = -1;
+      switch (a8) {
+        case 0x0F: slot = 0; break;
+        case 0x1F: slot = 1; break;
+        case 0x3F: slot = 2; break;
+        case 0x4F: slot = 3; break;
+        case 0x5F: slot = 4; break;
+        case 0xFB: slot = 5; break;
+      }
+      if (slot >= 0) {
+        sndriveLatch[slot] = data;
+        int l = sndriveLatch[0] + sndriveLatch[1] + sndriveLatch[2] + sndriveLatch[5];
+        int r = sndriveLatch[3] + sndriveLatch[4] + sndriveLatch[5];
+        if (l > 255) l = 255;
+        if (r > 255) r = 255;
+        LED::touchW(LED::COVOX);
+        ESPectrum::lastCovoxVal = (l + r) >> 1;
+        ESPectrum::CovoxGetSample();
+        ioContentionLate(MemESP::ramContended[rambank]);
+        return;
+      }
     }
 #if !PICO_RP2040
     // ShamaZX MIDI Interface (SAM2695)

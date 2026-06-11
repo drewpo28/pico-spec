@@ -1049,7 +1049,7 @@ void ESPectrum::setup() {
 #endif
                 (unsigned)getFreeHeap());
   TurboSubsys::request(!Config::tape_player && Config::turbosound != 0);
-  CovoxSubsys::request(Config::covox != 0);
+  CovoxSubsys::request(Config::covox != 0 || Config::soundriveEnabled());
 #if !PICO_RP2040
   PitSubsys::request(Z80Ops::isByte);
   SaaSubsys::request(!Config::tape_player && Config::SAA1099);
@@ -1273,6 +1273,7 @@ void ESPectrum::reset(uint8_t romInUse) {
   }
 #endif
   lastCovoxVal = lastaudioBit = 0;
+  memset(Ports::sndriveLatch, 0, sizeof(Ports::sndriveLatch));
 
   AY_emu = Config::AY48;
 #if !PICO_RP2040
@@ -1321,7 +1322,7 @@ void ESPectrum::reset(uint8_t romInUse) {
   // Reconfigure optional subsystems against current Config and apply
   // synchronously here (we're outside the main loop's frame boundary).
   TurboSubsys::request(!Config::tape_player && Config::turbosound != 0);
-  CovoxSubsys::request(Config::covox != 0);
+  CovoxSubsys::request(Config::covox != 0 || Config::soundriveEnabled());
 #if !PICO_RP2040
   PitSubsys::request(Z80Ops::isByte);
   SaaSubsys::request(!Config::tape_player && Config::SAA1099);
@@ -2249,7 +2250,7 @@ void ESPectrum::loop() {
             dc_fade_q8 = 256u;
           }
         }
-        if (CovoxSubsys::enabled && Config::covox && faudbufcntCovox < samplesPerFrame) {
+        if (CovoxSubsys::enabled && (Config::covox || Config::soundriveEnabled()) && faudbufcntCovox < samplesPerFrame) {
           uint8_t *sound_buf = audioBufferCovox + faudbufcntCovox;
           int sound_bufsize = samplesPerFrame - faudbufcntCovox;
           while (sound_bufsize-- > 0) {
@@ -2480,6 +2481,16 @@ void ESPectrum::loop() {
     if (i32 < gs_perf_idle_min) gs_perf_idle_min = i32;
     if (i32 < 0) gs_perf_idle_neg_frames++;
     gs_perf_frames++;
+#endif
+
+#if SND_PORT_TRACE
+    {
+      static uint32_t snd_trace_frames = 0;
+      if (++snd_trace_frames >= 250) {
+        snd_trace_frames = 0;
+        Ports::sndTraceDump();
+      }
+    }
 #endif
 
     totalsecondsnodelay += elapsed;

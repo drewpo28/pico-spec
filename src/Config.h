@@ -190,6 +190,8 @@ public:
     static uint8_t  ayConfig;
     static uint8_t  turbosound;
     static uint8_t  covox;
+    static uint8_t  soundrive;          // 0=Off, 1=On, 2=Auto (Profi only)
+    static bool soundriveEnabled();     // resolves Auto against current arch
     static uint8_t  gs_enabled;
     static uint8_t  gs_ram_size;
     static uint8_t  gs_clock;   // 0=12MHz 1=13MHz 2=14MHz 3=20MHz 4=24MHz

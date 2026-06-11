@@ -2894,25 +2894,17 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             while (1) {
                                 string menu = MENU_COVOX[Config::lang];
                                 uint8_t prev = Config::covox;
-                                if (prev == 0) {
-                                    menu.replace(menu.find("[N",0),2,"[*");
-                                    menu.replace(menu.find("[F",0),2,"[ ");
-                                    menu.replace(menu.find("[D",0),2,"[ ");
-                                } else if (prev == 1) {
-                                    menu.replace(menu.find("[N",0),2,"[ ");
-                                    menu.replace(menu.find("[F",0),2,"[*");
-                                    menu.replace(menu.find("[D",0),2,"[ ");
-                                } else {
-                                    menu.replace(menu.find("[N",0),2,"[ ");
-                                    menu.replace(menu.find("[F",0),2,"[ ");
-                                    menu.replace(menu.find("[D",0),2,"[*");
+                                static const char covox_tags[3] = {'N','F','D'};
+                                for (uint8_t i = 0; i < 3; i++) {
+                                    const char tag[3] = {'[', covox_tags[i], 0};
+                                    menu.replace(menu.find(tag,0),2, i == prev ? "[*" : "[ ");
                                 }
                                 uint8_t opt2 = menuRun(menu);
                                 if (opt2) {
                                     Config::covox = opt2 - 1;
                                     if (Config::covox != prev) {
                                         Config::save();
-                                        CovoxSubsys::request(Config::covox != 0);
+                                        CovoxSubsys::request(Config::covox != 0 || Config::soundriveEnabled());
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -2923,8 +2915,35 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                             }
                         }
+                        else if (options_num == 5) { // SounDrive
+                            menu_level = 2;
+                            menu_curopt = 1;
+                            menu_saverect = true;
+                            while (1) {
+                                string menu = MENU_SOUNDRIVE[Config::lang];
+                                uint8_t prev = Config::soundrive;
+                                menu.replace(menu.find("[A",0),2, prev == 2 ? "[*" : "[ ");
+                                menu.replace(menu.find("[O",0),2, prev == 1 ? "[*" : "[ ");
+                                menu.replace(menu.find("[F",0),2, prev == 0 ? "[*" : "[ ");
+                                uint8_t opt2 = menuRun(menu);
+                                if (opt2) {
+                                    static const uint8_t sd_map[3] = {2, 1, 0}; // menu row → mode
+                                    Config::soundrive = (opt2 <= 3) ? sd_map[opt2 - 1] : prev;
+                                    if (Config::soundrive != prev) {
+                                        Config::save();
+                                        CovoxSubsys::request(Config::covox != 0 || Config::soundriveEnabled());
+                                    }
+                                    menu_curopt = opt2;
+                                    menu_saverect = false;
+                                } else {
+                                    menu_curopt = 5;
+                                    menu_level = 1;
+                                    break;
+                                }
+                            }
+                        }
 #if !PICO_RP2040
-                        else if (options_num == 5) {
+                        else if (options_num == 6) {
                             menu_level = 2;
                             menu_curopt = 1;
                             menu_saverect = true;
@@ -2961,13 +2980,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     menu_curopt = opt2;
                                     menu_saverect = false;
                                 } else {
-                                    menu_curopt = 5;
+                                    menu_curopt = 6;
                                     menu_level = 1;
                                     break;
                                 }
                             }
                         }
-                        else if (options_num == 6) {
+                        else if (options_num == 7) {
                             menu_level = 2;
                             menu_curopt = 1;
                             menu_saverect = true;
@@ -3021,14 +3040,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     menu_curopt = opt2;
                                     menu_saverect = false;
                                 } else {
-                                    menu_curopt = 6;
+                                    menu_curopt = 7;
                                     menu_level = 1;
                                     break;
                                 }
                             }
                         }
 #ifdef USE_GS
-                        else if (gs_avail && options_num == 7) { // General Sound
+                        else if (gs_avail && options_num == 8) { // General Sound
                             static const char* GS_CLOCK_NAMES[5] = {"12 MHz", "13 MHz", "14 MHz", "20 MHz", "24 MHz"};
                             menu_level = 2;
                             menu_curopt = 1;
@@ -3109,7 +3128,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     menu_curopt = 2;
                                     continue;
                                 } else {
-                                    menu_curopt = 7;
+                                    menu_curopt = 8;
                                     menu_level = 1;
                                     break;
                                 }
@@ -3119,9 +3138,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #endif
                         else if (options_num ==
 #if !PICO_RP2040
-                            (gs_avail ? 8 : 7)
+                            (gs_avail ? 9 : 8)
 #else
-                            5
+                            6
 #endif
                         ) {
                             menu_level = 2;
@@ -3165,9 +3184,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 } else {
                                     menu_curopt =
 #if !PICO_RP2040
-                                        (gs_avail ? 8 : 7);
+                                        (gs_avail ? 9 : 8);
 #else
-                                        5;
+                                        6;
 #endif
                                     menu_level = 1;
                                     break;
@@ -3176,9 +3195,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         }
                         else if (options_num ==
 #if !PICO_RP2040
-                            (gs_avail ? 9 : 8)
+                            (gs_avail ? 10 : 9)
 #else
-                            6
+                            7
 #endif
                         ) { // Volume Boost
                             menu_level = 2;
@@ -8721,6 +8740,11 @@ void OSD::EmulatorInfo() {
             pos += snprintf(buf + pos, sizeof(buf) - pos, " Covox          : On (#DD)\n");
         else
             pos += snprintf(buf + pos, sizeof(buf) - pos, " Covox          : Off\n");
+
+        // SounDrive
+        pos += snprintf(buf + pos, sizeof(buf) - pos, " SounDrive      : %s\n",
+            Config::soundrive == 2 ? (Config::soundriveEnabled() ? "Auto (On)" : "Auto (Off)")
+                                   : (Config::soundrive == 1 ? "On" : "Off"));
 
 #if !PICO_RP2040
         // SAA1099

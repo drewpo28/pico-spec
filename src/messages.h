@@ -896,6 +896,7 @@ static const char *MENU_SDLEDBLINK[2] = { "SD card LED\n" , "LED tarjeta SD\n"};
     "AY-3-8912 Stereo\t>\n"\
     "TurboSound\t>\n"\
     "Covox\t>\n"\
+    "SounDrive\t>\n"\
     "Audio Driver\t>\n"\
     "Volume Boost\t>\n"
 #define MENU_AUDIO_ES "Audio\n"\
@@ -903,6 +904,7 @@ static const char *MENU_SDLEDBLINK[2] = { "SD card LED\n" , "LED tarjeta SD\n"};
     "AY-3-8912 Est" "\x82" "reo\t>\n"\
     "TurboSound\t>\n"\
     "Covox\t>\n"\
+    "SounDrive\t>\n"\
     "Controlador de audio\t>\n"\
     "Aumento de volumen\t>\n"
 #else
@@ -911,6 +913,7 @@ static const char *MENU_SDLEDBLINK[2] = { "SD card LED\n" , "LED tarjeta SD\n"};
     "AY-3-8912 Stereo\t>\n"\
     "TurboSound\t>\n"\
     "Covox\t>\n"\
+    "SounDrive\t>\n"\
     "SAA1099 ON/OFF\t>\n"\
     "MIDI\t>\n"\
     "Audio Driver\t>\n"\
@@ -920,6 +923,7 @@ static const char *MENU_SDLEDBLINK[2] = { "SD card LED\n" , "LED tarjeta SD\n"};
     "AY-3-8912 Est" "\x82" "reo\t>\n"\
     "TurboSound\t>\n"\
     "Covox\t>\n"\
+    "SounDrive\t>\n"\
     "SAA1099 ON/OFF\t>\n"\
     "MIDI\t>\n"\
     "Controlador de audio\t>\n"\
@@ -1153,6 +1157,14 @@ static const char *MENU_TS[2] = { MENU_TS_EN, MENU_TS_EN };
     "#FB    \t[F]\n"\
     "#DD    \t[D]\n"
 static const char *MENU_COVOX[2] = { MENU_COVOX_EN, MENU_COVOX_EN };
+
+// SounDrive 8-bit DAC at #0F/#1F/#3F (left), #4F/#5F (right), #FB (both).
+// Auto = enabled on Profi only (Profi CP/M games stream PCM there).
+#define MENU_SOUNDRIVE_EN "SounDrive\n"\
+    "Auto (Profi only)\t[A]\n"\
+    "On               \t[O]\n"\
+    "Off              \t[F]\n"
+static const char *MENU_SOUNDRIVE[2] = { MENU_SOUNDRIVE_EN, MENU_SOUNDRIVE_EN };
 
 #define MENU_I2S_EN "Audio Driver\n"\
     "Auto     \t[A]\n"\

@@ -93,6 +93,7 @@ bool CovoxSubsys::apply() {
                 Debug::log("CovoxSubsys: OOM");
                 wanted = false;
                 Config::covox = 0;
+                Config::soundrive = 0;
                 return false;
             }
         }

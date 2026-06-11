@@ -33,6 +33,7 @@ option(ZERO2 "RP2350-PiZero" OFF)
 option(IDE_PORT_TRACE "Enable PROFI IDE/HDD port access tracing" OFF)
 option(FDD_PORT_TRACE "Enable WD1793 (ВГ93) FDD command/port tracing" OFF)
 option(PROFI_PORT_TRACE "Enable 0x7FFD/0xDFFD paging-port write tracing" OFF)
+option(SND_PORT_TRACE "Enable per-port I/O histogram (sound-DAC port hunting)" OFF)
 option(PERF_TRACE "Enable per-60-frame CPU/HDMI/FPS performance logging" OFF)
 option(GS_PERF_TRACE "Enable General Sound per-second perf counters (GS.cpp)" OFF)
 
@@ -307,6 +308,14 @@ if (PROFI_PORT_TRACE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE PROFI_PORT_TRACE=1)
 else ()
     target_compile_definitions(${PROJECT_NAME} PRIVATE PROFI_PORT_TRACE=0)
+endif ()
+
+# Per-port I/O histogram for hunting unknown sound-DAC ports (see Ports.cpp
+# `#if SND_PORT_TRACE`). Dumps W/R counts per low address byte every ~5 s.
+if (SND_PORT_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE SND_PORT_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE SND_PORT_TRACE=0)
 endif ()
 
 # Per-60-frame performance logging (see Video.cpp `#if PERF_TRACE`).
