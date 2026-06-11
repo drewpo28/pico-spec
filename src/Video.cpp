@@ -417,6 +417,16 @@ static int brdcol_end1 = 0;        // end of left border / paper skip point (T-s
 static int brdcol_retrace = 0;     // where H-retrace begins (= brdcol_end when no retrace visible)
 static int brdcol_step = 4;        // T-states per column (4 for 48K/128K, 1 for Pentagon)
 static bool brdPairWrite = true;   // true: uint32_t pair writes, false: uint16_t XOR
+#if !PICO_RP2040
+// Profi DS80 border: per-T-state writes into the packed-pair framebuffer
+// (1T = 4px = 1 uint16_t of two pair bytes).  Geometry applied by
+// applyDS80BorderGeometry(); ds80_brd_col_off shifts the 160 visible
+// T-columns inside wider rows (720×576: 180 uint16 cols → off=10).
+static bool ds80_border_geom = false;
+static int  ds80_brd_col_off = 0;
+static bool ds80_osd_carve = false; // stats overlay visible → carve its rect
+static bool ds80_carve240 = false;  // stats rect coords differ 640×480 vs 720×576
+#endif // !PICO_RP2040
 static void Select_Update_Border(); // forward declaration
 
 // Timex SCLD video modes
@@ -575,6 +585,59 @@ void (*VIDEO::DrawBorder)() = &VIDEO::TopBorder_Blank;
 static uint16_t* brdptr16;
 static uint8_t* prevBrdptr8; // 4-bit packed: 1 byte = 2 pixels
 
+#if !PICO_RP2040
+// Apply / restore the Profi DS80 screen+border timing geometry (ZXMAK2
+// ProfiRenderer model: 192 T/line, paper at line 72 tact 24 minus 19T INT
+// offset, 16T side borders, 1T = 4 px = 1 uint16_t of packed pair bytes).
+// on=true:  called from Reset() DS80 branch and EndFrame() activation.
+// on=false: called from EndFrame() deactivation — restores the standard
+// Profi geometry that Reset() computes for non-DS80 (224 T/line).
+static void applyDS80BorderGeometry(bool on) {
+    if (on) {
+        VIDEO::tStatesPerLine = TSTATES_PER_LINE_PROFI_DS80;
+        VIDEO::tStatesScreen  = TS_SCREEN_PROFI_DS80;
+        const bool tall = (int)VIDEO::vga.yres >= 288;  // 720×576: 24-row top/bottom bands
+        VIDEO::tStatesBorder = tall ? TS_BORDER_PROFI_DS80_288 : TS_BORDER_PROFI_DS80_240;
+        lin_end  = tall ? DS80_BORDER_TOP : 0;
+        lin_end2 = lin_end + 240;
+        // Defensive: never let the border/content machines run past the fb
+        // (e.g. DS80 forced while a <240-row video mode is active).
+        if (lin_end2 > VIDEO::vga.yres) lin_end2 = VIDEO::vga.yres;
+        brdcol_step    = 1;
+        brdPairWrite   = false;
+        brdcol_start   = 0;
+        brdcol_end     = 160;          // 16T left + 128T paper + 16T right
+        brdcol_end1    = 16;
+        brdcol_retrace = brdcol_end;
+        // Row width in uint16 cols minus the 160 visible T-cols, split evenly:
+        // 640×480 (320 B/row → 160 cols) → 0; 720×576 (360 B → 180 cols) → 10.
+        ds80_brd_col_off = ((int)VIDEO::vga.xres / 2 - 160) / 2;
+        ds80_border_geom = true;
+    } else {
+        ds80_border_geom = false;
+        ds80_brd_col_off = 0;
+        VIDEO::tStatesPerLine = TSTATES_PER_LINE_PROFI;
+        VIDEO::tStatesScreen  = TS_SCREEN_PROFI;
+        const bool isFB    = VIDEO::isFullBorderMode();
+        const bool isFB240 = VIDEO::isFullBorder240();
+        const bool is169   = Config::aspect_16_9 != 0;
+        VIDEO::tStatesBorder = isFB ? (isFB240 ? TS_BORDER_360x240_PROFI : TS_BORDER_360x288_PROFI)
+                             : is169 ? TS_BORDER_360x200_PROFI : TS_BORDER_320x240_PROFI;
+        if      (isFB && !isFB240) { lin_end = 48; lin_end2 = 240; }
+        else if (isFB)             { lin_end = 24; lin_end2 = 216; }
+        else if (is169)            { lin_end = 4;  lin_end2 = 196; }
+        else                       { lin_end = 24; lin_end2 = 216; }
+        brdcol_end     = isFB ? 180 : 160;
+        brdcol_step    = 1;
+        brdPairWrite   = false;
+        brdcol_start   = is169 ? 10 : 0;
+        brdcol_end1    = isFB ? 26 : brdcol_start + (brdcol_end - brdcol_start - 128) / 2;
+        brdcol_retrace = brdcol_end;
+    }
+    Select_Update_Border();
+}
+#endif // !PICO_RP2040
+
 uint32_t VIDEO::lastBrdTstate;
 bool VIDEO::brdChange = false;
 bool VIDEO::brdnextframe = true;
@@ -667,8 +730,10 @@ void precalcborder32()
 void VIDEO::updateBorderBrd() {
 #if !PICO_RP2040
     if (isProfiDS80()) {
-        // DS80 has no border — use black for all surrounding areas
-        uint8_t b = profi_pair_lookup[0][0];
+        // DS80 border colour = Palette[(~borderIndex) & 7] (inverse index, per
+        // ZXMAK2 ProfiRenderer m_borderColorPaper), mapped to its solid pair slot.
+        uint8_t bidx = (uint8_t)(~borderColor) & 0x07;
+        uint8_t b = profi_pair_lookup[bidx][bidx];
         brd = (uint32_t)b * 0x01010101u;
         return;
     }
@@ -1665,6 +1730,12 @@ void VIDEO::Reset() {
     // brdcol_cnt counts T-states (1T = 2px = 1 uint16_t in framebuffer)
     // 48K/128K: step=4 (8px per column), brdPairWrite=true
     // Pentagon:  step=1 (2px per column), brdPairWrite=false (XOR)
+#if !PICO_RP2040
+    // Clear stale DS80 border geometry first (re-applied below if DS80 active) —
+    // Select_Update_Border() would otherwise keep the DS80 updater on arch switch.
+    ds80_border_geom = false;
+    ds80_brd_col_off = 0;
+#endif
     brdcol_end = isFullBorder ? 180 : 160;  // vga.xres / 2 (T-states = half pixel count)
     if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
         brdcol_step = 1;
@@ -1717,13 +1788,11 @@ void VIDEO::Reset() {
         profi_clrmem = ((int)clrPage < totPg) ? MemESP::ram[clrPage].direct() : nullptr;
         Debug::log("[VID] DS80 Reset: clrPage=%u totPg=%d clrmem=%p grmem=%p", clrPage, totPg, profi_clrmem, grmem);
 #if !PICO_RP2040
-        // DS80 is a full 512×240 framebuffer — no border, 240 content lines.
-        // The grmem layout (pixCoff formula) covers all 240 lines; lines 192..239
-        // live at offsets 6144..8191 (odd) and 14336..16383 (even) of the 16KB page.
-        // Shift tStatesScreen back by lin_end lines so rendering starts at FB row 0.
-        tStatesScreen -= (int)lin_end * (int)tStatesPerLine;  // e.g. 12583 - 32×224 = 5415
-        lin_end  = 0;
-        lin_end2 = 240;
+        // DS80: 512×240 content + per-T-state side borders, ZXMAK2 timing
+        // (192 T/line).  The grmem layout (pixCoff formula) covers all 240
+        // lines; lines 192..239 live at offsets 6144..8191 (odd) and
+        // 14336..16383 (even) of the 16KB page.
+        applyDS80BorderGeometry(true);
 #endif
     } else {
         grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
@@ -2305,31 +2374,11 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
         // 1-frame stats → flicker.  The stats rectangle (fb bytes 168..311) straddles
         // the content area AND the right border pad (288..319), so BOTH the content
         // write and the right-pad fill must carve it out, leaving it for drawStats.
-        // (720×576 keeps stats in the bottom border band, carved out in EndFrame.)
+        // (720×576 keeps stats in the bottom border band, carved out in Update_Border_DS80.)
         bool skip_stats_row = (ds80_voff == 0) && (VIDEO::OSD & 0x03) && !(VIDEO::OSD & 0x04)
                               && frow >= 220 && frow < 236;
-        // Per-line side borders: fill left/right pads with the CURRENT border colour
-        // (mapped to its solid DS80 pair slot) once, on the first column batch of the
-        // line.  Done per-scanline so raster border effects (OUT 0xFE bursts) show.
-        if (fb_row && start_col == 0) {
-            // Border colour = Palette[(~borderIndex) & 7] (per ZXMAK2 ProfiRenderer
-            // UlaAction.Profi32_0 → m_borderColorPaper).  Note the INVERSE index: the
-            // Profi ULA derives the solid-border colour from the complement of the
-            // port-0xFE value, then maps it through the live palette.
-            uint8_t bidx = (uint8_t)(~VIDEO::borderColor) & 0x07;
-            uint8_t bbyte = profi_pair_lookup[bidx][bidx];
-            memset(fb_row, bbyte, pad_l);
-            const int rpad_start = pad_l + 256;
-            const int xres = (int)vga.xres;
-            if (skip_stats_row && 312 > rpad_start && 312 < xres) {
-                // Right pad overlaps the stats box (168..311): fill only 312..xres-1,
-                // leaving 288..311 for drawStats.  (Left of 312 in the right pad is the
-                // stats box itself.)
-                memset(fb_row + 312, bbyte, xres - 312);
-            } else {
-                memset(fb_row + rpad_start, bbyte, xres - rpad_start);
-            }
-        }
+        // Side borders are rendered per-T-state by the border state machine
+        // (Update_Border_DS80, ZXMAK2 192T-line timing) — no per-line fill here.
         for (unsigned int j = start_col; j < end_col; j++) {
             uint8_t bmpEven = fgrmem[pixCoff + j + 8192];
             uint8_t bmpOdd  = fgrmem[pixCoff + j];
@@ -2743,11 +2792,12 @@ IRAM_ATTR void VIDEO::EndFrame() {
                 ds80_dbg_clrmem = profi_clrmem;
 #endif
             }
-            tStatesScreen -= (int)lin_end * (int)tStatesPerLine;
-            lin_end  = 0;
-            lin_end2 = 240;
+            applyDS80BorderGeometry(true);
             tstateDraw   = tStatesScreen;
-            linedraw_cnt = 0;
+            linedraw_cnt = lin_end;
+            updateBorderBrd();        // seed DS80 border pair colour
+            DrawBorder = &Border_Blank; // mid-frame machine state is stale — skip this frame's flush
+            brdChange = true;           // schedule full border repaint next frame
             // Zero all vga.frameBuffer rows: scan-time renderer writes only content bytes
             // (pad_l..pad_l+255) into each DS80 row; padding bytes must start at 0 (black
             // pair) and are never overwritten. Rows 240..yres-1 stay black throughout DS80.
@@ -2773,18 +2823,12 @@ IRAM_ATTR void VIDEO::EndFrame() {
             // Restore standard Profi (non-DS80) geometry.
             grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
             profi_clrmem = nullptr;
-            {
-                bool isFB    = VIDEO::isFullBorderMode();
-                bool isFB240 = VIDEO::isFullBorder240();
-                bool is169   = Config::aspect_16_9 != 0;
-                if      (isFB && !isFB240) { lin_end = 48; lin_end2 = 240; }
-                else if (isFB)             { lin_end = 24; lin_end2 = 216; }
-                else if (is169)            { lin_end = 4;  lin_end2 = 196; }
-                else                       { lin_end = 24; lin_end2 = 216; }
-            }
-            tStatesScreen = TS_SCREEN_PROFI;
+            applyDS80BorderGeometry(false);
             tstateDraw    = tStatesScreen;
             linedraw_cnt  = lin_end;
+            updateBorderBrd();        // back to std border palette
+            DrawBorder = &Border_Blank; // mid-frame machine state is stale — skip this frame's flush
+            brdChange = true;           // schedule full border repaint next frame
         }
     }
 
@@ -2798,40 +2842,10 @@ IRAM_ATTR void VIDEO::EndFrame() {
         }
     }
 
-    // DS80 720×576 top/bottom border bands: the scan-time renderer only writes the
-    // 240 content lines (fb rows DS80_BORDER_TOP..+239), so the top rows 0..TOP-1 and
-    // the bottom rows TOP+240..yres-1 are never touched by it.  Fill them with the
-    // current border colour each frame (frame-accurate; side borders are per-line).
-    // 640×480 (yres=240) has no vertical border band → nothing to do.
-    {
-        if (profi_ds80_active && vga.frameBuffer && (int)vga.yres >= 288) {
-            // Border colour = Palette[(~borderIndex) & 7] (inverse index — see renderer).
-            uint8_t bidx = (uint8_t)(~VIDEO::borderColor) & 0x07;
-            uint8_t bbyte = profi_pair_lookup[bidx][bidx];
-            const int botStart = DS80_BORDER_TOP + 240;
-            // Top band: never overlaps the stats overlay → plain full-width fill.
-            for (int y = 0; y < DS80_BORDER_TOP; y++)
-                if (vga.frameBuffer[y]) memset(vga.frameBuffer[y], bbyte, vga.xres);
-            // Bottom band: the F8 stats overlay (isFullBorder288: x=188, y=268, 144×16)
-            // lives here.  If we fill those rows full-width every frame, the per-frame
-            // drawStats() repaint races the fill → flicker when stats text updates.
-            // Carve the stats rectangle out of the fill and let drawStats own it.
-            bool statsHere = (VIDEO::OSD & 0x03) && !(VIDEO::OSD & 0x04);
-            const int sx = 188, sw = 144, sy = 268, sh = 16;   // matches OSD::drawStats 288-mode
-            for (int y = botStart; y < (int)vga.yres; y++) {
-                if (!vga.frameBuffer[y]) continue;
-                uint8_t* row = (uint8_t*)vga.frameBuffer[y];
-                if (statsHere && y >= sy && y < sy + sh) {
-                    // Fill only the border segments left/right of the stats box.
-                    if (sx > 0) memset(row, bbyte, sx);
-                    int rstart = sx + sw;
-                    if (rstart < (int)vga.xres) memset(row + rstart, bbyte, (int)vga.xres - rstart);
-                } else {
-                    memset(row, bbyte, vga.xres);
-                }
-            }
-        }
-    }
+    // DS80 top/bottom border bands (720×576) are rendered per-T-state by the
+    // border state machine (TopBorder/BottomBorder with DS80 geometry) — no
+    // frame-granular fill here.  The stats rectangle is carved out inside
+    // Update_Border_DS80 and owned by OSD::drawStats.
 
 // DS80 framebuffer diagnostic: log framebuffer bytes and latched pointers every 60 frames.
     // This tells us whether the renderer is filling the framebuffer correctly.
@@ -2970,14 +2984,12 @@ IRAM_ATTR void VIDEO::EndFrame() {
     }
 
 #if !PICO_RP2040
-    // DS80 mode has no border (lin_end=0). The border renderer uses
-    // "brdlin_cnt == lin_end" to transition TopBorder→MiddleBorder, but
-    // with lin_end=0 that check never fires (brdlin_cnt starts at 0 and
-    // is incremented to 1 before the first test → 1 != 0 → infinite loop).
-    // The loop eventually accesses vga.frameBuffer[480] (past end of the
-    // 480-entry array) → SIGBUS.  Fix: disable border rendering when DS80
-    // is active or just became active this frame.
-    if (isProfiDS80()) DrawBorder = &Border_Blank;
+    // DS80 borders are rendered by the state machine with DS80 geometry
+    // (applyDS80BorderGeometry).  TopBorder_Blank handles lin_end==0 and
+    // MiddleBorder guards lin_end2==yres, so no Border_Blank override needed.
+    // Refresh the per-frame stats carve-out flags for Update_Border_DS80.
+    ds80_osd_carve = ds80_border_geom && (VIDEO::OSD & 0x03) && !(VIDEO::OSD & 0x04);
+    ds80_carve240  = (int)vga.yres < 288;
 #endif
 
     if (!skipFrame) {
@@ -3000,11 +3012,6 @@ IRAM_ATTR void VIDEO::EndFrame() {
         DrawBorder = &Border_Blank;
     else
         DrawBorder = &TopBorder_Blank;
-#if !PICO_RP2040
-    // Re-apply DS80 border-blank override (TopBorder_Blank above would
-    // fire next frame and overflow brdlin_cnt past yres when lin_end=0).
-    if (isProfiDS80()) DrawBorder = &Border_Blank;
-#endif
     lastBrdTstate = tStatesBorder;
     brdChange = false;
 
@@ -3114,6 +3121,40 @@ IRAM_ATTR static void Update_Border_XOR() {
     brdptr16[brdcol_cnt ^ 1] = VIDEO::brd;
 }
 
+#if !PICO_RP2040
+// Profi DS80: write 1 uint16_t (2 packed pair bytes = 4px) per T-state.
+// The HDMI/VGA ISR reads pair bytes in (x^2) order, so within an aligned
+// uint16 pair display order is swapped — same ^1 trick as Pentagon.
+// VIDEO::brd already holds the solid border pair byte replicated.
+// ds80_brd_col_off centres the 160 visible T-cols in wider rows (720×576);
+// the off-screen edge cols (h-blanking) are extended from the nearest tact.
+IRAM_ATTR static void Update_Border_DS80() {
+    if (ds80_osd_carve) {
+        // Stats overlay rectangle is owned by OSD::drawStats — skip it.
+        if (ds80_carve240) {
+            // 640×480: rows 220..235, fb bytes 288..311 (right pad part)
+            if (brdlin_cnt >= 220 && brdlin_cnt < 236
+                && brdcol_cnt >= 144 && brdcol_cnt < 156) return;
+        } else {
+            // 720×576: rows 268..283, fb bytes 188..331 (bottom band)
+            int c = brdcol_cnt + ds80_brd_col_off;
+            if (brdlin_cnt >= 268 && brdlin_cnt < 284
+                && c >= 94 && c < 166) return;
+        }
+    }
+    const uint16_t v = (uint16_t)VIDEO::brd;
+    const int col = brdcol_cnt + ds80_brd_col_off;
+    brdptr16[col ^ 1] = v;
+    if (ds80_brd_col_off) {
+        if (brdcol_cnt == 0) {
+            for (int c = 0; c < ds80_brd_col_off; c++) brdptr16[c ^ 1] = v;
+        } else if (brdcol_cnt == brdcol_end - 1) {
+            for (int c = col + 1; c <= col + ds80_brd_col_off; c++) brdptr16[c ^ 1] = v;
+        }
+    }
+}
+#endif // !PICO_RP2040
+
 IRAM_ATTR static void Update_Border_XOR_Gig() {
     uint32_t newColor = VIDEO::brd; // 0xCCCCCCCC: 4 copies of palette index byte
     int idx = brdcol_cnt ^ 1;
@@ -3132,6 +3173,12 @@ IRAM_ATTR static void Update_Border_XOR_Gig() {
 }
 
 static void Select_Update_Border() {
+#if !PICO_RP2040
+    if (ds80_border_geom) {
+        Update_Border = &Update_Border_DS80;  // Gigascreen incompatible with Profi
+        return;
+    }
+#endif
     if (brdPairWrite)
         Update_Border = VIDEO::gigascreen_enabled ? &Update_Border_Pair_Gig : &Update_Border_Pair;
     else
@@ -3158,7 +3205,9 @@ IRAM_ATTR void VIDEO::TopBorder_Blank() {
         brdlin_cnt = 0;
         brdptr16 = (uint16_t *)(vga.frameBuffer[0]);
         prevBrdptr8 = vga.prevFrameBuffer ? (uint8_t *)(vga.prevFrameBuffer[0]) : (uint8_t *)brdptr16;
-        DrawBorder = &TopBorder;
+        // lin_end==0 (DS80 640×480): no top border rows — straight to side borders.
+        // (TopBorder would otherwise paint row 0 full-width over the content.)
+        DrawBorder = lin_end ? &TopBorder : &MiddleBorder;
         DrawBorder();
     }
 }
@@ -3212,15 +3261,28 @@ IRAM_ATTR void VIDEO::MiddleBorder() {
             brdcol_cnt = brdcol_end1 + 128;
         } else if (brdcol_cnt >= brdcol_end) {
             brdlin_cnt++;
-            brdptr16 = (uint16_t *)(vga.frameBuffer[brdlin_cnt]);
-            prevBrdptr8 = vga.prevFrameBuffer ? (uint8_t *)(vga.prevFrameBuffer[brdlin_cnt]) : (uint8_t *)brdptr16;
             brdcol_cnt = brdcol_start;
             lastBrdTstate += tStatesPerLine - brdcol_end;
-            if (brdlin_cnt == lin_end2) {
+            if (brdlin_cnt == (int)lin_end2) {
+                // DS80 640×480: lin_end2 == yres — no bottom border rows at all.
+                if (brdlin_cnt >= (int)vga.yres) {
+                    DrawBorder = &Border_Blank;
+                    return;
+                }
+                brdptr16 = (uint16_t *)(vga.frameBuffer[brdlin_cnt]);
+                prevBrdptr8 = vga.prevFrameBuffer ? (uint8_t *)(vga.prevFrameBuffer[brdlin_cnt]) : (uint8_t *)brdptr16;
+#if !PICO_RP2040
+                // DS80: BottomBorder_OSD carve coords are for std-fb layouts —
+                // Update_Border_DS80 carves the stats rect itself; use plain bottom.
+                DrawBorder = ds80_border_geom ? &BottomBorder : Draw_OSD43;
+#else
                 DrawBorder = Draw_OSD43;
+#endif
                 DrawBorder();
                 return;
             }
+            brdptr16 = (uint16_t *)(vga.frameBuffer[brdlin_cnt]);
+            prevBrdptr8 = vga.prevFrameBuffer ? (uint8_t *)(vga.prevFrameBuffer[brdlin_cnt]) : (uint8_t *)brdptr16;
         }
     }
 }

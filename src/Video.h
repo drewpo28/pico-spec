@@ -58,6 +58,14 @@ visit https://zxespectrum.speccy.org/contacto
 #define TS_SCREEN_PROFI        12583  // START OF ULA DRAW PAPER PROFI (56*224+39)
 #define TS_SCREEN_BYTE         14392  // START OF ULA DRAW PAPER BYTE (64*224+56)
 
+// Profi DS80 (512×240) sync-gen runs 192 T-states/line (not 224!) — per ZXMAK2
+// ProfiRenderer: c_ulaLineTime=192, c_ulaFirstPaperLine=72, c_ulaFirstPaperTact=24,
+// c_ulaIntBegin=19 (screen tact = CPU tact + 19), 16T side borders (1T = 4 px).
+#define TSTATES_PER_LINE_PROFI_DS80 192
+#define TS_SCREEN_PROFI_DS80   13829  // 72*192 + 24 - 19 (INT offset)
+#define TS_BORDER_PROFI_DS80_240 13817 // 13829 - 16 (left border) + 4 (step=1 correction)
+#define TS_BORDER_PROFI_DS80_288 9209  // 13817 - 24*192 (24-row top band incl. blanking rows)
+
 #define TS_BORDER_320x240 8948  // START OF BORDER 48 (+5 correction)
 #define TS_BORDER_320x240_128 8878  // START OF BORDER 128 (+5 correction)
 #define TS_BORDER_320x240_PENTAGON 12595  // START OF BORDER PENTAGON
