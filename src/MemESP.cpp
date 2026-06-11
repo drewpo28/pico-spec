@@ -46,6 +46,17 @@ uint32_t MEM_PG_CNT = 64;
 volatile uint32_t mem_spi_evict_count = 0;  // from_vram calls (SPI DMA loads)
 volatile uint32_t mem_spi_evict_page  = 0;  // last evicted page index
 
+// Cold paths for memory breakpoints — see declaration in MemESP.h.
+__attribute__((noinline)) void MemESP::checkMemReadBP(uint16_t addr) {
+    if (Config::hasBreakPoint(addr, Config::BP_MEM_READ))
+        CPU::portBasedBP = true;
+}
+
+__attribute__((noinline)) void MemESP::checkMemWriteBP(uint16_t addr) {
+    if (Config::hasBreakPoint(addr, Config::BP_MEM_WRITE))
+        CPU::portBasedBP = true;
+}
+
 static FIL f;
 static const char PAGEFILE[] = "/tmp/pico-spec.swap";
 

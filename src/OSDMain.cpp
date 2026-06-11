@@ -44,6 +44,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Subsystem.h"
 #include "CPU.h"
 #include "Video.h"
+#include "Z80DMA.h"
 #include "ESPectrum.h"
 #include "messages.h"
 #include "Config.h"
@@ -3603,6 +3604,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 if (opt2) {
                                     Config::dma_mode = opt2 - 1;
                                     if (Config::dma_mode != prev) {
+#if !PICO_RP2040
+                                        // Attr shadow lives on heap only while DMA mode is on
+                                        if (Config::dma_mode) Z80DMA::ensureAttrShadow();
+                                        else Z80DMA::freeAttrShadow();
+#endif
                                         Config::save();
                                     }
                                     menu_curopt = opt2;

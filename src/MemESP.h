@@ -206,6 +206,12 @@ public:
     static void writebyte(uint16_t addr, uint8_t data);
     static void writeword(uint16_t addr, uint16_t data);
 
+    // Cold out-of-line breakpoint checks: keep the 20-entry scan and the
+    // portBasedBP store out of every inlined readbyte/writebyte expansion
+    // in the Z80 core (icache footprint), entered only when mem BPs exist.
+    static void checkMemReadBP(uint16_t addr);
+    static void checkMemWriteBP(uint16_t addr);
+
     static int getByteContention(uint16_t addr);
 
     inline static void recoverPage0() {
@@ -232,8 +238,8 @@ inline int MemESP::getByteContention(uint16_t addr) {
 }
 
 inline uint8_t MemESP::readbyte(uint16_t addr) {
-    if (Config::numMemReadBP > 0 && Config::hasBreakPoint(addr, Config::BP_MEM_READ))
-        CPU::portBasedBP = true;
+    if (__builtin_expect(Config::numMemReadBP != 0, 0))
+        checkMemReadBP(addr);
     uint8_t page = addr >> 14;
 #if !PICO_RP2040
     if (page == 0 && divmmc_mapped) {
@@ -249,8 +255,8 @@ inline uint16_t MemESP::readword(uint16_t addr) {
 
 inline void MemESP::writebyte(uint16_t addr, uint8_t data)
 {
-    if (Config::numMemWriteBP > 0 && Config::hasBreakPoint(addr, Config::BP_MEM_WRITE))
-        CPU::portBasedBP = true;
+    if (__builtin_expect(Config::numMemWriteBP != 0, 0))
+        checkMemWriteBP(addr);
     uint8_t page = addr >> 14;
 #if !PICO_RP2040
     if (page == 0 && divmmc_mapped) {

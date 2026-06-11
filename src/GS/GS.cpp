@@ -192,6 +192,17 @@ static inline void __not_in_flash_func(gs_trace_gs)(uint8_t kind, uint8_t data, 
 }
 #endif  // GS_DEBUG_TRACE
 
+// Perf counters are compile-gated: volatile increments in the core1 hot
+// path (pump/gs_pc_read/host IO) survive optimization even when the
+// once-per-second log below is disabled, so keep them out of release
+// builds entirely. Enable with -DGS_PERF_TRACE=ON in CMake.
+#if GS_PERF_TRACE
+#define GS_PERF(stmt) stmt
+#else
+#define GS_PERF(stmt) ((void)0)
+#endif
+
+#if GS_PERF_TRACE
 // Cache stats: hit/miss counts per second to gauge how often gs_pc_read
 // has to fetch a fresh 64-byte line from PSRAM (vs hitting in SRAM cache).
 // High miss count during slow seconds = GS-Z80 thrashing PSRAM and
@@ -221,6 +232,7 @@ static volatile uint32_t s_perf_h_b3r   = 0;
 static volatile uint32_t s_perf_h_bbw   = 0;
 static volatile uint32_t s_perf_h_bbr   = 0;
 static volatile uint32_t s_perf_h_spin_us = 0;     // total spinwait µs/sec in hostWriteB3
+#endif  // GS_PERF_TRACE
 
 
 
@@ -329,18 +341,18 @@ static inline void __not_in_flash_func(gs_pc_invalidate_line)(uint32_t psram_off
 static inline zuint8 __not_in_flash_func(gs_pc_read)(uint32_t psram_off) {
     uint32_t line = psram_off >> GS_PC_LINE_BITS;
     uint32_t col  = psram_off & GS_PC_LINE_MASK;
-    if (line == s_pc_last_line) { s_perf_pc_hit++; return s_pc_last_buf[col]; }
+    if (line == s_pc_last_line) { GS_PERF(s_perf_pc_hit++); return s_pc_last_buf[col]; }
     uint32_t set  = line & GS_PC_SETS_MASK;
     for (int w = 0; w < GS_PC_WAYS; w++) {
         if (s_pc_tag[set][w] == line) {
             s_pc_last_line = line;
             s_pc_last_buf  = s_pc_data[set][w];
-            s_perf_pc_hit++;
+            GS_PERF(s_perf_pc_hit++);
             return s_pc_data[set][w][col];
         }
     }
     // Miss — FIFO eviction, bulk-copy 64 bytes from PSRAM (XIP burst friendly).
-    s_perf_pc_miss++;
+    GS_PERF(s_perf_pc_miss++);
     uint8_t v = s_pc_next[set];
     s_pc_next[set] = (v + 1) & (GS_PC_WAYS - 1);
     if (s_gs_use_spi) {
@@ -486,9 +498,9 @@ static zuint8 __not_in_flash_func(gs_cb_in)(void* ctx, zuint16 port) {
         case 0x04: {
             v = GS::reg_status;
             uint16_t pc = Z80_PC(s_cpu);
-            s_perf_p04_total++;
-            if (pc == s_perf_p04_pc) s_perf_p04_spin++;
-            s_perf_p04_pc = pc;
+            GS_PERF(s_perf_p04_total++);
+            GS_PERF(if (pc == s_perf_p04_pc) s_perf_p04_spin++);
+            GS_PERF(s_perf_p04_pc = pc);
             // Two IN A,(04) in main idle loop. PC already advanced by 2:
             // 0x026E → PC=0x0270 (early-exit path when work_ram[0x4084]=0)
             // 0x027F → PC=0x0281 (steady-state path, always reached after C000)
@@ -881,6 +893,7 @@ void GS::pollPerf() {
         }
     }
 #endif  // GS_DEBUG_TRACE
+#if GS_PERF_TRACE
     static uint32_t s_last_us = 0;
     uint32_t now = time_us_32();
     if ((now - s_last_us) < 1000000) return;
@@ -971,11 +984,12 @@ void GS::pollPerf() {
     (void)pc_m; (void)pc_h; (void)pc_miss_pct;
     (void)b3w; (void)b3r; (void)bbw; (void)bbr; (void)hsw;
 #endif
+#endif  // GS_PERF_TRACE
 }
 
 void __not_in_flash_func(GS::pump)() {
     if (!enabled) return;
-    s_perf_pump_calls++;
+    GS_PERF(s_perf_pump_calls++);
     // Wall-clock-locked pacing. Independent of how fast the emulator can
     // crunch instructions — we always advance GS-Z80 time at exactly
     // GS_CLOCK_HZ T-states per real second. With INSN handlers placed in
@@ -1000,12 +1014,13 @@ void __not_in_flash_func(GS::pump)() {
     // when wall-clock paced), don't push more or we'll overrun.
     uint32_t used = s_ring_wpos - s_ring_rpos;
     if (used >= (GS_RING_SIZE * 7 / 8)) {
-        s_perf_pump_skip++;
+        GS_PERF(s_perf_pump_skip++);
         return;
     }
 
     int ran = step(budget_t);
-    s_perf_tstates += (uint32_t)ran;
+    GS_PERF(s_perf_tstates += (uint32_t)ran);
+    (void)ran;
 }
 
 int __not_in_flash_func(GS::step)(int tstates) {
@@ -1062,7 +1077,7 @@ int __not_in_flash_func(GS::step)(int tstates) {
 }
 
 uint8_t GS::hostReadB3() {
-    s_perf_h_b3r++;
+    GS_PERF(s_perf_h_b3r++);
     uint8_t v = reg_data_gs;
     __dmb();  // consume data before clearing the flag
     uint32_t fifo_used = s_host_fifo_w - s_host_fifo_r;
@@ -1078,7 +1093,7 @@ uint8_t GS::hostReadB3() {
 }
 
 uint8_t GS::hostReadBB() {
-    s_perf_h_bbr++;
+    GS_PERF(s_perf_h_bbr++);
     uint8_t v = reg_status | 0x7E;
     gs_trace_host(TR_BBr, v, reg_status);
     return v;
@@ -1093,7 +1108,7 @@ uint8_t GS::hostReadBB() {
 // FIFO size is 512 bytes; at 37500 bytes/sec drain rate that's ~14 ms
 // buffer — enough to absorb a full SCL sector (256 B) plus a margin.
 void GS::hostWriteB3(uint8_t data) {
-    s_perf_h_b3w++;
+    GS_PERF(s_perf_h_b3w++);
     gs_trace_host(TR_B3w, data, reg_status);
     uint32_t w = s_host_fifo_w;
     uint32_t used = w - s_host_fifo_r;
@@ -1103,7 +1118,8 @@ void GS::hostWriteB3(uint8_t data) {
                && (time_us_32() - spin_t0) < 500) {
             __dmb();
         }
-        s_perf_h_spin_us += time_us_32() - spin_t0;
+        GS_PERF(s_perf_h_spin_us += time_us_32() - spin_t0);
+        (void)spin_t0;
         if ((s_host_fifo_w - s_host_fifo_r) >= GS_HOST_FIFO_SIZE) {
             s_host_fifo_r = s_host_fifo_w - GS_HOST_FIFO_SIZE + 1;
         }
@@ -1117,7 +1133,7 @@ void GS::hostWriteB3(uint8_t data) {
 }
 
 void GS::hostWriteBB(uint8_t data) {
-    s_perf_h_bbw++;
+    GS_PERF(s_perf_h_bbw++);
     gs_trace_host(TR_BBw, data, reg_status);
 #ifdef GS_DEBUG_TRACE
     // Auto-dump trigger: ZP4 GS-detection sequence starts with CMD 0xD2 →

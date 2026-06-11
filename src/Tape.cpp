@@ -146,7 +146,7 @@ void Tape::FreeSymDefTable() {
 
 int Tape::inflateCSW(int blocknumber, long startPos, long data_length) {
 
-    char destFileName[16]; // Nombre del archivo descomprimido
+    char destFileName[32]; // Nombre del archivo descomprimido
     uint8_t s_inbuf[BUF_SIZE];
     uint8_t s_outbuf[BUF_SIZE];
     FIL pOutfile;
@@ -154,7 +154,7 @@ int Tape::inflateCSW(int blocknumber, long startPos, long data_length) {
 
     // printf(CONFIG_DIR "/.csw%04d.tmp\n",blocknumber);
 
-    sprintf(destFileName, "/tmp/.csw%04d.tmp", blocknumber);
+    snprintf(destFileName, sizeof(destFileName), "/tmp/.csw%04d.tmp", blocknumber);
 
     // Move to input file compressed data position
     f_lseek(&tape, startPos);

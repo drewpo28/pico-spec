@@ -726,33 +726,81 @@ void Config::load() {
     loaded = true;
 }
 
-static void nvs_set_str(string& buf, const char* name, const char* val) {
-    buf += name;
-    buf += '=';
-    buf += val;
-    buf += '\n';
+// Streams key=value lines straight to the SD file when one is open;
+// the whole config (~5KB) must never be built in a heap string — on
+// RP2040 only ~15KB heap is free at save time and the realloc growth
+// of a single big buffer OOMs (see CLAUDE.md RP2040 rules).
+struct NvsWriter {
+    FIL* f = nullptr;       // file target
+    string* ram = nullptr;  // RAM fallback target (no SD)
+    bool ok = true;
+    void write(const char* s, size_t n) {
+        if (f) {
+            UINT bw;
+            if (f_write(f, s, n, &bw) != FR_OK || bw != n) ok = false;
+        } else if (ram) {
+            ram->append(s, n);
+        }
+    }
+};
+
+static void nvs_set_str(NvsWriter& buf, const char* name, const char* val) {
+    buf.write(name, strlen(name));
+    buf.write("=", 1);
+    buf.write(val, strlen(val));
+    buf.write("\n", 1);
 }
-static void nvs_set_i(string& buf, const char* name, int val) {
-    nvs_set_str(buf, name, to_string(val).c_str());
+static void nvs_set_i(NvsWriter& buf, const char* name, int val) {
+    char t[16]; snprintf(t, sizeof(t), "%d", val);
+    nvs_set_str(buf, name, t);
 }
-static void nvs_set_i8(string& buf, const char* name, int8_t val) {
-    nvs_set_str(buf, name, to_string(val).c_str());
+static void nvs_set_i8(NvsWriter& buf, const char* name, int8_t val) {
+    nvs_set_i(buf, name, val);
 }
-static void nvs_set_u8(string& buf, const char* name, uint8_t val) {
-    nvs_set_str(buf, name, to_string(val).c_str());
+static void nvs_set_u8(NvsWriter& buf, const char* name, uint8_t val) {
+    nvs_set_i(buf, name, val);
 }
-static void nvs_set_u16(string& buf, const char* name, uint16_t val) {
-    nvs_set_str(buf, name, to_string(val).c_str());
+static void nvs_set_u16(NvsWriter& buf, const char* name, uint16_t val) {
+    nvs_set_i(buf, name, val);
 }
-static void nvs_set_sc(string& buf, const char* name, signed char val) {
-    nvs_set_str(buf, name, to_string(val).c_str());
+static void nvs_set_sc(NvsWriter& buf, const char* name, signed char val) {
+    nvs_set_i(buf, name, val);
 }
 
 // Dump actual config to FS
 void Config::save() {
-    static string buf;
-    buf.clear();
-    if (buf.capacity() < 2048) buf.reserve(2048);
+    static const char* nvs_tmp = STORAGE_NVS ".tmp";
+    static const char* nvs_path = STORAGE_NVS;
+    FIL* handle = nullptr;
+    if (FileUtils::fsMount) {
+        if (!loaded) {
+            // Config was never loaded from file — refuse to overwrite
+            // existing storage.nvs with defaults
+            FILINFO fi;
+            if (f_stat(STORAGE_NVS, &fi) == FR_OK) {
+                Debug::log("Config::save BLOCKED — not loaded, file exists (%u bytes)", fi.fsize);
+                return;
+            }
+        }
+        // Make sure /.config/pico-spec/<ver>/<board>/ exists before writing.
+        // If mkdir fails (broken/full SD), refuse to write — otherwise the
+        // following f_open would silently fail and we'd lose original state.
+        if (!FileUtils::mkdirParents(CONFIG_DIR_BOARD)) {
+            Debug::log("Config::save FAILED — cannot create %s", CONFIG_DIR_BOARD);
+        } else {
+            // Atomic write: stream to .tmp, then rename over the original
+            handle = fopen2(nvs_tmp, FA_WRITE | FA_CREATE_ALWAYS);
+            if (!handle) Debug::log("Config::save FAILED — cannot open %s", nvs_tmp);
+        }
+    }
+    NvsWriter buf;
+    if (handle) {
+        buf.f = handle;
+    } else {
+        // No SD target — keep config in RAM for session persistence
+        nvs_ram_buf.clear();
+        buf.ram = &nvs_ram_buf;
+    }
     nvs_set_u16(buf,"cpu_mhz", cpu_mhz);
     nvs_set_u16(buf,"max_flash_freq", max_flash_freq);
     nvs_set_u16(buf,"max_psram_freq", max_psram_freq);
@@ -937,70 +985,45 @@ void Config::save() {
     }
     nvs_set_i(buf,"MEM_PG_CNT", MEM_PG_CNT);
 
-    if (FileUtils::fsMount) {
-        if (!loaded) {
-            // Config was never loaded from file — refuse to overwrite
-            // existing storage.nvs with defaults
-            FILINFO fi;
-            if (f_stat(STORAGE_NVS, &fi) == FR_OK) {
-                Debug::log("Config::save BLOCKED — not loaded, file exists (%u bytes)", fi.fsize);
-                return;
+    if (handle) {
+        // f_sync flushes FAT before close so we don't commit the
+        // rename on top of a half-written file when the card stalls.
+        FRESULT sy = buf.ok ? f_sync(handle) : FR_DISK_ERR;
+        fclose2(handle);
+        if (buf.ok && sy == FR_OK) {
+            // Try rename first; on FR_EXIST drop the original then
+            // retry, narrowing the window where neither file exists.
+            FRESULT rn = f_rename(nvs_tmp, nvs_path);
+            if (rn == FR_EXIST) {
+                f_unlink(nvs_path);
+                rn = f_rename(nvs_tmp, nvs_path);
             }
-        }
-        // Make sure /.config/pico-spec/<ver>/<board>/ exists before writing.
-        // If mkdir fails (broken/full SD), refuse to write — otherwise the
-        // following f_open would silently fail and we'd lose original state.
-        if (!FileUtils::mkdirParents(CONFIG_DIR_BOARD)) {
-            Debug::log("Config::save FAILED — cannot create %s", CONFIG_DIR_BOARD);
-        } else {
-            // Atomic write: write to .tmp, then rename over the original
-            static const char* nvs_tmp = STORAGE_NVS ".tmp";
-            static const char* nvs_path = STORAGE_NVS;
-            FIL* handle = fopen2(nvs_tmp, FA_WRITE | FA_CREATE_ALWAYS);
-            if (handle) {
-                UINT bw;
-                FRESULT wr = f_write(handle, buf.c_str(), buf.size(), &bw);
-                // f_sync flushes FAT before close so we don't commit the
-                // rename on top of a half-written file when the card stalls.
-                FRESULT sy = (wr == FR_OK) ? f_sync(handle) : wr;
-                fclose2(handle);
-                if (wr == FR_OK && sy == FR_OK && bw == buf.size()) {
-                    // Try rename first; on FR_EXIST drop the original then
-                    // retry, narrowing the window where neither file exists.
-                    FRESULT rn = f_rename(nvs_tmp, nvs_path);
-                    if (rn == FR_EXIST) {
-                        f_unlink(nvs_path);
-                        rn = f_rename(nvs_tmp, nvs_path);
-                    }
-                    if (rn != FR_OK) {
-                        Debug::log("Config::save FAILED — rename error (rn=%d)", rn);
-                        // Leave .tmp behind for manual recovery if needed.
-                    }
-                } else {
-                    // Write failed — remove incomplete temp, keep original intact
-                    f_unlink(nvs_tmp);
-                    Debug::log("Config::save FAILED — write error (wr=%d, sy=%d, bw=%u/%u)", wr, sy, bw, buf.size());
-                }
+            if (rn != FR_OK) {
+                Debug::log("Config::save FAILED — rename error (rn=%d)", rn);
+                // Leave .tmp behind for manual recovery if needed.
             } else {
-                Debug::log("Config::save FAILED — cannot open %s", nvs_tmp);
+                // File is authoritative — drop any stale RAM copy
+                nvs_ram_buf.clear();
+                nvs_ram_buf.shrink_to_fit();
             }
+        } else {
+            // Write failed — remove incomplete temp, keep original intact
+            f_unlink(nvs_tmp);
+            Debug::log("Config::save FAILED — write error (ok=%d, sy=%d)", (int)buf.ok, sy);
         }
     }
-    // Always keep in RAM (for session persistence without SD)
-    nvs_ram_buf = std::move(buf);
 }
 
 #define VMODE_PENDING_FILE CONFIG_DIR "/vmode_pending.nvs"
 
 void Config::savePendingVideoMode() {
     if (!FileUtils::fsMount) return;
-    string buf;
-    nvs_set_u8(buf, "hdmi_vmode", Config::hdmi_video_mode);
-    nvs_set_u8(buf, "vga_vmode", Config::vga_video_mode);
     FIL* handle = fopen2(VMODE_PENDING_FILE, FA_WRITE | FA_CREATE_ALWAYS);
     if (handle) {
-        UINT bw;
-        f_write(handle, buf.c_str(), buf.size(), &bw);
+        NvsWriter buf;
+        buf.f = handle;
+        nvs_set_u8(buf, "hdmi_vmode", Config::hdmi_video_mode);
+        nvs_set_u8(buf, "vga_vmode", Config::vga_video_mode);
         fclose2(handle);
     }
 }

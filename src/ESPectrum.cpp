@@ -2470,7 +2470,7 @@ void ESPectrum::loop() {
     elapsed = time_us_64() - ts_start;
     idle = target - elapsed;
 
-#ifdef USE_GS
+#if defined(USE_GS) && GS_PERF_TRACE
     // Track min per-frame IDL across the current pollPerf interval — lets
     // us correlate worst-case host stalls with concurrent GS-side activity.
     extern volatile int32_t gs_perf_idle_min;

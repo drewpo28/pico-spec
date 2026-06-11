@@ -34,6 +34,7 @@ option(IDE_PORT_TRACE "Enable PROFI IDE/HDD port access tracing" OFF)
 option(FDD_PORT_TRACE "Enable WD1793 (ВГ93) FDD command/port tracing" OFF)
 option(PROFI_PORT_TRACE "Enable 0x7FFD/0xDFFD paging-port write tracing" OFF)
 option(PERF_TRACE "Enable per-60-frame CPU/HDMI/FPS performance logging" OFF)
+option(GS_PERF_TRACE "Enable General Sound per-second perf counters (GS.cpp)" OFF)
 
 # Per-board Debug-Probe UART toggles (logging over UART). Declared here together;
 # the board-specific `if(<board>_DBG_UART)` blocks below consume them (they call
@@ -292,6 +293,13 @@ if (FDD_PORT_TRACE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE FDD_PORT_TRACE=1)
 else ()
     target_compile_definitions(${PROJECT_NAME} PRIVATE FDD_PORT_TRACE=0)
+endif ()
+
+# General Sound perf counters toggle (see GS.cpp `GS_PERF()` / `#if GS_PERF_TRACE`).
+if (GS_PERF_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE GS_PERF_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE GS_PERF_TRACE=0)
 endif ()
 
 # 0x7FFD/0xDFFD paging-port write tracing (see Ports.cpp `#if PROFI_PORT_TRACE`).
