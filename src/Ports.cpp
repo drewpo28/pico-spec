@@ -1277,6 +1277,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     if ((covox == 1 && a8 == 0xFB) || (covox == 2 && a8 == 0xDD)) {
       LED::touchW(LED::COVOX);
       ESPectrum::lastCovoxVal = data;
+      ESPectrum::lastCovoxValR = data;
       ESPectrum::CovoxGetSample();
     }
     // SounDrive: five 8-bit DAC latches — #0F/#1F/#3F mix left, #4F/#5F right,
@@ -1285,8 +1286,8 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // SounDrive CS by DOS=0, and Profi CP/M periphery mode (DFFD bit5) decodes
     // the FDC there too — so the ports act as DACs only outside both modes.
     // Single Warrior loads its disk with CPM=1, then streams 7.6 kHz menu PCM
-    // to #3F/#5F with CPM=0 and trdos=0. Downmixed to mono into the covox
-    // buffer; return so the writes never reach the FDC block
+    // to #3F/#5F with CPM=0 and trdos=0. Stereo: left/right latch groups go to
+    // the L/R covox buffers; return so the writes never reach the FDC block
     // (out_has_raw_disk would route them to WD1793 regs).
     else if ((Config::soundrive == 1 ||
               (Config::soundrive == 2 && Z80Ops::isProfi)) &&
@@ -1307,7 +1308,8 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         if (l > 255) l = 255;
         if (r > 255) r = 255;
         LED::touchW(LED::COVOX);
-        ESPectrum::lastCovoxVal = (l + r) >> 1;
+        ESPectrum::lastCovoxVal = l;
+        ESPectrum::lastCovoxValR = r;
         ESPectrum::CovoxGetSample();
         ioContentionLate(MemESP::ramContended[rambank]);
         return;

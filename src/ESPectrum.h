@@ -114,7 +114,11 @@ public:
     static uint8_t audioBuffer_L[ESP_AUDIO_SAMPLES_PENTAGON];
     static uint8_t audioBuffer_R[ESP_AUDIO_SAMPLES_PENTAGON];
     // Dynamically allocated by CovoxSubsys when Config::covox != 0; nullptr otherwise.
-    static uint8_t* audioBufferCovox;
+    // Single 2x allocation: L at audioBufferCovoxL, R at audioBufferCovoxR
+    // (= audioBufferCovoxL + ESP_AUDIO_SAMPLES_PENTAGON). Plain Covox writes the
+    // same value to both; SounDrive splits by port (#0F/#1F/#3F=L, #4F/#5F=R).
+    static uint8_t* audioBufferCovoxL;
+    static uint8_t* audioBufferCovoxR;
     static uint8_t overSamplebuf[ESP_AUDIO_SAMPLES_PENTAGON];
     static unsigned char audioSampleDivider;
     static unsigned char audioAYDivider;
@@ -178,6 +182,7 @@ public:
 #endif
     static int lastaudioBit;
     static int lastCovoxVal;
+    static int lastCovoxValR;
     static int faudioBit;
     static int samplesPerFrame;
     static bool AY_emu;

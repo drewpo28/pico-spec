@@ -189,7 +189,8 @@ void repeat_handler(void) {
 //=======================================================================================
 uint8_t ESPectrum::audioBuffer_L[ESP_AUDIO_SAMPLES_PENTAGON] = {0};
 uint8_t ESPectrum::audioBuffer_R[ESP_AUDIO_SAMPLES_PENTAGON] = {0};
-uint8_t* ESPectrum::audioBufferCovox = nullptr;
+uint8_t* ESPectrum::audioBufferCovoxL = nullptr;
+uint8_t* ESPectrum::audioBufferCovoxR = nullptr;
 uint8_t ESPectrum::overSamplebuf[ESP_AUDIO_SAMPLES_PENTAGON] = {0};
 signed char ESPectrum::aud_volume = ESP_VOLUME_DEFAULT;
 bool ESPectrum::vol_changed = false;
@@ -218,6 +219,7 @@ ESPectrum::FDDSound ESPectrum::fddSound = {{}, 0xACE1, 0, false, 0, 12};
 const uint8_t ESPectrum::fdd_click_decay[12] = {48,36,27,20,15,11,8,6,4,3,2,1};
 int ESPectrum::lastaudioBit = 0;
 int ESPectrum::lastCovoxVal = 0;
+int ESPectrum::lastCovoxValR = 0;
 int ESPectrum::faudioBit = 0;
 int ESPectrum::samplesPerFrame;
 bool ESPectrum::AY_emu = false;
@@ -1263,7 +1265,7 @@ void ESPectrum::reset(uint8_t romInUse) {
   memset(overSamplebuf, 0, sizeof(overSamplebuf));
   memset(audioBuffer_L, 0, sizeof(audioBuffer_L));
   memset(audioBuffer_R, 0, sizeof(audioBuffer_R));
-  if (audioBufferCovox) memset(audioBufferCovox, 0, ESP_AUDIO_SAMPLES_PENTAGON);
+  if (audioBufferCovoxL) memset(audioBufferCovoxL, 0, 2 * ESP_AUDIO_SAMPLES_PENTAGON); // L+R halves
   memset(chip0.SamplebufAY_L, 0, sizeof(chip0.SamplebufAY_L));
   if (chip1) memset(chip1->SamplebufAY_R, 0, sizeof(chip1->SamplebufAY_R));
 #if !PICO_RP2040
@@ -1272,7 +1274,7 @@ void ESPectrum::reset(uint8_t romInUse) {
     memset(saaChip->SamplebufSAA_R, 0, sizeof(saaChip->SamplebufSAA_R));
   }
 #endif
-  lastCovoxVal = lastaudioBit = 0;
+  lastCovoxVal = lastCovoxValR = lastaudioBit = 0;
   memset(Ports::sndriveLatch, 0, sizeof(Ports::sndriveLatch));
 
   AY_emu = Config::AY48;
@@ -1940,15 +1942,17 @@ __not_in_flash("audio") void ESPectrum::BeeperGetSample() {
 }
 
 __not_in_flash("audio") void ESPectrum::CovoxGetSample() {
-  if (!audioBufferCovox) return;
+  if (!audioBufferCovoxL) return;
   uint32_t audbufpos = CPU::tstates / audioCOVOXDivider;
   if (multiplicator)
     audbufpos >>= multiplicator;
   if (audbufpos > audbufcntCovox) {
-    uint8_t *sound_buf = audioBufferCovox + audbufcntCovox;
+    uint8_t *sound_buf_l = audioBufferCovoxL + audbufcntCovox;
+    uint8_t *sound_buf_r = audioBufferCovoxR + audbufcntCovox;
     int sound_bufsize = audbufpos - audbufcntCovox;
     while (sound_bufsize-- > 0) {
-      *sound_buf++ = lastCovoxVal;
+      *sound_buf_l++ = lastCovoxVal;
+      *sound_buf_r++ = lastCovoxValR;
     }
     audbufcntCovox = audbufpos;
   }
@@ -2281,10 +2285,12 @@ void ESPectrum::loop() {
           }
         }
         if (CovoxSubsys::enabled && (Config::covox || Config::soundriveEnabled()) && faudbufcntCovox < samplesPerFrame) {
-          uint8_t *sound_buf = audioBufferCovox + faudbufcntCovox;
+          uint8_t *sound_buf_l = audioBufferCovoxL + faudbufcntCovox;
+          uint8_t *sound_buf_r = audioBufferCovoxR + faudbufcntCovox;
           int sound_bufsize = samplesPerFrame - faudbufcntCovox;
           while (sound_bufsize-- > 0) {
-            *sound_buf++ = lastCovoxVal;
+            *sound_buf_l++ = lastCovoxVal;
+            *sound_buf_r++ = lastCovoxValR;
           }
         }
 #if !PICO_RP2040
@@ -2323,7 +2329,7 @@ void ESPectrum::loop() {
         // Hoist frame-invariant source flags outside the mix loop
         bool mix_chip0 = AY_emu && (Config::turbosound != 0 || AySound::selected_chip == 0);
         bool mix_chip1 = AY_emu && (Config::turbosound != 0 || AySound::selected_chip == 1) && TurboSubsys::enabled && chip1;
-        bool mix_covox = CovoxSubsys::enabled && audioBufferCovox;
+        bool mix_covox = CovoxSubsys::enabled && audioBufferCovoxL;
 #if !PICO_RP2040
         bool mix_saa = SaaSubsys::enabled && saaChip;
         bool mix_midi = MidiSubsys::enabled && (Midi::enabled == 3) && audioBufferMIDI_L && audioBufferMIDI_R;
@@ -2337,12 +2343,15 @@ void ESPectrum::loop() {
         for (int i = 0; i < samplesPerFrame; i++)
         {
           int beeper_L = overSamplebuf[i];
-          if (mix_covox) beeper_L += audioBufferCovox[i];
 #if !PICO_RP2040
           if (mix_pit) beeper_L += audioBufferPIT[i];
 #endif
           if (mix_fdd) beeper_L += getFDDSample(i);
           int beeper_R = beeper_L;
+          if (mix_covox) {
+            beeper_L += audioBufferCovoxL[i];
+            beeper_R += audioBufferCovoxR[i];
+          }
           if (mix_chip0) {
             beeper_L += chip0.SamplebufAY_L[i];
             beeper_R += chip0.SamplebufAY_R[i];

@@ -30,7 +30,7 @@ namespace Subsystems {
     }
 
 SUBSYSTEM_DECL(TurboSubsys);   // AY chip1 (second AY for TurboSound)
-SUBSYSTEM_DECL(CovoxSubsys);   // 640 B audioBufferCovox
+SUBSYSTEM_DECL(CovoxSubsys);   // 640 B audioBufferCovoxL
 SUBSYSTEM_DECL(PitSubsys);     // 640 B audioBufferPIT (Pentagon Byte 8253)
 
 #if !PICO_RP2040

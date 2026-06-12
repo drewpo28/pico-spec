@@ -60,7 +60,8 @@ public:
     static uint8_t dmaInput(uint16_t address);
 
     // SounDrive (Config::covox==3) DAC latches: #0F,#1F,#3F (left), #4F,#5F
-    // (right), #FB (both). Mixed to mono into the covox buffer. Cleared on reset.
+    // (right), #FB (both). Mixed in stereo into the covox L/R buffers.
+    // Cleared on reset.
     static uint8_t sndriveLatch[6];
 
     static uint8_t portAFF7;

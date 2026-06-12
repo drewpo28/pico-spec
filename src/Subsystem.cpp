@@ -71,7 +71,8 @@ bool TurboSubsys::apply() {
 }
 
 // ----------------------------------------------------------------------------
-// CovoxSubsys — 640 B sample buffer used only when Covox DAC is selected.
+// CovoxSubsys — 2x640 B stereo sample buffer used only when Covox DAC is
+// selected. Single allocation: L = first half, R = second half.
 // ----------------------------------------------------------------------------
 volatile bool CovoxSubsys::enabled = false;
 bool CovoxSubsys::wanted = false;
@@ -87,21 +88,23 @@ bool CovoxSubsys::apply() {
     if (wanted == enabled) return true;
 
     if (wanted) {
-        if (!ESPectrum::audioBufferCovox) {
-            ESPectrum::audioBufferCovox = (uint8_t*)calloc(ESP_AUDIO_SAMPLES_PENTAGON, 1);
-            if (!ESPectrum::audioBufferCovox) {
+        if (!ESPectrum::audioBufferCovoxL) {
+            ESPectrum::audioBufferCovoxL = (uint8_t*)calloc(2 * ESP_AUDIO_SAMPLES_PENTAGON, 1);
+            if (!ESPectrum::audioBufferCovoxL) {
                 Debug::log("CovoxSubsys: OOM");
                 wanted = false;
                 Config::covox = 0;
                 Config::soundrive = 0;
                 return false;
             }
+            ESPectrum::audioBufferCovoxR = ESPectrum::audioBufferCovoxL + ESP_AUDIO_SAMPLES_PENTAGON;
         }
         enabled = true;
     } else {
         enabled = false;
-        free(ESPectrum::audioBufferCovox);
-        ESPectrum::audioBufferCovox = nullptr;
+        free(ESPectrum::audioBufferCovoxL);
+        ESPectrum::audioBufferCovoxL = nullptr;
+        ESPectrum::audioBufferCovoxR = nullptr;
     }
     return true;
 }
