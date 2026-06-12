@@ -7,6 +7,7 @@
 #include "pwm_audio.h"
 #include "Config.h"
 #include "Debug.h"
+#include "Subsystem.h"
 #ifdef USE_GS
 #include "GS/GS.h"
 #endif
@@ -288,9 +289,12 @@ static bool hw_get_bit_LOAD() {
 
 void init_sound() {
 #if !PICO_RP2040 && defined(VGA_HDMI)
+    // Buffers (~36.9 KB) are allocated/freed by HdmiAudioSubsys::apply() at
+    // the next Subsystems::applyPending() — both init_sound() call sites are
+    // followed by one.
+    HdmiAudioSubsys::request(Config::audio_driver == 4);
     if (Config::audio_driver == 4) {
         Debug::log("init_sound: HDMI audio mode");
-        hdmi_audio_init();
         return;
     }
 #endif

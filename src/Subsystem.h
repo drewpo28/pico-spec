@@ -2,8 +2,8 @@
  * Subsystem.h — dynamic allocation pattern for optional emulator features.
  *
  * Each optional subsystem (TurboSound chip1, SAA1099, Covox, PIT, MIDI synth,
- * MB-02 EPROM, DivMMC misc state, GigaScreen prev-FB) reserves SRAM only
- * while enabled. apply() is called from a frame-boundary point in
+ * MB-02 EPROM, DivMMC misc state, GigaScreen prev-FB, HDMI audio) reserves
+ * SRAM only while enabled. apply() is called from a frame-boundary point in
  * ESPectrum::loop() so producers/mixer never observe a half-applied state.
  */
 
@@ -36,6 +36,9 @@ SUBSYSTEM_DECL(PitSubsys);     // 640 B audioBufferPIT (Pentagon Byte 8253)
 #if !PICO_RP2040
 SUBSYSTEM_DECL(SaaSubsys);     // SAASound saaChip + sample buffers
 SUBSYSTEM_DECL(MidiSubsys);    // MIDI synth + 2x640 B L/R buffers
+#ifdef VGA_HDMI
+SUBSYSTEM_DECL(HdmiAudioSubsys); // ~36.9 KB HDMI audio packet queue + sample rings
+#endif
 // MB-02 8 KB EPROM composite buffer + extra sync helper for boot path.
 struct Mb02Subsys {
     static volatile bool enabled;

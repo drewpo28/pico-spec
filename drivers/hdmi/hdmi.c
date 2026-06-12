@@ -119,8 +119,11 @@ static inline uint32_t hdmi_scanline_gray(void) {
 // ============================================================
 #define HDMI_AUDIO_RING_SIZE 1024
 #define HDMI_AUDIO_RING_MASK (HDMI_AUDIO_RING_SIZE - 1)
-static volatile int16_t hdmi_audio_ring_L[HDMI_AUDIO_RING_SIZE];
-static volatile int16_t hdmi_audio_ring_R[HDMI_AUDIO_RING_SIZE];
+// Heap-allocated together with aq_blob (~36.9 KB total) by hdmi_audio_init();
+// freed by hdmi_audio_deinit() via the HdmiAudio subsystem so the SRAM is
+// spent only when audio_driver == HDMI.
+static volatile int16_t *hdmi_audio_ring_L = NULL;
+static volatile int16_t *hdmi_audio_ring_R = NULL;
 static volatile uint32_t hdmi_audio_wr = 0;
 static volatile uint32_t hdmi_audio_rd = 0;
 static volatile bool hdmi_audio_enabled = false;
@@ -146,7 +149,7 @@ static hdmi_di_blob_t blob_null_vs;  // Null packet with VSYNC=0 baked (vsync li
 // the steady line-locked drain. 128 packets x 4 samples / 32 kHz ≈ 16 ms of
 // stall tolerance (was 32 = 4 ms, too shallow → underrun → TV audio mute).
 #define HDMI_AQ_LEN 128
-static hdmi_di_blob_t aq_blob[HDMI_AQ_LEN];
+static hdmi_di_blob_t *aq_blob = NULL;  // heap, see hdmi_audio_ring_L note
 static volatile uint32_t aq_wr = 0, aq_rd = 0;
 
 // Emission pacing: depth-targeted bang-bang around HDMI_AU_TARGET queued
@@ -1416,6 +1419,8 @@ static void hdmi_pick_acr(uint32_t pix_hz, uint32_t *n_out, uint32_t *cts_out) {
 }
 
 static void __attribute__((noinline)) hdmi_audio_hw_init(void) {
+    // Buffers not allocated (subsystem off / OOM) — audio stays disabled
+    if (!aq_blob) return;
     struct video_mode_t mode = graphics_get_video_mode(get_video_mode());
     // Island block (22 bytes) + ≥2 bytes control + video preamble (4) + guard (1)
     // must fit into hsync + back porch
@@ -1554,7 +1559,7 @@ void hdmi_audio_dbg_stats(uint32_t *q_prod, uint32_t *q_cons, uint32_t *s_prod, 
     *s_cons = hdmi_audio_rd;
 }
 
-void hdmi_audio_init(void) {
+bool hdmi_audio_init(void) {
     // init_sound() re-runs on every machine reset/arch switch. Once audio is
     // live, the SPSC indices are owned by the core0 timer IRQ (producer) and
     // the core1 video ISR (consumer) — zeroing them here races their
@@ -1562,17 +1567,43 @@ void hdmi_audio_init(void) {
     // queue forever and feeding garbage blobs to the sink). Reset only on
     // the first bring-up.
     if (!hdmi_audio_enabled) {
+        if (!aq_blob) {
+            // Packet queue + both sample rings in one block (~36.9 KB): the
+            // dominant SRAM cost of HDMI audio, paid only while it's enabled.
+            uint8_t *blk = (uint8_t *)calloc(HDMI_AQ_LEN * sizeof(hdmi_di_blob_t)
+                                             + 2 * HDMI_AUDIO_RING_SIZE * sizeof(int16_t), 1);
+            if (!blk) return false;
+            aq_blob = (hdmi_di_blob_t *)blk;
+            hdmi_audio_ring_L = (volatile int16_t *)(blk + HDMI_AQ_LEN * sizeof(hdmi_di_blob_t));
+            hdmi_audio_ring_R = hdmi_audio_ring_L + HDMI_AUDIO_RING_SIZE;
+        }
         hdmi_audio_wr = 0;
         hdmi_audio_rd = 0;
         aq_wr = 0;
         aq_rd = 0;
-        nf_memset((void *)hdmi_audio_ring_L, 0, sizeof(hdmi_audio_ring_L));
-        nf_memset((void *)hdmi_audio_ring_R, 0, sizeof(hdmi_audio_ring_R));
+        nf_memset((void *)hdmi_audio_ring_L, 0, HDMI_AUDIO_RING_SIZE * sizeof(int16_t));
+        nf_memset((void *)hdmi_audio_ring_R, 0, HDMI_AUDIO_RING_SIZE * sizeof(int16_t));
     }
     // Init order safe both ways: graphics_init_hdmi() (core1 startup) calls
     // hdmi_audio_hw_init() when the flag is already set; if init_sound() runs
     // later, this direct call brings the hardware tables up instead.
     hdmi_audio_hw_init();
+    return hdmi_audio_enabled;
+}
+
+void hdmi_audio_deinit(void) {
+    if (hdmi_audio_enabled) {
+        hdmi_audio_enabled = false;
+        __dmb();
+        // An in-flight core1 scanline ISR that sampled the flag before the
+        // clear may still read aq_blob; it finishes within one line period
+        // (~32 µs) — wait that out with margin before freeing.
+        busy_wait_us(200);
+    }
+    free((void *)aq_blob);  // single block, see hdmi_audio_init
+    aq_blob = NULL;
+    hdmi_audio_ring_L = NULL;
+    hdmi_audio_ring_R = NULL;
 }
 
 void __not_in_flash_func(hdmi_audio_write_sample)(int16_t left, int16_t right) {

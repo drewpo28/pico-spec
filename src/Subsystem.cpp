@@ -21,6 +21,9 @@ extern size_t getFreeHeap(void);
 #include "MidiSynth.h"
 #include "MB02.h"
 #include "DivMMC.h"
+#ifdef VGA_HDMI
+#include "hdmi.h"
+#endif
 #endif
 
 #include "Debug.h"
@@ -340,6 +343,44 @@ void DivMmcSubsys::syncFromState() {
     dirty = false;
 }
 
+// ----------------------------------------------------------------------------
+// HdmiAudioSubsys — HDMI audio packet queue + sample rings (~36.9 KB), used
+// only when audio_driver == 4 (HDMI). The driver choice itself changes only
+// via reboot today, so apply() effectively runs once at setup; the disable
+// path keeps the contract complete for a future hot toggle.
+// ----------------------------------------------------------------------------
+#ifdef VGA_HDMI
+
+volatile bool HdmiAudioSubsys::enabled = false;
+bool HdmiAudioSubsys::wanted = false;
+bool HdmiAudioSubsys::dirty = false;
+
+void HdmiAudioSubsys::request(bool on) {
+    wanted = on;
+    if (wanted != enabled) dirty = true;
+}
+
+bool HdmiAudioSubsys::apply() {
+    dirty = false;
+    if (wanted == enabled) return true;
+
+    if (wanted) {
+        if (!hdmi_audio_init()) {
+            Debug::log("HdmiAudioSubsys: init failed, free=%u", (unsigned)getFreeHeap());
+            hdmi_audio_deinit();   // release the block if alloc partially succeeded
+            wanted = false;
+            return false;
+        }
+        enabled = true;
+    } else {
+        enabled = false;
+        hdmi_audio_deinit();
+    }
+    return true;
+}
+
+#endif // VGA_HDMI
+
 #endif // !PICO_RP2040
 
 // ----------------------------------------------------------------------------
@@ -381,5 +422,11 @@ void Subsystems::applyPending() {
         Debug::log2SD("Subsys: Gs wanted=%d freeHeap=%u", (int)GsSubsys::wanted, (unsigned)getFreeHeap());
         GsSubsys::apply();
     }
+#ifdef VGA_HDMI
+    if (HdmiAudioSubsys::dirty) {
+        Debug::log2SD("Subsys: HdmiAudio wanted=%d freeHeap=%u", (int)HdmiAudioSubsys::wanted, (unsigned)getFreeHeap());
+        HdmiAudioSubsys::apply();
+    }
+#endif
 #endif
 }

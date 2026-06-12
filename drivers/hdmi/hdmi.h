@@ -34,7 +34,14 @@ extern "C" {
 
 // HDMI audio support (RP2350 only)
 #if !PICO_RP2040
-void hdmi_audio_init(void);
+// Allocates the packet queue + sample rings (~36.9 KB) on first call and
+// brings the audio hardware tables up. Returns false on OOM or if the video
+// mode can't carry Data Islands. Managed by HdmiAudioSubsys — prefer
+// HdmiAudioSubsys::request() over calling this directly.
+bool hdmi_audio_init(void);
+// Stops island emission (waits out the in-flight core1 ISR) and frees the
+// buffers allocated by hdmi_audio_init().
+void hdmi_audio_deinit(void);
 void hdmi_audio_write_sample(int16_t left, int16_t right);
 // Diagnostic stage of the staged-injection debug build:
 // -1 = audio disabled or staging compiled out, 0..3 = active stage
