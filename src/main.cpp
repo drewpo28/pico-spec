@@ -952,17 +952,81 @@ uint32_t __not_in_flash_func(butter_psram_size)() {
         PSRAM_DATA[i] = 1;
     register uint32_t res = PSRAM_DATA[MB16 - 4096];
     for (register int i = MB16 - MB1; i < MB16; i += 4096) {
-        if (res != PSRAM_DATA[i])
+        if (res != PSRAM_DATA[i]) {
+            BUTTER_PSRAM_SIZE = 0;
             return 0;
+        }
     }
+    // A floating bus (no chip) can read back a consistent garbage value (e.g.
+    // 0xFF); only the markers actually planted by the probe are trustworthy.
+    if (res != 1 && res != 4 && res != 8 && res != 16)
+        res = 0;
     BUTTER_PSRAM_SIZE = res << 20;
     return BUTTER_PSRAM_SIZE;
 #endif
 }
+
+// Probe for a PSRAM chip on XIP CS1 via QMI direct mode: exit QPI (0xF5) in
+// case the chip is still in QPI after a warm reboot, then Read ID (0x9F).
+// APS6404-compatible chips answer MF ID 0x0D, KGD 0x5D; with no chip the SD
+// lines float and read 0x00/0xFF. Must run entirely from RAM: while direct
+// mode is enabled any flash (CS0) access would deadlock the QMI.
+static bool __no_inline_not_in_flash_func(psram_detect)() {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        // Exit QPI mode (quad-width single byte, output enabled)
+        qmi_hw->direct_csr |= QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+        qmi_hw->direct_tx = QMI_DIRECT_TX_OE_BITS |
+                            (QMI_DIRECT_TX_IWIDTH_VALUE_Q << QMI_DIRECT_TX_IWIDTH_LSB) |
+                            0xF5;
+        while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
+            ;
+        (void)qmi_hw->direct_rx;
+        qmi_hw->direct_csr &= ~QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+        for (volatile int d = 0; d < 64; ++d)   // respect min CS deselect time
+            ;
+
+        // Read ID: 0x9F + 3 address bytes, then MF ID and KGD
+        qmi_hw->direct_csr |= QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+        uint8_t mfid = 0, kgd = 0;
+        for (int i = 0; i < 6; ++i) {
+            qmi_hw->direct_tx = (i == 0) ? 0x9F : 0xFF;
+            while (!(qmi_hw->direct_csr & QMI_DIRECT_CSR_TXEMPTY_BITS))
+                ;
+            while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
+                ;
+            uint8_t b = (uint8_t)qmi_hw->direct_rx;
+            if (i == 4) mfid = b;
+            else if (i == 5) kgd = b;
+        }
+        qmi_hw->direct_csr &= ~QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+        for (volatile int d = 0; d < 64; ++d)
+            ;
+
+        if (kgd == 0x5D || mfid == 0x5D)
+            return true;
+        // The first transaction after a chip reset is known to come back
+        // garbage on some chips (see init_psram in psram_spi.c) — retry.
+    }
+    return false;
+}
 void __no_inline_not_in_flash_func(psram_init)(uint cs_pin) {
     gpio_set_function(cs_pin, GPIO_FUNC_XIP_CS1);
 
-    // Enable direct mode, PSRAM CS, clkdiv of 10.
+    // Enable direct mode (manual CS for the ID probe), clkdiv of 30.
+    qmi_hw->direct_csr = 30 << QMI_DIRECT_CSR_CLKDIV_LSB | QMI_DIRECT_CSR_EN_BITS;
+    while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
+        ;
+
+    // No chip on CS1 (board assembled without PSRAM): leave XIP CS1 unconfigured.
+    // Without this check the size probe below reads a floating bus, which can
+    // return a consistent garbage value and report a chip that is not there.
+    if (!psram_detect()) {
+        qmi_hw->direct_csr = 0;
+        BUTTER_PSRAM_SIZE = 0;
+        return;
+    }
+
+    // Re-enter direct mode with auto CS, clkdiv of 10.
     qmi_hw->direct_csr = 10 << QMI_DIRECT_CSR_CLKDIV_LSB | \
                                QMI_DIRECT_CSR_EN_BITS | \
                                QMI_DIRECT_CSR_AUTO_CS1N_BITS;
