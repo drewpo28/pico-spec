@@ -9948,16 +9948,16 @@ return text;
 }
 
 #define MENU_JOYSELKEY_EN "Key      \n"\
+    "None     \n"\
     "A-Z      \n"\
     "0-9      \n"\
     "Special  \n"\
-    "PS/2     \n"\
     "Joystick \n"
 #define MENU_JOYSELKEY_ES "Tecla    \n"\
+    "None     \n"\
     "A-Z      \n"\
     "0-9      \n"\
     "Especial \n"\
-    "PS/2     \n"\
     "Joystick \n"
 static const char *MENU_JOYSELKEY[2] = { MENU_JOYSELKEY_EN, MENU_JOYSELKEY_ES };
 
@@ -10002,16 +10002,6 @@ static const char *MENU_JOYSELKEY[2] = { MENU_JOYSELKEY_EN, MENU_JOYSELKEY_ES };
 	"9\n"
 
 #define MENU_JOY_SPECIAL\
-    "Enter\n"\
-    "Caps\n"\
-    "SymbShift\n"\
-    "Brk/Space\n"\
-    "Backspace\n"\
-    "KP 0/Ins\n"\
-    "KP ./Del\n"\
-    "None\n"
-
-#define MENU_JOY_PS2 "PS/2\n"\
     "F1\n"\
     "F2\n"\
     "F3\n"\
@@ -10029,7 +10019,14 @@ static const char *MENU_JOYSELKEY[2] = { MENU_JOYSELKEY_EN, MENU_JOYSELKEY_ES };
     "Left\n"\
     "Right\n"\
     "Up\n"\
-    "Down\n"
+    "Down\n"\
+    "Enter\n"\
+    "Caps\n"\
+    "SymbShift\n"\
+    "Brk/Space\n"\
+    "Backspace\n"\
+    "KP 0/Ins\n"\
+    "KP ./Del\n"
 
 #define MENU_JOY_KEMPSTON "DPAD\n"\
     "Left\n"\
@@ -10263,7 +10260,7 @@ unsigned int joyControl[14][3]={
     {63,30,zxColor(0,0)},   // Up
     {63,78,zxColor(0,0)},   // Down
     {49,109,zxColor(0,0)},  // Start
-    {136,109,zxColor(0,0)}, // Mode
+    {130,109,zxColor(0,0)}, // Select
     {142,17,zxColor(0,0)},  // A (circle left of A cell)
     {222,17,zxColor(0,0)},  // B
     {142,65,zxColor(0,0)},  // C
@@ -10303,10 +10300,10 @@ void DrawjoyControls(unsigned short x, unsigned short y) {
     VIDEO::vga.setCursor(x + joyControl[4][0], y + joyControl[4][1]);
     VIDEO::vga.print("START");
 
-    // MODE text
+    // SELECT text
     VIDEO::vga.setTextColor(joyControl[5][2], zxColor(7, 1));
     VIDEO::vga.setCursor(x + joyControl[5][0], y + joyControl[5][1]);
-    VIDEO::vga.print("MODE");
+    VIDEO::vga.print("SELECT");
 
     // Text A
     VIDEO::vga.setTextColor( joyControl[6][2],zxColor(7, 1));
@@ -10689,15 +10686,15 @@ void OSD::joyDialog(void) {
     int joytype = Config::joystick;
 
     string selkeymenu[5] = {
+        "",             // None (no submenu)
         MENU_JOY_AZ,
         MENU_JOY_09,
         "",
-        MENU_JOY_PS2,
         "Joystick"
     };
 
-    selkeymenu[2] = (Config::lang ? "Especial\n" : "Special\n");
-    selkeymenu[2] += MENU_JOY_SPECIAL;
+    selkeymenu[3] = (Config::lang ? "Especial\n" : "Special\n");
+    selkeymenu[3] += MENU_JOY_SPECIAL;
     selkeymenu[4] = MENU_JOY_KEMPSTON;
     int curDropDown = 2;
     uint8_t joyDialogMode = 0; // 0 -> Define, 1 -> Test
@@ -10849,46 +10846,27 @@ void OSD::joyDialog(void) {
                             menu_saverect = true;
                             uint8_t opt = simpleMenuRun(keymenu,x + joyDropdown[curDropDown][0],y + joyDropdown[curDropDown][1],6,11);
                             if(opt!=0) {
+                                if (opt == 1) {// None: assign directly, no submenu
+                                    joyDropdown[curDropDown][6] = fabgl::VK_NONE;
+                                    VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
+                                    VIDEO::vga.setCursor(x + joyDropdown[curDropDown][0], y + joyDropdown[curDropDown][1]);
+                                    VIDEO::vga.print(vkToText(joyDropdown[curDropDown][6]).c_str());
+                                    break;
+                                }
                                 // Key select menu
                                 menu_saverect = true;
                                 menu_level = 0;
                                 menu_curopt = 1;
                                 uint8_t opt2 = simpleMenuRun(selkeymenu[opt - 1],x + joyDropdown[curDropDown][0],y + joyDropdown[curDropDown][1],6,11);
                                 if(opt2!=0) {
-                                    if (opt == 1) {// A-Z
+                                    if (opt == 2) {// A-Z
                                         joyDropdown[curDropDown][6] = (fabgl::VirtualKey) 47 + opt2;
                                     } else
-                                    if (opt == 2) {// 0-9
+                                    if (opt == 3) {// 0-9
                                         joyDropdown[curDropDown][6] = (fabgl::VirtualKey) 1 + opt2;
                                     } else
-                                    if (opt == 3) {// Special
-                                        if (opt2 == 1) {
-                                            joyDropdown[curDropDown][6] = fabgl::VK_RETURN;
-                                        } else
-                                        if (opt2 == 2) {
-                                            joyDropdown[curDropDown][6] = fabgl::VK_LSHIFT;
-                                        } else
-                                        if (opt2 == 3) {
-                                            joyDropdown[curDropDown][6] = fabgl::VK_LCTRL;
-                                        } else
-                                        if (opt2 == 4) {
-                                            joyDropdown[curDropDown][6] = fabgl::VK_SPACE;
-                                        } else
-                                        if (opt2 == 5) {
-                                            joyDropdown[curDropDown][6] = fabgl::VK_BACKSPACE;
-                                        } else
-                                        if (opt2 == 6) {
-                                            joyDropdown[curDropDown][6] = fabgl::VK_KP_0;
-                                        } else
-                                        if (opt2 == 7) {
-                                            joyDropdown[curDropDown][6] = fabgl::VK_KP_PERIOD;
-                                        } else
-                                        if (opt2 == 8) {
-                                            joyDropdown[curDropDown][6] = fabgl::VK_NONE;
-                                        }
-                                    } else
-                                    if (opt == 4) {// PS/2
-                                        if (opt2 < 13) {
+                                    if (opt == 4) {// Special
+                                        if (opt2 < 13) {// F1-F12
                                             joyDropdown[curDropDown][6] = (fabgl::VirtualKey) 158 + opt2;
                                         } else
                                         if (opt2 == 13) {
@@ -10908,6 +10886,27 @@ void OSD::joyDialog(void) {
                                         } else
                                         if (opt2 == 18) {
                                             joyDropdown[curDropDown][6] = fabgl::VirtualKey::VK_DOWN;
+                                        } else
+                                        if (opt2 == 19) {
+                                            joyDropdown[curDropDown][6] = fabgl::VK_RETURN;
+                                        } else
+                                        if (opt2 == 20) {
+                                            joyDropdown[curDropDown][6] = fabgl::VK_LSHIFT;
+                                        } else
+                                        if (opt2 == 21) {
+                                            joyDropdown[curDropDown][6] = fabgl::VK_LCTRL;
+                                        } else
+                                        if (opt2 == 22) {
+                                            joyDropdown[curDropDown][6] = fabgl::VK_SPACE;
+                                        } else
+                                        if (opt2 == 23) {
+                                            joyDropdown[curDropDown][6] = fabgl::VK_BACKSPACE;
+                                        } else
+                                        if (opt2 == 24) {
+                                            joyDropdown[curDropDown][6] = fabgl::VK_KP_0;
+                                        } else
+                                        if (opt2 == 25) {
+                                            joyDropdown[curDropDown][6] = fabgl::VK_KP_PERIOD;
                                         }
                                     } else
                                     if (opt == 5) {// Kempston / Fuller
