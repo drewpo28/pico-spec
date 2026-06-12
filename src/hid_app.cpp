@@ -503,6 +503,8 @@ static void process_hid_gamepad(uint8_t const* report, uint16_t len)
     bool btn_y     = (b5 & 0x80) != 0;
     bool btn_l     = (b6 & 0x01) != 0;
     bool btn_r     = (b6 & 0x02) != 0;
+    bool btn_lt    = (b6 & 0x04) != 0;  // LT/RT: DragonRise-family layout,
+    bool btn_rt    = (b6 & 0x08) != 0;  // zero on pads without triggers
     bool btn_sel   = (b6 & 0x10) != 0;
     bool btn_start = (b6 & 0x20) != 0;
 
@@ -545,11 +547,13 @@ static void process_hid_gamepad(uint8_t const* report, uint16_t len)
     }
     // X / Y / L / R — fed to joydef via VK_JOY_X/Y/Z/C-style dropdowns. Use the
     // remaining DPAD slots so users can rebind in the joystick definition menu.
-    static bool prev_x = false, prev_y = false, prev_l = false, prev_r = false;
+    static bool prev_x = false, prev_y = false, prev_l = false, prev_r = false, prev_lt = false, prev_rt = false;
     if (btn_x != prev_x) { kbdPushData(fabgl::VirtualKey::VK_JOY_X, btn_x); prev_x = btn_x; }
     if (btn_y != prev_y) { kbdPushData(fabgl::VirtualKey::VK_JOY_Y, btn_y); prev_y = btn_y; }
     if (btn_l != prev_l) { kbdPushData(fabgl::VirtualKey::VK_JOY_Z, btn_l); prev_l = btn_l; }
     if (btn_r != prev_r) { kbdPushData(fabgl::VirtualKey::VK_JOY_C, btn_r); prev_r = btn_r; }
+    if (btn_lt != prev_lt) { kbdPushData(fabgl::VirtualKey::VK_JOY_L2, btn_lt); prev_lt = btn_lt; }
+    if (btn_rt != prev_rt) { kbdPushData(fabgl::VirtualKey::VK_JOY_R2, btn_rt); prev_rt = btn_rt; }
 
     gamepad1_bits.up = up;
     gamepad1_bits.down = down;
@@ -828,6 +832,8 @@ static void process_f710_dinput(uint8_t instance, uint8_t const* report, uint16_
     bool btn_y     = (face & 0x80) != 0;
     bool btn_lb    = (b5 & 0x01) != 0;
     bool btn_rb    = (b5 & 0x02) != 0;
+    bool btn_lt    = (b5 & 0x04) != 0;
+    bool btn_rt    = (b5 & 0x08) != 0;
     bool btn_back  = (b5 & 0x10) != 0;
     bool btn_start = (b5 & 0x20) != 0;
 
@@ -864,11 +870,13 @@ static void process_f710_dinput(uint8_t instance, uint8_t const* report, uint16_
         if (Config::secondJoy != 1) joyPushData(fabgl::VirtualKey::VK_DPAD_SELECT, btn_back);
     }
 
-    static bool prev_x = false, prev_y = false, prev_lb = false, prev_rb = false;
+    static bool prev_x = false, prev_y = false, prev_lb = false, prev_rb = false, prev_lt = false, prev_rt = false;
     if (btn_x  != prev_x)  { kbdPushData(fabgl::VirtualKey::VK_JOY_X, btn_x);  prev_x  = btn_x; }
     if (btn_y  != prev_y)  { kbdPushData(fabgl::VirtualKey::VK_JOY_Y, btn_y);  prev_y  = btn_y; }
     if (btn_lb != prev_lb) { kbdPushData(fabgl::VirtualKey::VK_JOY_Z, btn_lb); prev_lb = btn_lb; }
     if (btn_rb != prev_rb) { kbdPushData(fabgl::VirtualKey::VK_JOY_C, btn_rb); prev_rb = btn_rb; }
+    if (btn_lt != prev_lt) { kbdPushData(fabgl::VirtualKey::VK_JOY_L2, btn_lt); prev_lt = btn_lt; }
+    if (btn_rt != prev_rt) { kbdPushData(fabgl::VirtualKey::VK_JOY_R2, btn_rt); prev_rt = btn_rt; }
 
     gamepad1_bits.up     = up;
     gamepad1_bits.down   = down;

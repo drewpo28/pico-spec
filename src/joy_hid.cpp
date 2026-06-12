@@ -47,8 +47,9 @@ static xinput_snap_t xinput_snap[CFG_TUH_XINPUT];
 // Mapping mirrors hid_app.cpp process_ds4_gamepad/process_hid_gamepad:
 // D-pad+stick → Kempston (VK_DPAD_*) + OSD nav (VK_MENU_*), no cursor
 // overlay. A=Fire, B=AltFire, Start=F1/Start, Back=Select, X/Y/LB/RB →
-// VK_JOY_X/Y/Z/C for joydef rebinding. Left analog stick falls back to
-// D-pad direction so games requiring Kempston work without the hat.
+// VK_JOY_X/Y/Z/C and LT/RT → VK_JOY_L2/R2 for joydef rebinding. Left
+// analog stick falls back to D-pad direction so games requiring
+// Kempston work without the hat.
 void tuh_xinput_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* report, uint16_t len) {
     auto xid_itf = (xinputh_interface_t *)report;
     const xinput_gamepad_t* p = &xid_itf->pad;
@@ -127,6 +128,17 @@ void tuh_xinput_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t c
     if (btn_y  != prev_y)  { kbdPushData(fabgl::VirtualKey::VK_JOY_Y, btn_y);  prev_y  = btn_y; }
     if (btn_lb != prev_lb) { kbdPushData(fabgl::VirtualKey::VK_JOY_Z, btn_lb); prev_lb = btn_lb; }
     if (btn_rb != prev_rb) { kbdPushData(fabgl::VirtualKey::VK_JOY_C, btn_rb); prev_rb = btn_rb; }
+
+    // Analog triggers → VK_JOY_L2/R2 (digital, ~25% press threshold).
+    // F710 in XInput mode (046D:C21F) reports garbage in the trigger
+    // bytes (layout differs from real X360 wired) — skip it there.
+    bool f710_x = instance < CFG_TUH_XINPUT &&
+                  xinput_snap[instance].vid == 0x046D && xinput_snap[instance].pid == 0xC21F;
+    bool btn_lt = !f710_x && p->bLeftTrigger  > 0x40;
+    bool btn_rt = !f710_x && p->bRightTrigger > 0x40;
+    static bool prev_lt = false, prev_rt = false;
+    if (btn_lt != prev_lt) { kbdPushData(fabgl::VirtualKey::VK_JOY_L2, btn_lt); prev_lt = btn_lt; }
+    if (btn_rt != prev_rt) { kbdPushData(fabgl::VirtualKey::VK_JOY_R2, btn_rt); prev_rt = btn_rt; }
 
     gamepad1_bits.up     = up;
     gamepad1_bits.down   = down;
