@@ -311,7 +311,11 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   }
   bool ia = Z80Ops::isALF;
   uint8_t p8 = address & 0xFF;
-  if ((Z80Ops::isPentagon || Z80Ops::isProfi)) { // Hidden RAM (Pentagon 512/1024 only)
+  // Hidden RAM — Pentagon 512/1024 (and Profi) only. Plain Pentagon 128 must NOT
+  // react: stock software probes #xxFB (printer port) — e.g. BALLQ's loader does
+  // IN A,(#FB) at init — and remapping bank 0 to ram[MEM_PG_CNT+romLatch] sends
+  // every bank-0 access through SD-swap on no-PSRAM boards (FPS halves).
+  if ((Z80Ops::is512 || Z80Ops::is1024 || Z80Ops::isProfi)) {
     if (p8 == 0xFB) { // Hidden RAM on
       MemESP::newSRAM = true;
       MemESP::recoverPage0();

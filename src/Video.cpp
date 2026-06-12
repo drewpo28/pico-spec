@@ -2872,7 +2872,7 @@ IRAM_ATTR void VIDEO::EndFrame() {
 
     // Frame-timing diagnostic: average CPU::loop() time, logged every 60 frames.
 #if PERF_TRACE
-    if (Config::arch == "Profi") {
+    {   // all archs: cpu_frame_us is accumulated unconditionally in CPU::loop()
         extern volatile uint32_t cpu_frame_us;
         extern volatile uint32_t fdd_step_us;   // time in end-of-frame rvmWD1793Step
         extern volatile uint32_t hdmi_irq_max_gap_us;
