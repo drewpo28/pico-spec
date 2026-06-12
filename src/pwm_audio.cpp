@@ -513,6 +513,7 @@ void pcm_setup(int hz) {
 #if !PICO_RP2040
     if (Config::audio_driver == 4) {
         // HDMI audio — timer only, no I2S/PWM hardware
+        if (m_timer.delay_us) cancel_repeating_timer(&m_timer);
         add_repeating_timer_us(-1000000 / hz, timer_callback, NULL, &m_timer);
         return;
     }

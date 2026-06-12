@@ -1170,14 +1170,14 @@ static const char *MENU_SOUNDRIVE[2] = { MENU_SOUNDRIVE_EN, MENU_SOUNDRIVE_EN };
     "Auto     \t[A]\n"\
     "PWM      \t[P]\n"\
     "i2s      \t[I]\n"\
-    "AY-3-8910\t[Y]\n"
-	// \"HDMI     \t[H]\n"
+    "AY-3-8910\t[Y]\n"\
+	"HDMI     \t[H]\n"
 #define MENU_I2S_ES "Controlador de audio\n"\
     "Auto     \t[A]\n"\
     "PWM      \t[P]\n"\
     "i2s      \t[I]\n"\
-    "AY-3-8910\t[Y]\n"
-	// \"HDMI     \t[H]\n"
+    "AY-3-8910\t[Y]\n"\
+	"HDMI     \t[H]\n"
 static const char *MENU_I2S[2] = { MENU_I2S_EN, MENU_I2S_ES };
 
 #define MENU_AUDIO_BOOST_EN "Volume Boost\n"\

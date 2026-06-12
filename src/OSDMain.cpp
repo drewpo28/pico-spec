@@ -3148,6 +3148,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             menu_saverect = true;
                             while (1) {
                                 string menu = MENU_I2S[Config::lang];
+#if PICO_RP2040 || !defined(VGA_HDMI)
+                                // HDMI audio needs RP2350 + HDMI video — hide the entry
+                                {
+                                    auto pos = menu.find("HDMI");
+                                    if (pos != string::npos) menu.erase(pos, menu.find('\n', pos) - pos + 1);
+                                }
+#endif
 #ifdef ZERO2
                                 menu += "PCM5122  \t[5]\n";
 #endif
@@ -3163,8 +3170,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 uint8_t opt2 = menuRun(menu);
                                 if (opt2) {
                                     // Map menu position to driver value
-                                    // (HDMI may be hidden, so opt2-1 doesn't always match)
+                                    // (HDMI is hidden on RP2040/non-HDMI builds, so
+                                    // opt2-1 doesn't always match the driver number)
                                     static const uint8_t driver_map[] = {0, 1, 2, 3,
+#if !PICO_RP2040 && defined(VGA_HDMI)
+                                        4,
+#endif
 #ifdef ZERO2
                                         5
 #endif
