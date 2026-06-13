@@ -335,7 +335,22 @@ IRAM_ATTR void CPU::FlushOnHalt() {
 
             uint32_t incr = (stEnd - pre_tstates) >> 2;
             if (pre_tstates & 0x03) incr++;
-            tstates += (incr << 2);
+#if !PICO_RP2040
+            if (Z80Ops::isProfi) {
+                // Land the HALT-wake on the absolute 4T frame grid (phase 0)
+                // rather than inheriting pre_tstates' phase. A HALT only idles
+                // waiting for INT, so its exact wake T-state is a modelling
+                // choice, not discarded computation — same incr, hence same
+                // regR. The inherited phase depends on the (non-deterministic)
+                // flashload/CP/M handoff timing, which made INT-synced border
+                // effects (mcprofi2016) jitter 0..3T per launch; a phase-0
+                // landing is launch-independent. Other archs keep the
+                // inherited-phase model their border timings were calibrated
+                // against.
+                tstates = (pre_tstates & ~3u) + (incr << 2);
+            } else
+#endif
+                tstates += (incr << 2);
             Z80::incRegR(incr & 0x000000FF);
 
         }

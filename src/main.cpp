@@ -1357,37 +1357,61 @@ int main() {
 #endif
         uint16_t running_mhz = clock_get_hz(clk_sys) / 1000000;
         Debug::log2SD("main: cpu_mhz cfg=%d running=%d", (int)Config::cpu_mhz, (int)running_mhz);
-        if (Config::cpu_mhz != running_mhz) {
-            if (try_set_sys_clock_khz(Config::cpu_mhz * KHZ)) {
-                Debug::log2SD("main: sys_clk -> %d MHz OK", (int)Config::cpu_mhz);
-#ifdef VGA_HDMI
-                graphics_set_pio_clk_div((float)Config::cpu_mhz / 252.0f);
-#endif
-                // Reinit audio: I2S PIO divider was calculated for old sys_clk
-                pcm_setup(ESPectrum::Audio_freq);
-            } else {
-                // PLL did not lock — restore original PLL
-                Debug::log2SD("main: PLL lock FAILED at %d MHz, restoring %d",
-                              (int)Config::cpu_mhz, (int)running_mhz);
-                set_sys_clock_khz(running_mhz * KHZ, true);
-                //Config::cpu_mhz = running_mhz;
-                //Config::save();
+
+        // CRITICAL ordering note: ESPectrum::setup() already ran, so GS is live
+        // and the audio repeating-timer ISR fires on core0 at ~Audio_freq. That
+        // ISR (pcm_call_inner) touches GS state and, with HDMI audio, flash/PSRAM.
+        // try_set_sys_clock_khz() briefly drops clk_sys to the USB PLL and brings
+        // it back at the new rate, while flash/PSRAM QMI timing still reflects the
+        // boot clock until flash_timings()/psram_retiming() run. If that ISR (or
+        // any flash/PSRAM access) lands inside this window at the higher clock with
+        // stale QMI timing, the QMI hangs — observed as a freeze on the
+        // try_set_sys_clock_khz() line at 252/504 MHz with GS + HDMI audio enabled
+        // (378 MHz = boot clock, so the whole block is skipped). Run the switch and
+        // the timing fix-up as one interrupt-disabled critical section, then bring
+        // IRQs back only once flash/PSRAM timing matches the new clock. All four
+        // helpers below are __not_in_flash so they execute safely with IRQs off.
+        bool clk_changed = (Config::cpu_mhz != running_mhz);
+        bool clk_locked  = true;
+        {
+            const uint32_t ints = save_and_disable_interrupts();
+            if (clk_changed) {
+                clk_locked = try_set_sys_clock_khz(Config::cpu_mhz * KHZ);
+                if (!clk_locked) {
+                    // PLL did not lock — restore original PLL
+                    set_sys_clock_khz(running_mhz * KHZ, true);
+                }
             }
-        }
-        // Always re-apply flash/PSRAM timing with Config values
+            const uint16_t applied_mhz = clk_locked ? Config::cpu_mhz : running_mhz;
+            // Re-apply flash/PSRAM timing for the now-active clock BEFORE re-enabling
+            // interrupts, so the next flash/PSRAM access (incl. the audio ISR) is safe.
 #ifndef PICO_RP2040
-        flash_timings(Config::cpu_mhz);
+            flash_timings(applied_mhz);
 #endif
 #if PICO_RP2350 && defined(BUTTER_PSRAM_GPIO) && BUTTER_PSRAM_GPIO != 255
-        psram_retiming();
+            psram_retiming();
 #endif
-        // Recalculate PIO SPI PSRAM clkdiv for the now-active sys_clk.
-        // init_psram() ran at boot-time 378 MHz; if Config::cpu_mhz differs
-        // (e.g. 504 MHz) the frozen clkdiv=1.5 drives SCK at 168 MHz — above
-        // the 133 MHz spec.  Always re-apply to get a clean integer divider.
+            // Recalculate PIO SPI PSRAM clkdiv for the now-active sys_clk.
+            // init_psram() ran at boot-time 378 MHz; if applied_mhz differs
+            // (e.g. 504 MHz) the frozen clkdiv=1.5 drives SCK at 168 MHz — above
+            // the 133 MHz spec.  Always re-apply to get a clean integer divider.
 #ifdef PSRAM
-        psram_update_clkdiv();
+            psram_update_clkdiv();
 #endif
+            restore_interrupts(ints);
+        }
+
+        if (clk_changed && clk_locked) {
+            Debug::log2SD("main: sys_clk -> %d MHz OK", (int)Config::cpu_mhz);
+#ifdef VGA_HDMI
+            graphics_set_pio_clk_div((float)Config::cpu_mhz / 252.0f);
+#endif
+            // Reinit audio: I2S PIO divider was calculated for old sys_clk
+            pcm_setup(ESPectrum::Audio_freq);
+        } else if (clk_changed) {
+            Debug::log2SD("main: PLL lock FAILED at %d MHz, restoring %d",
+                          (int)Config::cpu_mhz, (int)running_mhz);
+        }
     }
 
     sem_init(&vga_start_semaphore, 0, 1);

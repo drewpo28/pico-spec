@@ -58,13 +58,21 @@ visit https://zxespectrum.speccy.org/contacto
 #define TS_SCREEN_PROFI        12583  // START OF ULA DRAW PAPER PROFI (56*224+39)
 #define TS_SCREEN_BYTE         14392  // START OF ULA DRAW PAPER BYTE (64*224+56)
 
-// Profi DS80 (512×240) sync-gen runs 192 T-states/line (not 224!) — per ZXMAK2
-// ProfiRenderer: c_ulaLineTime=192, c_ulaFirstPaperLine=72, c_ulaFirstPaperTact=24,
-// c_ulaIntBegin=19 (screen tact = CPU tact + 19), 16T side borders (1T = 4 px).
+// Profi DS80 (512×240) sync-gen runs 192 T-states/line (not 224!) — ZXMAK2
+// ProfiRenderer: c_ulaLineTime=192, c_ulaFirstPaperTact=24, 16T side borders (1T = 4 px).
+// First paper line = 48 after INT, NOT ZXMAK2's 72: mcprofi2016's border effect
+// is exactly 4608 OUTs × 12T = 55296T = 288 lines starting at T≈4574 after INT —
+// it tiles the full 288-line visible window (24+240+24) only with paper at line 48.
+// With 72 the effect ends at paper bottom and the 24-row bottom band stays solid.
+// ZXMAK2's c_ulaIntBegin=19 (screen tact = CPU tact + 19) is NOT subtracted: real-hw
+// photo of mcprofi2016 shows our border pattern ~19T right of the true position with it.
+// −2T net calibration on top of that centres the effect around the paper: +1T measured
+// from hw screenshot side-strip asymmetry, −3T after FlushOnHalt phase-0 snap (CPU.cpp)
+// fixed the per-launch 0..3T wake-up jitter and locked the pattern 3T left of centre.
 #define TSTATES_PER_LINE_PROFI_DS80 192
-#define TS_SCREEN_PROFI_DS80   13829  // 72*192 + 24 - 19 (INT offset)
-#define TS_BORDER_PROFI_DS80_240 13817 // 13829 - 16 (left border) + 4 (step=1 correction)
-#define TS_BORDER_PROFI_DS80_288 9209  // 13817 - 24*192 (24-row top band incl. blanking rows)
+#define TS_SCREEN_PROFI_DS80   9238   // 48*192 + 24 - 2 (calibration)
+#define TS_BORDER_PROFI_DS80_240 9226 // 9238 - 16 (left border) + 4 (step=1 correction)
+#define TS_BORDER_PROFI_DS80_288 4618 // 9226 - 24*192 (24-row top band incl. blanking rows)
 
 #define TS_BORDER_320x240 8948  // START OF BORDER 48 (+5 correction)
 #define TS_BORDER_320x240_128 8878  // START OF BORDER 128 (+5 correction)

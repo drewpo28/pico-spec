@@ -359,12 +359,23 @@ void VIDEO::profiPaletteWrite(uint8_t index, uint8_t profi_color) {
 //   → ink=8 is fully independent from ink=0 → changing palette[8] can't corrupt black pixels.
 // written[] guard in hdmi_set_profi_ds80_mode() ensures paper=0 TMDS wins for merged slots.
 static void init_profi_pair_lookup() {
-    // safe[]: all slots except 240..244 (sync/scanline) and 255 (border) → 250 slots
+    // safe[]: all slots except 240..244 (sync/scanline) and 255 (border) → 250 slots.
+    // With HDMI audio the Data Island machinery owns 40 more indices (184..199 =
+    // DI data set 2, 216..239 = preambles/guards/data set 0 — see hdmi.c), so
+    // pair_lut must avoid them → 210 slots; the bright-ink × bright-paper merges
+    // below free exactly the difference (40 extra merges). VGA video or any
+    // non-HDMI audio driver keeps the full 250-pair palette.
+    bool reserve_di = false;
+#if defined(VGA_HDMI)
+    extern bool SELECT_VGA;
+    reserve_di = !SELECT_VGA && Config::audio_driver == 4;
+#endif
     int safe[256], ns = 0;
     for (int i = 0; i < 256; i++) {
         if (i >= 240 && i <= 244) continue;
         if (i == 255) continue;
-        safe[ns++] = i;  // ns == 250
+        if (reserve_di && ((i >= 184 && i <= 199) || (i >= 216 && i <= 239))) continue;
+        safe[ns++] = i;  // ns == 250 (210 with reserve_di)
     }
     bool assigned[16][16] = {};
     int slot_idx = 0;
@@ -373,6 +384,14 @@ static void init_profi_pair_lookup() {
             // For inks 0..5 only: paper=8 → paper=0 (6 merges to fit in 250 slots).
             // For inks 6..15 (including ink=8): full independence — paper=8 is own slot.
             int cp = (paper == 8 && ink <= 5) ? 0 : paper;
+            // HDMI-audio slot diet: bright ink (9..15) on a DIFFERENT bright paper
+            // renders on the base paper (p-8) instead — 42 candidates minus the two
+            // preserved classic text schemes (white-on-bright-blue and
+            // bright-blue-on-white) = exactly the 40 reserved DI slots. Diagonals
+            // (ink==paper) keep their own slots, so solid fills are unaffected.
+            if (reserve_di && ink >= 9 && paper >= 9 && ink != paper
+                && !(ink == 15 && paper == 9) && !(ink == 9 && paper == 15))
+                cp = paper - 8;
             if (!assigned[ink][cp]) {
                 assigned[ink][cp] = true;
                 VIDEO::profi_pair_lookup[ink][paper] = (uint8_t)safe[slot_idx++];
@@ -381,7 +400,7 @@ static void init_profi_pair_lookup() {
             }
         }
     }
-    // slot_idx == 250 here
+    // slot_idx == 250 here (210 with reserve_di)
 }
 
 bool VIDEO::isProfiDS80() {
@@ -587,8 +606,8 @@ static uint8_t* prevBrdptr8; // 4-bit packed: 1 byte = 2 pixels
 
 #if !PICO_RP2040
 // Apply / restore the Profi DS80 screen+border timing geometry (ZXMAK2
-// ProfiRenderer model: 192 T/line, paper at line 72 tact 24 minus 19T INT
-// offset, 16T side borders, 1T = 4 px = 1 uint16_t of packed pair bytes).
+// ProfiRenderer model: 192 T/line, paper at line 48 tact 24 minus 19T INT
+// offset (see Video.h), 16T side borders, 1T = 4 px = 1 uint16_t of packed pair bytes).
 // on=true:  called from Reset() DS80 branch and EndFrame() activation.
 // on=false: called from EndFrame() deactivation — restores the standard
 // Profi geometry that Reset() computes for non-DS80 (224 T/line).

@@ -291,8 +291,10 @@ void init_sound() {
 #if !PICO_RP2040 && defined(VGA_HDMI)
     // Buffers (~36.9 KB) are allocated/freed by HdmiAudioSubsys::apply() at
     // the next Subsystems::applyPending() — both init_sound() call sites are
-    // followed by one.
-    HdmiAudioSubsys::request(Config::audio_driver == 4);
+    // followed by one. With the VGA output active, Data Islands can't be
+    // emitted at all — don't waste the SRAM on a stale audio_driver=4 config.
+    extern bool SELECT_VGA;
+    HdmiAudioSubsys::request(Config::audio_driver == 4 && !SELECT_VGA);
     if (Config::audio_driver == 4) {
         Debug::log("init_sound: HDMI audio mode");
         return;

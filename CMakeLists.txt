@@ -36,6 +36,7 @@ option(PROFI_PORT_TRACE "Enable 0x7FFD/0xDFFD paging-port write tracing" OFF)
 option(SND_PORT_TRACE "Enable per-port I/O histogram (sound-DAC port hunting)" OFF)
 option(PERF_TRACE "Enable per-60-frame CPU/HDMI/FPS performance logging" OFF)
 option(GS_PERF_TRACE "Enable General Sound per-second perf counters (GS.cpp)" OFF)
+option(GS_DEBUG_TRACE "Enable General Sound port-IO trace ring + auto-dumps (~50 KB SRAM)" OFF)
 
 # Per-board Debug-Probe UART toggles (logging over UART). Declared here together;
 # the board-specific `if(<board>_DBG_UART)` blocks below consume them (they call
@@ -301,6 +302,13 @@ if (GS_PERF_TRACE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE GS_PERF_TRACE=1)
 else ()
     target_compile_definitions(${PROJECT_NAME} PRIVATE GS_PERF_TRACE=0)
+endif ()
+
+# General Sound port-IO trace ring + auto-dump triggers (see GS.cpp
+# `#ifdef GS_DEBUG_TRACE`). Costs ~50 KB SRAM — diagnostic builds only;
+# the code tests presence with #ifdef, so define it only when ON.
+if (GS_DEBUG_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE GS_DEBUG_TRACE=1)
 endif ()
 
 # 0x7FFD/0xDFFD paging-port write tracing (see Ports.cpp `#if PROFI_PORT_TRACE`).

@@ -431,7 +431,9 @@ static void __scratch_x("hdmi_driver") dma_handler_HDMI() {
     // the render leaves too little margin when the ISR fires late (SD/USB
     // IRQ pressure) — torn packets have bad BCH and make the sink mute.
     bool au_ok_now = false, au_ok_prev = false, au_video_guards = false, au_pair_vs = false;
-    if (hdmi_audio_enabled && !profi_ds80_active) {
+    // DS80 mode is island-compatible: when HDMI audio is on, init_profi_pair_lookup
+    // (Video.cpp) keeps the DI palette indices (184..199, 216..239) out of pair_lut.
+    if (hdmi_audio_enabled) {
         const uint b = inx_buf_dma & 1;
         au_pair_vs = (line >= mode.vsync_start) && (line < mode.vsync_end);
         au_ok_now = true; au_ok_prev = true; au_video_guards = true;
@@ -562,7 +564,7 @@ ex:
     }
 
 #if !PICO_RP2040
-    if (hdmi_audio_enabled && !profi_ds80_active) {
+    if (hdmi_audio_enabled) {
         // Byte-level decoration (after the sync memsets above). Vsync lines
         // carry VSYNC=0 variants (Null packets), matching the memset branch.
         if (au_ok_now) {
@@ -963,10 +965,11 @@ extern volatile bool profi_ds80_active; // defined in vga.c, shared with VGA pat
 //   - Snapshot the current conv_color (for full restore on disable, including audio/sync).
 //   - For every (ink,paper) pair encoded in pair_lut[ink*16+paper], write
 //     conv_color[slot] = (TMDS(palette[ink]), TMDS(palette[paper])).
-//     pair_lut contains only safe indices (not in sync range 220-244, not 255).
+//     pair_lut never references sync slots 240-244 or border 255; with HDMI
+//     audio on it also avoids the Data Island indices 184-199/216-239
+//     (init_profi_pair_lookup, Video.cpp) — islands keep running through DS80.
 //   - Explicitly set slot 255 = (TMDS(black), TMDS(black)) so HDMI border fill is black.
-//   - Sync/audio range 220-244 is never touched → stream stays well-formed.
-// active=false: restore from snapshot.
+// active=false: restore from snapshot (skipping live DI slots, see below).
 // Idempotent in both directions.
 void hdmi_set_profi_ds80_mode(bool active,
                                const uint32_t *palette16_rgb888,
@@ -1044,7 +1047,19 @@ void hdmi_set_profi_ds80_mode(bool active,
         profi_ds80_active = true;
     } else {
         if (conv_color_std_snapshot_valid) {
-            for (int i = 0; i < 1240; i++) conv_color[i] = conv_color_std_snapshot[i];
+            for (int i = 0; i < 1240; i++) {
+#if !PICO_RP2040
+                // With audio live, the core1 ISR owns the DI slots: data sets are
+                // rewritten every line (a stale snapshot word restored mid-scan =
+                // torn packet, bad BCH, sink mute) and the control entries are
+                // mode constants identical to the snapshot — skip the whole range.
+                const int slot = i >> 2;  // 4 uint32 words per palette slot
+                if (hdmi_audio_enabled &&
+                    ((slot >= 184 && slot <= 199) || (slot >= 216 && slot <= 239)))
+                    continue;
+#endif
+                conv_color[i] = conv_color_std_snapshot[i];
+            }
         }
         profi_ds80_active = false;
     }
@@ -1630,8 +1645,9 @@ void __not_in_flash_func(hdmi_audio_write_sample)(int16_t left, int16_t right) {
     prevR = right;
     hdmi_audio_wr = wr;
     uint32_t avail = wr - hdmi_audio_rd;
-    // If the consumer stalled (e.g. DS80 mode suppresses islands), drop the
-    // backlog instead of replaying half-overwritten ring data afterwards
+    // If the consumer stalled (paranoia — the core1 ISR drains every line,
+    // including DS80 mode), drop the backlog instead of replaying
+    // half-overwritten ring data afterwards
     if (avail > 256) {
         hdmi_audio_rd = wr - 4;
         avail = 4;
