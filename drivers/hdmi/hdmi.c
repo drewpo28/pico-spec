@@ -119,7 +119,7 @@ static inline uint32_t hdmi_scanline_gray(void) {
 // ============================================================
 #define HDMI_AUDIO_RING_SIZE 1024
 #define HDMI_AUDIO_RING_MASK (HDMI_AUDIO_RING_SIZE - 1)
-// Heap-allocated together with aq_blob (~36.9 KB total) by hdmi_audio_init();
+// Heap-allocated together with aq_blob (~8.6 KB total) by hdmi_audio_init();
 // freed by hdmi_audio_deinit() via the HdmiAudio subsystem so the SRAM is
 // spent only when audio_driver == HDMI.
 static volatile int16_t *hdmi_audio_ring_L = NULL;
@@ -159,14 +159,21 @@ typedef uint64_t hdmi_di_blob_t[32];
 static hdmi_di_blob_t blob_null, blob_acr, blob_audio_if, blob_avi_if, blob_vendor_if;
 static hdmi_di_blob_t blob_null_vs;  // Null packet with VSYNC=0 baked (vsync lines)
 
-// SPSC queue of encoded audio-sample packets: core0 audio IRQ -> core1 video ISR.
+// Raw (un-encoded) audio-sample packet: 4-byte header + 4x8-byte subpackets
+// (ECC already filled by the producer). 36 bytes vs 256 for the encoded blob —
+// the TERC4 expansion (hdmi_pack_blob) is deferred to the ISR consumer, which
+// encodes straight into conv_color. Trades ~27 KB of queue SRAM for a small
+// per-audio-line encode in the core1 video ISR (runs in blanking).
+typedef struct { uint8_t hdr[4]; uint8_t sp[4][8]; } hdmi_audio_pkt_t;
+
+// SPSC queue of raw audio-sample packets: core0 audio IRQ -> core1 video ISR.
 // The consumer (hdmi_di_load) emits packets metered by the VIDEO LINE CLOCK
 // (see hdmi_au_spl24 below), not greedily, so the queue must buffer the gap
 // between the core0 producer timer (which can stall on SD/USB/flash/GS) and
 // the steady line-locked drain. 128 packets x 4 samples / 48 kHz ≈ 10.7 ms of
 // stall tolerance (was 32 = 4 ms, too shallow → underrun → TV audio mute).
 #define HDMI_AQ_LEN 128
-static hdmi_di_blob_t *aq_blob = NULL;  // heap, see hdmi_audio_ring_L note
+static hdmi_audio_pkt_t *aq_blob = NULL;  // heap, see hdmi_audio_ring_L note
 static volatile uint32_t aq_wr = 0, aq_rd = 0;
 
 // Emission pacing: depth-targeted bang-bang around HDMI_AU_TARGET queued
@@ -1356,22 +1363,21 @@ static int hdmi_iec_frame_ct = 0;  // PICO-BK convention: frame_index = (192 - c
 
 // Encode one Audio Sample packet (4 samples L+R, 16-bit) from the ring buffer.
 // Runs on core0 in the 31250 Hz pcm timer IRQ (every 4th tick, ~6 µs with LUTs).
-static void __not_in_flash_func(hdmi_encode_audio_blob)(uint64_t out[32]) {
+static void __not_in_flash_func(hdmi_encode_audio_blob)(hdmi_audio_pkt_t *out) {
     int ct = hdmi_iec_frame_ct;
-    uint8_t hdr[4];
+    uint8_t *hdr = out->hdr;
     hdr[0] = 0x02;
     hdr[1] = 0x0F;                              // layout=0, samples 0-3 present
     hdr[2] = (ct < 4 ? (1 << ct) : 0) << 4;     // B.x: IEC block start flags
     hdr[3] = hdmi_bch3(hdr);
 
-    uint8_t sp[4][8];
     uint32_t rd = hdmi_audio_rd;
     for (int s = 0; s < 4; s++) {
         int16_t l = hdmi_audio_ring_L[(rd + s) & HDMI_AUDIO_RING_MASK];
         int16_t r = hdmi_audio_ring_R[(rd + s) & HDMI_AUDIO_RING_MASK];
         // No channel-status bits (C=0, V=0, U=0) — exactly what SpeccyP
         // transmits; the sink takes the rate from ACR + Audio InfoFrame
-        uint8_t *d = sp[s];
+        uint8_t *d = out->sp[s];
         d[0] = 0;                               // 24-bit sample, low byte 0
         d[1] = l & 0xFF;
         d[2] = (l >> 8) & 0xFF;
@@ -1386,7 +1392,8 @@ static void __not_in_flash_func(hdmi_encode_audio_blob)(uint64_t out[32]) {
     }
     hdmi_iec_frame_ct = ct;
     hdmi_audio_rd = rd + 4;
-    hdmi_pack_blob(out, hdr, sp);
+    // TERC4 encoding deferred to the ISR (hdmi_di_load) — the raw 36-byte
+    // packet sits in the queue until popped.
 }
 
 // ---------- ISR-side packet loader ----------
@@ -1396,7 +1403,8 @@ static void __not_in_flash_func(hdmi_encode_audio_blob)(uint64_t out[32]) {
 // (or lines 1..4 when the mode has no vblank); audio packets whenever the
 // producer queue has one; Null packet otherwise.
 static void __not_in_flash_func(hdmi_di_load)(uint set, uint logical_line) {
-    const uint64_t *src;
+    const uint64_t *src = NULL;
+    const hdmi_audio_pkt_t *qpkt = NULL;
     bool from_q = false;
 
     // The line-clock audio meter credit (hdmi_au_pos) is accrued by the ISR
@@ -1424,7 +1432,7 @@ static void __not_in_flash_func(hdmi_di_load)(uint set, uint logical_line) {
         const uint32_t qd = aq_wr - aq_rd;
         if (qd != 0 && qd <= HDMI_AQ_LEN) {
             hdmi_au_pos -= (4u << 24);
-            src = aq_blob[aq_rd & (HDMI_AQ_LEN - 1)];
+            qpkt = &aq_blob[aq_rd & (HDMI_AQ_LEN - 1)];
             from_q = true;
         }
         else src = blob_null;
@@ -1432,10 +1440,14 @@ static void __not_in_flash_func(hdmi_di_load)(uint set, uint logical_line) {
     else src = blob_null;
 
     uint64_t *dst = ((uint64_t *)conv_color) + (set ? IDX_DI_DATA2_BASE : IDX_DI_DATA_BASE) * 2;
-    for (int i = 0; i < 32; i++) dst[i] = src[i];
     if (from_q) {
+        // Encode the raw audio packet straight into conv_color (replaces the
+        // 32-uint64 copy — see hdmi_audio_pkt_t). hdmi_pack_blob writes all 32.
+        hdmi_pack_blob(dst, qpkt->hdr, qpkt->sp);
         __dmb();
         aq_rd = aq_rd + 1;
+    } else {
+        for (int i = 0; i < 32; i++) dst[i] = src[i];
     }
 }
 
@@ -1601,7 +1613,7 @@ static void __attribute__((noinline)) hdmi_audio_hw_init(void) {
         // the full target depth exists from the very first emitted island and
         // the bang-bang never has to build it by underpacing real audio.
         for (int i = 0; i < HDMI_AU_TARGET; i++)
-            hdmi_encode_audio_blob(aq_blob[(aq_wr + i) & (HDMI_AQ_LEN - 1)]);
+            hdmi_encode_audio_blob(&aq_blob[(aq_wr + i) & (HDMI_AQ_LEN - 1)]);
         aq_wr = aq_wr + HDMI_AU_TARGET;
         hdmi_audio_rd = hdmi_audio_wr;  // encoding consumed zeroed ring; rewind
         __dmb();
@@ -1634,13 +1646,14 @@ bool hdmi_audio_init(void) {
     // the first bring-up.
     if (!hdmi_audio_enabled) {
         if (!aq_blob) {
-            // Packet queue + both sample rings in one block (~36.9 KB): the
-            // dominant SRAM cost of HDMI audio, paid only while it's enabled.
-            uint8_t *blk = (uint8_t *)calloc(HDMI_AQ_LEN * sizeof(hdmi_di_blob_t)
+            // Raw packet queue + both sample rings in one block (~8.6 KB):
+            // 128x36 B queue (raw, not TERC4-encoded) + 2x1024x2 B rings.
+            // Paid only while HDMI audio is enabled.
+            uint8_t *blk = (uint8_t *)calloc(HDMI_AQ_LEN * sizeof(hdmi_audio_pkt_t)
                                              + 2 * HDMI_AUDIO_RING_SIZE * sizeof(int16_t), 1);
             if (!blk) return false;
-            aq_blob = (hdmi_di_blob_t *)blk;
-            hdmi_audio_ring_L = (volatile int16_t *)(blk + HDMI_AQ_LEN * sizeof(hdmi_di_blob_t));
+            aq_blob = (hdmi_audio_pkt_t *)blk;
+            hdmi_audio_ring_L = (volatile int16_t *)(blk + HDMI_AQ_LEN * sizeof(hdmi_audio_pkt_t));
             hdmi_audio_ring_R = hdmi_audio_ring_L + HDMI_AUDIO_RING_SIZE;
         }
         hdmi_audio_wr = 0;
@@ -1706,7 +1719,7 @@ void __not_in_flash_func(hdmi_audio_write_sample)(int16_t left, int16_t right) {
     // Encode up to 2 packets per tick (steady state needs ~0.4/tick; the cap
     // bounds IRQ time while still allowing catch-up after a backlog)
     for (int k = 0; k < 2 && avail >= 4 && (aq_wr - aq_rd) < HDMI_AQ_LEN; k++) {
-        hdmi_encode_audio_blob(aq_blob[aq_wr & (HDMI_AQ_LEN - 1)]);
+        hdmi_encode_audio_blob(&aq_blob[aq_wr & (HDMI_AQ_LEN - 1)]);
         __dmb();
         aq_wr = aq_wr + 1;
         avail = hdmi_audio_wr - hdmi_audio_rd;
