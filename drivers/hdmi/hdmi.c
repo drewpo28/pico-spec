@@ -131,11 +131,28 @@ static volatile bool hdmi_audio_enabled = false;
 // HDMI sinks only accept the standard rate set (32/44.1/48/88.2/96/176.4/192
 // kHz) — a non-standard rate in ACR/channel-status makes some TVs reject the
 // whole input (SpeccyP hit the same wall). The pcm timer produces 31250 Hz
-// (ESP_AUDIO_FREQ); we Bresenham-upsample it to 32 kHz (ratio 1.024, nearly
-// constant 1 sample per tick).  48 kHz (ratio 1.536, alternating 1/2 per tick)
-// causes burst production that can overflow shallow TV audio FIFOs → 0.5 s mute.
-#define HDMI_AUDIO_FS    32000
+// (ESP_AUDIO_FREQ); we Bresenham-upsample it to the HDMI output rate.
+// 48 kHz (ratio 1.536, alternating 1/2 samples per tick) is the most
+// universally supported PCM rate — strict sinks (Sony/Philips) often refuse
+// 32 kHz (not listed in their EDID SAD) and mute, while accepting 48 kHz.
+// Trade-off vs the old 32 kHz (ratio 1.024, near-constant 1/tick): 48 kHz
+// produces bursts that can stress shallow TV audio FIFOs, and the queue's
+// stall-tolerance shrinks ~33% (the same packet count covers fewer ms) — the
+// bang-bang pacing below absorbs the burst; the queue (~10.7 ms at 128 pkt)
+// stays well above the 4 ms that once caused underrun, so depth is unchanged.
+#define HDMI_AUDIO_FS    48000
 #define HDMI_AUDIO_FS_IN 31250
+
+// Audio InfoFrame SF field (CEA-861 / IEC 60958 sample-frequency code), derived
+// from HDMI_AUDIO_FS so the declared rate can never drift from the actual one.
+#define HDMI_AUDIO_SF_CODE ( \
+    (HDMI_AUDIO_FS) == 32000  ? 1 : \
+    (HDMI_AUDIO_FS) == 44100  ? 2 : \
+    (HDMI_AUDIO_FS) == 48000  ? 3 : \
+    (HDMI_AUDIO_FS) == 88200  ? 4 : \
+    (HDMI_AUDIO_FS) == 96000  ? 5 : \
+    (HDMI_AUDIO_FS) == 176400 ? 6 : \
+    (HDMI_AUDIO_FS) == 192000 ? 7 : 0)
 
 // Encoded-packet blobs: 32 uint64 = 16 conv_color entry pairs = one island payload
 typedef uint64_t hdmi_di_blob_t[32];
@@ -146,14 +163,14 @@ static hdmi_di_blob_t blob_null_vs;  // Null packet with VSYNC=0 baked (vsync li
 // The consumer (hdmi_di_load) emits packets metered by the VIDEO LINE CLOCK
 // (see hdmi_au_spl24 below), not greedily, so the queue must buffer the gap
 // between the core0 producer timer (which can stall on SD/USB/flash/GS) and
-// the steady line-locked drain. 128 packets x 4 samples / 32 kHz ≈ 16 ms of
+// the steady line-locked drain. 128 packets x 4 samples / 48 kHz ≈ 10.7 ms of
 // stall tolerance (was 32 = 4 ms, too shallow → underrun → TV audio mute).
 #define HDMI_AQ_LEN 128
 static hdmi_di_blob_t *aq_blob = NULL;  // heap, see hdmi_audio_ring_L note
 static volatile uint32_t aq_wr = 0, aq_rd = 0;
 
 // Emission pacing: depth-targeted bang-bang around HDMI_AU_TARGET queued
-// packets (64 pkt x 4 samples / 32 kHz = 8 ms latency cushion). The ISR
+// packets (64 pkt x 4 samples / 48 kHz ≈ 5.3 ms latency cushion). The ISR
 // accrues per-line-pair credit (.24 fixed-point samples) at +1% over nominal
 // while the queue is above target (drain backlog gently) and -1% at/below it
 // (let the producer rebuild the cushion); hdmi_di_load pops one packet per
@@ -162,7 +179,7 @@ static volatile uint32_t aq_wr = 0, aq_rd = 0;
 // The cushion rides out core0 producer stalls (SD/USB/flash IRQ pressure —
 // the dropouts seen at 378 MHz where a near-empty queue punched audible
 // holes), and the +1% ceiling keeps the post-stall backlog from dumping at
-// 1 pkt/line = 4x the ACR-declared 32 kHz (TV audio FIFO overflow -> ~0.5 s
+// 1 pkt/line = 4x the ACR-declared 48 kHz (TV audio FIFO overflow -> ~0.5 s
 // mute, the original rare-dropout cause).
 // NB: the two rates must STRADDLE the producer rate with margin: the ISR
 // line counter wraps 0..v_total INCLUSIVE (a 640x480 frame is 525 lines,
@@ -172,6 +189,15 @@ static volatile uint32_t aq_wr = 0, aq_rd = 0;
 #define HDMI_AU_TARGET 64
 static uint32_t hdmi_au_spl24_hi = 0, hdmi_au_spl24_lo = 0;
 static uint32_t hdmi_au_pos = 0;       // consumer-only (core1)
+// Credit ceiling. Must survive the longest run of consecutive lines that emit
+// NO audio packet (InfoFrame burst + vsync), or banked credit is clamped away
+// and the consumer systematically under-delivers -> sink mutes permanently.
+// 576p50 puts vsync_start right after the 4 InfoFrame lines (9-line contiguous
+// run) — at 48 kHz that needs ~14 samples of credit; the old fixed 8<<24 (2
+// packets) clamped it (worked at 32 kHz, ~9 samples, by a hair). Computed per
+// mode from spl24 in hdmi_audio_hw_init. The post-run catch-up burst is bounded
+// by the actual queue backlog, not this ceiling, so a generous cap is safe.
+static uint32_t hdmi_au_cap = (8u << 24);
 
 // Per-character ch0 TERC4 base (sync levels + D3 first-char flag), mode-baked.
 // _vs variant has VSYNC=0 (Null packets transmitted on vsync lines).
@@ -442,11 +468,12 @@ static void __scratch_x("hdmi_driver") dma_handler_HDMI() {
         // transmitted lines (pixel doubling); with scanlines enabled the gray
         // 2nd play carries no island and its di_load call is skipped, so
         // accrue per pair HERE — metering per call would halve the delivered
-        // rate. Cap ≈ 2 packets so credit held through ACR/InfoFrame/vsync
-        // lines never releases as a FIFO-choking burst.
+        // rate. Cap (hdmi_au_cap) sized per mode to the longest no-pop run so
+        // credit banked through the ACR/InfoFrame/vsync span is never clamped
+        // away (that under-delivers and mutes the sink — 576p50 @48kHz).
         hdmi_au_pos += ((aq_wr - aq_rd) > HDMI_AU_TARGET ? hdmi_au_spl24_hi
                                                          : hdmi_au_spl24_lo) * 2;
-        if (hdmi_au_pos > (8u << 24)) hdmi_au_pos = (8u << 24);
+        if (hdmi_au_pos > hdmi_au_cap) hdmi_au_pos = hdmi_au_cap;
 #if HDMI_AUDIO_DEBUG_STAGES
         {
             const uint stage = (hdmi_dbg_frame_ct >> 10) & 3;
@@ -1273,7 +1300,7 @@ static void hdmi_build_audio_if_blob(void) {
     uint8_t sp[4][8];
     nf_memset(sp, 0, sizeof(sp));
     sp[0][1] = 0x11;  // CT=1 (PCM), CC=1 (2 channels)
-    sp[0][2] = 0x05;  // SS=1 (16-bit), SF=1 (32 kHz — matches ACR and actual output rate)
+    sp[0][2] = (HDMI_AUDIO_SF_CODE << 2) | 0x01;  // SF=HDMI_AUDIO_FS, SS=1 (16-bit). Matches ACR + actual output rate.
     sp[0][4] = 0x00;  // CA = FL/FR
     sp[0][5] = 0x00;  // LSV=0, DM_INH=0
     hdmi_if_checksum(hdr, sp);
@@ -1415,9 +1442,8 @@ static void __not_in_flash_func(hdmi_di_load)(uint set, uint logical_line) {
 // ---------- init ----------
 
 // Pick ACR N/CTS for the real TMDS pixel clock (clk_sys / (pio_div * 10)).
-// CEA-861-F Table 7-1 recommended N for 32 kHz is 4096; at 25.2 MHz it gives
-// CTS=25200 (the same value SpeccyP uses). Fall back to other N if the clock
-// doesn't divide cleanly.
+// CEA-861-F Table 7-1 recommended N for 48 kHz is 6144; at 25.2 MHz it gives
+// CTS=25200. Fall back to other N if the clock doesn't divide cleanly.
 static void hdmi_pick_acr(uint32_t pix_hz, uint32_t *n_out, uint32_t *cts_out) {
     const uint64_t denom = 128ull * HDMI_AUDIO_FS;  // 4,096,000
     static const uint16_t n_cand[] = { 4096, 6144, 6000, 6720, 5120, 12288 };
@@ -1527,10 +1553,35 @@ static void __attribute__((noinline)) hdmi_audio_hw_init(void) {
     hdmi_au_spl24_hi = spl24 + spl24 / 100;
     hdmi_au_spl24_lo = spl24 - spl24 / 100;
 
-    printf("hdmi_audio_hw_init: mode=%d hs=%d bp=%d v_act=%d v_tot=%d pix=%lu N=%lu CTS=%lu lps=%lu spl24=%lu\n",
+    // Credit ceiling = enough to bank the longest no-pop run (InfoFrame burst +
+    // vsync) without clamping; clamping there under-delivers and the sink mutes
+    // (576p50 @48kHz: 9-line contiguous run, vsync_start right after the 4
+    // InfoFrame lines). InfoFrames span 4 lines from di_if_base+1 (lines 1..4
+    // when no vblank); vsync is [vsync_start, vsync_end). The runs merge into
+    // one when adjacent/overlapping, else the longest is max(4, vsync width).
+    const uint if0 = (di_if_base ? di_if_base : 0) + 1;
+    const uint if1 = if0 + 4;
+    const uint vs0 = (uint)mode.vsync_start, vs1 = (uint)mode.vsync_end;
+    uint nopop_run;
+    if (if0 <= vs1 && vs0 <= if1) {                       // merged run
+        const uint lo = if0 < vs0 ? if0 : vs0;
+        const uint hi = if1 > vs1 ? if1 : vs1;
+        nopop_run = hi - lo;
+    } else {                                              // disjoint
+        const uint vw = vs1 - vs0;
+        nopop_run = vw > 4 ? vw : 4;
+    }
+    // run*spl24_hi (per-line credit at the +1% accrual) + 2 packets headroom
+    // for start-of-run leftover and pair quantization. The post-run catch-up is
+    // bounded by the queue backlog, not this cap, so the headroom is harmless.
+    uint64_t cap = (uint64_t)nopop_run * hdmi_au_spl24_hi + (8u << 24);
+    hdmi_au_cap = cap < (8u << 24) ? (8u << 24) : (uint32_t)cap;
+
+    printf("hdmi_audio_hw_init: mode=%d hs=%d bp=%d v_act=%d v_tot=%d pix=%lu N=%lu CTS=%lu lps=%lu spl24=%lu run=%u cap=%lu\n",
            get_video_mode(), mode.h_sync_bytes, mode.h_bp_bytes, mode.v_active, mode.v_total,
            (unsigned long)pix_hz, (unsigned long)acr_n, (unsigned long)acr_cts,
-           (unsigned long)lines_per_sec, (unsigned long)spl24);
+           (unsigned long)lines_per_sec, (unsigned long)spl24,
+           nopop_run, (unsigned long)hdmi_au_cap);
 
     hdmi_build_null_blob();
     hdmi_build_acr_blob(acr_cts, acr_n);
@@ -1623,7 +1674,7 @@ void hdmi_audio_deinit(void) {
 
 void __not_in_flash_func(hdmi_audio_write_sample)(int16_t left, int16_t right) {
     if (!hdmi_audio_enabled) return;
-    // Bresenham upsample 31250 -> 32000 with linear interpolation between
+    // Bresenham upsample 31250 -> 48000 with linear interpolation between
     // consecutive input samples (plain sample-and-hold leaves audible HF
     // imaging on AY tones). Long-run output rate is exactly 48000/31250.
     static uint32_t accum = 0;
