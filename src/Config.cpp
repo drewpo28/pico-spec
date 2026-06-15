@@ -388,7 +388,14 @@ void Config::loadDiskMounts() {
                 plen = strlen(prefix);
                 if (s.length() >= plen && s.compare(0, plen, prefix) == 0) {
                     std::string fn = s.substr(plen);
-                    if (!fn.empty() && MB02::enabled) {
+                    // Re-insert into the FDD struct even when MB-02+ is currently
+                    // disabled, so the remembered disks survive a power cycle /
+                    // hard reset taken while MB-02+ is off. The struct is never
+                    // ejected on disable (MB02::init keeps disk[] intact), so the
+                    // disks reappear when the interface is re-enabled. InsertDisk
+                    // only opens/parses the file; it doesn't need the track buffer
+                    // that MB02::init allocates on enable.
+                    if (!fn.empty()) {
                         rvmWD1793InsertDisk(&ESPectrum::mb02_fdd, i, fn);
                         if (ESPectrum::mb02_fdd.disk[i])
                             ESPectrum::mb02_fdd.disk[i]->writeprotect = mb02WP[i];
