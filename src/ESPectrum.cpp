@@ -2119,31 +2119,6 @@ void ESPectrum::loop() {
       OSD::osdCenteredMsg(msg, LEVEL_WARN, 5000);
       debug_number = 0;
     }
-#if !PICO_RP2040 && defined(VGA_HDMI)
-    {
-      // HDMI-audio staged diagnostic: announce stage transitions in the log
-      static int hdmi_dbg_last_stage = -2;
-      int hdmi_dbg_s = hdmi_audio_dbg_stage();
-      if (hdmi_dbg_s != hdmi_dbg_last_stage) {
-        hdmi_dbg_last_stage = hdmi_dbg_s;
-        Debug::log("HDMI-audio stage -> %d (0=off 1=vblank-isl 2=+vguard 3=full)\n", hdmi_dbg_s);
-      }
-      // Periodic producer/consumer stats (~60 s): the log write itself blocks
-      // the emulator loop for ~8 ms over the 115200-baud debug UART — keep it
-      // rare so it doesn't cause the very audio gaps it's meant to debug
-      if (Config::audio_driver == 4) {
-        static uint32_t hdmi_dbg_frames = 0;
-        if (++hdmi_dbg_frames >= 3000) {
-          hdmi_dbg_frames = 0;
-          uint32_t qp, qc, sp_, sc;
-          hdmi_audio_dbg_stats(&qp, &qc, &sp_, &sc);
-          Debug::log("HDMI-audio: q_wr=%lu q_rd=%lu (depth %ld) ring_wr=%lu ring_rd=%lu (lag %ld)\n",
-                     (unsigned long)qp, (unsigned long)qc, (long)(qp - qc),
-                     (unsigned long)sp_, (unsigned long)sc, (long)(sp_ - sc));
-        }
-      }
-    }
-#endif
     ts_start = time_us_64();
 
     if (!CPU::paused)
