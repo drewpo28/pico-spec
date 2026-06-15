@@ -971,6 +971,10 @@ static const char *MENU_GS_CLOCK_SEL[2]  = {
     "Indicadores LED\t>\n"\
     "LED tarjeta SD\t>\n"
 static const char *MENU_OTHER[2] = { MENU_OTHER_EN, MENU_OTHER_ES };
+// RP2350-only extra row appended to the Other menu at runtime (Pentagon/Profi
+// Mr Gluk MC146818 clock + battery-backed CMOS persisted to SD).
+static const char *MENU_OTHER_RTC[2] = { "RTC + NVRAM\t>\n", "RTC + NVRAM\t>\n" };
+static const char *MENU_RTC[2]       = { "RTC + NVRAM\n",    "RTC + NVRAM\n" };
 
 #ifdef PICO_RP2040
 #define MENU_CPU_MHZ \
@@ -2243,16 +2247,14 @@ const uint8_t ESPectrum_logo[] = {
 #define MENU_NETWORK_EN \
     "Network\n"\
     "Status\n"\
-    "Connect\n"\
-    "Disconnect\n"\
-    "Reload wifi.cfg\n"\
+    "Sync time (SNTP)\n"\
+    "Time zone\t>\n"\
     "ZiFi NIC\t>\n"
 #define MENU_NETWORK_ES \
     "Red\n"\
     "Estado\n"\
-    "Conectar\n"\
-    "Desconectar\n"\
-    "Recargar wifi.cfg\n"\
+    "Sincronizar hora\n"\
+    "Zona horaria\t>\n"\
     "ZiFi NIC\t>\n"
 static const char *MENU_NETWORK[2] = { MENU_NETWORK_EN, MENU_NETWORK_ES };
 
@@ -2270,6 +2272,16 @@ static const char *MSG_WIFI_DISCONNECTED[2]  = { "Disconnected",      "Desconect
 static const char *MSG_WIFI_CONNECT_ERR[2]   = { "Connect failed",    "Error al conectar"  };
 static const char *MSG_WIFI_NO_CFG[2]        = { "No /wifi.cfg found","Sin /wifi.cfg"      };
 static const char *MSG_WIFI_CFG_RELOADED[2]  = { "wifi.cfg reloaded", "wifi.cfg recargado" };
+static const char *MSG_RTC_SYNCING[2]        = { "Syncing time...",   "Sincronizando..."   };
+static const char *MSG_RTC_SYNCED[2]         = { "Time set:",         "Hora ajustada:"     };
+static const char *MSG_RTC_SYNC_ERR[2]       = { "Time sync failed",  "Error de hora"      };
+static const char *MSG_WIFI_SCANNING[2]      = { "Scanning...",       "Buscando..."        };
+static const char *MSG_WIFI_NO_NETS[2]       = { "No networks found", "Sin redes"          };
+static const char *MSG_WIFI_PASS_LABEL[2]    = { "Pass:",             "Clave:"             };
+static const char *MSG_WIFI_DISCONNECT_Q[2]  = { "Disconnect?",       "\xA8" "Desconectar?" };
+static const char *MENU_WIFI_LIST_TITLE[2]   = { "Wi-Fi networks",    "Redes Wi-Fi"        };
+static const char *MENU_TZ_TITLE[2]          = { "Time zone (UTC)",   "Zona horaria (UTC)" };
+static const char *MENU_ZIFI_GPIO_TITLE[2]   = { "ZiFi UART GPIO",    "ZiFi UART GPIO"     };
 
 #endif // !PICO_RP2040
 

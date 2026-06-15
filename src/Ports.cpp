@@ -66,6 +66,7 @@ extern "C" const uint32_t profi_default_palette16[16];
 #include "DivMMC.h"
 #include "IDE.h"
 #include "ZiFi.h"
+#include "RTC.h"
 #include "MB02.h"
 #include "hardware/gpio.h"
 #include "sdcard.h"
@@ -402,7 +403,26 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       uint8_t zifi_hi = address >> 8;
       if (zifi_hi <= 0xC7)
         return ZiFi::read(zifi_hi);
+      if (zifi_hi >= 0xF8) // 16550 UART window (#F8EF..#FFEF) — raw-UART drivers
+        return ZiFi::uart16550Read(zifi_hi);
     }
+    // MC146818 RTC data read (#BFF7) — Pentagon/Profi "Mr Gluk" TimeKeeper.
+    // Register index was latched via OUT (#DFF7). Port is RTC-specific on these
+    // machines, so no extra gating needed.
+    if (Config::rtc_enabled && (Z80Ops::isPentagon || Z80Ops::isProfi) && address == 0xBFF7) {
+      uint8_t rv = RTC::readData();
+#if RTC_PORT_TRACE
+      Debug::log("[RTC RD ] BFF7 sel=%02X -> %02X pc=%04X eff7=%02X",
+                 RTC::dbgSel(), rv, Z80::getRegPC(), Ports::portEFF7);
+#endif
+      return rv;
+    }
+#if RTC_PORT_TRACE
+    // Catch-all: any other IN with low byte 0xF7 (reveals a non-#BFF7 data port).
+    if ((Z80Ops::isPentagon || Z80Ops::isProfi) && (address & 0xFF) == 0xF7)
+      Debug::log("[RTC IN?] %04X pc=%04X eff7=%02X sel=%02X",
+                 address, Z80::getRegPC(), Ports::portEFF7, RTC::dbgSel());
+#endif
 #endif
 #ifndef NO_ALF
     if (ia && bitRead(p8, 7) == 0) {
@@ -949,6 +969,22 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       ZiFi::write(zifi_hi, data);
       return;
     }
+    if (zifi_hi >= 0xF8) { // 16550 UART window (#F8EF..#FFEF) — raw-UART drivers
+      ZiFi::uart16550Write(zifi_hi, data);
+      return;
+    }
+  }
+  // MC146818 RTC (Pentagon/Profi "Mr Gluk" TimeKeeper):
+  //   OUT (#DFF7), reg  → latch register index
+  //   OUT (#BFF7), data → write selected register
+  if (Config::rtc_enabled && (Z80Ops::isPentagon || Z80Ops::isProfi)) {
+#if RTC_PORT_TRACE
+    if (a8 == 0xF7)
+      Debug::log("[RTC OUT] %04X <- %02X pc=%04X eff7=%02X",
+                 address, data, Z80::getRegPC(), Ports::portEFF7);
+#endif
+    if (address == 0xDFF7) { RTC::selectReg(data); return; }
+    if (address == 0xBFF7) { RTC::writeData(data); return; }
   }
 #endif
 

@@ -274,7 +274,10 @@ bool IDE::createImage(const char* path, uint32_t megabytes,
                       void (*progress)(uint32_t, uint32_t)) {
     if (!path || !path[0] || megabytes == 0) return false;
 
-    FIL f;
+    // Static, not stack: invoked deep in the OSD file-browser/text-edit chain on
+    // core0's 2 KB stack — a ~560 B FIL local risks overflow (see CreateEmptyTRD).
+    // One-shot, non-reentrant.
+    static FIL f;
     FRESULT fr = f_open(&f, path, FA_CREATE_ALWAYS | FA_WRITE);
     if (fr != FR_OK) {
         Debug::log("IDE: createImage open %s failed (err=%d)", path, fr);

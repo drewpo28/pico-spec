@@ -32,6 +32,7 @@ option(ZERO2 "RP2350-PiZero" OFF)
 # Add new toggles here following the same option(...) + compile-definition pattern.
 option(IDE_PORT_TRACE "Enable PROFI IDE/HDD port access tracing" OFF)
 option(FDD_PORT_TRACE "Enable WD1793 (ВГ93) FDD command/port tracing" OFF)
+option(RTC_PORT_TRACE "Enable MC146818 Mr Gluk RTC port access tracing" OFF)
 option(PROFI_PORT_TRACE "Enable 0x7FFD/0xDFFD paging-port write tracing" OFF)
 option(SND_PORT_TRACE "Enable per-port I/O histogram (sound-DAC port hunting)" OFF)
 option(PERF_TRACE "Enable per-60-frame CPU/HDMI/FPS performance logging" OFF)
@@ -156,6 +157,15 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
 
 project(${PROJECT_NAME} C CXX ASM)
+
+# Core0 stack lives at the top of SCRATCH_Y (.scratch_y is empty), and SCRATCH_X
+# (core1/video stack) sits directly below it. The default 2 KB core0 stack is too
+# tight for the OSD menu call chain (file browser → text-edit → file-info/create →
+# std::string + format parsers): it overflowed into SCRATCH_X, corrupting core1's
+# video stack — manifesting as SIGBUS (MSTKERR) crashes (F1 file info, F9 create
+# TRD) and a garbled screen. Grow core0 to 4 KB (fills the otherwise-empty 4 KB
+# SCRATCH_Y exactly); pin core1 at 2 KB so SCRATCH_X is unchanged.
+add_compile_definitions(PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x800)
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
@@ -298,6 +308,14 @@ else ()
     target_compile_definitions(${PROJECT_NAME} PRIVATE FDD_PORT_TRACE=0)
 endif ()
 
+# RTC (MC146818 Mr Gluk TimeKeeper) port tracing — logs every IN/OUT with low
+# byte 0xF7 (and the EFF7 enable), to discover Gluk's real RTC port/register use.
+if (RTC_PORT_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RTC_PORT_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RTC_PORT_TRACE=0)
+endif ()
+
 # General Sound perf counters toggle (see GS.cpp `GS_PERF()` / `#if GS_PERF_TRACE`).
 if (GS_PERF_TRACE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE GS_PERF_TRACE=1)
@@ -378,30 +396,9 @@ if (BUTTER_PSRAM_GPIO AND NOT PICO_PLATFORM STREQUAL "rp2040")
 endif()
 
 # ZiFi (ESP-01S WiFi NIC emulation) — RP2350 only.
-# To enable UART backend, pass -DZIFI_TX_PIN=<gpio> -DZIFI_RX_PIN=<gpio> to cmake.
-# Example (ZERO2, UART1 on GPIO 20/21):
-#   cmake -DZERO2=1 -DZIFI_TX_PIN=20 -DZIFI_RX_PIN=21 ..
-# Per-board defaults (overridable on the command line):
-#   PICO_DV: GP0/GP1 = UART0 TX/RX (freed from PS/2 KBD, which moved to GP14/15).
-if (PICO_DV AND NOT DEFINED ZIFI_TX_PIN)
-    set(ZIFI_TX_PIN 0)
-    set(ZIFI_RX_PIN 1)
-endif()
-# Error if ZIFI_TX_PIN and MIDI_TX_PIN share the same UART instance.
-if (ZIFI_TX_PIN AND NOT PICO_PLATFORM STREQUAL "rp2040")
-    target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_TX_PIN=${ZIFI_TX_PIN})
-    if (ZIFI_RX_PIN)
-        target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_RX_PIN=${ZIFI_RX_PIN})
-    endif()
-    # Detect UART conflict with MIDI at configure time
-    if (MIDI_TX_PIN AND ZIFI_TX_PIN)
-        math(EXPR _zifi_uart "(${ZIFI_TX_PIN} / 4) % 2")
-        math(EXPR _midi_uart "(${MIDI_TX_PIN} / 4) % 2")
-        if (_zifi_uart EQUAL _midi_uart)
-            message(FATAL_ERROR "ZIFI_TX_PIN=${ZIFI_TX_PIN} and MIDI_TX_PIN=${MIDI_TX_PIN} share UART${_zifi_uart} — choose different pins or disable one.")
-        endif()
-    endif()
-endif()
+# TX/RX pins are chosen at RUNTIME (Network → GPIO picker, stored in NVS) from a
+# per-board candidate list defined in src/BoardPins.cpp. No compile-time pin
+# define is needed anymore; the old -DZIFI_TX_PIN/-DZIFI_RX_PIN are obsolete.
 
 # redcode/Z80 build configuration for GS (LGPLv3 library vendored in src/GS/)
 set_source_files_properties(src/GS/Z80_redcode.c PROPERTIES
@@ -443,13 +440,13 @@ IF(MURM2)
 
         #PSRAM
         # PSRAM_MUTEX=1
-        PSRAM_SPINLOCK=1
-        PSRAM_ASYNC=1
+        PSRAM_SPINLOCK=255
+        PSRAM_ASYNC=255
 
-        PSRAM_PIN_CS=18
-        PSRAM_PIN_SCK=19
-        PSRAM_PIN_MOSI=20
-        PSRAM_PIN_MISO=21
+        PSRAM_PIN_CS=255
+        PSRAM_PIN_SCK=255
+        PSRAM_PIN_MOSI=255
+        PSRAM_PIN_MISO=255
 
         # NES Gamepad
         USE_NESPAD
@@ -534,14 +531,14 @@ ELSEIF(PICO_PC)
         SDCARD_PIN_SPI0_MOSI=7
         SDCARD_PIN_SPI0_CS=22
 
-        #PSRAM           # not implemented
-        PSRAM_SPINLOCK=1 # not implemented
-        PSRAM_ASYNC=1    # not implemented
+        #PSRAM             # not implemented
+        PSRAM_SPINLOCK=255 # not implemented
+        PSRAM_ASYNC=255    # not implemented
 
-        PSRAM_PIN_CS=3   # not implemented
-        PSRAM_PIN_SCK=3  # not implemented
-        PSRAM_PIN_MOSI=3 # not implemented
-        PSRAM_PIN_MISO=3 # not implemented
+        PSRAM_PIN_CS=255   # not implemented
+        PSRAM_PIN_SCK=255  # not implemented
+        PSRAM_PIN_MOSI=255 # not implemented
+        PSRAM_PIN_MISO=255 # not implemented
 
         # NES Gamepad
         USE_NESPAD
@@ -611,14 +608,14 @@ ELSEIF(PICO_DV)
         SDCARD_PIO=pio1
         SDCARD_PIO_SM=0
 
-        #PSRAM           # not implemented
-        PSRAM_SPINLOCK=1 # not implemented
-        PSRAM_ASYNC=1    # not implemented
+        #PSRAM             # not implemented
+        PSRAM_SPINLOCK=255 # not implemented
+        PSRAM_ASYNC=255    # not implemented
 
-        PSRAM_PIN_CS=3   # not implemented
-        PSRAM_PIN_SCK=3  # not implemented
-        PSRAM_PIN_MOSI=3 # not implemented
-        PSRAM_PIN_MISO=3 # not implemented
+        PSRAM_PIN_CS=255   # not implemented
+        PSRAM_PIN_SCK=255  # not implemented
+        PSRAM_PIN_MOSI=255 # not implemented
+        PSRAM_PIN_MISO=255 # not implemented
 
         # NES Gamepad
         NES_GPIO_CLK=8    # UXT1-6
@@ -675,15 +672,14 @@ ELSEIF(ZERO)
         SDCARD_PIN_SPI0_MISO=20
         SDCARD_PIN_SPI0_CS=21
 
-     #   PSRAM
-        # PSRAM_MUTEX=1
-        PSRAM_SPINLOCK=1
-        PSRAM_ASYNC=1
+        #PSRAM             # not implemented
+        PSRAM_SPINLOCK=255 # not implemented
+        PSRAM_ASYNC=255    # not implemented
 
-        PSRAM_PIN_CS=2
-        PSRAM_PIN_SCK=3
-        PSRAM_PIN_MOSI=4
-        PSRAM_PIN_MISO=5
+        PSRAM_PIN_CS=255   # not implemented
+        PSRAM_PIN_SCK=255  # not implemented
+        PSRAM_PIN_MOSI=255 # not implemented
+        PSRAM_PIN_MISO=255 # not implemented
 
         # NES Gamepad
         USE_NESPAD
@@ -754,15 +750,14 @@ ELSEIF(ZERO2)
         SDCARD_PIN_SPI0_MISO=40
         SDCARD_PIN_SPI0_CS=43
 
-        # PSRAM
-        # PSRAM_MUTEX=1
-        PSRAM_SPINLOCK=0
-        PSRAM_ASYNC=1
+        #PSRAM             # not implemented
+        PSRAM_SPINLOCK=255 # not implemented
+        PSRAM_ASYNC=255    # not implemented
 
-        PSRAM_PIN_CS=0
-        PSRAM_PIN_SCK=0
-        PSRAM_PIN_MOSI=0
-        PSRAM_PIN_MISO=0
+        PSRAM_PIN_CS=255   # not implemented
+        PSRAM_PIN_SCK=255  # not implemented
+        PSRAM_PIN_MOSI=255 # not implemented
+        PSRAM_PIN_MISO=255 # not implemented
 
         # NES Gamepad
         USE_NESPAD

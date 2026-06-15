@@ -3479,10 +3479,14 @@ void SCLtoTRD(rvmwdDisk *d, unsigned char* track0) {
 // 80 tracks, 2 sides, 16 sectors/track, 256 bytes/sector = 655360 bytes.
 // Track 0: 9 catalog sectors (0xFF-filled) + service sector + 6 zero sectors.
 bool rvmWD1793CreateEmptyTRD(const char *path) {
-    FIL f;
+    // FIL (~560 B with FF_FS_TINY=0) + buf must NOT live on the stack: this runs
+    // deep in the OSD file-browser call chain on core0's 2 KB stack (PICO_STACK_SIZE),
+    // and ~820 B of locals overflowed it → stack corruption → MSTKERR fault on the
+    // next ISR entry. Static, like FileInfo.cpp. Not reentrant — one-shot creation.
+    static FIL f;
+    static uint8_t buf[256];
     if (f_open(&f, path, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) return false;
     UINT bw;
-    uint8_t buf[256];
 
     // Sectors 0-7: catalog (empty = zeros, 8 sectors = 128 directory entries)
     memset(buf, 0, 256);

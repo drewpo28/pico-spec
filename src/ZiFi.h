@@ -23,21 +23,71 @@ public:
     static void    sendRaw(const uint8_t* buf, size_t len);
     static size_t  recvRaw(uint8_t* buf, size_t maxlen);
 
+    // 16550-UART register window (#F8EF..#FFEF) used by raw-UART ZiFi drivers
+    // such as the MRF terminal's ZW-64/ZW-64-SC/GZ-80 drivers. reg_hi is the
+    // high address byte (0xF8..0xFF); its low 3 bits pick the 16550 register.
+    // THR/RBR bridge to the same ESP UART FIFOs as the ZIFI-API path.
+    static uint8_t uart16550Read(uint8_t reg_hi);
+    static void    uart16550Write(uint8_t reg_hi, uint8_t data);
+
 private:
-    // ZIFI in/out ring buffers (256 bytes each, index wrap on uint8_t overflow)
-    static uint8_t zifi_in_buf[256];
+    // RX ring: IRQ landing zone. Big enough (4 KB) to absorb a frame's worth of
+    // 115200-baud data (~230 B) plus SD-write latency spikes between tick() calls.
+    // The real (unbounded) buffering is the SD swap file — see rxSpillTick()/
+    // rxPop(). Free-running uint16_t indices, power-of-2 size → mask on access.
+    static const uint16_t ZIFI_IN_SZ = 4096;
+    static uint8_t zifi_in_buf[ZIFI_IN_SZ];
+    static volatile uint16_t zifi_in_head;  // written by RX IRQ
+    static volatile uint16_t zifi_in_tail;  // consumed by rxSpillTick()/rxPop()
+
+    // TX ring: guest → ESP, low rate (AT commands). 256 B / uint8_t wrap is plenty.
     static uint8_t zifi_out_buf[256];
-    static volatile uint8_t zifi_in_head;  // written by RX IRQ
-    static volatile uint8_t zifi_in_tail;  // consumed by read()
     static volatile uint8_t zifi_out_head; // produced by write()
     static volatile uint8_t zifi_out_tail; // consumed by tick() / UART TX
 
     static uint8_t api_mode; // 0=reset/off, 1=transparent UART
     static bool    hw_initialized;
 
+    // ── SD-backed RX swap ──────────────────────────────────────────────────
+    // MRF reads the UART far slower than the ESP delivers (sustained ~7:1), with
+    // multi-second stalls — no finite RAM FIFO survives it. So once the RAM ring
+    // starts backing up we spill it to an SD file (/tmp/zifi-rx.swap): an
+    // effectively unbounded FIFO. The guest then drains from SD at its own pace;
+    // no bytes are lost. Fast path (read ring directly) stays for normal AT
+    // traffic so the handshake isn't slowed. rxSpillTick() (per frame) drives
+    // spill/mode; rxPop() is the single byte source for all read paths.
+    static int  rxPop();              // next RX byte, or -1 if none available
+    static bool rxAvailable();        // any RX byte ready (ring | SD | out_buf)?
+    static void rxSpillTick();        // per-frame: spill ring → SD, manage SD mode
+    static void rxReset();            // CLRFIFO / deinit: drop everything, close swap
+
+    // Traffic counters (ZIFI_TRACE). rx_dropped > 0 means the 256-byte RX ring
+    // overflowed — the ESP delivered bytes faster than the guest drained them
+    // (e.g. while MRF stalls the UART to write a sector), so the download is
+    // silently truncated/corrupted. Incremented in the RX IRQ (cheap), logged
+    // rate-limited from tick().
+    static volatile uint32_t rx_bytes;    // total bytes received from ESP
+    static volatile uint32_t rx_dropped;  // bytes lost to RX-FIFO overflow
+    static volatile uint32_t tx_bytes;    // total bytes sent to ESP
+
+    // 16550 register state (#F8EF..#FFEF window). Baud is fixed by the physical
+    // ESP UART (115200 8N1), so the divisor latches are stored but ignored.
+    static uint8_t u16550_lcr; // line control (bit7 = DLAB)
+    static uint8_t u16550_ier; // interrupt enable
+    static uint8_t u16550_mcr; // modem control
+    static uint8_t u16550_scr; // scratch
+    static uint8_t u16550_dll; // divisor latch low  (ignored)
+    static uint8_t u16550_dlm; // divisor latch high (ignored)
+
+    // OUT ring helpers (256 B / uint8_t wrap).
     static inline uint8_t fifo_fill(uint8_t head, uint8_t tail) { return (uint8_t)(head - tail); }
     static inline bool    fifo_empty(uint8_t head, uint8_t tail) { return head == tail; }
     static inline bool    fifo_full(uint8_t head, uint8_t tail)  { return (uint8_t)(head - tail) == 255; }
+
+    // IN ring helpers (ZIFI_IN_SZ, free-running uint16_t; access masked).
+    static inline uint16_t in_fill()  { return (uint16_t)(zifi_in_head - zifi_in_tail); }
+    static inline bool     in_empty() { return zifi_in_head == zifi_in_tail; }
+    static inline bool     in_full()  { return in_fill() >= ZIFI_IN_SZ; }
 
     static void uart_rx_irq_handler();
 };

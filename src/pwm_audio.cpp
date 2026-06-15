@@ -6,6 +6,7 @@
 #include "audio.h"
 #include "pwm_audio.h"
 #include "Config.h"
+#include "BoardPins.h"
 #include "Debug.h"
 #include "Subsystem.h"
 #ifdef USE_GS
@@ -301,7 +302,8 @@ void init_sound() {
     }
 #endif
 #ifdef PCM5122_I2S_DATA
-    if (Config::audio_driver == 5) {
+    // Yield I2S DATA pin to ZiFi if it owns it (skip PCM5122 → standard audio).
+    if (Config::audio_driver == 5 && !BoardPins::zifiOwnsPin(PCM5122_I2S_DATA)) {
         Debug::log("init_sound: PCM5122 mode (explicit)");
         pcm5122_detected = pcm5122_init(PCM5122_I2C_SDA, PCM5122_I2C_SCL);
         Debug::log("init_sound: PCM5122 detected=%d", (int)pcm5122_detected);
@@ -312,7 +314,7 @@ void init_sound() {
         i2s_volume(&i2s_config, 0);
         return;
     }
-    if (Config::audio_driver == 0) {
+    if (Config::audio_driver == 0 && !BoardPins::zifiOwnsPin(PCM5122_I2S_DATA)) {
         // Auto mode: probe PCM5122 via I2C before standard testPins
         if (pcm5122_detect(PCM5122_I2C_SDA, PCM5122_I2C_SCL)) {
             Debug::log("init_sound: PCM5122 detected in auto mode");
@@ -356,7 +358,10 @@ void init_sound() {
     if (Config::midi != 1 && Config::midi != 2)
 #endif
     {
-        inInit(LOAD_WAV_PIO);
+#if !PICO_RP2040
+        if (!BoardPins::zifiOwnsPin(LOAD_WAV_PIO)) // yield WAV input pin to ZiFi
+#endif
+            inInit(LOAD_WAV_PIO);
     }
 #endif
 }

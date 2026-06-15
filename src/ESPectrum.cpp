@@ -72,6 +72,9 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Midi.h"
 #include "MidiSynth.h"
 #include "ZiFi.h"
+#include "ZiFiAT.h"
+#include "BoardPins.h"
+#include "RTC.h"
 #include "Z80DMA.h"
 #ifdef USE_GS
 #include "GS/GS.h"
@@ -912,6 +915,8 @@ void ESPectrum::setup() {
   Debug::log2SD("setup: DivMMC::init done, freeHeap=%u", (unsigned)getFreeHeap());
   // IDE/HDD (NEMO/PROFI schemes) — independent of DivMMC.
   IDE::init();
+  // MC146818 RTC (Pentagon/Profi Mr Gluk TimeKeeper) — set register defaults.
+  RTC::init();
   // MB-02+ disk interface (allocates SRAM in butter PSRAM after DivMMC)
   Debug::log2SD("setup: MB02::init begin");
   MB02::init();
@@ -974,6 +979,10 @@ void ESPectrum::setup() {
 #if !PICO_RP2040
     SAA_emu = Config::SAA1099;
     Midi::enabled = Config::midi;
+#if !PICO_RP2040 && defined(MIDI_TX_PIN)
+    // Yield the MIDI TX pin to ZiFi when it owns it (boot-time, after Config).
+    if (BoardPins::zifiOwnsPin(MIDI_TX_PIN)) Midi::enabled = 0;
+#endif
     if (Midi::enabled) {
         Debug::log2SD("setup: Midi::init mode=%d", (int)Midi::enabled);
         Midi::init();
@@ -2187,6 +2196,26 @@ void ESPectrum::loop() {
     }
 
     if (ZiFi::enabled) ZiFi::tick();
+    RTC::flushNVRAM(); // persist CMOS NVRAM to SD when dirty (debounced)
+
+    // Auto-sync the RTC over SNTP at startup when both ZiFi and RTC are on and a
+    // WiFi network is configured. Runs entirely in the background (non-blocking
+    // state machine, no OSD) so it never freezes audio/video. Kicked off ~4s into
+    // the run so the ESP has time to auto-reconnect; then stepped each loop tick.
+    static bool     rtc_autosync_begun = false;
+    static uint32_t rtc_autosync_at    = 0;
+    if (ZiFi::enabled && Config::rtc_enabled && !Config::wifi_ssid.empty()) {
+        if (!rtc_autosync_begun) {
+            uint32_t now = to_ms_since_boot(get_absolute_time());
+            if (rtc_autosync_at == 0) rtc_autosync_at = now + 4000;
+            else if (now >= rtc_autosync_at) {
+                rtc_autosync_begun = true;
+                ZiFiAT::autoSyncBegin(Config::wifi_ssid, Config::wifi_pass, Config::wifi_tz);
+            }
+        } else {
+            ZiFiAT::autoSyncPoll();
+        }
+    }
 #endif
 
     // GS-Z80 runs on core1 alongside pcm_call(); core0 only reads the ring.
