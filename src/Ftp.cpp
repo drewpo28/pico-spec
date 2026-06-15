@@ -1,0 +1,245 @@
+#include "Ftp.h"
+
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+
+#include "ZiFiSock.h"
+#include "Debug.h"
+#include "ff.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+// Shared transfer buffer (static, not stack — PICO_STACK_SIZE is only 4 KB).
+// One FTP transfer runs at a time from the OSD, so a single buffer is safe.
+static uint8_t g_ftp_buf[1024];
+
+Ftp::Ftp() : connected(false), cur_dir("/") {}
+Ftp::~Ftp() { disconnect(); }
+
+// Read one or more control lines until a final reply line "NNN " (space, not '-').
+int Ftp::readReply(std::string& msg, uint32_t timeout_ms) {
+    char line[256];
+    int code = -1;
+    msg.clear();
+    while (ZiFiSock::sock_recv_line(CTRL, line, sizeof(line), timeout_ms)) {
+#if ZIFI_TRACE
+        Debug::log("FTP < %s", line);
+#endif
+        if (msg.empty()) msg = line;
+        // A final line is "NNN <text>"; continuation lines are "NNN-<text>".
+        if (strlen(line) >= 4 && line[0] >= '0' && line[0] <= '9' &&
+            line[1] >= '0' && line[1] <= '9' && line[2] >= '0' && line[2] <= '9') {
+            int c = atoi(line);
+            if (line[3] == ' ') { code = c; break; }
+        }
+    }
+    return code;
+}
+
+int Ftp::command(const char* verb, const char* arg, std::string& reply, uint32_t to) {
+    char buf[300];
+    if (arg && arg[0]) snprintf(buf, sizeof(buf), "%s %s\r\n", verb, arg);
+    else               snprintf(buf, sizeof(buf), "%s\r\n", verb);
+#if ZIFI_TRACE
+    Debug::log("FTP > %s %s", verb, arg ? arg : "");
+#endif
+    if (ZiFiSock::sock_send(CTRL, (const uint8_t*)buf, strlen(buf), 8000) < 0) return -1;
+    return readReply(reply, to);
+}
+
+bool Ftp::connect(const char* host, uint16_t port, const char* user, const char* pass) {
+    if (!ZiFiSock::begin(true)) return false; // CIPMUX=1 for control+data
+    if (ZiFiSock::sock_open(host, port, false, 12000) != CTRL) return false;
+
+    std::string reply;
+    if (readReply(reply) != 220) { disconnect(); return false; } // greeting
+
+    int uc = command("USER", user, reply);
+    if (uc / 100 == 3) {           // 331 → server wants a password
+        if (command("PASS", pass, reply) / 100 != 2) { disconnect(); return false; }
+    } else if (uc / 100 != 2) {    // not 230 (logged in with no password)
+        disconnect(); return false;
+    }
+
+    command("TYPE", "I", reply);   // binary
+    command("PWD", nullptr, reply);
+    // 257 "<dir>" ...
+    size_t q1 = reply.find('"');
+    if (q1 != std::string::npos) {
+        size_t q2 = reply.find('"', q1 + 1);
+        if (q2 != std::string::npos) cur_dir = reply.substr(q1 + 1, q2 - q1 - 1);
+    }
+    connected = true;
+    return true;
+}
+
+bool Ftp::openPasvData() {
+    std::string reply;
+    if (command("PASV", nullptr, reply) != 227) return false;
+    // 227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)
+    size_t lp = reply.find('(');
+    if (lp == std::string::npos) return false;
+    int h[4], p[2];
+    if (sscanf(reply.c_str() + lp + 1, "%d,%d,%d,%d,%d,%d",
+               &h[0], &h[1], &h[2], &h[3], &p[0], &p[1]) != 6) return false;
+    char ip[20];
+    snprintf(ip, sizeof(ip), "%d.%d.%d.%d", h[0], h[1], h[2], h[3]);
+    uint16_t dport = (uint16_t)(p[0] * 256 + p[1]);
+    return ZiFiSock::sock_open(ip, dport, false, 12000) == DATA;
+}
+
+uint32_t Ftp::sizeOf(const std::string& remote) {
+    std::string reply;
+    if (command("SIZE", remote.c_str(), reply) == 213) {
+        size_t sp = reply.find(' ');
+        if (sp != std::string::npos) return (uint32_t)strtoul(reply.c_str() + sp + 1, nullptr, 10);
+    }
+    return 0;
+}
+
+bool Ftp::cwd(const std::string& path) {
+    std::string reply;
+    if (command("CWD", path.c_str(), reply) / 100 != 2) return false;
+    if (command("PWD", nullptr, reply) == 257) {
+        size_t q1 = reply.find('"');
+        if (q1 != std::string::npos) {
+            size_t q2 = reply.find('"', q1 + 1);
+            if (q2 != std::string::npos) cur_dir = reply.substr(q1 + 1, q2 - q1 - 1);
+        }
+    }
+    return true;
+}
+
+// Parse a Unix "ls -l" listing line into a RemoteEntry. Returns false to skip.
+static bool parse_ls_line(const char* line, RemoteEntry& e) {
+    if (!line[0]) return false;
+    // "drwxr-xr-x  2 user group  4096 Jan 01 12:00 name"
+    char type = line[0];
+    if (type != 'd' && type != '-' && type != 'l') {
+        // Not a standard ls line (could be a bare name from NLST) — treat as file.
+        e.name = line; e.isDir = false; e.size = 0;
+        return !e.name.empty() && e.name != "." && e.name != "..";
+    }
+    // Tokenise: fields 0..7 are perms,links,owner,group,size,month,day,time/year;
+    // the name is everything after the 8th whitespace-separated token.
+    const char* p = line;
+    int field = 0;
+    uint32_t sz = 0;
+    while (*p && field < 8) {
+        while (*p == ' ') p++;
+        const char* tok = p;
+        while (*p && *p != ' ') p++;
+        if (field == 4) sz = (uint32_t)strtoul(tok, nullptr, 10);
+        field++;
+    }
+    while (*p == ' ') p++;
+    if (!*p) return false;
+    e.name = p;
+    // Strip a symlink "name -> target" suffix.
+    size_t arrow = e.name.find(" -> ");
+    if (arrow != std::string::npos) e.name.resize(arrow);
+    e.isDir = (type == 'd');
+    e.size  = sz;
+    return e.name != "." && e.name != "..";
+}
+
+bool Ftp::list(const std::string& path, std::vector<RemoteEntry>& out) {
+    if (!connected) return false;
+    if (!path.empty() && path != cur_dir) { if (!cwd(path)) return false; }
+    if (!openPasvData()) return false;
+
+    std::string reply;
+    int code = command("LIST", nullptr, reply); // 150/125 → transfer starting
+    if (code / 100 != 1) { ZiFiSock::sock_close(DATA); return false; }
+
+    // Read the whole listing off the data connection.
+    std::string acc;
+    for (;;) {
+        int n = ZiFiSock::sock_recv(DATA, g_ftp_buf, sizeof(g_ftp_buf), 8000);
+        if (n < 0) break;
+        if (n == 0) break; // EOF
+        acc.append((const char*)g_ftp_buf, n);
+    }
+    ZiFiSock::sock_close(DATA);
+    readReply(reply); // 226 transfer complete
+
+    // Split accumulated text into lines.
+    size_t start = 0;
+    while (start < acc.size()) {
+        size_t nl = acc.find('\n', start);
+        std::string ln = acc.substr(start, (nl == std::string::npos ? acc.size() : nl) - start);
+        if (!ln.empty() && ln.back() == '\r') ln.pop_back();
+        RemoteEntry e;
+        if (parse_ls_line(ln.c_str(), e)) out.push_back(e);
+        if (nl == std::string::npos) break;
+        start = nl + 1;
+    }
+    return true;
+}
+
+bool Ftp::get(const std::string& remote, const std::string& localSdPath, XferProgressCb cb) {
+    if (!connected) return false;
+    uint32_t total = sizeOf(remote);
+    if (!openPasvData()) return false;
+
+    std::string reply;
+    if (command("RETR", remote.c_str(), reply) / 100 != 1) { ZiFiSock::sock_close(DATA); return false; }
+
+    FIL* f = fopen2(localSdPath.c_str(), FA_WRITE | FA_CREATE_ALWAYS);
+    if (!f) { ZiFiSock::sock_close(DATA); return false; }
+
+    uint32_t done = 0;
+    bool ok = true;
+    for (;;) {
+        int n = ZiFiSock::sock_recv(DATA, g_ftp_buf, sizeof(g_ftp_buf), 10000);
+        if (n < 0) { ok = false; break; }
+        if (n == 0) break; // EOF
+        UINT bw;
+        if (f_write(f, g_ftp_buf, n, &bw) != FR_OK || (int)bw != n) { ok = false; break; }
+        done += n;
+        if (cb && !cb(done, total)) { ok = false; break; } // user abort
+    }
+    fclose2(f);
+    ZiFiSock::sock_close(DATA);
+    readReply(reply); // 226
+    return ok;
+}
+
+bool Ftp::put(const std::string& localSdPath, const std::string& remote, XferProgressCb cb) {
+    if (!connected) return false;
+    FIL* f = fopen2(localSdPath.c_str(), FA_READ);
+    if (!f) return false;
+    uint32_t total = f_size(f);
+
+    if (!openPasvData()) { fclose2(f); return false; }
+    std::string reply;
+    if (command("STOR", remote.c_str(), reply) / 100 != 1) { ZiFiSock::sock_close(DATA); fclose2(f); return false; }
+
+    uint32_t done = 0;
+    bool ok = true;
+    for (;;) {
+        UINT br;
+        if (f_read(f, g_ftp_buf, sizeof(g_ftp_buf), &br) != FR_OK) { ok = false; break; }
+        if (br == 0) break; // EOF
+        if (ZiFiSock::sock_send(DATA, g_ftp_buf, br, 12000) != (int)br) { ok = false; break; }
+        done += br;
+        if (cb && !cb(done, total)) { ok = false; break; }
+    }
+    fclose2(f);
+    ZiFiSock::sock_close(DATA); // closing data conn signals EOF to server
+    readReply(reply); // 226
+    return ok;
+}
+
+void Ftp::disconnect() {
+    if (connected) {
+        std::string reply;
+        command("QUIT", nullptr, reply, 1500);
+    }
+    ZiFiSock::sock_close(DATA);
+    ZiFiSock::sock_close(CTRL);
+    ZiFiSock::end();
+    connected = false;
+}
+
+#endif // !PICO_RP2040 && ZIFI_NET_CLIENT

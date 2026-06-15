@@ -2283,6 +2283,25 @@ static const char *MENU_WIFI_LIST_TITLE[2]   = { "Wi-Fi networks",    "Redes Wi-
 static const char *MENU_TZ_TITLE[2]          = { "Time zone (UTC)",   "Zona horaria (UTC)" };
 static const char *MENU_ZIFI_GPIO_TITLE[2]   = { "ZiFi UART GPIO",    "ZiFi UART GPIO"     };
 
+// ─── File transfer (FTP/SFTP) client strings ────────────────────────────────
+static const char *MENU_NET_PROTO[2]         = { "Protocol\nFTP\nSFTP\n", "Protocolo\nFTP\nSFTP\n" };
+static const char *MSG_NET_FT_NOWIFI[2]      = { "Connect Wi-Fi first", "Conecte Wi-Fi primero" };
+static const char *MSG_NET_HOST_LABEL[2]     = { "Host:",   "Host:"     };
+static const char *MSG_NET_USER_LABEL[2]     = { "User:",   "Usuario:"  };
+static const char *MSG_NET_PORT_LABEL[2]     = { "Port:",   "Puerto:"   };
+static const char *MSG_NET_PASS_LABEL[2]     = { "Pass:",   "Clave:"    };
+static const char *MSG_NET_CONNECTING[2]     = { "Connecting...",    "Conectando..."     };
+static const char *MSG_NET_CONN_ERR[2]       = { "Connection failed","Error de conexion" };
+static const char *MSG_NET_TRUST_Q[2]        = { "Trust this host key?", "\xA8" "Confiar en la clave?" };
+static const char *MSG_NET_HOSTKEY_BAD[2]    = { "HOST KEY CHANGED!\nPossible MITM", "\xA8" "CLAVE CAMBIADA!\nPosible MITM" };
+static const char *MSG_NET_DOWNLOADING[2]    = { "Downloading...",   "Descargando..."    };
+static const char *MSG_NET_UPLOADING[2]      = { "Uploading...",     "Subiendo..."       };
+static const char *MSG_NET_XFER_OK[2]        = { "Transfer complete","Transferencia OK"  };
+static const char *MSG_NET_XFER_ERR[2]       = { "Transfer failed",  "Fallo al transferir" };
+static const char *MSG_NET_EMPTY_DIR[2]      = { "(empty)",          "(vacio)"           };
+static const char *MSG_NET_DL_OR_UL[2]       = { "Download\nUpload here\n", "Descargar\nSubir aqui\n" };
+static const char *MENU_NET_BROWSE_TITLE[2]  = { "Remote files",     "Archivos remotos"  };
+
 #endif // !PICO_RP2040
 
 #endif // ESPECTRUM_MESSAGES_h

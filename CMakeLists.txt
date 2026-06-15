@@ -39,6 +39,7 @@ option(PERF_TRACE "Enable per-60-frame CPU/HDMI/FPS performance logging" OFF)
 option(GS_PERF_TRACE "Enable General Sound per-second perf counters (GS.cpp)" OFF)
 option(GS_DEBUG_TRACE "Enable General Sound port-IO trace ring + auto-dumps (~50 KB SRAM)" OFF)
 option(ZIFI_TRACE "Enable ZiFi (ESP-01S WiFi NIC) port/UART tracing" ON)
+option(ZIFI_NET_CLIENT "Enable FTP/SFTP/SSH client over ZiFi (RP2350 only, uses mbedTLS)" ON)
 
 # Per-board Debug-Probe UART toggles (logging over UART). Declared here together;
 # the board-specific `if(<board>_DBG_UART)` blocks below consume them (they call
@@ -399,6 +400,23 @@ endif()
 # TX/RX pins are chosen at RUNTIME (Network → GPIO picker, stored in NVS) from a
 # per-board candidate list defined in src/BoardPins.cpp. No compile-time pin
 # define is needed anymore; the old -DZIFI_TX_PIN/-DZIFI_RX_PIN are obsolete.
+
+# ZiFi network client (FTP/SFTP/SSH over the ESP-01S TCP sockets). RP2350 only —
+# SSH crypto runs on the Pico via mbedTLS primitives (NOT wolfSSH, NOT mbedTLS's
+# TLS stack; see src/mbedtls_config_picospec.h). New sources (ZiFiSock/Ftp/Ssh/
+# Sftp.cpp) auto-compile via the GLOB; each file body is wrapped in
+# `#if !PICO_RP2040 && ZIFI_NET_CLIENT` so RP2040 builds get zero footprint.
+if (ZIFI_NET_CLIENT AND NOT PICO_PLATFORM STREQUAL "rp2040")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE
+        ZIFI_NET_CLIENT=1
+        MBEDTLS_CONFIG_FILE="mbedtls_config_picospec.h")
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        pico_mbedtls          # crypto primitives from pico-sdk's vendored mbedTLS
+        pico_rand)            # hardware RNG for SSH ephemeral keys / padding
+    message(STATUS "ZiFi network client (FTP/SFTP/SSH) enabled with mbedTLS crypto")
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_NET_CLIENT=0)
+endif ()
 
 # redcode/Z80 build configuration for GS (LGPLv3 library vendored in src/GS/)
 set_source_files_properties(src/GS/Z80_redcode.c PROPERTIES

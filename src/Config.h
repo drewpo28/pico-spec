@@ -235,6 +235,12 @@ public:
     static string wifi_pass;
     static bool wifi_autoconnect;
     static signed char wifi_tz; // SNTP timezone offset in hours (wifi.cfg key "tz")
+    // Network file-transfer client (Network → File transfer). Stored in wifi.cfg.
+    // Passwords are NOT persisted (re-prompted each session).
+    static string   net_host;   // last remote host
+    static string   net_user;   // last username
+    static uint16_t net_port;   // last port (0 = protocol default: 21 FTP / 22 SFTP)
+    static uint8_t  net_proto;  // 0 = FTP, 1 = SFTP
     static void loadWifiConfig();
     static void saveWifiConfig();
 #endif

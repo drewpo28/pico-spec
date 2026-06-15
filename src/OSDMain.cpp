@@ -69,6 +69,13 @@ visit https://zxespectrum.speccy.org/contacto
 #include "ZiFi.h"
 #include "ZiFiAT.h"
 #include "BoardPins.h"
+#if ZIFI_NET_CLIENT
+#include "ZiFiSock.h"
+#include "RemoteFs.h"
+#include "Ftp.h"
+#include "Sftp.h"
+#include "Ssh.h"
+#endif
 #include "kbd_img.h"
 extern "C" void graphics_set_scanlines(uint8_t level);
 extern "C" void graphics_set_dither(bool enabled);
@@ -303,6 +310,200 @@ static string wifiAskPassword(const string& ssid) {
     VIDEO::SaveRect.restore_last();
     return pass;
 }
+
+#if ZIFI_NET_CLIENT
+// ─── Network file-transfer client (FTP / SFTP) ──────────────────────────────
+// A centred single-line text-entry dialog (host / user / port). Returns the
+// typed text, or "\x1B" if Esc was pressed. Generalises wifiAskPassword().
+static string netAskField(const string& label, const string& initial) {
+    const int field = 30;
+    const int lbl = (int)label.size();
+    const unsigned short cols = lbl + field + 2;
+    const unsigned short w = (cols * OSD_FONT_W) + 2;
+    const unsigned short h = (OSD_FONT_H * 2) + 3;
+    const unsigned short x = OSD::scrAlignCenterX(w);
+    const unsigned short y = OSD::scrAlignCenterY(h);
+    VIDEO::SaveRect.save(x, y, w, h);
+    VIDEO::vga.setFont(Font6x8);
+    VIDEO::vga.rect(x, y, w, h, zxColor(0, 0));
+    VIDEO::vga.fillRect(x + 1, y + 1, w - 2, OSD_FONT_H, zxColor(0, 0));
+    VIDEO::vga.fillRect(x + 1, y + 1 + OSD_FONT_H, w - 2, h - OSD_FONT_H - 2, zxColor(7, 1));
+    VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(0, 0));
+    VIDEO::vga.setCursor(x + OSD_FONT_W + 1, y + 1);
+    VIDEO::vga.print(label.c_str());
+    VIDEO::vga.setTextColor(zxColor(0, 0), zxColor(7, 1));
+    string r = OSD::inlineTextEdit(x + OSD_FONT_W, y + 1 + OSD_FONT_H + 1, field, initial);
+    VIDEO::SaveRect.restore_last();
+    return r;
+}
+
+#define NET_KNOWN_HOSTS CONFIG_DIR "/known_hosts"
+
+// Look up a stored SHA-256 fingerprint for `host` (returns "" if unknown).
+static string knownHostsLookup(const string& host) {
+    FIL* f = fopen2(NET_KNOWN_HOSTS, FA_READ);
+    if (!f) return "";
+    string line, result;
+    UINT br; char c;
+    while (!f_eof(f)) {
+        if (f_read(f, &c, 1, &br) != FR_OK || br == 0) break;
+        if (c == '\n') {
+            size_t sp = line.find(' ');
+            if (sp != string::npos && line.substr(0, sp) == host) { result = line.substr(sp + 1); break; }
+            line.clear();
+        } else if (c != '\r') line += c;
+    }
+    fclose2(f);
+    return result;
+}
+
+static void knownHostsSave(const string& host, const string& fp) {
+    FileUtils::mkdirParents(CONFIG_DIR);
+    FIL* f = fopen2(NET_KNOWN_HOSTS, FA_OPEN_APPEND | FA_WRITE);
+    if (!f) return;
+    string line = host + " " + fp + "\n";
+    UINT bw; f_write(f, line.data(), line.size(), &bw);
+    fclose2(f);
+}
+
+// Host-key callback: trust-on-first-use against /known_hosts, refuse on mismatch.
+static string g_net_host_for_cb;
+static Ssh::TrustResult netHostKeyCb(const char* host, const char* keytype,
+                                     const char* fp, bool sig_verified) {
+    (void)host; (void)sig_verified;
+    string stored = knownHostsLookup(g_net_host_for_cb);
+    if (!stored.empty()) {
+        if (stored == fp) return Ssh::TRUST;
+        OSD::msgDialog(MSG_NET_HOSTKEY_BAD[Config::lang], fp); // mismatch → refuse
+        return Ssh::REJECT;
+    }
+    // First contact — show fingerprint and ask to trust.
+    string body = string(keytype) + "\nSHA256:" + fp + "\n" + MSG_NET_TRUST_Q[Config::lang];
+    if (OSD::msgDialog(g_net_host_for_cb, body) == DLG_YES) {
+        knownHostsSave(g_net_host_for_cb, fp);
+        return Ssh::TRUST;
+    }
+    return Ssh::REJECT;
+}
+
+// Progress callback for get/put: updates the progress dialog, Esc aborts.
+static string g_xfer_title;
+static bool netProgressCb(uint32_t done, uint32_t total) {
+    int pct = total ? (int)((uint64_t)done * 100 / total) : 0;
+    if (pct > 100) pct = 100;
+    OSD::progressDialog(g_xfer_title, "", pct, 1);
+    fabgl::VirtualKeyItem k;
+    if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable() && ESPectrum::readKbd(&k))
+        if (k.down && is_back(k.vk)) return false; // user aborted
+    return true;
+}
+
+// Interactive remote directory browser, driven by menuRun over a live listing.
+static void netRemoteBrowse(RemoteFs* fs) {
+    while (1) {
+        vector<RemoteEntry> entries;
+        OSD::osdCenteredMsg(MSG_NET_CONNECTING[Config::lang], LEVEL_INFO, 0); // brief "working" notice while listing
+        bool ok = fs->list("", entries);
+        if (!ok) { OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000); return; }
+
+        // Build the menu: title shows cwd; row1 = upload, row2 = "..", then entries.
+        string cwd = fs->cwdPath();
+        if (cwd.size() > 30) cwd = "..." + cwd.substr(cwd.size() - 27);
+        string m = string(MENU_NET_BROWSE_TITLE[Config::lang]) + " " + cwd + "\n";
+        m += (Config::lang ? "[Subir archivo aqui]\n" : "[Upload file here]\n");
+        m += "..\t>\n";
+        for (auto& e : entries) m += e.name + (e.isDir ? "\t>\n" : "\n");
+        if (entries.empty()) { /* still allow upload / .. */ }
+
+        OSD::menu_level = 2; OSD::menu_saverect = true; OSD::menu_curopt = 1;
+        uint8_t sel = OSD::menuRun(m);
+        if (sel == 0) return; // Esc → leave browser
+        VIDEO::SaveRect.restore_last();
+
+        if (sel == 1) { // Upload a local SD file into the current remote dir
+            string dir = "/";
+            string local = OSD::fileDialog(dir, Config::lang ? "Subir" : "Upload", 0, 40, 18);
+            if (!local.empty()) {
+                string base = local.substr(local.find_last_of('/') + 1);
+                g_xfer_title = MSG_NET_UPLOADING[Config::lang];
+                OSD::progressDialog(g_xfer_title, base, 0, 0);
+                bool put_ok = fs->put(local, base, netProgressCb);
+                OSD::progressDialog("", "", 0, 2);
+                OSD::osdCenteredMsg(put_ok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
+                                    put_ok ? LEVEL_INFO : LEVEL_WARN, 1800);
+            }
+            continue;
+        }
+        if (sel == 2) { fs->cwd(".."); continue; } // parent dir
+
+        RemoteEntry& e = entries[sel - 3];
+        if (e.isDir) { fs->cwd(e.name); continue; }
+
+        // A file: confirm and download into /spec (user data root).
+        if (OSD::msgDialog(e.name, MSG_NET_DOWNLOADING[Config::lang]) != DLG_YES) continue;
+        FileUtils::mkdirParents("/spec");
+        string local = "/spec/" + e.name;
+        g_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
+        OSD::progressDialog(g_xfer_title, e.name, 0, 0);
+        bool got = fs->get(e.name, local, netProgressCb);
+        OSD::progressDialog("", "", 0, 2);
+        OSD::osdCenteredMsg(got ? (string(MSG_NET_XFER_OK[Config::lang]) + "\n" + local)
+                                : MSG_NET_XFER_ERR[Config::lang],
+                            got ? LEVEL_INFO : LEVEL_WARN, 2200);
+    }
+}
+
+// Top-level entry: pick protocol, gather credentials, connect, browse.
+static void netFileTransfer() {
+    // Require an active WiFi link.
+    string ssid, ip;
+    if (!Config::zifi_enabled || !ZiFiAT::getStatus(ssid, ip)) {
+        OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200);
+        return;
+    }
+
+    OSD::menu_level = 2; OSD::menu_saverect = true; OSD::menu_curopt = Config::net_proto + 1;
+    uint8_t proto = OSD::menuRun(MENU_NET_PROTO[Config::lang]); // 1=FTP, 2=SFTP
+    if (proto == 0) return;
+    VIDEO::SaveRect.restore_last();
+    Config::net_proto = proto - 1;
+
+    string host = netAskField(MSG_NET_HOST_LABEL[Config::lang], Config::net_host);
+    if (host == "\x1B" || host.empty()) return;
+    string user = netAskField(MSG_NET_USER_LABEL[Config::lang], Config::net_user);
+    if (user == "\x1B") return;
+    uint16_t defport = Config::net_proto ? 22 : 21;
+    char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%u", Config::net_port ? Config::net_port : defport);
+    string ports = netAskField(MSG_NET_PORT_LABEL[Config::lang], pbuf);
+    if (ports == "\x1B") return;
+    uint16_t port = (uint16_t)atoi(ports.c_str()); if (!port) port = defport;
+    string pass = netAskField(MSG_NET_PASS_LABEL[Config::lang], "");
+    if (pass == "\x1B") return;
+
+    Config::net_host = host; Config::net_user = user; Config::net_port = port;
+    Config::saveWifiConfig();
+
+    OSD::osdCenteredMsg(MSG_NET_CONNECTING[Config::lang], LEVEL_INFO, 0);
+
+    RemoteFs* fs = nullptr;
+    if (Config::net_proto == 0) {
+        Ftp* ftp = new Ftp();
+        if (ftp->connect(host.c_str(), port, user.c_str(), pass.c_str())) fs = ftp;
+        else delete ftp;
+    } else {
+        g_net_host_for_cb = host;
+        Ssh::setHostKeyCb(netHostKeyCb);
+        Sftp* sftp = new Sftp();
+        if (sftp->connect(host.c_str(), port, user.c_str(), pass.c_str())) fs = sftp;
+        else delete sftp;
+    }
+
+    if (!fs) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
+    netRemoteBrowse(fs);
+    fs->disconnect();
+    delete fs;
+}
+#endif // ZIFI_NET_CLIENT
 #endif
 
 // // Cursor to OSD first row,col
@@ -5652,12 +5853,16 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         st = "WiFi Off";
                     }
                     if (st.size() < 32) st.append(32 - st.size(), ' '); else st.resize(32);
-                    return string(Config::lang ? "Red\n" : "Network\n")
+                    string r = string(Config::lang ? "Red\n" : "Network\n")
                          + gpio + "\n"
                          + st + "\n"
                          + (Config::lang ? "Sincronizar hora\n" : "Sync time (SNTP)\n")
                          + (Config::lang ? "Zona horaria\t>\n" : "Time zone\t>\n")
                          + "ZiFi NIC\t>\n";
+#if ZIFI_NET_CLIENT
+                    r += (Config::lang ? "Transferir archivos\t>\n" : "File transfer\t>\n");
+#endif
+                    return r;
                 };
                 refreshNetStatus();
                 while (1) {
@@ -5804,6 +6009,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 OSD::esp_hard_reset();
                         }
                     }
+#if ZIFI_NET_CLIENT
+                    else if (net_opt == 6) { // File transfer (FTP/SFTP)
+                        netFileTransfer();
+                        refreshNetStatus();
+                    }
+#endif
                     menu_curopt = net_opt;
                     // Only the FIRST menuRun above may save/position the Network window.
                     // menuRun's Enter path leaves menu_saverect == true, so without this

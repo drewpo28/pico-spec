@@ -132,6 +132,10 @@ string   Config::wifi_ssid;
 string   Config::wifi_pass;
 bool     Config::wifi_autoconnect = false;
 signed char Config::wifi_tz = 0;
+string   Config::net_host;
+string   Config::net_user;
+uint16_t Config::net_port = 0;
+uint8_t  Config::net_proto = 0;
 #endif
 
 uint8_t Config::scanlines = 0;
@@ -447,6 +451,10 @@ void Config::loadWifiConfig() {
                 else if (key == "pass")   wifi_pass = val;
                 else if (key == "autoconnect") wifi_autoconnect = (val == "1" || val == "true");
                 else if (key == "tz")     wifi_tz = (signed char)atoi(val.c_str());
+                else if (key == "net_host")  net_host = val;
+                else if (key == "net_user")  net_user = val;
+                else if (key == "net_port")  net_port = (uint16_t)atoi(val.c_str());
+                else if (key == "net_proto") net_proto = (uint8_t)atoi(val.c_str());
             }
             line.clear();
         } else if (c != '\r') {
@@ -460,11 +468,14 @@ void Config::saveWifiConfig() {
     FileUtils::mkdirParents(CONFIG_DIR);
     FIL* f = fopen2(WIFI_CFG_PATH, FA_WRITE | FA_CREATE_ALWAYS);
     if (!f) return;
-    char buf[160];
+    char buf[320];
     int n = snprintf(buf, sizeof(buf),
-                     "ssid=%s\npass=%s\ntz=%d\nautoconnect=%d\n",
+                     "ssid=%s\npass=%s\ntz=%d\nautoconnect=%d\n"
+                     "net_host=%s\nnet_user=%s\nnet_port=%u\nnet_proto=%u\n",
                      wifi_ssid.c_str(), wifi_pass.c_str(),
-                     (int)wifi_tz, wifi_autoconnect ? 1 : 0);
+                     (int)wifi_tz, wifi_autoconnect ? 1 : 0,
+                     net_host.c_str(), net_user.c_str(),
+                     (unsigned)net_port, (unsigned)net_proto);
     UINT bw;
     if (n > 0) f_write(f, buf, n, &bw);
     fclose2(f);
