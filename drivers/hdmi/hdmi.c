@@ -1318,11 +1318,18 @@ static void hdmi_build_avi_if_blob(int active_width, int active_height) {
     uint8_t hdr[4] = { 0x82, 0x02, 0x0D, 0 };
     uint8_t sp[4][8];
     nf_memset(sp, 0, sizeof(sp));
-    // Same payload SpeccyP sends (hw-confirmed on this class of TVs).
-    // VIC: 1 = 640x480p60, 2 = 720x480p60, 17 = 720x576p50
+    // VIC: declares a CEA timing the sink validates against. Our pixel clock is
+    // a non-standard 25.2 MHz for ALL modes (the 720-wide modes are NOT real
+    // 720x480p60/720x576p50 — those need 27 MHz). Declaring VIC=2/17 makes
+    // strict sinks (Philips/Sony) cross-check the timing, fail it, and drop
+    // audio (or fall back to DVI). Send VIC=0 ("no specific format") for the
+    // 720-wide modes so the sink takes the timing as-is — what frank-nes does
+    // for its non-standard timings (works on Philips). 640x480 stays VIC=1: it
+    // genuinely is ~640x480p60 and that timing validates.
     uint8_t vic;
-    if (active_width == 720) vic = (active_height == 480) ? 2 : 17;
+    if (active_width == 720) vic = 0;
     else vic = 1;
+    (void)active_height;
     sp[0][1] = 0x00;  // Y=0 RGB, no scan/active-format info
     sp[0][2] = 0x08;  // R=8 same-as-picture
     sp[0][3] = 0x00;  // Q=0 default range
@@ -1399,9 +1406,10 @@ static void __not_in_flash_func(hdmi_encode_audio_blob)(hdmi_audio_pkt_t *out) {
 // ---------- ISR-side packet loader ----------
 
 // Copy the packet for logical line `l` into conv_color data set `set`.
-// InfoFrames + ACR go out once per frame on the first 4 vblank lines
-// (or lines 1..4 when the mode has no vblank); audio packets whenever the
-// producer queue has one; Null packet otherwise.
+// AVI/Vendor/Audio InfoFrames go out once per frame on vblank lines 2..4 (or
+// lines 2..4 when the mode has no vblank); ACR goes out on vblank line 1 and
+// every 4th vblank line after (strict sinks need a dense ACR stream); audio
+// packets whenever the producer queue has one; Null packet otherwise.
 static void __not_in_flash_func(hdmi_di_load)(uint set, uint logical_line) {
     const uint64_t *src = NULL;
     const hdmi_audio_pkt_t *qpkt = NULL;
@@ -1418,10 +1426,11 @@ static void __not_in_flash_func(hdmi_di_load)(uint set, uint logical_line) {
                          ? logical_line - di_if_base
                          : (di_if_base == 0 ? logical_line : 0);
     if ((pr >= di_vs_start) && (pr < di_vs_end)) src = blob_null_vs;
-    else if (vbl == 1) src = blob_acr;                          // ACR once per frame (~60/sec; CEA-861 limit: Fs/1000=48/sec)
+    else if (vbl == 1) src = blob_acr;                          // ACR — first of many per frame (see below)
     else if (vbl == 2) src = blob_avi_if;                       // AVI once per frame
     else if (vbl == 3) src = blob_vendor_if;                    // Vendor Specific (HDMI mode signal — keeps sink in HDMI, not DVI)
     else if (vbl == 4) src = blob_audio_if;                     // Audio InfoFrame once per frame
+    else if (vbl != 0 && (vbl & 3) == 0) src = blob_acr;        // extra ACR every 4th vblank line (vbl 8,12,16,...). Strict sinks (Philips/Sony) recover the audio clock from the ACR stream and need it FAR more often than once/frame to lock the PLL — they stay silent at 1/frame even though lenient sinks (Xiaomi) accept it. frank-nes/SpeccyP send ACR this often. Displaced audio-packet lines are recovered by the credit metering (long-run delivery unchanged).
     else if (hdmi_au_pos >= (4u << 24)) {
         // Credit for one packet (4 samples) available. Pop only when the
         // queue has one (and the depth is sane; a desynced/wrapped pair —
