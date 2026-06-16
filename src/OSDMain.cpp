@@ -457,9 +457,11 @@ void net_call_on_stack(void* new_top, void (*fn)(void*), void* arg) {
 
 // Top-level entry: pick protocol, gather credentials, connect, browse.
 static void netFileTransfer() {
-    // Require an active WiFi link.
+    // Require an active WiFi link — that's the real prerequisite. The ZiFi NIC
+    // toggle is independent (it's for ZX-Spectrum software); getStatus() brings
+    // the ESP UART up and confirms we're associated with an IP.
     string ssid, ip;
-    if (!Config::zifi_enabled || !ZiFiAT::getStatus(ssid, ip)) {
+    if (!ZiFiAT::getStatus(ssid, ip)) {
         OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200);
         return;
     }
@@ -5824,7 +5826,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 string st_ssid, st_ip;
                 auto refreshNetStatus = [&]() {
                     st_ssid.clear(); st_ip.clear();
-                    st_conn = Config::zifi_enabled && ZiFiAT::getStatus(st_ssid, st_ip);
+                    // Query when the ESP is in use — NIC on, or already connected (e.g.
+                    // the boot SNTP auto-connect, or a connect from the WiFi menu while
+                    // the NIC toggle is off). Avoids powering up the ESP just by opening
+                    // the menu when networking was never started.
+                    st_conn = (Config::zifi_enabled || ZiFiAT::connected)
+                              && ZiFiAT::getStatus(st_ssid, st_ip);
                 };
 
                 // ── ESP-01S hardware/config pickers (level 3, under the ESP01 submenu) ──
@@ -5944,7 +5951,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         }
                     } else {
                         OSD::osdCenteredMsg(MSG_WIFI_SCANNING[Config::lang], LEVEL_INFO, 0);
-                        string nets[24];
+                        // static, not on the 4 KB core stack: 24 std::strings (~768 B)
+                        // plus the nested connect+SNTP-sync call chain under do_OSD
+                        // overflowed the stack (SIGBUS/stackOvf). Single-use, non-reentrant.
+                        static string nets[24];
                         int n = ZiFiAT::scan(nets, 24);
                         if (n <= 0) { OSD::osdCenteredMsg(MSG_WIFI_NO_NETS[Config::lang], LEVEL_WARN, 2000); return; }
                         string m = string(MENU_WIFI_LIST_TITLE[Config::lang]) + "\n";
@@ -5960,7 +5970,15 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 if (ZiFiAT::connect(chosen, pass) == ZiFiAT::OK) {
                                     Config::wifi_ssid = chosen; Config::wifi_pass = pass; Config::wifi_autoconnect = true;
                                     Config::saveWifiConfig();
-                                    OSD::osdCenteredMsg(string(MSG_WIFI_CONNECTED[Config::lang]) + "\n" + ZiFiAT::current_ip, LEVEL_INFO, 2500);
+                                    // Sync the clock right away, then report it all in one OSD.
+                                    string msg = string(MSG_WIFI_CONNECTED[Config::lang]) + "\n" + ZiFiAT::current_ip;
+                                    if (Config::rtc_enabled) {
+                                        OSD::osdCenteredMsg(MSG_RTC_SYNCING[Config::lang], LEVEL_INFO, 0); // working notice
+                                        string when;
+                                        if (ZiFiAT::syncTime(Config::wifi_tz, when) == ZiFiAT::OK)
+                                            msg += "\n" + when;
+                                    }
+                                    OSD::osdCenteredMsg(msg, LEVEL_INFO, 2500); // single combined result
                                 } else
                                     OSD::osdCenteredMsg(MSG_WIFI_CONNECT_ERR[Config::lang], LEVEL_WARN, 2500);
                             }

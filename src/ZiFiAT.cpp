@@ -331,39 +331,43 @@ int ZiFiAT::scan(string* out, int maxn, uint32_t timeout_ms) {
     ZiFi::init();
     sendCmd("AT+CWMODE=1", "OK", 2000); // ensure station mode (required for CWLAP)
 
-    // Flush RX, send the scan request.
-    uint8_t dummy[64];
-    while (ZiFi::recvRaw(dummy, sizeof(dummy)) > 0) {}
-    const char* q = "AT+CWLAP";
-    ZiFi::sendRaw((const uint8_t*)q, strlen(q));
-    const uint8_t crlf[] = {'\r', '\n'};
-    ZiFi::sendRaw(crlf, 2);
-
     int count = 0;
     char line[160];
-    absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
-    while (!time_reached(deadline)) {
-        uint32_t remain = absolute_time_diff_us(get_absolute_time(), deadline) / 1000;
-        if (remain == 0) break;
-        if (!recvLine(line, sizeof(line), remain < 300 ? remain : 300)) continue;
+    // The first AT+CWLAP right after a cold init / mode change often returns an
+    // empty list (the radio hasn't finished its first scan) — retry once or twice.
+    for (int attempt = 0; attempt < 3 && count == 0; attempt++) {
+        if (attempt > 0) sleep_ms(400); // let the radio warm up before retrying
+        uint8_t dummy[64];
+        while (ZiFi::recvRaw(dummy, sizeof(dummy)) > 0) {} // flush stale RX
+        const char* q = "AT+CWLAP";
+        ZiFi::sendRaw((const uint8_t*)q, strlen(q));
+        const uint8_t crlf[] = {'\r', '\n'};
+        ZiFi::sendRaw(crlf, 2);
+
+        absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+        while (!time_reached(deadline)) {
+            uint32_t remain = absolute_time_diff_us(get_absolute_time(), deadline) / 1000;
+            if (remain == 0) break;
+            if (!recvLine(line, sizeof(line), remain < 300 ? remain : 300)) continue;
 #if ZIFI_TRACE
-        Debug::log("ZiFiAT rx: %s", line);
+            Debug::log("ZiFiAT rx: %s", line);
 #endif
-        // +CWLAP:(enc,"ssid",rssi,"mac",ch,...)
-        char* p = strstr(line, "+CWLAP:");
-        if (p) {
-            char* q1 = strchr(p, '"');
-            if (q1) {
-                char* q2 = strchr(q1 + 1, '"');
-                if (q2 && q2 > q1 + 1) {
-                    string ssid(q1 + 1, q2 - q1 - 1);
-                    bool dup = false;
-                    for (int i = 0; i < count; i++) if (out[i] == ssid) { dup = true; break; }
-                    if (!dup && count < maxn) out[count++] = ssid;
+            // +CWLAP:(enc,"ssid",rssi,"mac",ch,...)
+            char* p = strstr(line, "+CWLAP:");
+            if (p) {
+                char* q1 = strchr(p, '"');
+                if (q1) {
+                    char* q2 = strchr(q1 + 1, '"');
+                    if (q2 && q2 > q1 + 1) {
+                        string ssid(q1 + 1, q2 - q1 - 1);
+                        bool dup = false;
+                        for (int i = 0; i < count; i++) if (out[i] == ssid) { dup = true; break; }
+                        if (!dup && count < maxn) out[count++] = ssid;
+                    }
                 }
             }
+            if (strstr(line, "OK") || strstr(line, "ERROR")) break;
         }
-        if (strstr(line, "OK") || strstr(line, "ERROR")) break;
     }
     return count;
 }
@@ -380,52 +384,50 @@ ZiFiAT::Status ZiFiAT::disconnect(uint32_t timeout_ms) {
 
 bool ZiFiAT::getStatus(string& ssid_out, string& ip_out) {
     ZiFi::init(); // idempotent — ensure UART backend before talking to the ESP
-    // Query current SSID
+    ssid_out.clear();
+    ip_out.clear();
     char line[128];
+
+    // 1) SSID — best effort. The CWJAP? reply format varies between ESP-AT builds
+    //    (quoted "ssid" vs bare ssid), so do NOT decide "connected" from it; only a
+    //    definitive "No AP" means disconnected. Connection is decided by the IP below.
+    bool no_ap = false;
     {
         uint8_t dummy[64];
         while (ZiFi::recvRaw(dummy, sizeof(dummy)) > 0) {}
-
         const uint8_t cmd[] = "AT+CWJAP?";
         ZiFi::sendRaw(cmd, sizeof(cmd) - 1);
         const uint8_t crlf[] = {'\r', '\n'};
         ZiFi::sendRaw(crlf, 2);
 
         absolute_time_t deadline = make_timeout_time_ms(2000);
-        bool found = false;
         while (!time_reached(deadline)) {
             uint32_t remain = absolute_time_diff_us(get_absolute_time(), deadline) / 1000;
             if (remain == 0) break;
-            if (recvLine(line, sizeof(line), remain < 200 ? remain : 200)) {
-                // Response: +CWJAP:"ssid",..."
-                if (strncmp(line, "+CWJAP:", 7) == 0) {
-                    // Extract ssid between first pair of quotes
-                    char* q1 = strchr(line + 7, '"');
-                    if (q1) {
-                        char* q2 = strchr(q1 + 1, '"');
-                        if (q2) {
-                            ssid_out = string(q1 + 1, q2 - q1 - 1);
-                            found = true;
-                        }
-                    }
+            if (!recvLine(line, sizeof(line), remain < 200 ? remain : 200)) continue;
+            if (strncmp(line, "+CWJAP:", 7) == 0) {
+                char* s = line + 7;
+                char* q1 = strchr(s, '"');
+                if (q1) {                       // quoted: +CWJAP:"ssid",...
+                    char* q2 = strchr(q1 + 1, '"');
+                    if (q2) ssid_out = string(q1 + 1, q2 - q1 - 1);
+                } else {                        // bare: +CWJAP:ssid,...
+                    char* c = strchr(s, ',');
+                    ssid_out = c ? string(s, c - s) : string(s);
                 }
-                if (strstr(line, "No AP") || strstr(line, "ERROR")) {
-                    connected = false;
-                    ssid_out.clear();
-                    ip_out.clear();
-                    return false;
-                }
-                if (strstr(line, "OK") && found) break;
             }
+            if (strstr(line, "No AP")) { no_ap = true; break; }
+            if (strstr(line, "OK") || strstr(line, "ERROR")) break;
         }
-        if (!found) { connected = false; return false; }
     }
+    if (no_ap) { connected = false; current_ssid.clear(); current_ip.clear(); return false; }
 
-    // Query IP address
+    // 2) IP — decides "connected". A non-zero station IP from CIFSR is the reliable,
+    //    firmware-independent signal that we're associated and have DHCP.
+    bool have_ip = false;
     {
         uint8_t dummy[64];
         while (ZiFi::recvRaw(dummy, sizeof(dummy)) > 0) {}
-
         const uint8_t cmd[] = "AT+CIFSR";
         ZiFi::sendRaw(cmd, sizeof(cmd) - 1);
         const uint8_t crlf[] = {'\r', '\n'};
@@ -435,24 +437,25 @@ bool ZiFiAT::getStatus(string& ssid_out, string& ip_out) {
         while (!time_reached(deadline)) {
             uint32_t remain = absolute_time_diff_us(get_absolute_time(), deadline) / 1000;
             if (remain == 0) break;
-            if (recvLine(line, sizeof(line), remain < 200 ? remain : 200)) {
-                // Response line: +CIFSR:STAIP,"192.168.x.x"
-                if (strncmp(line, "+CIFSR:STAIP,", 13) == 0) {
-                    char* q1 = strchr(line + 13, '"');
-                    if (q1) {
-                        char* q2 = strchr(q1 + 1, '"');
-                        if (q2) ip_out = string(q1 + 1, q2 - q1 - 1);
+            if (!recvLine(line, sizeof(line), remain < 200 ? remain : 200)) continue;
+            if (strncmp(line, "+CIFSR:STAIP,", 13) == 0) {
+                char* q1 = strchr(line + 13, '"');
+                if (q1) {
+                    char* q2 = strchr(q1 + 1, '"');
+                    if (q2) {
+                        string ip(q1 + 1, q2 - q1 - 1);
+                        if (!ip.empty() && ip != "0.0.0.0") { ip_out = ip; have_ip = true; }
                     }
                 }
-                if (strstr(line, "OK")) break;
             }
+            if (strstr(line, "OK") || strstr(line, "ERROR")) break;
         }
     }
 
-    connected = true;
-    current_ssid = ssid_out;
-    current_ip   = ip_out;
-    return true;
+    connected = have_ip;
+    if (have_ip) { current_ssid = ssid_out; current_ip = ip_out; }
+    else         { current_ssid.clear(); current_ip.clear(); }
+    return have_ip;
 }
 
 #endif // !PICO_RP2040
