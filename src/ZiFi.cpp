@@ -209,6 +209,9 @@ void ZiFi::init() {
     gpio_set_function(rx, UART_FUNCSEL_NUM(g_uart, rx));
     uart_set_format(g_uart, 8, 1, UART_PARITY_NONE);
     uart_set_fifo_enabled(g_uart, true);
+    // Fire the RX IRQ at 1/8 full (4 of 32 bytes) instead of 1/2, so at high baud
+    // there's more headroom before the FIFO overflows if the handler is delayed.
+    uart_get_hw(g_uart)->ifls &= ~(0x7u << 3); // RXIFLSEL = 000 (1/8)
     // Optionally raise the link speed for faster transfers. Negotiate BEFORE
     // arming the RX IRQ so zifi_set_baud can poll-drain the transition bytes.
     if (Config::zifi_baud && Config::zifi_baud != ZIFI_BAUD)
