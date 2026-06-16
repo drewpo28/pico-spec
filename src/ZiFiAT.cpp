@@ -284,7 +284,7 @@ void ZiFiAT::autoSyncPoll() {
                 if (strstr(L, "OK") || strstr(L, "ERROR")) as_to_cwjap(now);
                 break;
             case AS_CWJAP:
-                if (strstr(L, "WIFI GOT IP")) as_got_ip = true;
+                if (strstr(L, "WIFI GOT IP")) { as_got_ip = true; connected = true; }
                 if ((strstr(L, "OK") && as_got_ip) || strstr(L, "FAIL") || strstr(L, "ERROR"))
                     as_to_sntpcfg(now);
                 break;

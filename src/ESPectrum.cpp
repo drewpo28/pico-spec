@@ -2204,7 +2204,12 @@ void ESPectrum::loop() {
     // the run so the ESP has time to auto-reconnect; then stepped each loop tick.
     static bool     rtc_autosync_begun = false;
     static uint32_t rtc_autosync_at    = 0;
-    if (ZiFi::enabled && Config::rtc_enabled && !Config::wifi_ssid.empty()) {
+    // Reconnect WiFi at boot whenever the user left it connected (wifi_autoconnect),
+    // independent of the RTC — otherwise the only reconnect path was the SNTP sync,
+    // so with RTC off the link stayed down and the menu always showed "WiFi Off".
+    // The background state machine also runs SNTP, which is harmless when RTC is off.
+    if (!Config::wifi_ssid.empty() &&
+        (Config::wifi_autoconnect || (ZiFi::enabled && Config::rtc_enabled))) {
         if (!rtc_autosync_begun) {
             uint32_t now = to_ms_since_boot(get_absolute_time());
             if (rtc_autosync_at == 0) rtc_autosync_at = now + 4000;
