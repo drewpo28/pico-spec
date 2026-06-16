@@ -123,18 +123,44 @@ No persistent settings: the FTP server is a transient action with no config of i
 
 ## ESP-01S wiring
 
-Just **4 wires**. Both sides are **3.3 V** logic — no level shifter needed.
-**TX and RX cross over.**
+Just **4 wires** — power (VCC, GND) and a serial pair (TX, RX). Both sides are
+**3.3 V** logic, so **no level shifter** is needed.
+
+**The serial pair crosses over:** each side's **TX → the other side's RX**.
+
+The diagram below uses the **PICO_DV** default pins (UART0: GPIO 0 = TX, GPIO 1 = RX).
+For other boards only the GPIO numbers change — see the table below.
 
 ```
-   ESP-01S                       RP2350 (pins — see table below)
-   TX   ───────────────────────►  RX    (zifi_rx, odd pin = tx+1)
-   RX   ◄───────────────────────  TX    (zifi_tx, even pin)
-   GND  ───── GND
-   VCC  ───── 3V3                 (stable 3.3 V)
+        ESP-01S                              RP2350  (example: PICO_DV)
+   ┌───────────────────┐
+   │  ((( antenna )))  │
+   │   ┌──────────┐    │
+   │   │ ESP8266  │    │
+   │   └──────────┘    │
+   │              TX ●─┼──────────────────●  GPIO 1   ( Pico RX )
+   │              RX ●─┼──────────────────●  GPIO 0   ( Pico TX )
+   │             GND ●─┼──────────────────●  GND
+   │             VCC ●─┼──────────────────●  3V3   ( solid 3.3 V — see note )
+   │                   │
+   └───────────────────┘
+   EN / RST / GPIO0 / GPIO2 on the ESP — leave unconnected
 
-   EN/CH_PD, RST, GPIO0, GPIO2 — leave unconnected
+   The crossover is baked into the labels:  ESP TX → Pico RX,  ESP RX → Pico TX.
 ```
+
+Connection list (PICO_DV):
+
+| ESP-01S |   | RP2350 (PICO_DV) | meaning |
+|---------|---|------------------|---------|
+| **TX**  | ──► | **GPIO 1** | ESP TX → Pico **RX** |
+| **RX**  | ◄── | **GPIO 0** | ESP RX ← Pico **TX** |
+| **GND** | ─── | **GND** | common ground |
+| **VCC** | ─── | **3V3** | 3.3 V power |
+
+> **The crossover rule never changes** (only the GPIO numbers do): **Pico TX (even
+> pin) → ESP RX**, and **Pico RX (odd pin) → ESP TX**. Connecting TX→TX / RX→RX is the
+> #1 reason "nothing happens".
 
 > **Power.** The ESP-01S draws bursts up to ~300 mA on WiFi TX. Feed it from a solid
 > 3.3 V rail and add a **100–470 µF** cap at VCC — otherwise expect brownout resets.
