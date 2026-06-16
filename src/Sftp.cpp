@@ -154,7 +154,7 @@ bool Sftp::cwd(const std::string& path) {
     return true;
 }
 
-bool Sftp::list(const std::string& path, std::vector<RemoteEntry>& out) {
+bool Sftp::listStream(const std::string& path, RemoteListCb cb, void* ctx) {
     if (!up) return false;
     std::string dir = path.empty() ? cur_dir : absPath(path);
 
@@ -178,14 +178,12 @@ bool Sftp::list(const std::string& path, std::vector<RemoteEntry>& out) {
             uint64_t sz; uint32_t perms;
             if (!r.str(name) || !r.str(longname) || !r.attrs(sz, perms)) break;
             if (name == "." || name == "..") continue;
-            RemoteEntry e; e.name = name; e.isDir = (perms & S_IFDIR_MASK) != 0; e.size = (uint32_t)sz;
-            out.push_back(e);
+            cb(ctx, name.c_str(), (perms & S_IFDIR_MASK) != 0, (uint32_t)sz);
         }
     }
     Buf cl; cl.u32(next_id++); cl.str(handle);
     sendPacket(FXP_CLOSE, cl.d);
     recvPacket(t, b); // status
-    sortRemoteEntries(out);
     return true;
 }
 

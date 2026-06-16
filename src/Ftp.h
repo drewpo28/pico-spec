@@ -16,7 +16,7 @@ public:
     // Open control connection, log in (USER/PASS), set binary mode.
     bool connect(const char* host, uint16_t port, const char* user, const char* pass);
 
-    bool list(const std::string& path, std::vector<RemoteEntry>& out) override;
+    bool listStream(const std::string& path, RemoteListCb cb, void* ctx) override;
     bool cwd(const std::string& path) override;
     std::string cwdPath() const override { return cur_dir; }
     bool get(const std::string& remote, const std::string& localSdPath, XferProgressCb cb) override;

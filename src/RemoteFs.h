@@ -7,23 +7,12 @@
 
 #include <inttypes.h>
 #include <string>
-#include <vector>
-#include <algorithm>
-#include <strings.h>
 
-struct RemoteEntry {
-    std::string name;
-    bool        isDir;
-    uint32_t    size;
-};
-
-// Sort a listing for display: directories first, then case-insensitive by name.
-inline void sortRemoteEntries(std::vector<RemoteEntry>& v) {
-    std::sort(v.begin(), v.end(), [](const RemoteEntry& a, const RemoteEntry& b) {
-        if (a.isDir != b.isDir) return a.isDir && !b.isDir; // dirs before files
-        return strcasecmp(a.name.c_str(), b.name.c_str()) < 0;
-    });
-}
+// Per-entry callback for listStream: invoked once per directory entry. Streaming
+// (rather than returning a vector) keeps RAM bounded for huge directories — the
+// OSD browser spools entries straight to an SD index file. `size` is best-effort
+// (0 if unknown). "." and ".." are filtered out by the implementations.
+typedef void (*RemoteListCb)(void* ctx, const char* name, bool isDir, uint32_t size);
 
 // Progress callback for get/put: (done, total). total==0 means unknown. Return
 // false to abort the transfer (e.g. user pressed Esc).
@@ -33,8 +22,9 @@ class RemoteFs {
 public:
     virtual ~RemoteFs() {}
 
-    // List entries in `path` (or the current dir if empty). Returns false on error.
-    virtual bool list(const std::string& path, std::vector<RemoteEntry>& out) = 0;
+    // Stream entries of `path` (or the current dir if empty) to cb. Returns false
+    // on error. Never accumulates the whole listing in RAM.
+    virtual bool listStream(const std::string& path, RemoteListCb cb, void* ctx) = 0;
 
     // Change current directory. Returns false on error.
     virtual bool cwd(const std::string& path) = 0;

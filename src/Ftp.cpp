@@ -110,15 +110,15 @@ bool Ftp::cwd(const std::string& path) {
     return true;
 }
 
-// Parse a Unix "ls -l" listing line into a RemoteEntry. Returns false to skip.
-static bool parse_ls_line(const char* line, RemoteEntry& e) {
-    if (!line[0]) return false;
+// Parse one Unix "ls -l" line and emit it via cb. Skips "."/".." and blank lines.
+static void parse_ls_line(const char* line, RemoteListCb cb, void* ctx) {
+    if (!line[0]) return;
     // "drwxr-xr-x  2 user group  4096 Jan 01 12:00 name"
     char type = line[0];
     if (type != 'd' && type != '-' && type != 'l') {
         // Not a standard ls line (could be a bare name from NLST) — treat as file.
-        e.name = line; e.isDir = false; e.size = 0;
-        return !e.name.empty() && e.name != "." && e.name != "..";
+        if (line[0] && strcmp(line, ".") && strcmp(line, "..")) cb(ctx, line, false, 0);
+        return;
     }
     // Tokenise: fields 0..7 are perms,links,owner,group,size,month,day,time/year;
     // the name is everything after the 8th whitespace-separated token.
@@ -133,17 +133,16 @@ static bool parse_ls_line(const char* line, RemoteEntry& e) {
         field++;
     }
     while (*p == ' ') p++;
-    if (!*p) return false;
-    e.name = p;
+    if (!*p) return;
+    std::string name = p;
     // Strip a symlink "name -> target" suffix.
-    size_t arrow = e.name.find(" -> ");
-    if (arrow != std::string::npos) e.name.resize(arrow);
-    e.isDir = (type == 'd');
-    e.size  = sz;
-    return e.name != "." && e.name != "..";
+    size_t arrow = name.find(" -> ");
+    if (arrow != std::string::npos) name.resize(arrow);
+    if (name == "." || name == "..") return;
+    cb(ctx, name.c_str(), type == 'd', sz);
 }
 
-bool Ftp::list(const std::string& path, std::vector<RemoteEntry>& out) {
+bool Ftp::listStream(const std::string& path, RemoteListCb cb, void* ctx) {
     if (!connected) return false;
     if (!path.empty() && path != cur_dir) { if (!cwd(path)) return false; }
     if (!openPasvData()) return false;
@@ -152,29 +151,29 @@ bool Ftp::list(const std::string& path, std::vector<RemoteEntry>& out) {
     int code = command("LIST", nullptr, reply); // 150/125 → transfer starting
     if (code / 100 != 1) { ZiFiSock::sock_close(DATA); return false; }
 
-    // Read the whole listing off the data connection.
-    std::string acc;
+    // Read the listing off the data connection, parsing one line at a time so we
+    // never hold the whole directory in RAM (only the current line).
+    std::string line;
     for (;;) {
         int n = ZiFiSock::sock_recv(DATA, g_ftp_buf, sizeof(g_ftp_buf), 8000);
-        if (n < 0) break;
-        if (n == 0) break; // EOF
-        acc.append((const char*)g_ftp_buf, n);
+        if (n <= 0) break; // EOF / error
+        for (int i = 0; i < n; i++) {
+            char c = (char)g_ftp_buf[i];
+            if (c == '\n') {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                parse_ls_line(line.c_str(), cb, ctx);
+                line.clear();
+            } else {
+                line += c;
+            }
+        }
+    }
+    if (!line.empty()) { // trailing line with no newline
+        if (line.back() == '\r') line.pop_back();
+        parse_ls_line(line.c_str(), cb, ctx);
     }
     ZiFiSock::sock_close(DATA);
     readReply(reply); // 226 transfer complete
-
-    // Split accumulated text into lines.
-    size_t start = 0;
-    while (start < acc.size()) {
-        size_t nl = acc.find('\n', start);
-        std::string ln = acc.substr(start, (nl == std::string::npos ? acc.size() : nl) - start);
-        if (!ln.empty() && ln.back() == '\r') ln.pop_back();
-        RemoteEntry e;
-        if (parse_ls_line(ln.c_str(), e)) out.push_back(e);
-        if (nl == std::string::npos) break;
-        start = nl + 1;
-    }
-    sortRemoteEntries(out);
     return true;
 }
 

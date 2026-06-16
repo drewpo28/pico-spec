@@ -129,6 +129,8 @@ public:
     static string formatSlotRow(const string& label, const string& fname,
                                 bool wp, bool showWP);
     static string fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t mfcols, uint8_t mfrows);
+    // Remote (FTP/SFTP) file browser — bounded RAM via an SD index (see OSDFile.cpp).
+    static void remoteFileDialog(class RemoteFs* fs);
     static int menuTape(const string& title);
     static void menuScroll(bool up);
     static void fd_Redraw(const string& title, const string& fdir, uint8_t ftype, const vector<string>& filexts);

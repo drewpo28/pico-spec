@@ -386,77 +386,6 @@ static Ssh::TrustResult netHostKeyCb(const char* host, const char* keytype,
     return Ssh::REJECT;
 }
 
-// Progress callback for get/put: updates the progress dialog, Esc aborts.
-static string g_xfer_title;
-static bool netProgressCb(uint32_t done, uint32_t total) {
-    int pct = total ? (int)((uint64_t)done * 100 / total) : 0;
-    if (pct > 100) pct = 100;
-    OSD::progressDialog(g_xfer_title, "", pct, 1);
-    fabgl::VirtualKeyItem k;
-    if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable() && ESPectrum::readKbd(&k))
-        if (k.down && is_back(k.vk)) return false; // user aborted
-    return true;
-}
-
-// Interactive remote directory browser, driven by menuRun over a live listing.
-static void netRemoteBrowse(RemoteFs* fs) {
-    while (1) {
-        vector<RemoteEntry> entries;
-        // progressDialog (not osdCenteredMsg) saves/restores its background, so the
-        // "working" notice is cleanly removed before the file menu is drawn.
-        OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], fs->cwdPath(), 0, 0);
-        bool ok = fs->list("", entries);
-        OSD::progressDialog("", "", 0, 2);
-        Debug::log("netbrowse: list ok=%d entries=%u dir=%s", ok, (unsigned)entries.size(), fs->cwdPath().c_str());
-        if (!ok) { OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000); return; }
-
-        // Build the menu: title shows cwd; row1 = upload, row2 = "..", then entries.
-        string cwd = fs->cwdPath();
-        if (cwd.size() > 30) cwd = "..." + cwd.substr(cwd.size() - 27);
-        string m = string(MENU_NET_BROWSE_TITLE[Config::lang]) + " " + cwd + "\n";
-        m += (Config::lang ? "[Subir archivo aqui]\n" : "[Upload file here]\n");
-        m += "..\t>\n";
-        for (auto& e : entries) m += e.name + (e.isDir ? "\t>\n" : "\n");
-        if (entries.empty()) { /* still allow upload / .. */ }
-
-        OSD::menu_level = 0; OSD::menu_saverect = true; OSD::menu_curopt = 1;
-        uint8_t sel = OSD::menuRun(m);
-        if (sel == 0) return; // Esc → leave browser
-        VIDEO::SaveRect.restore_last();
-
-        if (sel == 1) { // Upload a local SD file into the current remote dir
-            string dir = "/";
-            string local = OSD::fileDialog(dir, Config::lang ? "Subir" : "Upload", 0, 40, 18);
-            if (!local.empty()) {
-                string base = local.substr(local.find_last_of('/') + 1);
-                g_xfer_title = MSG_NET_UPLOADING[Config::lang];
-                OSD::progressDialog(g_xfer_title, base, 0, 0);
-                bool put_ok = fs->put(local, base, netProgressCb);
-                OSD::progressDialog("", "", 0, 2);
-                OSD::osdCenteredMsg(put_ok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
-                                    put_ok ? LEVEL_INFO : LEVEL_WARN, 1800);
-            }
-            continue;
-        }
-        if (sel == 2) { fs->cwd(".."); continue; } // parent dir
-
-        RemoteEntry& e = entries[sel - 3];
-        if (e.isDir) { fs->cwd(e.name); continue; }
-
-        // A file: confirm and download into /spec (user data root).
-        if (OSD::msgDialog(e.name, MSG_NET_DOWNLOADING[Config::lang]) != DLG_YES) continue;
-        FileUtils::mkdirParents("/spec");
-        string local = "/spec/" + e.name;
-        g_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
-        OSD::progressDialog(g_xfer_title, e.name, 0, 0);
-        bool got = fs->get(e.name, local, netProgressCb);
-        OSD::progressDialog("", "", 0, 2);
-        OSD::osdCenteredMsg(got ? (string(MSG_NET_XFER_OK[Config::lang]) + "\n" + local)
-                                : MSG_NET_XFER_ERR[Config::lang],
-                            got ? LEVEL_INFO : LEVEL_WARN, 2200);
-    }
-}
-
 // The SSH/SFTP crypto path (mbedTLS ECDH/ECP/bignum) needs far more than the
 // 4 KB core-0 stack (PICO_STACK_SIZE=0x1000), especially nested under do_OSD —
 // it overflows and faults (observed: SIGBUS, stackOvf=1). So we run the whole
@@ -485,7 +414,7 @@ static void netSessionRun(void* p) {
     }
     OSD::progressDialog("", "", 0, 2); // close the "Connecting..." notice
     if (!fs) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
-    netRemoteBrowse(fs);
+    OSD::remoteFileDialog(fs); // SD-indexed browser (bounded RAM); runs on this alt-stack
     fs->disconnect();
     delete fs;
 }

@@ -58,6 +58,9 @@ using namespace std;
 
 #include "Debug.h"
 #include "PinSerialData_595.h"
+#if ZIFI_NET_CLIENT
+#include "RemoteFs.h"
+#endif
 
 extern Font Font6x8;
 
@@ -1239,3 +1242,161 @@ void OSD::fd_PrintRow(uint8_t virtual_row_num, uint8_t line_type, const vector<s
 
     VIDEO::vga.print(" ");
 }
+
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+// ─── Remote (FTP/SFTP) file browser ─────────────────────────────────────────
+// Bounded RAM for any directory size: each listing is streamed straight into a
+// sorted_files SD index (fixed 256-byte records, on-disk quicksort, dirs first),
+// and only the visible window is read back per redraw — mirrors how fileDialog
+// handles huge SD directories. No vector / no giant menu string in RAM.
+
+// listStream callback: push one entry into the index (DIR_MARKER prefix = dir,
+// so the on-disk sort groups directories first).
+static void rfd_push(void* ctx, const char* name, bool isDir, uint32_t size) {
+    (void)size;
+    sorted_files* idx = (sorted_files*)ctx;
+    std::string rec;
+    if (isDir) rec += (char)DIR_MARKER;
+    rec += name;
+    idx->push(rec);
+}
+
+// Transfer progress: update the dialog; Esc/F1 aborts.
+static string rfd_xfer_title;
+static bool rfd_progress(uint32_t done, uint32_t total) {
+    int pct = total ? (int)((uint64_t)done * 100 / total) : 0;
+    if (pct > 100) pct = 100;
+    OSD::progressDialog(rfd_xfer_title, "", pct, 1);
+    fabgl::VirtualKeyItem k;
+    if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable() && ESPectrum::readKbd(&k))
+        if (k.down && is_back(k.vk)) return false;
+    return true;
+}
+
+void OSD::remoteFileDialog(RemoteFs* fs) {
+    sorted_files idx;
+    idx.init("__netfs__");           // /tmp/.__netfs__.idx
+
+    const int cols_n = 36;           // visible name columns
+    const int MAXVIS = 17;
+
+    while (1) {
+        // ── (Re)build the index for the current directory (streamed) ──
+        OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], fs->cwdPath(), 0, 0);
+        idx.unlink();                // truncate to empty (also (re)creates the file)
+        bool ok = fs->listStream("", rfd_push, &idx);
+        OSD::progressDialog("", "", 0, 2);
+        if (!ok) { OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000); idx.unlink(); return; }
+        idx.sort();
+
+        int nfiles = (int)idx.size();
+        int total  = nfiles + 2;     // [0]=upload, [1]="..", [2..]=entries
+        int vis    = total < MAXVIS ? total : MAXVIS;
+
+        int w = (cols_n + 2) * OSD_FONT_W + 2;
+        int h = (vis + 1) * OSD_FONT_H + 2;     // +1 title row
+        int wx = scrAlignCenterX(w), wy = scrAlignCenterY(h);
+
+        int cursor = 0, top = 0;
+        VIDEO::SaveRect.save(wx, wy, w, h);
+
+        // Draw the whole window (title + visible rows). Cheap (<=17 rows).
+        auto redraw = [&]() {
+            VIDEO::vga.setFont(Font6x8);
+            VIDEO::vga.rect(wx, wy, w, h, zxColor(0, 0));
+            // Title bar = current remote dir.
+            VIDEO::vga.fillRect(wx + 1, wy + 1, w - 2, OSD_FONT_H, zxColor(0, 0));
+            VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(0, 0));
+            VIDEO::vga.setCursor(wx + 1 + OSD_FONT_W, wy + 1);
+            string title = fs->cwdPath();
+            if ((int)title.size() > cols_n) title = "..." + title.substr(title.size() - (cols_n - 3));
+            VIDEO::vga.print(title.c_str());
+            // Rows.
+            for (int r = 0; r < vis; r++) {
+                int abs = top + r;
+                bool foc = (abs == cursor);
+                VIDEO::vga.setTextColor(zxColor(0, 1), foc ? zxColor(5, 1) : zxColor(7, 1));
+                VIDEO::vga.setCursor(wx + 1, wy + 1 + OSD_FONT_H + r * OSD_FONT_H);
+                string disp;
+                if (abs == 0)      disp = Config::lang ? "[Subir archivo aqui]" : "[Upload file here]";
+                else if (abs == 1) disp = "..";
+                else if (abs < total) {
+                    string rec = idx.get(abs - 2);
+                    if (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER) disp = rec.substr(1) + "/";
+                    else disp = rec;
+                }
+                if ((int)disp.size() > cols_n) disp = disp.substr(0, cols_n);
+                VIDEO::vga.print(" ");
+                VIDEO::vga.print(disp.c_str());
+                for (int i = (int)disp.size(); i < cols_n + 1; i++) VIDEO::vga.print(" ");
+            }
+        };
+        redraw();
+
+        // ── Key loop ──
+        bool do_action = false;
+        while (1) {
+            if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
+                fabgl::VirtualKeyItem k;
+                if (!ESPectrum::readKbd(&k) || !k.down) continue;
+                int oc = cursor;
+                if (is_up(k.vk))            cursor--;
+                else if (is_down(k.vk))     cursor++;
+                else if (k.vk == fabgl::VK_PAGEUP)   cursor -= vis;
+                else if (k.vk == fabgl::VK_PAGEDOWN) cursor += vis;
+                else if (is_home(k.vk))     cursor = 0;
+                else if (k.vk == fabgl::VK_END) cursor = total - 1;
+                else if (is_enter(k.vk))    { do_action = true; click(); break; }
+                else if (is_back(k.vk))     { VIDEO::SaveRect.restore_last(); click(); idx.unlink(); return; }
+                else continue;
+                if (cursor < 0) cursor = 0;
+                if (cursor > total - 1) cursor = total - 1;
+                if (cursor < top) top = cursor;
+                if (cursor >= top + vis) top = cursor - vis + 1;
+                if (top > total - vis) top = total - vis;
+                if (top < 0) top = 0;
+                if (cursor != oc) { redraw(); click(); }
+            }
+            sleep_ms(5);
+        }
+
+        // ── Handle the selection ──
+        VIDEO::SaveRect.restore_last();
+        if (!do_action) continue;
+
+        if (cursor == 0) {               // Upload a local SD file into this dir
+            string ldir = "/";
+            string local = OSD::fileDialog(ldir, Config::lang ? "Subir" : "Upload", 0, 40, 18);
+            if (!local.empty()) {
+                string base = local.substr(local.find_last_of('/') + 1);
+                rfd_xfer_title = MSG_NET_UPLOADING[Config::lang];
+                OSD::progressDialog(rfd_xfer_title, base, 0, 0);
+                bool put_ok = fs->put(local, base, rfd_progress);
+                OSD::progressDialog("", "", 0, 2);
+                OSD::osdCenteredMsg(put_ok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
+                                    put_ok ? LEVEL_INFO : LEVEL_WARN, 1800);
+            }
+        } else if (cursor == 1) {        // Parent directory
+            fs->cwd("..");
+        } else {
+            string rec = idx.get(cursor - 2);
+            bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
+            string nm = isDir ? rec.substr(1) : rec;
+            if (isDir) {
+                fs->cwd(nm);
+            } else if (OSD::msgDialog(nm, MSG_NET_DOWNLOADING[Config::lang]) == DLG_YES) {
+                FileUtils::mkdirParents("/spec");
+                string localp = "/spec/" + nm;
+                rfd_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
+                OSD::progressDialog(rfd_xfer_title, nm, 0, 0);
+                bool got = fs->get(nm, localp, rfd_progress);
+                OSD::progressDialog("", "", 0, 2);
+                OSD::osdCenteredMsg(got ? (string(MSG_NET_XFER_OK[Config::lang]) + "\n" + localp)
+                                        : MSG_NET_XFER_ERR[Config::lang],
+                                    got ? LEVEL_INFO : LEVEL_WARN, 2200);
+            }
+        }
+        // loop → re-list current directory
+    }
+}
+#endif // !PICO_RP2040 && ZIFI_NET_CLIENT
