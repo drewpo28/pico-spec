@@ -128,6 +128,7 @@ uint16_t Config::ide_chs[2][3] = {{0,0,0},{0,0,0}};
 uint8_t  Config::zifi_enabled = 0;
 uint8_t  Config::zifi_tx_pin = 0xFE; // 0xFE = board default (BoardPins)
 uint8_t  Config::zifi_rx_pin = 0xFE;
+uint32_t Config::zifi_baud = 115200;
 string   Config::wifi_ssid;
 string   Config::wifi_pass;
 bool     Config::wifi_autoconnect = false;
@@ -455,6 +456,7 @@ void Config::loadWifiConfig() {
                 else if (key == "net_user")  net_user = val;
                 else if (key == "net_port")  net_port = (uint16_t)atoi(val.c_str());
                 else if (key == "net_proto") net_proto = (uint8_t)atoi(val.c_str());
+                else if (key == "baud")      { zifi_baud = (uint32_t)strtoul(val.c_str(), nullptr, 10); if (!zifi_baud) zifi_baud = 115200; }
             }
             line.clear();
         } else if (c != '\r') {
@@ -468,14 +470,14 @@ void Config::saveWifiConfig() {
     FileUtils::mkdirParents(CONFIG_DIR);
     FIL* f = fopen2(WIFI_CFG_PATH, FA_WRITE | FA_CREATE_ALWAYS);
     if (!f) return;
-    char buf[320];
+    char buf[360];
     int n = snprintf(buf, sizeof(buf),
                      "ssid=%s\npass=%s\ntz=%d\nautoconnect=%d\n"
-                     "net_host=%s\nnet_user=%s\nnet_port=%u\nnet_proto=%u\n",
+                     "net_host=%s\nnet_user=%s\nnet_port=%u\nnet_proto=%u\nbaud=%u\n",
                      wifi_ssid.c_str(), wifi_pass.c_str(),
                      (int)wifi_tz, wifi_autoconnect ? 1 : 0,
                      net_host.c_str(), net_user.c_str(),
-                     (unsigned)net_port, (unsigned)net_proto);
+                     (unsigned)net_port, (unsigned)net_proto, (unsigned)zifi_baud);
     UINT bw;
     if (n > 0) f_write(f, buf, n, &bw);
     fclose2(f);

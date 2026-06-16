@@ -30,7 +30,7 @@
 //
 // Only CR mode=1 (transparent) passes DR bytes to UART TX.
 
-#define ZIFI_BAUD 115200
+#define ZIFI_BAUD 115200   // ESP-01S AT firmware power-on default; our base rate
 
 // Runtime UART selection — pins come from Config (resolved via BoardPins), not a
 // compile-time #define. g_uart == nullptr means no physical UART (OFF/invalid):
@@ -39,6 +39,24 @@ static uart_inst_t* g_uart     = nullptr;
 static uint         g_uart_irq = 0;
 static uint8_t      g_tx       = BoardPins::PIN_OFF;
 static uint8_t      g_rx       = BoardPins::PIN_OFF;
+static uint32_t     g_cur_baud = ZIFI_BAUD; // actual UART rate the ESP+Pico are on
+
+// Switch the ESP-01S (and our UART) to `target` baud. Uses the volatile
+// AT+UART_CUR so it never persists in ESP flash — every fresh boot the ESP is
+// back at 115200, which init() relies on. Call only with the RX IRQ disabled so
+// the transition garbage can be poll-drained here.
+static void zifi_set_baud(uint32_t target) {
+    if (!g_uart || target == 0 || target == g_cur_baud) return;
+    char cmd[48];
+    int n = snprintf(cmd, sizeof(cmd), "AT+UART_CUR=%u,8,1,0,0\r\n", (unsigned)target);
+    for (int i = 0; i < n; i++) { while (!uart_is_writable(g_uart)) tight_loop_contents(); uart_putc(g_uart, cmd[i]); }
+    uart_tx_wait_blocking(g_uart);
+    sleep_ms(80);                          // let the ESP ack + reconfigure its UART
+    uart_set_baudrate(g_uart, target);
+    g_cur_baud = target;
+    sleep_ms(20);
+    while (uart_is_readable(g_uart)) (void)uart_getc(g_uart); // flush transition garbage
+}
 
 uint8_t ZiFi::enabled = 0;
 
@@ -186,14 +204,19 @@ void ZiFi::init() {
     g_uart_irq = inst ? UART1_IRQ : UART0_IRQ;
     g_tx = tx; g_rx = rx;
     uart_init(g_uart, ZIFI_BAUD);
+    g_cur_baud = ZIFI_BAUD;
     gpio_set_function(tx, UART_FUNCSEL_NUM(g_uart, tx));
     gpio_set_function(rx, UART_FUNCSEL_NUM(g_uart, rx));
     uart_set_format(g_uart, 8, 1, UART_PARITY_NONE);
     uart_set_fifo_enabled(g_uart, true);
+    // Optionally raise the link speed for faster transfers. Negotiate BEFORE
+    // arming the RX IRQ so zifi_set_baud can poll-drain the transition bytes.
+    if (Config::zifi_baud && Config::zifi_baud != ZIFI_BAUD)
+        zifi_set_baud(Config::zifi_baud);
     irq_set_exclusive_handler(g_uart_irq, uart_rx_irq_handler);
     uart_set_irq_enables(g_uart, true, false); // RX IRQ only
     irq_set_enabled(g_uart_irq, true);
-    Debug::log("ZiFi: UART%d init TX=%d RX=%d baud=%d", inst, tx, rx, ZIFI_BAUD);
+    Debug::log("ZiFi: UART%d init TX=%d RX=%d baud=%u", inst, tx, rx, (unsigned)g_cur_baud);
     hw_initialized = true;
 }
 
@@ -203,6 +226,9 @@ void ZiFi::deinit() {
         irq_set_enabled(g_uart_irq, false);
         uart_set_irq_enables(g_uart, false, false);
         irq_remove_handler(g_uart_irq, uart_rx_irq_handler);
+        // Put the ESP back to the default rate so the next init() (which always
+        // starts at 115200) can talk to it. IRQ is off → poll-drain is safe.
+        if (g_cur_baud != ZIFI_BAUD) zifi_set_baud(ZIFI_BAUD);
         uart_deinit(g_uart);
         gpio_deinit(g_tx);
         gpio_deinit(g_rx);

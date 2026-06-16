@@ -231,6 +231,7 @@ public:
     // (resolved via BoardPins). See BoardPins.h / Network → GPIO picker.
     static uint8_t zifi_tx_pin;
     static uint8_t zifi_rx_pin;
+    static uint32_t zifi_baud;  // ESP-01S UART rate (115200 default; raised via AT+UART_CUR)
     static string wifi_ssid;
     static string wifi_pass;
     static bool wifi_autoconnect;

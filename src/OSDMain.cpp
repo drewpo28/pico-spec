@@ -5803,208 +5803,209 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             else if (opt == 10) { // Network
                 menu_saverect = true;
                 menu_curopt = 1;
-                // Live status shown inline on the "Status" row. getStatus() is a
-                // blocking AT round-trip, so cache it and refresh only on entry and
-                // after connect/disconnect. The row is padded to a fixed width so
-                // the menu geometry doesn't shift when the text changes.
+                // Live WiFi status (getStatus is a blocking AT round-trip) — cached,
+                // refreshed on entry and after connect/disconnect/NIC toggle.
                 bool   st_conn = false;
                 string st_ssid, st_ip;
                 auto refreshNetStatus = [&]() {
                     st_ssid.clear(); st_ip.clear();
                     st_conn = Config::zifi_enabled && ZiFiAT::getStatus(st_ssid, st_ip);
                 };
-                auto buildNetMenu = [&]() -> string {
-                    // Row 1: ZiFi UART GPIO pair (current selection / OFF / default).
-                    char gpio[40];
-                    if (Config::zifi_tx_pin == BoardPins::PIN_OFF) {
-                        snprintf(gpio, sizeof(gpio), "GPIO Off\t>");
-                    } else {
-                        uint8_t dtx, drx;
-                        BoardPins::resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, dtx, drx);
-                        snprintf(gpio, sizeof(gpio), "GPIO %u/%u%s\t>", dtx, drx,
-                                 Config::zifi_tx_pin == BoardPins::PIN_DEFAULT ? " (def)" : "");
+
+                // ── ESP-01S hardware/config pickers (level 3, under the ESP01 submenu) ──
+                auto pickGpio = [&]() {
+                    menu_level = 3; menu_saverect = true;
+                    string m = string(MENU_ZIFI_GPIO_TITLE[Config::lang]) + "\n";
+                    m += "Off\n";
+                    int nopt = BoardPins::zifiPairCount();
+                    for (int i = 0; i < nopt; i++) {
+                        const BoardPins::UartPair* p = BoardPins::zifiPair(i);
+                        char b[48];
+                        snprintf(b, sizeof(b), "%u/%u%s%s\n", p->tx, p->rx, p->note[0] ? "  " : "", p->note);
+                        m += b;
                     }
-                    // Row 2: live WiFi status (padded to fixed width so geometry is stable).
+                    if (Config::zifi_tx_pin == BoardPins::PIN_OFF) menu_curopt = 1;
+                    else {
+                        uint8_t rtx, rrx;
+                        BoardPins::resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, rtx, rrx);
+                        menu_curopt = 2;
+                        for (int i = 0; i < nopt; i++)
+                            if (BoardPins::zifiPair(i)->tx == rtx) { menu_curopt = i + 2; break; }
+                    }
+                    uint8_t sel = menuRun(m);
+                    if (sel > 0) {
+                        VIDEO::SaveRect.restore_last();
+                        bool conflict = false;
+                        if (sel == 1) Config::zifi_tx_pin = Config::zifi_rx_pin = BoardPins::PIN_OFF;
+                        else {
+                            const BoardPins::UartPair* p = BoardPins::zifiPair(sel - 2);
+                            if (p) { Config::zifi_tx_pin = p->tx; Config::zifi_rx_pin = p->rx; conflict = p->note[0] != 0; }
+                        }
+                        Config::save();
+                        if (Config::zifi_enabled) { ZiFi::deinit(); ZiFi::init(); }
+                        refreshNetStatus();
+                        if (conflict && OSD::msgDialog(MENU_ZIFI_GPIO_TITLE[Config::lang],
+                                                       OSD_DLG_APPLYREBOOT[Config::lang]) == DLG_YES)
+                            OSD::esp_hard_reset();
+                    }
+                };
+                auto pickBaud = [&]() {
+                    menu_level = 3; menu_saverect = true;
+                    static const uint32_t bauds[] = { 115200, 230400, 460800, 921600 };
+                    const int NB = 4;
+                    string m = string(MENU_BAUD_TITLE[Config::lang]) + "\n";
+                    for (int i = 0; i < NB; i++) { char b[16]; snprintf(b, sizeof(b), "%u\n", (unsigned)bauds[i]); m += b; }
+                    menu_curopt = 1;
+                    for (int i = 0; i < NB; i++) if (bauds[i] == Config::zifi_baud) { menu_curopt = i + 1; break; }
+                    uint8_t sel = menuRun(m);
+                    if (sel > 0) {
+                        VIDEO::SaveRect.restore_last();
+                        uint32_t nb = bauds[sel - 1];
+                        if (nb != Config::zifi_baud) {
+                            Config::zifi_baud = nb;
+                            Config::saveWifiConfig();
+                            // deinit resets the ESP to 115200, init re-handshakes at the new rate.
+                            if (Config::zifi_enabled) { ZiFi::deinit(); ZiFi::init(); }
+                            refreshNetStatus();
+                        }
+                    }
+                };
+                auto pickTz = [&]() {
+                    menu_level = 3; menu_saverect = true;
+                    string m = string(MENU_TZ_TITLE[Config::lang]) + "\n";
+                    for (int tz = -12; tz <= 14; tz++) { char b[16]; snprintf(b, sizeof(b), "UTC%+d\n", tz); m += b; }
+                    menu_curopt = Config::wifi_tz + 13;
+                    uint8_t sel = menuRun(m);
+                    if (sel > 0) {
+                        Config::wifi_tz = (signed char)((int)sel - 13);
+                        Config::saveWifiConfig();
+                        VIDEO::SaveRect.restore_last();
+                    }
+                };
+                auto doSync = [&]() {
+                    OSD::osdCenteredMsg(MSG_RTC_SYNCING[Config::lang], LEVEL_INFO, 0);
+                    string when;
+                    if (ZiFiAT::syncTime(Config::wifi_tz, when) == ZiFiAT::OK)
+                        OSD::osdCenteredMsg(string(MSG_RTC_SYNCED[Config::lang]) + "\n" + when, LEVEL_INFO, 3000);
+                    else
+                        OSD::osdCenteredMsg(MSG_RTC_SYNC_ERR[Config::lang], LEVEL_WARN, 3000);
+                };
+                // ── ESP01 submenu (level 2): GPIO / Baud / Time zone / Sync time ──
+                auto esp01Menu = [&]() {
+                    menu_saverect = true; menu_curopt = 1;
+                    while (1) {
+                        menu_level = 2;
+                        char gpio[40];
+                        if (Config::zifi_tx_pin == BoardPins::PIN_OFF)
+                            snprintf(gpio, sizeof(gpio), "GPIO Off\t>");
+                        else {
+                            uint8_t dtx, drx;
+                            BoardPins::resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, dtx, drx);
+                            snprintf(gpio, sizeof(gpio), "GPIO %u/%u%s\t>", dtx, drx,
+                                     Config::zifi_tx_pin == BoardPins::PIN_DEFAULT ? " (def)" : "");
+                        }
+                        char baud[32]; snprintf(baud, sizeof(baud), "Baud %u\t>", (unsigned)Config::zifi_baud);
+                        string m = string(MENU_ESP01_TITLE[Config::lang]) + "\n"
+                                 + gpio + "\n" + baud + "\n"
+                                 + (Config::lang ? "Zona horaria\t>\n" : "Time zone\t>\n")
+                                 + (Config::lang ? "Sincronizar hora\n" : "Sync time (SNTP)\n");
+                        uint8_t e = menuRun(m);
+                        if (e == 0) break; // Esc → back to Network (menuRun popped our rect)
+                        if      (e == 1) pickGpio();
+                        else if (e == 2) pickBaud();
+                        else if (e == 3) pickTz();
+                        else if (e == 4) doSync();
+                        menu_curopt = e;
+                        menu_saverect = false; // only the first ESP01 menuRun saves/positions
+                    }
+                };
+                // ── WiFi connect/disconnect (level 2 list) ──
+                auto doWifi = [&]() {
+                    if (st_conn) {
+                        string msg = st_ip + "  " + string(MSG_WIFI_DISCONNECT_Q[Config::lang]);
+                        if (OSD::msgDialog(st_ssid, msg) == DLG_YES) {
+                            ZiFiAT::disconnect();
+                            OSD::osdCenteredMsg(MSG_WIFI_DISCONNECTED[Config::lang], LEVEL_INFO, 1500);
+                        }
+                    } else {
+                        OSD::osdCenteredMsg(MSG_WIFI_SCANNING[Config::lang], LEVEL_INFO, 0);
+                        string nets[24];
+                        int n = ZiFiAT::scan(nets, 24);
+                        if (n <= 0) { OSD::osdCenteredMsg(MSG_WIFI_NO_NETS[Config::lang], LEVEL_WARN, 2000); return; }
+                        string m = string(MENU_WIFI_LIST_TITLE[Config::lang]) + "\n";
+                        for (int i = 0; i < n; i++) m += nets[i] + "\n";
+                        menu_level = 2; menu_saverect = true; menu_curopt = 1;
+                        uint8_t sel = menuRun(m);
+                        if (sel > 0) {
+                            VIDEO::SaveRect.restore_last();
+                            string chosen = nets[sel - 1];
+                            string pass = wifiAskPassword(chosen);
+                            if (pass != "\x1B") {
+                                OSD::osdCenteredMsg(MSG_WIFI_CONNECTING[Config::lang], LEVEL_INFO, 0);
+                                if (ZiFiAT::connect(chosen, pass) == ZiFiAT::OK) {
+                                    Config::wifi_ssid = chosen; Config::wifi_pass = pass; Config::wifi_autoconnect = true;
+                                    Config::saveWifiConfig();
+                                    OSD::osdCenteredMsg(string(MSG_WIFI_CONNECTED[Config::lang]) + "\n" + ZiFiAT::current_ip, LEVEL_INFO, 2500);
+                                } else
+                                    OSD::osdCenteredMsg(MSG_WIFI_CONNECT_ERR[Config::lang], LEVEL_WARN, 2500);
+                            }
+                        }
+                    }
+                };
+                // ── ZiFi NIC on/off (level 2) ──
+                auto doNic = [&]() {
+                    menu_level = 2; menu_saverect = true; menu_curopt = Config::zifi_enabled + 1;
+                    uint8_t zn = menuRun(MENU_ZIFI_NIC[Config::lang]);
+                    if (zn > 0) {
+                        Config::zifi_enabled = zn - 1;
+                        if (Config::zifi_enabled) ZiFi::init(); else ZiFi::deinit();
+                        Config::save();
+                        VIDEO::SaveRect.restore_last();
+                        refreshNetStatus();
+                        if (Config::zifi_enabled && BoardPins::zifiActiveNote()[0] &&
+                            OSD::msgDialog("", OSD_DLG_APPLYREBOOT[Config::lang]) == DLG_YES)
+                            OSD::esp_hard_reset();
+                    }
+                };
+
+                refreshNetStatus();
+                while (1) {
+                    menu_level = 1;
+                    // Row 2: live WiFi status, padded to a fixed width so geometry is stable.
                     string st;
                     if (st_conn) {
-                        const char* pre = "WiFi On "; // 8 chars
-                        string ssid = st_ssid, ip = st_ip; // keep IP whole, trim SSID to fit
+                        const char* pre = "WiFi On ";
+                        string ssid = st_ssid, ip = st_ip;
                         int avail = 32 - (int)strlen(pre) - 1 - (int)ip.size();
                         if (avail < 0) avail = 0;
                         if ((int)ssid.size() > avail) ssid.resize(avail);
                         st = string(pre) + ssid + " " + ip;
-                    } else {
-                        st = "WiFi Off";
-                    }
+                    } else st = "WiFi Off";
                     if (st.size() < 32) st.append(32 - st.size(), ' '); else st.resize(32);
-                    string r = string(Config::lang ? "Red\n" : "Network\n")
-                         + gpio + "\n"
-                         + st + "\n"
-                         + (Config::lang ? "Sincronizar hora\n" : "Sync time (SNTP)\n")
-                         + (Config::lang ? "Zona horaria\t>\n" : "Time zone\t>\n")
-                         + "ZiFi NIC\t>\n";
+
+                    string nm = string(Config::lang ? "Red\n" : "Network\n")
+                              + string(MENU_ESP01_TITLE[Config::lang]) + "\t>\n"  // 1 ESP01
+                              + st + "\n";                                        // 2 WiFi
 #if ZIFI_NET_CLIENT
-                    r += (Config::lang ? "Transferir archivos\t>\n" : "File transfer\t>\n");
+                    nm += (Config::lang ? "Transferir archivos\t>\n" : "File transfer\t>\n"); // 3
 #endif
-                    return r;
-                };
-                refreshNetStatus();
-                while (1) {
-                    menu_level = 1;
-                    uint8_t net_opt = menuRun(buildNetMenu());
+                    nm += "ZiFi NIC\t>\n";                                        // 3 or 4
+
+                    uint8_t net_opt = menuRun(nm);
                     if (net_opt == 0) break;
 
-                    if (net_opt == 1) { // ZiFi UART GPIO (TX/RX) picker
-                        menu_level = 2;
-                        menu_saverect = true;
-                        string m = string(MENU_ZIFI_GPIO_TITLE[Config::lang]) + "\n";
-                        m += "Off\n";
-                        int nopt = BoardPins::zifiPairCount();
-                        for (int i = 0; i < nopt; i++) {
-                            const BoardPins::UartPair* p = BoardPins::zifiPair(i);
-                            char b[48];
-                            snprintf(b, sizeof(b), "%u/%u%s%s\n", p->tx, p->rx,
-                                     p->note[0] ? "  " : "", p->note);
-                            m += b;
-                        }
-                        // Preselect: row 1 = Off, rows 2.. = pairs.
-                        if (Config::zifi_tx_pin == BoardPins::PIN_OFF) {
-                            menu_curopt = 1;
-                        } else {
-                            uint8_t rtx, rrx;
-                            BoardPins::resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, rtx, rrx);
-                            menu_curopt = 2;
-                            for (int i = 0; i < nopt; i++)
-                                if (BoardPins::zifiPair(i)->tx == rtx) { menu_curopt = i + 2; break; }
-                        }
-                        uint8_t sel = menuRun(m);
-                        if (sel > 0) {
-                            VIDEO::SaveRect.restore_last(); // pop picker rect (Enter path)
-                            bool conflict = false; // chosen pair displaces another peripheral
-                            if (sel == 1) {
-                                Config::zifi_tx_pin = Config::zifi_rx_pin = BoardPins::PIN_OFF;
-                            } else {
-                                const BoardPins::UartPair* p = BoardPins::zifiPair(sel - 2);
-                                if (p) {
-                                    Config::zifi_tx_pin = p->tx;
-                                    Config::zifi_rx_pin = p->rx;
-                                    conflict = p->note[0] != 0; // non-empty note = displaces NESPAD/MIDI/WAV/…
-                                }
-                            }
-                            Config::save();
-                            // Re-apply pins now if the NIC is on (deinit+init reads new pins).
-                            if (Config::zifi_enabled) { ZiFi::deinit(); ZiFi::init(); }
-                            refreshNetStatus();
-                            // The displaced peripheral only releases its pins at boot
-                            // (yield-at-boot), so offer a reboot to make it take effect.
-                            if (conflict && OSD::msgDialog(MENU_ZIFI_GPIO_TITLE[Config::lang],
-                                                           OSD_DLG_APPLYREBOOT[Config::lang]) == DLG_YES)
-                                OSD::esp_hard_reset();
-                        }
-                    }
-                    else if (net_opt == 2) { // WiFi — connect / disconnect / scan
-                        if (st_conn) {
-                            // Connected: show network + IP, offer to disconnect.
-                            string msg = st_ip + "  " + string(MSG_WIFI_DISCONNECT_Q[Config::lang]);
-                            if (OSD::msgDialog(st_ssid, msg) == DLG_YES) {
-                                ZiFiAT::disconnect();
-                                OSD::osdCenteredMsg(MSG_WIFI_DISCONNECTED[Config::lang], LEVEL_INFO, 1500);
-                            }
-                        } else {
-                            // Not connected: scan, pick a network, ask password, connect.
-                            OSD::osdCenteredMsg(MSG_WIFI_SCANNING[Config::lang], LEVEL_INFO, 0);
-                            string nets[24];
-                            int n = ZiFiAT::scan(nets, 24);
-                            if (n <= 0) {
-                                OSD::osdCenteredMsg(MSG_WIFI_NO_NETS[Config::lang], LEVEL_WARN, 2000);
-                            } else {
-                                string m = string(MENU_WIFI_LIST_TITLE[Config::lang]) + "\n";
-                                for (int i = 0; i < n; i++) m += nets[i] + "\n";
-                                menu_level = 2;
-                                menu_saverect = true;
-                                menu_curopt = 1;
-                                uint8_t sel = menuRun(m);
-                                if (sel > 0) {
-                                    VIDEO::SaveRect.restore_last(); // pop list rect (Enter path)
-                                    string chosen = nets[sel - 1];
-                                    string pass = wifiAskPassword(chosen);
-                                    if (pass != "\x1B") {
-                                        OSD::osdCenteredMsg(MSG_WIFI_CONNECTING[Config::lang], LEVEL_INFO, 0);
-                                        if (ZiFiAT::connect(chosen, pass) == ZiFiAT::OK) {
-                                            Config::wifi_ssid = chosen;
-                                            Config::wifi_pass = pass;
-                                            Config::wifi_autoconnect = true;
-                                            Config::saveWifiConfig();
-                                            OSD::osdCenteredMsg(string(MSG_WIFI_CONNECTED[Config::lang]) + "\n" + ZiFiAT::current_ip, LEVEL_INFO, 2500);
-                                        } else {
-                                            OSD::osdCenteredMsg(MSG_WIFI_CONNECT_ERR[Config::lang], LEVEL_WARN, 2500);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        refreshNetStatus(); // connection may have changed → update inline label
-                    }
-                    else if (net_opt == 3) { // Sync time (SNTP)
-                        OSD::osdCenteredMsg(MSG_RTC_SYNCING[Config::lang], LEVEL_INFO, 0);
-                        string when;
-                        if (ZiFiAT::syncTime(Config::wifi_tz, when) == ZiFiAT::OK)
-                            OSD::osdCenteredMsg(string(MSG_RTC_SYNCED[Config::lang]) + "\n" + when, LEVEL_INFO, 3000);
-                        else
-                            OSD::osdCenteredMsg(MSG_RTC_SYNC_ERR[Config::lang], LEVEL_WARN, 3000);
-                    }
-                    else if (net_opt == 4) { // Time zone (UTC offset)
-                        menu_level = 2;
-                        menu_saverect = true;
-                        string m = string(MENU_TZ_TITLE[Config::lang]) + "\n";
-                        for (int tz = -12; tz <= 14; tz++) {
-                            char b[16]; snprintf(b, sizeof(b), "UTC%+d\n", tz); m += b;
-                        }
-                        menu_curopt = Config::wifi_tz + 13; // tz=-12 → row 1
-                        uint8_t sel = menuRun(m);
-                        if (sel > 0) {
-                            Config::wifi_tz = (signed char)((int)sel - 13);
-                            Config::saveWifiConfig();
-                            VIDEO::SaveRect.restore_last(); // pop list rect (Enter path)
-                        }
-                    }
-                    else if (net_opt == 5) { // ZiFi NIC toggle
-                        // Child submenu at level 2 (right of Network) — saves its own bg.
-                        menu_level = 2;
-                        menu_saverect = true;
-                        menu_curopt = Config::zifi_enabled + 1;
-                        uint8_t zn = menuRun(MENU_ZIFI_NIC[Config::lang]);
-                        if (zn > 0) {
-                            Config::zifi_enabled = zn - 1;
-                            if (Config::zifi_enabled)
-                                ZiFi::init();
-                            else
-                                ZiFi::deinit();
-                            Config::save();
-                            // Selected via Enter: menuRun leaves its rect on the stack
-                            // (only the Esc/back path pops it). Pop it here so the NIC
-                            // submenu doesn't linger over the Network window.
-                            VIDEO::SaveRect.restore_last();
-                            refreshNetStatus(); // NIC off → WiFi gone → update label
-                            // If the active pins displace another peripheral, that one
-                            // only yields at boot — offer a reboot to apply cleanly.
-                            if (Config::zifi_enabled && BoardPins::zifiActiveNote()[0] &&
-                                OSD::msgDialog("", OSD_DLG_APPLYREBOOT[Config::lang]) == DLG_YES)
-                                OSD::esp_hard_reset();
-                        }
-                    }
+                    if      (net_opt == 1) esp01Menu();
+                    else if (net_opt == 2) doWifi();
 #if ZIFI_NET_CLIENT
-                    else if (net_opt == 6) { // File transfer (FTP/SFTP)
-                        netFileTransfer();
-                        refreshNetStatus();
-                    }
+                    else if (net_opt == 3) { netFileTransfer(); }
+                    else if (net_opt == 4) doNic();
+#else
+                    else if (net_opt == 3) doNic();
 #endif
+                    refreshNetStatus();
                     menu_curopt = net_opt;
-                    // Only the FIRST menuRun above may save/position the Network window.
-                    // menuRun's Enter path leaves menu_saverect == true, so without this
-                    // each loop re-entry re-saves and shifts y down by (8 + 8*prevopt),
-                    // marching the window lower after every action. The bg saved on the
-                    // first pass stays on the stack for the final restore on Esc.
+                    // Only the FIRST Network menuRun may save/position (see existing note):
+                    // keep menu_saverect false on re-entry so the window doesn't march down.
                     menu_saverect = false;
                 }
                 menu_curopt = 10;

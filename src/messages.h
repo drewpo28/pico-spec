@@ -2282,6 +2282,8 @@ static const char *MSG_WIFI_DISCONNECT_Q[2]  = { "Disconnect?",       "\xA8" "De
 static const char *MENU_WIFI_LIST_TITLE[2]   = { "Wi-Fi networks",    "Redes Wi-Fi"        };
 static const char *MENU_TZ_TITLE[2]          = { "Time zone (UTC)",   "Zona horaria (UTC)" };
 static const char *MENU_ZIFI_GPIO_TITLE[2]   = { "ZiFi UART GPIO",    "ZiFi UART GPIO"     };
+static const char *MENU_ESP01_TITLE[2]       = { "ESP-01S",           "ESP-01S"            };
+static const char *MENU_BAUD_TITLE[2]        = { "UART baud rate",    "Velocidad UART"     };
 
 // ─── File transfer (FTP/SFTP) client strings ────────────────────────────────
 static const char *MENU_NET_PROTO[2]         = { "Protocol\nFTP\nSFTP\n", "Protocolo\nFTP\nSFTP\n" };
