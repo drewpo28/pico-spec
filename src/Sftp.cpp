@@ -87,18 +87,22 @@ bool Sftp::recvPacket(uint8_t& out_type, std::string& out_body, uint32_t timeout
 bool Sftp::connect(const char* host, uint16_t port, const char* user, const char* pass) {
     if (!ssh.connect(host, port, user, pass)) return false;
     chan = ssh.openSubsystem("sftp");
-    if (chan < 0) return false;
+    if (chan < 0) { Debug::log("SFTP: openSubsystem failed"); return false; }
 
     // SSH_FXP_INIT(version=3).
     Buf init; init.u32(3);
-    if (!sendPacket(FXP_INIT, init.d)) return false;
+    if (!sendPacket(FXP_INIT, init.d)) { Debug::log("SFTP: INIT send failed"); return false; }
     uint8_t t; std::string b;
-    if (!recvPacket(t, b) || t != FXP_VERSION) return false;
+    bool got = recvPacket(t, b);
+    Debug::log("SFTP: INIT->VERSION got=%d type=%d len=%u", got, t, (unsigned)b.size());
+    if (!got || t != FXP_VERSION) return false;
     up = true;
 
     // Resolve "." to an absolute home directory for the initial cwd.
     std::string home;
-    if (realpath(".", home) && !home.empty()) cur_dir = home;
+    bool rp = realpath(".", home);
+    Debug::log("SFTP: realpath('.')=%d home=%s", rp, rp ? home.c_str() : "(none)");
+    if (rp && !home.empty()) cur_dir = home;
     return true;
 }
 

@@ -514,8 +514,11 @@ int Ssh::openSubsystem(const char* name) {
 
     std::string resp;
     for (int i = 0; i < 8; i++) {
-        if (!readPacket(resp, 12000) || resp.empty()) return -1;
+        if (!readPacket(resp, 12000) || resp.empty()) { Debug::log("SSH: chanopen read fail"); return -1; }
         uint8_t m = (uint8_t)resp[0];
+#if ZIFI_TRACE
+        Debug::log("SSH: chanopen rx msg=%d", m);
+#endif
         if (m == MSG_CHANNEL_OPEN_CONFIRMATION) {
             Reader r(resp); uint8_t t; r.u8(t);
             uint32_t rch, ign;
@@ -523,9 +526,9 @@ int Ssh::openSubsystem(const char* name) {
             chan_remote = rch; chan_open = true;
             break;
         }
-        if (m == MSG_CHANNEL_OPEN_FAILURE) return -1;
+        if (m == MSG_CHANNEL_OPEN_FAILURE) { Debug::log("SSH: CHANNEL_OPEN_FAILURE"); return -1; }
     }
-    if (!chan_open) return -1;
+    if (!chan_open) { Debug::log("SSH: chanopen no confirmation"); return -1; }
 
     // Request the subsystem.
     Buf req;
@@ -537,12 +540,16 @@ int Ssh::openSubsystem(const char* name) {
     if (!writePacket(req.d)) return -1;
 
     for (int i = 0; i < 8; i++) {
-        if (!readPacket(resp, 12000) || resp.empty()) return -1;
+        if (!readPacket(resp, 12000) || resp.empty()) { Debug::log("SSH: subsys read fail"); return -1; }
         uint8_t m = (uint8_t)resp[0];
-        if (m == MSG_CHANNEL_SUCCESS) return chan_local;
-        if (m == MSG_CHANNEL_FAILURE) return -1;
+#if ZIFI_TRACE
+        Debug::log("SSH: subsys rx msg=%d", m);
+#endif
+        if (m == MSG_CHANNEL_SUCCESS) { Debug::log("SSH: subsystem ok (ch=%d)", chan_local); return chan_local; }
+        if (m == MSG_CHANNEL_FAILURE) { Debug::log("SSH: CHANNEL_FAILURE (subsystem)"); return -1; }
         // ignore window-adjust/data that may arrive before the reply
     }
+    Debug::log("SSH: subsystem no reply");
     return -1;
 }
 
@@ -572,6 +579,13 @@ int Ssh::channelSend(int ch, const uint8_t* buf, size_t len) {
 
 int Ssh::channelRecv(int ch, uint8_t* buf, size_t maxlen, uint32_t timeout_ms) {
     if (ch != chan_local) return -1;
+    // Serve any buffered CHANNEL_DATA remainder from a previous packet first.
+    if (!chan_inbuf.empty()) {
+        size_t n = chan_inbuf.size() < maxlen ? chan_inbuf.size() : maxlen;
+        memcpy(buf, chan_inbuf.data(), n);
+        chan_inbuf.erase(0, n);
+        return (int)n;
+    }
     // Drain SSH packets until we get CHANNEL_DATA for our channel (or EOF/close).
     for (;;) {
         std::string m;
@@ -582,8 +596,6 @@ int Ssh::channelRecv(int ch, uint8_t* buf, size_t maxlen, uint32_t timeout_ms) {
             Reader r(m); uint8_t tt; r.u8(tt); uint32_t c; r.u32(c);
             std::string data;
             if (!r.str(data)) return -1;
-            size_t n = data.size() < maxlen ? data.size() : maxlen;
-            memcpy(buf, data.data(), n);
             // Replenish our advertised window so the peer keeps sending.
             chan_window_in -= (chan_window_in < data.size() ? chan_window_in : data.size());
             if (chan_window_in < CHAN_WINDOW / 2) {
@@ -592,6 +604,11 @@ int Ssh::channelRecv(int ch, uint8_t* buf, size_t maxlen, uint32_t timeout_ms) {
                 writePacket(wa.d);
                 chan_window_in = CHAN_WINDOW;
             }
+            if (data.empty()) continue;
+            size_t n = data.size() < maxlen ? data.size() : maxlen;
+            memcpy(buf, data.data(), n);
+            // Stash anything beyond what the caller asked for.
+            if (n < data.size()) chan_inbuf.assign(data.data() + n, data.size() - n);
             return (int)n;
         } else if (t == MSG_CHANNEL_EOF) {
             chan_eof = true;
@@ -624,6 +641,7 @@ void Ssh::disconnect() {
     if (sockfd >= 0) { ZiFiSock::sock_close(sockfd); ZiFiSock::end(); }
     sockfd = -1; connected = false; authed = false; encrypting = false;
     chan_open = false; chan_eof = false; chan_local = chan_remote = -1;
+    chan_inbuf.clear();
 }
 
 #endif // !PICO_RP2040 && ZIFI_NET_CLIENT

@@ -73,6 +73,10 @@ private:
     uint32_t  chan_window_out;   // bytes we may still send to peer
     uint32_t  chan_window_in;    // bytes peer may still send us
     bool      chan_open, chan_eof;
+    // Leftover CHANNEL_DATA bytes not yet consumed by channelRecv. A single
+    // CHANNEL_DATA can carry more than the caller's current request (SFTP reads
+    // a 4-byte length, then the body); without this the remainder would be lost.
+    std::string chan_inbuf;
 
     // ── Wire helpers ──────────────────────────────────────────────────────────
     bool readPacket(std::string& payload, uint32_t timeout_ms);   // decrypt + unpad
