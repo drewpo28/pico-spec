@@ -402,8 +402,12 @@ static bool netProgressCb(uint32_t done, uint32_t total) {
 static void netRemoteBrowse(RemoteFs* fs) {
     while (1) {
         vector<RemoteEntry> entries;
-        OSD::osdCenteredMsg(MSG_NET_CONNECTING[Config::lang], LEVEL_INFO, 0); // brief "working" notice while listing
+        // progressDialog (not osdCenteredMsg) saves/restores its background, so the
+        // "working" notice is cleanly removed before the file menu is drawn.
+        OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], fs->cwdPath(), 0, 0);
         bool ok = fs->list("", entries);
+        OSD::progressDialog("", "", 0, 2);
+        Debug::log("netbrowse: list ok=%d entries=%u dir=%s", ok, (unsigned)entries.size(), fs->cwdPath().c_str());
         if (!ok) { OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000); return; }
 
         // Build the menu: title shows cwd; row1 = upload, row2 = "..", then entries.
@@ -415,7 +419,7 @@ static void netRemoteBrowse(RemoteFs* fs) {
         for (auto& e : entries) m += e.name + (e.isDir ? "\t>\n" : "\n");
         if (entries.empty()) { /* still allow upload / .. */ }
 
-        OSD::menu_level = 2; OSD::menu_saverect = true; OSD::menu_curopt = 1;
+        OSD::menu_level = 0; OSD::menu_saverect = true; OSD::menu_curopt = 1;
         uint8_t sel = OSD::menuRun(m);
         if (sel == 0) return; // Esc → leave browser
         VIDEO::SaveRect.restore_last();
@@ -463,7 +467,10 @@ struct NetSessCtx { string host, user, pass; uint16_t port; uint8_t proto; };
 
 static void netSessionRun(void* p) {
     NetSessCtx* c = (NetSessCtx*)p;
-    OSD::osdCenteredMsg(MSG_NET_CONNECTING[Config::lang], LEVEL_INFO, 0);
+    // progressDialog saves/restores its background (osdCenteredMsg with 0 does not),
+    // so the notice is cleanly removed before the browser menu draws. The host-key
+    // trust msgDialog (during SSH connect) saves/restores its own rect over this.
+    OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], c->host, 0, 0);
     RemoteFs* fs = nullptr;
     if (c->proto == 0) {
         Ftp* ftp = new Ftp();
@@ -476,6 +483,7 @@ static void netSessionRun(void* p) {
         if (sftp->connect(c->host.c_str(), c->port, c->user.c_str(), c->pass.c_str())) fs = sftp;
         else delete sftp;
     }
+    OSD::progressDialog("", "", 0, 2); // close the "Connecting..." notice
     if (!fs) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
     netRemoteBrowse(fs);
     fs->disconnect();
