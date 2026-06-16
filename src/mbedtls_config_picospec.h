@@ -44,7 +44,47 @@
 #define MBEDTLS_OID_C
 
 // ── Encodings ─────────────────────────────────────────────────────────────
-#define MBEDTLS_BASE64_C                   // known_hosts fingerprints
+#define MBEDTLS_BASE64_C                   // known_hosts fingerprints + PEM
+
+// ── TLS client stack (HTTPS for the internet archive downloader) ────────────
+// In addition to the SSH crypto primitives above, the catalog/download feature
+// (HttpCatalogFs) needs an actual TLS client to reach github.io and the archive
+// sites. This runs on the RP2350 (mbedTLS) over ZiFiSock's plain-TCP pipe — the
+// ESP-01S is a dumb conduit, exactly like the SSH client. RP2350 has the heap
+// (~520 KB + PSRAM) for a TLS handshake; the ESP-01S would not, which is why we
+// do NOT use the ESP's own AT+CIPSTART SSL. See TlsSock.cpp.
+//
+// TLS 1.2 only (sufficient for github.io / Fastly / Let's Encrypt; avoids the
+// extra TLS 1.3 / HKDF / PSA footprint). AEAD-only (AES-GCM) with ECDHE, which
+// is what modern CDNs require — the stock ESP-AT firmware lacks GCM, another
+// reason to terminate TLS on the host.
+#define MBEDTLS_SSL_TLS_C
+#define MBEDTLS_SSL_CLI_C
+#define MBEDTLS_SSL_PROTO_TLS1_2
+#define MBEDTLS_SSL_SERVER_NAME_INDICATION  // SNI — required by virtual-hosted CDNs
+
+// Key exchange: ephemeral ECDHE with RSA or ECDSA server certs (covers github.io
+// and the archive sites). ECDH_C / ECDSA_C / RSA_C are already enabled above.
+#define MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
+#define MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED
+
+// AEAD record cipher (AES-GCM). AES_C is already enabled for SSH's AES-CTR.
+#define MBEDTLS_GCM_C
+
+// X.509 server-certificate validation + PEM CA bundle parsing (cacert.pem on SD).
+#define MBEDTLS_PK_C
+#define MBEDTLS_PK_PARSE_C
+#define MBEDTLS_X509_USE_C
+#define MBEDTLS_X509_CRT_PARSE_C
+#define MBEDTLS_PEM_PARSE_C
+
+// Trim the record buffers: we receive large server records (cert chains up to
+// 16 KB) but only ever send tiny HTTP GET requests, so shrink the OUT buffer.
+#define MBEDTLS_SSL_IN_CONTENT_LEN   16384
+#define MBEDTLS_SSL_OUT_CONTENT_LEN   4096
+
+// RNG: TlsSock supplies its own f_rng backed by the RP2350 hardware RNG
+// (pico_rand), same approach as Ssh.cpp — no entropy/CTR_DRBG modules needed.
 
 // Keep error strings out of flash (we map to our own messages).
 // #define MBEDTLS_ERROR_C

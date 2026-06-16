@@ -293,6 +293,51 @@ Port low byte `0xEF`; high address byte = register. Gated by `Config::zifi_enabl
 - **Picker**: Network → first row `GPIO x/y` (or `GPIO Off`, `(def)` suffix when unset) → submenu listing `Off` + each board pair with a note (what it displaces, e.g. "off: NESPAD"). On select: save + `ZiFi::deinit()/init()` if NIC on. `BoardPins` is the reusable home for board pin-maps (extend for MIDI etc.).
 - **Yield-at-boot**: when a chosen pair shares pins with a peripheral (non-empty note), ZiFi has priority — at boot each conflicting peripheral calls `BoardPins::zifiOwnsPin(pin)` and **skips its own init** if ZiFi owns it: NESPAD (`main.cpp`, moved after `Config::load`, gated by `nespad_active`), MIDI (`ESPectrum.cpp` `Midi::enabled=0`), WAV (`pwm_audio.cpp` skip `inInit`), PCM5122 (`pwm_audio.cpp` skip I2S), AY-clock (`PinSerialData_595.c` via `extern "C" board_zifi_owns_pin`). The displaced peripheral only releases pins at boot, so selecting a conflicting pair **or** enabling the NIC with a conflicting default prompts `OSD_DLG_APPLYREBOOT` (`BoardPins::zifiActiveNote()` non-empty). Defaults that conflict by design: MURM2/PICO_PC 20/21 = NESPAD, MURM1_P2 16/17 = NESPAD.
 
+## Internet archive downloader (WIP — TR-DOS/tape images over HTTPS to SD)
+
+Goal: browse/download disk & tape images (vtrd.in, then zxart.ee, worldofspectrum)
+over the ESP-01 and save to SD, with minimal SRAM. RP2350-only, behind
+`#if !PICO_RP2040 && ZIFI_NET_CLIENT`. Reuses `RemoteFs` + `OSD::remoteFileDialog`.
+
+### Architecture: host-TLS on RP2350 + serverless GitHub Pages catalog
+- **Catalog** built by a **GitHub Action (cron)** → static per-site index files
+  (`vtrd.tsv`, `zxart.tsv`, `wos.tsv` + `sites.tsv`) served over HTTPS from
+  GitHub Pages. No always-on server. Index line = `type \t name \t size \t locator`
+  (`D`=dir/category, `F`=file → absolute download URL). Per-site logic lives in the
+  Action; the device stays generic. Fallback for a Cloudflare-hard site (vtrd 403s
+  bots): the Action mirrors extracted `.trd` to Pages. **Local :80 proxy** remains
+  the documented fallback if host-TLS proves unworkable.
+- **Device does HTTPS itself** (the load-bearing decision): TLS runs on the RP2350,
+  the ESP-01 is a dumb plain-TCP pipe — **same host-crypto/dumb-ESP split as SSH**
+  (`Ssh.cpp`). ESP-AT's own SSL is NOT used (ESP-01S lacks heap for a ~40-50 KB
+  handshake and stock AT firmware has no GCM ciphers).
+
+### TLS layer (`src/TlsSock.{h,cpp}`)
+- mbedTLS TLS 1.2 client over `ZiFiSock::sock_open(host,443,/*tls=*/false,..)`,
+  wired via `mbedtls_ssl_set_bio` (`bioSend`/`bioRecv` → `ZiFiSock::sock_send/recv`).
+- `bioRecv` uses new `ZiFiSock::isClosed(id)` to tell clean EOF from a transient
+  no-data timeout (returns `MBEDTLS_ERR_SSL_WANT_READ`).
+- f_rng from RP2350 hardware RNG (`pico/rand.h` `get_rand_32`), like `Ssh.cpp`'s
+  `ssh_rng` — no entropy/CTR_DRBG modules.
+- CA verification: `loadCaFile()` parses PEM from `cacert.pem` on SD →
+  `VERIFY_REQUIRED`; no CA → `VERIFY_NONE` (bring-up spike only, logs a warning).
+  SNI always set via `mbedtls_ssl_set_hostname`.
+- **mbedTLS config** (`src/mbedtls_config_picospec.h`): TLS stack added on top of the
+  SSH crypto primitives — `MBEDTLS_SSL_TLS_C/SSL_CLI_C/SSL_PROTO_TLS1_2/SNI`,
+  ECDHE-RSA/ECDSA key exch, `GCM_C`, X.509 (`PK_C/PK_PARSE_C/X509_USE_C/X509_CRT_PARSE_C/PEM_PARSE_C`).
+  TLS 1.2 only (no 1.3 → no version pinning needed). Buffers trimmed:
+  `SSL_IN_CONTENT_LEN=16384` (cert chains), `SSL_OUT_CONTENT_LEN=4096` (tiny GETs).
+
+### HTTP layer (`src/HttpsGet.{h,cpp}`)
+- Minimal HTTP/1.1 GET: `https://`→`TlsSock`, `http://`→plain `ZiFiSock`. Streams
+  body to a `SinkCb` (or `getToFile()` straight to SD via `fopen2`/`f_write`),
+  static 1 KB buffer off the stack (like `Ftp.cpp` `g_ftp_buf`). Handles
+  Content-Length + connection-close bodies; **chunked T-E is rejected** (Pages sends
+  Content-Length). Browser `User-Agent` (for vtrd's 403 filter).
+- **`HttpsGet::selfTest(url[,caPath])`** — bring-up spike: GET + log status /
+  Content-Length / first body bytes. Use to validate TLS-over-ESP on hardware
+  before building `HttpCatalogFs`/menu (next: Commit 1).
+
 ## RTC / Time (Pentagon Mr Gluk TimeKeeper)
 
 - `src/RTC.*` — MC146818 emulation (RP2350-only). Ports (Pentagon/Profi):

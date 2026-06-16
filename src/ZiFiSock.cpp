@@ -194,6 +194,11 @@ bool ZiFiSock::begin(bool mux) {
 
 bool ZiFiSock::ready() { return is_ready; }
 
+bool ZiFiSock::isClosed(int id) {
+    if (id < 0 || id >= N_LINKS) return true;
+    return closed[id] && ringFill(id) == 0;
+}
+
 int ZiFiSock::sock_open(const char* host, uint16_t port, bool tls, uint32_t timeout_ms) {
     if (!is_ready) return -1;
     int id = 0;

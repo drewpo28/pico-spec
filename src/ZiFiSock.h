@@ -48,6 +48,11 @@ public:
     // True once begin() has succeeded and the ESP is in a known mux mode.
     static bool ready();
 
+    // True if the peer closed link `id` (CLOSED seen) and its ring is drained.
+    // Lets a layered protocol (e.g. TlsSock's BIO recv) tell a clean EOF apart
+    // from a transient "no data yet" return of sock_recv.
+    static bool isClosed(int id);
+
     // Max concurrent links we demux. FTP needs 2 (control id0 + PASV data id1);
     // SSH uses single mode (link 0). Each gets its own 2 KB assembly ring so the
     // interleaved +IPD frames of FTP's two connections never mix.
