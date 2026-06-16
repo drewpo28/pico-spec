@@ -453,6 +453,56 @@ static void netRemoteBrowse(RemoteFs* fs) {
     }
 }
 
+// The SSH/SFTP crypto path (mbedTLS ECDH/ECP/bignum) needs far more than the
+// 4 KB core-0 stack (PICO_STACK_SIZE=0x1000), especially nested under do_OSD —
+// it overflows and faults (observed: SIGBUS, stackOvf=1). So we run the whole
+// network session on a large heap-allocated stack via a switch trampoline.
+// ARMv8-M (RP2350/Cortex-M33): also clear MSPLIM during the window so the
+// hardware stack-limit check doesn't fault on the alternate stack.
+struct NetSessCtx { string host, user, pass; uint16_t port; uint8_t proto; };
+
+static void netSessionRun(void* p) {
+    NetSessCtx* c = (NetSessCtx*)p;
+    OSD::osdCenteredMsg(MSG_NET_CONNECTING[Config::lang], LEVEL_INFO, 0);
+    RemoteFs* fs = nullptr;
+    if (c->proto == 0) {
+        Ftp* ftp = new Ftp();
+        if (ftp->connect(c->host.c_str(), c->port, c->user.c_str(), c->pass.c_str())) fs = ftp;
+        else delete ftp;
+    } else {
+        g_net_host_for_cb = c->host;
+        Ssh::setHostKeyCb(netHostKeyCb);
+        Sftp* sftp = new Sftp();
+        if (sftp->connect(c->host.c_str(), c->port, c->user.c_str(), c->pass.c_str())) fs = sftp;
+        else delete sftp;
+    }
+    if (!fs) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
+    netRemoteBrowse(fs);
+    fs->disconnect();
+    delete fs;
+}
+
+// Call fn(arg) with MSP switched to new_top (8-byte aligned highest address of a
+// scratch buffer). Saves/restores SP, MSPLIM and LR. RP2350/ARM only (this whole
+// file region is gated to RP2350 via ZIFI_NET_CLIENT).
+extern "C" __attribute__((naked, noinline))
+void net_call_on_stack(void* new_top, void (*fn)(void*), void* arg) {
+    __asm volatile(
+        "mrs  r12, msplim       \n" // save old MSPLIM
+        "movs r3, #0            \n"
+        "msr  msplim, r3        \n" // disable stack-limit check on the alt stack
+        "mov  r3, sp            \n" // r3 = old SP
+        "mov  sp, r0            \n" // SP = new_top
+        "push {r2, r3, r12, lr} \n" // 16 bytes → keeps 8-byte alignment
+        "mov  r0, r2            \n" // r0 = arg
+        "blx  r1                \n" // fn(arg)
+        "pop  {r2, r3, r12, lr} \n"
+        "mov  sp, r3            \n" // restore SP
+        "msr  msplim, r12       \n" // restore MSPLIM
+        "bx   lr                \n"
+    );
+}
+
 // Top-level entry: pick protocol, gather credentials, connect, browse.
 static void netFileTransfer() {
     // Require an active WiFi link.
@@ -483,25 +533,18 @@ static void netFileTransfer() {
     Config::net_host = host; Config::net_user = user; Config::net_port = port;
     Config::saveWifiConfig();
 
-    OSD::osdCenteredMsg(MSG_NET_CONNECTING[Config::lang], LEVEL_INFO, 0);
+    // Run the connect + browse session on a large heap stack (see net_call_on_stack).
+    NetSessCtx ctx; ctx.host = host; ctx.user = user; ctx.pass = pass;
+    ctx.port = port; ctx.proto = Config::net_proto;
 
-    RemoteFs* fs = nullptr;
-    if (Config::net_proto == 0) {
-        Ftp* ftp = new Ftp();
-        if (ftp->connect(host.c_str(), port, user.c_str(), pass.c_str())) fs = ftp;
-        else delete ftp;
-    } else {
-        g_net_host_for_cb = host;
-        Ssh::setHostKeyCb(netHostKeyCb);
-        Sftp* sftp = new Sftp();
-        if (sftp->connect(host.c_str(), port, user.c_str(), pass.c_str())) fs = sftp;
-        else delete sftp;
-    }
+    size_t stksz = 24 * 1024;
+    uint8_t* stk = (uint8_t*)malloc(stksz);
+    if (!stk) { stksz = 16 * 1024; stk = (uint8_t*)malloc(stksz); }
+    if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
 
-    if (!fs) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
-    netRemoteBrowse(fs);
-    fs->disconnect();
-    delete fs;
+    void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7); // 8-byte aligned top
+    net_call_on_stack(top, netSessionRun, &ctx);
+    free(stk);
 }
 #endif // ZIFI_NET_CLIENT
 #endif
