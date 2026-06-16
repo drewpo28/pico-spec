@@ -129,6 +129,8 @@ public:
     static string formatSlotRow(const string& label, const string& fname,
                                 bool wp, bool showWP);
     static string fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t mfcols, uint8_t mfrows);
+    // Remote (FTP/SFTP) file browser — bounded RAM via an SD index (see OSDFile.cpp).
+    static void remoteFileDialog(class RemoteFs* fs);
     static int menuTape(const string& title);
     static void menuScroll(bool up);
     static void fd_Redraw(const string& title, const string& fdir, uint8_t ftype, const vector<string>& filexts);
@@ -149,7 +151,8 @@ public:
     static unsigned int ndirs;
 
     static uint8_t msgDialog(const string& title, const string& msg);
-    static string inlineTextEdit(int ex, int ey, int maxlen, const string& text);
+    // mask=true → password field: shows '*' until revealed (TAB toggles).
+    static string inlineTextEdit(int ex, int ey, int maxlen, const string& text, bool mask = false);
     static bool videoModeConfirm(int timeout_sec = 15);
     static void progressDialog(const string& title, const string& msg, int percent, int action);
     string inputBox(int x, int y, const string& text);

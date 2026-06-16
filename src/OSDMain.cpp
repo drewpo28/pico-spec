@@ -66,6 +66,16 @@ visit https://zxespectrum.speccy.org/contacto
 #include "AySound.h"
 #include "Midi.h"
 #include "MidiSynth.h"
+#include "ZiFi.h"
+#include "ZiFiAT.h"
+#include "BoardPins.h"
+#if ZIFI_NET_CLIENT
+#include "ZiFiSock.h"
+#include "RemoteFs.h"
+#include "Ftp.h"
+#include "Sftp.h"
+#include "Ssh.h"
+#endif
 #include "kbd_img.h"
 extern "C" void graphics_set_scanlines(uint8_t level);
 extern "C" void graphics_set_dither(bool enabled);
@@ -174,8 +184,9 @@ unsigned short OSD::scrAlignCenterY(unsigned short pixel_height) { return (scrH 
 // Draws each character individually; cursor shown as highlighted block under current char.
 // Returns entered string on Enter, "\x1B" on Escape, "" if Enter pressed with empty field.
 // Ignores VK_MENU_* synthetic events to avoid double-fires from kbdExtraMapping.
-string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_text) {
+string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_text, bool mask) {
     string text = initial_text;
+    bool reveal = false; // password mask: false → show '*', toggled with TAB
     auto Kbd = ESPectrum::PS2Controller.keyboard();
     // Drain any keys still in the queue (e.g. the Enter that triggered the save action)
     { fabgl::VirtualKeyItem drain; while (Kbd->virtualKeyAvailable()) Kbd->getNextVirtualKey(&drain); }
@@ -194,7 +205,10 @@ string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_tex
             else
                 VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
             VIDEO::vga.setCursor(ex + p * OSD_FONT_W, ey);
-            char ch[2] = { display[p], 0 };
+            // Masked password: render '*' for the typed characters until revealed.
+            char dch = display[p];
+            if (mask && !reveal && p < cur) dch = '*';
+            char ch[2] = { dch, 0 };
             VIDEO::vga.print(ch);
         }
     };
@@ -214,6 +228,8 @@ string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_tex
         if (!ek.down) continue;
         // Skip synthetic VK_MENU_* events
         if (ek.vk >= fabgl::VK_MENU_UP && ek.vk <= fabgl::VK_MENU_BS) continue;
+        // TAB toggles password reveal (only relevant in masked fields).
+        if (ek.vk == fabgl::VK_TAB) { if (mask) { reveal = !reveal; redraw(true); } continue; }
         if (ek.vk == fabgl::VK_RETURN || ek.vk == fabgl::VK_KP_ENTER) return text;
         if (ek.vk == fabgl::VK_ESCAPE) return "\x1B";
         if (ek.vk == fabgl::VK_BACKSPACE) {
@@ -273,6 +289,221 @@ void OSD::esp_hard_reset() {
 static bool confirmReboot(const char* const dlg[2]) {
     return OSD::msgDialog("", dlg[Config::lang]) == DLG_YES;
 }
+
+#if !PICO_RP2040
+// Centred dialog to type a WiFi password (title = SSID). Saves/restores its own
+// screen rect. Returns the typed text, or "\x1B" if the user pressed Esc.
+static string wifiAskPassword(const string& ssid) {
+    const int field = 32; // visible password length
+    const int label = strlen(MSG_WIFI_PASS_LABEL[Config::lang]);
+    const unsigned short cols = label + field + 2;
+    const unsigned short w = (cols * OSD_FONT_W) + 2;
+    const unsigned short h = (OSD_FONT_H * 2) + 3;
+    const unsigned short x = OSD::scrAlignCenterX(w);
+    const unsigned short y = OSD::scrAlignCenterY(h);
+    VIDEO::SaveRect.save(x, y, w, h);
+    VIDEO::vga.setFont(Font6x8);
+    VIDEO::vga.rect(x, y, w, h, zxColor(0, 0));
+    VIDEO::vga.fillRect(x + 1, y + 1, w - 2, OSD_FONT_H, zxColor(0, 0));                       // title bar
+    VIDEO::vga.fillRect(x + 1, y + 1 + OSD_FONT_H, w - 2, h - OSD_FONT_H - 2, zxColor(7, 1));  // body
+    VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(0, 0));
+    VIDEO::vga.setCursor(x + OSD_FONT_W + 1, y + 1);
+    VIDEO::vga.print(ssid.substr(0, cols - 2).c_str());
+    // TAB-reveal hint, right-aligned in the title bar.
+    const char* hint = MSG_PASS_TAB[Config::lang];
+    VIDEO::vga.setCursor(x + w - 1 - (int)(strlen(hint) + 1) * OSD_FONT_W, y + 1);
+    VIDEO::vga.print(hint);
+    VIDEO::vga.setTextColor(zxColor(0, 0), zxColor(7, 1));
+    VIDEO::vga.setCursor(x + OSD_FONT_W, y + 1 + OSD_FONT_H + 1);
+    VIDEO::vga.print(MSG_WIFI_PASS_LABEL[Config::lang]);
+    string pass = OSD::inlineTextEdit(x + OSD_FONT_W * (label + 1), y + 1 + OSD_FONT_H + 1, field, "", true);
+    VIDEO::SaveRect.restore_last();
+    return pass;
+}
+
+#if ZIFI_NET_CLIENT
+// ─── Network file-transfer client (FTP / SFTP) ──────────────────────────────
+// A centred single-line text-entry dialog (host / user / port). Returns the
+// typed text, or "\x1B" if Esc was pressed. Generalises wifiAskPassword().
+static string netAskField(const string& label, const string& initial, bool mask = false) {
+    const int field = 30;
+    const int lbl = (int)label.size();
+    const unsigned short cols = lbl + field + 2;
+    const unsigned short w = (cols * OSD_FONT_W) + 2;
+    const unsigned short h = (OSD_FONT_H * 2) + 3;
+    const unsigned short x = OSD::scrAlignCenterX(w);
+    const unsigned short y = OSD::scrAlignCenterY(h);
+    VIDEO::SaveRect.save(x, y, w, h);
+    VIDEO::vga.setFont(Font6x8);
+    VIDEO::vga.rect(x, y, w, h, zxColor(0, 0));
+    VIDEO::vga.fillRect(x + 1, y + 1, w - 2, OSD_FONT_H, zxColor(0, 0));
+    VIDEO::vga.fillRect(x + 1, y + 1 + OSD_FONT_H, w - 2, h - OSD_FONT_H - 2, zxColor(7, 1));
+    VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(0, 0));
+    VIDEO::vga.setCursor(x + OSD_FONT_W + 1, y + 1);
+    VIDEO::vga.print(label.c_str());
+    if (mask) { // TAB-reveal hint, right-aligned in the title bar
+        const char* hint = MSG_PASS_TAB[Config::lang];
+        VIDEO::vga.setCursor(x + w - 1 - (int)(strlen(hint) + 1) * OSD_FONT_W, y + 1);
+        VIDEO::vga.print(hint);
+    }
+    VIDEO::vga.setTextColor(zxColor(0, 0), zxColor(7, 1));
+    string r = OSD::inlineTextEdit(x + OSD_FONT_W, y + 1 + OSD_FONT_H + 1, field, initial, mask);
+    VIDEO::SaveRect.restore_last();
+    return r;
+}
+
+#define NET_KNOWN_HOSTS CONFIG_DIR "/known_hosts"
+
+// Look up a stored SHA-256 fingerprint for `host` (returns "" if unknown).
+static string knownHostsLookup(const string& host) {
+    FIL* f = fopen2(NET_KNOWN_HOSTS, FA_READ);
+    if (!f) return "";
+    string line, result;
+    UINT br; char c;
+    while (!f_eof(f)) {
+        if (f_read(f, &c, 1, &br) != FR_OK || br == 0) break;
+        if (c == '\n') {
+            size_t sp = line.find(' ');
+            if (sp != string::npos && line.substr(0, sp) == host) { result = line.substr(sp + 1); break; }
+            line.clear();
+        } else if (c != '\r') line += c;
+    }
+    fclose2(f);
+    return result;
+}
+
+static void knownHostsSave(const string& host, const string& fp) {
+    FileUtils::mkdirParents(CONFIG_DIR);
+    FIL* f = fopen2(NET_KNOWN_HOSTS, FA_OPEN_APPEND | FA_WRITE);
+    if (!f) return;
+    string line = host + " " + fp + "\n";
+    UINT bw; f_write(f, line.data(), line.size(), &bw);
+    fclose2(f);
+}
+
+// Host-key callback: trust-on-first-use against /known_hosts, refuse on mismatch.
+static string g_net_host_for_cb;
+static Ssh::TrustResult netHostKeyCb(const char* host, const char* keytype,
+                                     const char* fp, bool sig_verified) {
+    (void)host; (void)sig_verified;
+    string stored = knownHostsLookup(g_net_host_for_cb);
+    if (!stored.empty()) {
+        if (stored == fp) return Ssh::TRUST;
+        OSD::msgDialog(MSG_NET_HOSTKEY_BAD[Config::lang], fp); // mismatch → refuse
+        return Ssh::REJECT;
+    }
+    // First contact — show fingerprint and ask to trust.
+    string body = string(keytype) + "\nSHA256:" + fp + "\n" + MSG_NET_TRUST_Q[Config::lang];
+    if (OSD::msgDialog(g_net_host_for_cb, body) == DLG_YES) {
+        knownHostsSave(g_net_host_for_cb, fp);
+        return Ssh::TRUST;
+    }
+    return Ssh::REJECT;
+}
+
+// The SSH/SFTP crypto path (mbedTLS ECDH/ECP/bignum) needs far more than the
+// 4 KB core-0 stack (PICO_STACK_SIZE=0x1000), especially nested under do_OSD —
+// it overflows and faults (observed: SIGBUS, stackOvf=1). So we run the whole
+// network session on a large heap-allocated stack via a switch trampoline.
+// ARMv8-M (RP2350/Cortex-M33): also clear MSPLIM during the window so the
+// hardware stack-limit check doesn't fault on the alternate stack.
+struct NetSessCtx { string host, user, pass; uint16_t port; uint8_t proto; };
+
+static void netSessionRun(void* p) {
+    NetSessCtx* c = (NetSessCtx*)p;
+    // progressDialog saves/restores its background (osdCenteredMsg with 0 does not),
+    // so the notice is cleanly removed before the browser menu draws. The host-key
+    // trust msgDialog (during SSH connect) saves/restores its own rect over this.
+    OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], c->host, 0, 0);
+    RemoteFs* fs = nullptr;
+    if (c->proto == 0) {
+        Ftp* ftp = new Ftp();
+        if (ftp->connect(c->host.c_str(), c->port, c->user.c_str(), c->pass.c_str())) fs = ftp;
+        else delete ftp;
+    } else {
+        g_net_host_for_cb = c->host;
+        Ssh::setHostKeyCb(netHostKeyCb);
+        Sftp* sftp = new Sftp();
+        if (sftp->connect(c->host.c_str(), c->port, c->user.c_str(), c->pass.c_str())) fs = sftp;
+        else delete sftp;
+    }
+    OSD::progressDialog("", "", 0, 2); // close the "Connecting..." notice
+    if (!fs) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
+    OSD::remoteFileDialog(fs); // SD-indexed browser (bounded RAM); runs on this alt-stack
+    fs->disconnect();
+    delete fs;
+}
+
+// Call fn(arg) with MSP switched to new_top (8-byte aligned highest address of a
+// scratch buffer). Saves/restores SP, MSPLIM and LR. RP2350/ARM only (this whole
+// file region is gated to RP2350 via ZIFI_NET_CLIENT).
+extern "C" __attribute__((naked, noinline))
+void net_call_on_stack(void* new_top, void (*fn)(void*), void* arg) {
+    __asm volatile(
+        "mrs  r12, msplim       \n" // save old MSPLIM
+        "movs r3, #0            \n"
+        "msr  msplim, r3        \n" // disable stack-limit check on the alt stack
+        "mov  r3, sp            \n" // r3 = old SP
+        "mov  sp, r0            \n" // SP = new_top
+        "push {r2, r3, r12, lr} \n" // 16 bytes → keeps 8-byte alignment
+        "mov  r0, r2            \n" // r0 = arg
+        "blx  r1                \n" // fn(arg)
+        "pop  {r2, r3, r12, lr} \n"
+        "mov  sp, r3            \n" // restore SP
+        "msr  msplim, r12       \n" // restore MSPLIM
+        "bx   lr                \n"
+    );
+}
+
+// Top-level entry: pick protocol, gather credentials, connect, browse.
+static void netFileTransfer() {
+    // Require an active WiFi link.
+    string ssid, ip;
+    if (!Config::zifi_enabled || !ZiFiAT::getStatus(ssid, ip)) {
+        OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200);
+        return;
+    }
+
+    OSD::menu_level = 2; OSD::menu_saverect = true; OSD::menu_curopt = Config::net_proto + 1;
+    uint8_t proto = OSD::menuRun(MENU_NET_PROTO[Config::lang]); // 1=FTP, 2=SFTP
+    if (proto == 0) return;
+    VIDEO::SaveRect.restore_last();
+    Config::net_proto = proto - 1;
+
+    string host = netAskField(MSG_NET_HOST_LABEL[Config::lang], Config::net_host);
+    if (host == "\x1B" || host.empty()) return;
+    string user = netAskField(MSG_NET_USER_LABEL[Config::lang], Config::net_user);
+    if (user == "\x1B") return;
+    uint16_t defport = Config::net_proto ? 22 : 21;
+    char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%u", Config::net_port ? Config::net_port : defport);
+    string ports = netAskField(MSG_NET_PORT_LABEL[Config::lang], pbuf);
+    if (ports == "\x1B") return;
+    uint16_t port = (uint16_t)atoi(ports.c_str()); if (!port) port = defport;
+    string pass = netAskField(MSG_NET_PASS_LABEL[Config::lang], "", true); // masked
+    if (pass == "\x1B") return;
+
+    Config::net_host = host; Config::net_user = user; Config::net_port = port;
+    Config::saveWifiConfig();
+
+    // Run the connect + browse session on a large heap stack (see net_call_on_stack).
+    NetSessCtx ctx; ctx.host = host; ctx.user = user; ctx.pass = pass;
+    ctx.port = port; ctx.proto = Config::net_proto;
+
+    // Modest alt stack: mbedTLS curve25519/P256/RSA-verify peaks at only a few KB,
+    // and the heap must keep enough for the handshake's mbedTLS allocations + SSH
+    // objects + the dir listing (free heap here is ~30-38 KB). Too big a stack
+    // starved the heap → "Out of memory" panic mid-handshake.
+    size_t stksz = 12 * 1024;
+    uint8_t* stk = (uint8_t*)malloc(stksz);
+    if (!stk) { stksz = 8 * 1024; stk = (uint8_t*)malloc(stksz); }
+    if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
+
+    void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7); // 8-byte aligned top
+    net_call_on_stack(top, netSessionRun, &ctx);
+    free(stk);
+}
+#endif // ZIFI_NET_CLIENT
+#endif
 
 // // Cursor to OSD first row,col
 void OSD::osdHome() { VIDEO::vga.setCursor(osdInsideX(), osdInsideY()); }
@@ -4908,7 +5139,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         menu_saverect = true;
                         while (1) {
                             // Other
-                            uint8_t options_num = menuRun(MENU_OTHER[Config::lang]);
+                            string other_menu = MENU_OTHER[Config::lang];
+#if !PICO_RP2040
+                            other_menu += MENU_OTHER_RTC[Config::lang]; // RP2350-only RTC toggle
+#endif
+                            uint8_t options_num = menuRun(other_menu);
                             if (options_num > 0) {
                                 if (options_num == 1) {
                                     menu_level = 3;
@@ -5209,6 +5444,37 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         }
                                     }
                                 }
+#if !PICO_RP2040
+                                else if (options_num == 10) {
+                                    // RTC + NVRAM (Pentagon/Profi Mr Gluk MC146818) ON/OFF
+                                    menu_level = 3;
+                                    menu_curopt = 1;
+                                    menu_saverect = true;
+                                    while (1) {
+                                        string opt_menu = MENU_RTC[Config::lang];
+                                        opt_menu += MENU_YESNO[Config::lang];
+                                        bool prev_opt = Config::rtc_enabled;
+                                        if (prev_opt) {
+                                            opt_menu.replace(opt_menu.find("[Y",0),2,"[*");
+                                            opt_menu.replace(opt_menu.find("[N",0),2,"[ ");
+                                        } else {
+                                            opt_menu.replace(opt_menu.find("[Y",0),2,"[ ");
+                                            opt_menu.replace(opt_menu.find("[N",0),2,"[*");
+                                        }
+                                        uint8_t opt2 = menuRun(opt_menu);
+                                        if (opt2 == 1 || opt2 == 2) {
+                                            Config::rtc_enabled = (opt2 == 1);
+                                            if (Config::rtc_enabled != prev_opt) Config::save();
+                                            menu_curopt = opt2;
+                                            menu_saverect = false;
+                                        } else {
+                                            menu_curopt = 10;
+                                            menu_level = 2;
+                                            break;
+                                        }
+                                    }
+                                }
+#endif
                             } else {
                                 menu_curopt = 5;
                                 break;
@@ -5548,7 +5814,223 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     }
                 }
             }
+#if !PICO_RP2040
+            else if (opt == 10) { // Network
+                menu_saverect = true;
+                menu_curopt = 1;
+                // Live WiFi status (getStatus is a blocking AT round-trip) — cached,
+                // refreshed on entry and after connect/disconnect/NIC toggle.
+                bool   st_conn = false;
+                string st_ssid, st_ip;
+                auto refreshNetStatus = [&]() {
+                    st_ssid.clear(); st_ip.clear();
+                    st_conn = Config::zifi_enabled && ZiFiAT::getStatus(st_ssid, st_ip);
+                };
+
+                // ── ESP-01S hardware/config pickers (level 3, under the ESP01 submenu) ──
+                auto pickGpio = [&]() {
+                    menu_level = 3; menu_saverect = true;
+                    string m = string(MENU_ZIFI_GPIO_TITLE[Config::lang]) + "\n";
+                    m += "Off\n";
+                    int nopt = BoardPins::zifiPairCount();
+                    for (int i = 0; i < nopt; i++) {
+                        const BoardPins::UartPair* p = BoardPins::zifiPair(i);
+                        char b[48];
+                        snprintf(b, sizeof(b), "%u/%u%s%s\n", p->tx, p->rx, p->note[0] ? "  " : "", p->note);
+                        m += b;
+                    }
+                    if (Config::zifi_tx_pin == BoardPins::PIN_OFF) menu_curopt = 1;
+                    else {
+                        uint8_t rtx, rrx;
+                        BoardPins::resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, rtx, rrx);
+                        menu_curopt = 2;
+                        for (int i = 0; i < nopt; i++)
+                            if (BoardPins::zifiPair(i)->tx == rtx) { menu_curopt = i + 2; break; }
+                    }
+                    uint8_t sel = menuRun(m);
+                    if (sel > 0) {
+                        VIDEO::SaveRect.restore_last();
+                        bool conflict = false;
+                        if (sel == 1) Config::zifi_tx_pin = Config::zifi_rx_pin = BoardPins::PIN_OFF;
+                        else {
+                            const BoardPins::UartPair* p = BoardPins::zifiPair(sel - 2);
+                            if (p) { Config::zifi_tx_pin = p->tx; Config::zifi_rx_pin = p->rx; conflict = p->note[0] != 0; }
+                        }
+                        Config::save();
+                        if (Config::zifi_enabled) { ZiFi::deinit(); ZiFi::init(); }
+                        refreshNetStatus();
+                        if (conflict && OSD::msgDialog(MENU_ZIFI_GPIO_TITLE[Config::lang],
+                                                       OSD_DLG_APPLYREBOOT[Config::lang]) == DLG_YES)
+                            OSD::esp_hard_reset();
+                    }
+                };
+                auto pickBaud = [&]() {
+                    menu_level = 3; menu_saverect = true;
+                    static const uint32_t bauds[] = { 115200, 230400, 460800, 921600 };
+                    const int NB = 4;
+                    string m = string(MENU_BAUD_TITLE[Config::lang]) + "\n";
+                    for (int i = 0; i < NB; i++) { char b[16]; snprintf(b, sizeof(b), "%u\n", (unsigned)bauds[i]); m += b; }
+                    menu_curopt = 1;
+                    for (int i = 0; i < NB; i++) if (bauds[i] == Config::zifi_baud) { menu_curopt = i + 1; break; }
+                    uint8_t sel = menuRun(m);
+                    if (sel > 0) {
+                        VIDEO::SaveRect.restore_last();
+                        uint32_t nb = bauds[sel - 1];
+                        if (nb != Config::zifi_baud) {
+                            Config::zifi_baud = nb;
+                            Config::saveWifiConfig();
+                            // deinit resets the ESP to 115200, init re-handshakes at the new rate.
+                            if (Config::zifi_enabled) { ZiFi::deinit(); ZiFi::init(); }
+                            refreshNetStatus();
+                        }
+                    }
+                };
+                auto pickTz = [&]() {
+                    menu_level = 3; menu_saverect = true;
+                    string m = string(MENU_TZ_TITLE[Config::lang]) + "\n";
+                    for (int tz = -12; tz <= 14; tz++) { char b[16]; snprintf(b, sizeof(b), "UTC%+d\n", tz); m += b; }
+                    menu_curopt = Config::wifi_tz + 13;
+                    uint8_t sel = menuRun(m);
+                    if (sel > 0) {
+                        Config::wifi_tz = (signed char)((int)sel - 13);
+                        Config::saveWifiConfig();
+                        VIDEO::SaveRect.restore_last();
+                    }
+                };
+                auto doSync = [&]() {
+                    OSD::osdCenteredMsg(MSG_RTC_SYNCING[Config::lang], LEVEL_INFO, 0);
+                    string when;
+                    if (ZiFiAT::syncTime(Config::wifi_tz, when) == ZiFiAT::OK)
+                        OSD::osdCenteredMsg(string(MSG_RTC_SYNCED[Config::lang]) + "\n" + when, LEVEL_INFO, 3000);
+                    else
+                        OSD::osdCenteredMsg(MSG_RTC_SYNC_ERR[Config::lang], LEVEL_WARN, 3000);
+                };
+                // ── ESP01 submenu (level 2): GPIO / Baud / Time zone / Sync time ──
+                auto esp01Menu = [&]() {
+                    menu_saverect = true; menu_curopt = 1;
+                    while (1) {
+                        menu_level = 2;
+                        char gpio[40];
+                        if (Config::zifi_tx_pin == BoardPins::PIN_OFF)
+                            snprintf(gpio, sizeof(gpio), "GPIO Off\t>");
+                        else {
+                            uint8_t dtx, drx;
+                            BoardPins::resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, dtx, drx);
+                            snprintf(gpio, sizeof(gpio), "GPIO %u/%u%s\t>", dtx, drx,
+                                     Config::zifi_tx_pin == BoardPins::PIN_DEFAULT ? " (def)" : "");
+                        }
+                        char baud[32]; snprintf(baud, sizeof(baud), "Baud %u\t>", (unsigned)Config::zifi_baud);
+                        string m = string(MENU_ESP01_TITLE[Config::lang]) + "\n"
+                                 + gpio + "\n" + baud + "\n"
+                                 + (Config::lang ? "Zona horaria\t>\n" : "Time zone\t>\n")
+                                 + (Config::lang ? "Sincronizar hora\n" : "Sync time (SNTP)\n");
+                        uint8_t e = menuRun(m);
+                        if (e == 0) break; // Esc → back to Network (menuRun popped our rect)
+                        if      (e == 1) pickGpio();
+                        else if (e == 2) pickBaud();
+                        else if (e == 3) pickTz();
+                        else if (e == 4) doSync();
+                        menu_curopt = e;
+                        menu_saverect = false; // only the first ESP01 menuRun saves/positions
+                    }
+                };
+                // ── WiFi connect/disconnect (level 2 list) ──
+                auto doWifi = [&]() {
+                    if (st_conn) {
+                        string msg = st_ip + "  " + string(MSG_WIFI_DISCONNECT_Q[Config::lang]);
+                        if (OSD::msgDialog(st_ssid, msg) == DLG_YES) {
+                            ZiFiAT::disconnect();
+                            OSD::osdCenteredMsg(MSG_WIFI_DISCONNECTED[Config::lang], LEVEL_INFO, 1500);
+                        }
+                    } else {
+                        OSD::osdCenteredMsg(MSG_WIFI_SCANNING[Config::lang], LEVEL_INFO, 0);
+                        string nets[24];
+                        int n = ZiFiAT::scan(nets, 24);
+                        if (n <= 0) { OSD::osdCenteredMsg(MSG_WIFI_NO_NETS[Config::lang], LEVEL_WARN, 2000); return; }
+                        string m = string(MENU_WIFI_LIST_TITLE[Config::lang]) + "\n";
+                        for (int i = 0; i < n; i++) m += nets[i] + "\n";
+                        menu_level = 2; menu_saverect = true; menu_curopt = 1;
+                        uint8_t sel = menuRun(m);
+                        if (sel > 0) {
+                            VIDEO::SaveRect.restore_last();
+                            string chosen = nets[sel - 1];
+                            string pass = wifiAskPassword(chosen);
+                            if (pass != "\x1B") {
+                                OSD::osdCenteredMsg(MSG_WIFI_CONNECTING[Config::lang], LEVEL_INFO, 0);
+                                if (ZiFiAT::connect(chosen, pass) == ZiFiAT::OK) {
+                                    Config::wifi_ssid = chosen; Config::wifi_pass = pass; Config::wifi_autoconnect = true;
+                                    Config::saveWifiConfig();
+                                    OSD::osdCenteredMsg(string(MSG_WIFI_CONNECTED[Config::lang]) + "\n" + ZiFiAT::current_ip, LEVEL_INFO, 2500);
+                                } else
+                                    OSD::osdCenteredMsg(MSG_WIFI_CONNECT_ERR[Config::lang], LEVEL_WARN, 2500);
+                            }
+                        }
+                    }
+                };
+                // ── ZiFi NIC on/off (level 2) ──
+                auto doNic = [&]() {
+                    menu_level = 2; menu_saverect = true; menu_curopt = Config::zifi_enabled + 1;
+                    uint8_t zn = menuRun(MENU_ZIFI_NIC[Config::lang]);
+                    if (zn > 0) {
+                        Config::zifi_enabled = zn - 1;
+                        if (Config::zifi_enabled) ZiFi::init(); else ZiFi::deinit();
+                        Config::save();
+                        VIDEO::SaveRect.restore_last();
+                        refreshNetStatus();
+                        if (Config::zifi_enabled && BoardPins::zifiActiveNote()[0] &&
+                            OSD::msgDialog("", OSD_DLG_APPLYREBOOT[Config::lang]) == DLG_YES)
+                            OSD::esp_hard_reset();
+                    }
+                };
+
+                refreshNetStatus();
+                while (1) {
+                    menu_level = 1;
+                    // Row 2: live WiFi status, padded to a fixed width so geometry is stable.
+                    string st;
+                    if (st_conn) {
+                        const char* pre = "WiFi On ";
+                        string ssid = st_ssid, ip = st_ip;
+                        int avail = 32 - (int)strlen(pre) - 1 - (int)ip.size();
+                        if (avail < 0) avail = 0;
+                        if ((int)ssid.size() > avail) ssid.resize(avail);
+                        st = string(pre) + ssid + " " + ip;
+                    } else st = "WiFi Off";
+                    if (st.size() < 32) st.append(32 - st.size(), ' '); else st.resize(32);
+
+                    string nm = string(Config::lang ? "Red\n" : "Network\n")
+                              + string(MENU_ESP01_TITLE[Config::lang]) + "\t>\n"  // 1 ESP01
+                              + st + "\n";                                        // 2 WiFi
+#if ZIFI_NET_CLIENT
+                    nm += (Config::lang ? "Transferir archivos\t>\n" : "File transfer\t>\n"); // 3
+#endif
+                    nm += "ZiFi NIC\t>\n";                                        // 3 or 4
+
+                    uint8_t net_opt = menuRun(nm);
+                    if (net_opt == 0) break;
+
+                    if      (net_opt == 1) esp01Menu();
+                    else if (net_opt == 2) doWifi();
+#if ZIFI_NET_CLIENT
+                    else if (net_opt == 3) { netFileTransfer(); }
+                    else if (net_opt == 4) doNic();
+#else
+                    else if (net_opt == 3) doNic();
+#endif
+                    refreshNetStatus();
+                    menu_curopt = net_opt;
+                    // Only the FIRST Network menuRun may save/position (see existing note):
+                    // keep menu_saverect false on re-entry so the window doesn't march down.
+                    menu_saverect = false;
+                }
+                menu_curopt = 10;
+            }
+#endif
+#if !PICO_RP2040
+            else if (opt == 11) { // ZX Keyboard — bitmap overlay
+#else
             else if (opt == 10) { // ZX Keyboard — bitmap overlay
+#endif
                 // Protect OSD area from Z80 video renderer overwrite
                 bool kbd_osd_enabled = (VIDEO::OSD != 0);
                 if (!kbd_osd_enabled) {
@@ -5600,7 +6082,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 if (VIDEO::OSD) OSD::drawStats();
                 return;
             }
+#if !PICO_RP2040
+            else if (opt == 12) { // Help — dynamic from hotkeys
+#else
             else if (opt == 11) { // Help — dynamic from hotkeys
+#endif
                 // Build index of visible hotkeys (no large buffer needed)
                 auto descs = Config::lang ? hkDescES : hkDescEN;
                 const int maxCols = osdMaxCols();
@@ -5693,7 +6179,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 if (VIDEO::OSD) OSD::drawStats();
                 return;
             }
+#if !PICO_RP2040
+            else if (opt == 13) { // About
+#else
             else if (opt == 12) { // About
+#endif
                 // About
                 // Protect OSD area from Z80 video renderer overwrite
                 bool about_osd_enabled = (VIDEO::OSD != 0);

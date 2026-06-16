@@ -22,6 +22,7 @@
 
 #include "ESPectrum.h"
 #include "Config.h"
+#include "BoardPins.h"
 #include "FileUtils.h"
 #ifdef USE_GS
 #include "GS/GS.h"
@@ -367,8 +368,10 @@ extern "C" bool handleScancode(const uint32_t ps2scancode) {
 // ghost release. The USB pad next callback would then see gamepad1_bits.X
 // reset and push a duplicate press → button stuck.
 static uint32_t nespad_prev_state = 0;
+static bool nespad_active = false; // false until nespad_begin(); stays false if yielded to ZiFi
 
 static void nespad_tick1(void) {
+    if (!nespad_active) return;
     nespad_read();
     uint32_t cur = nespad_state;
     uint32_t prev = nespad_prev_state;
@@ -461,6 +464,7 @@ static void nespad_tick1(void) {
 }
 
 static void nespad_tick2(void) {
+    if (!nespad_active) return;
     if (Config::secondJoy == 3) return;
     gamepad2_bits.a = (nespad_state2 & DPAD_A) != 0;
     gamepad2_bits.b = (nespad_state2 & DPAD_B) != 0;
@@ -1082,19 +1086,33 @@ uint8_t* PSRAM_DATA = (uint8_t*)0;
 uint32_t __not_in_flash_func(butter_psram_size)() { return 0; }
 #endif
 
+// Linker-defined core0 stack bounds (SCRATCH_Y). Used to flag stack overflow.
+extern char __StackBottom;
+extern char __StackTop;
+
 // C linkage so the naked-asm `b sigbus_handler` resolves without mangling.
 extern "C" void sigbus_handler(uint32_t *frame) {
     static int count = 0;
     if (++count > 3) return;
+    // Exception frame: [0]=r0 [1]=r1 [2]=r2 [3]=r3 [4]=r12 [5]=LR [6]=PC [7]=xPSR.
+    // LR = the return address of the function that faulted — that's the caller to
+    // locate with addr2line. `frame` itself ~= the SP at fault time. If SP ran
+    // below __StackBottom the core0 stack overflowed (silent corruption, not a
+    // clean MSTKERR once the guard-less stack fills SCRATCH_Y).
     uint32_t pc   = frame[6];
+    uint32_t lr   = frame[5];
+    uint32_t sp   = (uint32_t)frame;
+    int ovf = (sp < (uint32_t)&__StackBottom);
 #ifndef PICO_RP2040
     // CFSR/BFAR only exist on Cortex-M3+ (not M0+)
     uint32_t cfsr = *(volatile uint32_t*)0xE000ED28u;
     uint32_t bfar = *(volatile uint32_t*)0xE000ED38u;
-    printf("SIGBUS[%d]: PC=%08x CFSR=%08x BFAR=%08x\n",
-           count, (unsigned)pc, (unsigned)cfsr, (unsigned)bfar);
+    printf("SIGBUS[%d]: PC=%08x LR=%08x SP=%08x CFSR=%08x BFAR=%08x stackOvf=%d (bot=%08x top=%08x)\n",
+           count, (unsigned)pc, (unsigned)lr, (unsigned)sp, (unsigned)cfsr, (unsigned)bfar,
+           ovf, (unsigned)(uintptr_t)&__StackBottom, (unsigned)(uintptr_t)&__StackTop);
 #else
-    printf("SIGBUS[%d]: PC=%08x\n", count, (unsigned)pc);
+    printf("SIGBUS[%d]: PC=%08x LR=%08x SP=%08x stackOvf=%d\n",
+           count, (unsigned)pc, (unsigned)lr, (unsigned)sp, ovf);
 #endif
 }
 // Naked trampoline: pass the stacked exception frame to sigbus_handler.
@@ -1273,9 +1291,8 @@ int main() {
 #endif
 
 
-#if USE_NESPAD
-    nespad_begin(clock_get_hz(clk_sys) / 1000, NES_GPIO_CLK, NES_GPIO_DATA, NES_GPIO_LAT);
-#endif
+// NESPAD init moved below ESPectrum::setup() so Config (and thus the ZiFi pin
+// selection) is loaded first — see the guarded nespad_begin() after setup().
 
 #if !defined(BUTTER_PSRAM_GPIO) || BUTTER_PSRAM_GPIO != 255   // skip when PSRAM kill-switch on (set(PSRAM OFF))
 #if PICO_RP2350
@@ -1304,6 +1321,25 @@ int main() {
     ESPectrum::setup();
     Debug::log("main: after ESPectrum::setup()");
     Debug::log2SD("main: after ESPectrum::setup()");
+
+#if USE_NESPAD
+    // Bring up the NES gamepad now that Config is loaded — unless ZiFi (RP2350)
+    // has claimed any of its pins, in which case yield so the UART owns them.
+    {
+        bool nes_yield = false;
+#if !PICO_RP2040
+        nes_yield = BoardPins::zifiOwnsPin(NES_GPIO_CLK) ||
+                    BoardPins::zifiOwnsPin(NES_GPIO_DATA) ||
+                    BoardPins::zifiOwnsPin(NES_GPIO_LAT);
+#endif
+        if (!nes_yield) {
+            nespad_begin(clock_get_hz(clk_sys) / 1000, NES_GPIO_CLK, NES_GPIO_DATA, NES_GPIO_LAT);
+            nespad_active = true;
+        } else {
+            Debug::log("NESPAD: yielded to ZiFi (pins claimed)");
+        }
+    }
+#endif
     #ifdef PICO_DEFAULT_LED_PIN
     for (int i = 0; i < 6; i++) {
         sleep_ms(33);

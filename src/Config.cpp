@@ -53,6 +53,7 @@ uint16_t Config::max_tft_freq = 126;
 uint8_t  Config::vreq_voltage = VREG_VOLTAGE_1_60;
 #endif
 bool     Config::Issue2 = true;
+bool     Config::rtc_enabled = false;
 bool     Config::flashload = true;
 bool     Config::tape_player = false; // Tape player mode
 volatile bool Config::real_player = false;
@@ -124,6 +125,20 @@ bool     Config::zcontroller = false;
 uint8_t  Config::ide_scheme = 0;
 string   Config::ide_image[2] = {"", ""};
 uint16_t Config::ide_chs[2][3] = {{0,0,0},{0,0,0}};
+uint8_t  Config::zifi_enabled = 0;
+uint8_t  Config::zifi_tx_pin = 0xFE; // 0xFE = board default (BoardPins)
+uint8_t  Config::zifi_rx_pin = 0xFE;
+uint32_t Config::zifi_baud = 115200;
+string   Config::wifi_ssid;
+string   Config::wifi_pass;
+bool     Config::wifi_autoconnect = false;
+signed char Config::wifi_tz = 0;
+string   Config::net_host;
+string   Config::net_user;
+uint16_t Config::net_port = 0;
+uint8_t  Config::net_proto = 0;
+string   Config::net_dl_dir = "/spec";
+string   Config::net_ul_dir = "/spec";
 #endif
 
 uint8_t Config::scanlines = 0;
@@ -411,6 +426,70 @@ void Config::loadDiskMounts() {
     fclose2(handle);
 }
 
+#if !PICO_RP2040
+// Stored in CONFIG_DIR; legacy "/wifi.cfg" at the SD root is still read as a
+// fallback (migration) but new saves go to the config dir.
+#define WIFI_CFG_PATH      CONFIG_DIR "/wifi.cfg"
+#define WIFI_CFG_PATH_OLD  "/wifi.cfg"
+
+void Config::loadWifiConfig() {
+    wifi_ssid.clear();
+    wifi_pass.clear();
+    wifi_autoconnect = false;
+    wifi_tz = 0;
+    FIL* f = fopen2(WIFI_CFG_PATH, FA_READ);
+    if (!f) f = fopen2(WIFI_CFG_PATH_OLD, FA_READ); // legacy location
+    if (!f) return;
+    UINT br;
+    char c;
+    string line;
+    while (!f_eof(f)) {
+        if (f_read(f, &c, 1, &br) != FR_OK) break;
+        if (c == '\n') {
+            auto eq = line.find('=');
+            if (eq != string::npos) {
+                string key = line.substr(0, eq);
+                string val = line.substr(eq + 1);
+                if (key == "ssid")        wifi_ssid = val;
+                else if (key == "pass")   wifi_pass = val;
+                else if (key == "autoconnect") wifi_autoconnect = (val == "1" || val == "true");
+                else if (key == "tz")     wifi_tz = (signed char)atoi(val.c_str());
+                else if (key == "net_host")  net_host = val;
+                else if (key == "net_user")  net_user = val;
+                else if (key == "net_port")  net_port = (uint16_t)atoi(val.c_str());
+                else if (key == "net_proto") net_proto = (uint8_t)atoi(val.c_str());
+                else if (key == "net_dl")    { if (!val.empty()) net_dl_dir = val; }
+                else if (key == "net_ul")    { if (!val.empty()) net_ul_dir = val; }
+                else if (key == "baud")      { zifi_baud = (uint32_t)strtoul(val.c_str(), nullptr, 10); if (!zifi_baud) zifi_baud = 115200; }
+            }
+            line.clear();
+        } else if (c != '\r') {
+            line += c;
+        }
+    }
+    fclose2(f);
+}
+
+void Config::saveWifiConfig() {
+    FileUtils::mkdirParents(CONFIG_DIR);
+    FIL* f = fopen2(WIFI_CFG_PATH, FA_WRITE | FA_CREATE_ALWAYS);
+    if (!f) return;
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf),
+                     "ssid=%s\npass=%s\ntz=%d\nautoconnect=%d\n"
+                     "net_host=%s\nnet_user=%s\nnet_port=%u\nnet_proto=%u\nbaud=%u\n"
+                     "net_dl=%s\nnet_ul=%s\n",
+                     wifi_ssid.c_str(), wifi_pass.c_str(),
+                     (int)wifi_tz, wifi_autoconnect ? 1 : 0,
+                     net_host.c_str(), net_user.c_str(),
+                     (unsigned)net_port, (unsigned)net_proto, (unsigned)zifi_baud,
+                     net_dl_dir.c_str(), net_ul_dir.c_str());
+    UINT bw;
+    if (n > 0) f_write(f, buf, n, &bw);
+    fclose2(f);
+}
+#endif
+
 #if TFT
 extern "C" uint8_t TFT_FLAGS;
 extern "C" uint8_t TFT_INVERSION;
@@ -522,6 +601,7 @@ void Config::load() {
         }
 #endif
         nvs_get_b("Issue2", Issue2, sts);
+        nvs_get_b("rtc_enabled", rtc_enabled, sts);
         nvs_get_b("debug_log", Debug::log_enabled, sts);
         nvs_get_b("flashload", flashload, sts);
         nvs_get_b("rightSpace", rightSpace, sts);
@@ -647,6 +727,9 @@ void Config::load() {
             mb02SoundLed = old ? 3 : 0;
         }
         nvs_get_b("zcontroller", zcontroller, sts);
+        nvs_get_u8("zifi_enabled", zifi_enabled, sts);
+        nvs_get_u8("zifi_tx_pin", zifi_tx_pin, sts);
+        nvs_get_u8("zifi_rx_pin", zifi_rx_pin, sts);
 #endif
         nvs_get_str("SNA_Path", FileUtils::SNA_Path, sts);
         nvs_get_str("TAP_Path", FileUtils::TAP_Path, sts);
@@ -740,6 +823,10 @@ void Config::load() {
         else MEM_PG_CNT = mem_pg_cnt;
     }
     loaded = true;
+#if !PICO_RP2040
+    if (FileUtils::fsMount)
+        loadWifiConfig();
+#endif
 }
 
 // Streams key=value lines straight to the SD file when one is open;
@@ -870,6 +957,9 @@ void Config::save() {
     nvs_set_str(buf,"SAA1099", SAA1099 ? "true" : "false");
     nvs_set_u8(buf,"midi", midi);
     nvs_set_u8(buf,"midipreset", midi_synth_preset);
+    nvs_set_u8(buf,"zifi_enabled", zifi_enabled);
+    nvs_set_u8(buf,"zifi_tx_pin", zifi_tx_pin);
+    nvs_set_u8(buf,"zifi_rx_pin", zifi_rx_pin);
 #endif
     nvs_set_u8(buf,"ayConfig", Config::ayConfig);
     nvs_set_u8(buf,"turbosound", Config::turbosound);
@@ -879,6 +969,7 @@ void Config::save() {
     nvs_set_u8(buf,"gs_ram_size", Config::gs_ram_size);
     nvs_set_u8(buf,"gs_clock", Config::gs_clock);
     nvs_set_str(buf,"Issue2", Issue2 ? "true" : "false");
+    nvs_set_str(buf,"rtc_enabled", rtc_enabled ? "true" : "false");
     nvs_set_str(buf,"debug_log", Debug::log_enabled ? "true" : "false");
     nvs_set_str(buf,"flashload", flashload ? "true" : "false");
     nvs_set_str(buf,"ledIndicators", ledIndicators ? "true" : "false");

@@ -104,7 +104,8 @@ public:
     static uint8_t  vreq_voltage;  // vreg_voltage_t enum value, default VREG_VOLTAGE_1_60
 #endif
     static bool     Issue2;
-    static bool     flashload;    
+    static bool     rtc_enabled;  // Pentagon/Profi Mr Gluk MC146818 RTC + CMOS NVRAM (RP2350)
+    static bool     flashload;
     static bool     tape_player;
     static volatile bool real_player;
     static bool     profi_ext_keys;  // Profi extended keyboard mode (default false)
@@ -225,6 +226,26 @@ public:
     static uint8_t ide_scheme;   // IDE/HDD: 0=OFF 1=NEMO 2=PROFI (mutually exclusive with esxDOS DivMMC/DivIDE)
     static string ide_image[2];  // IDE hd0/hd1 image paths ([0]=master, [1]=slave)
     static uint16_t ide_chs[2][3]; // per-slot geometry override [C,H,S]; 0,0,0 = auto-detect
+    static uint8_t zifi_enabled; // 0=Off, 1=ZiFi NIC
+    // ZiFi UART pins: 0xFE = board default, 0xFF = OFF, else explicit TX/RX
+    // (resolved via BoardPins). See BoardPins.h / Network → GPIO picker.
+    static uint8_t zifi_tx_pin;
+    static uint8_t zifi_rx_pin;
+    static uint32_t zifi_baud;  // ESP-01S UART rate (115200 default; raised via AT+UART_CUR)
+    static string wifi_ssid;
+    static string wifi_pass;
+    static bool wifi_autoconnect;
+    static signed char wifi_tz; // SNTP timezone offset in hours (wifi.cfg key "tz")
+    // Network file-transfer client (Network → File transfer). Stored in wifi.cfg.
+    // Passwords are NOT persisted (re-prompted each session).
+    static string   net_host;   // last remote host
+    static string   net_user;   // last username
+    static uint16_t net_port;   // last port (0 = protocol default: 21 FTP / 22 SFTP)
+    static uint8_t  net_proto;  // 0 = FTP, 1 = SFTP
+    static string   net_dl_dir; // last SD folder a file was downloaded into
+    static string   net_ul_dir; // last SD folder a file was uploaded from
+    static void loadWifiConfig();
+    static void saveWifiConfig();
 #endif
     
     static signed char aud_volume;

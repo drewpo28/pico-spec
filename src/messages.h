@@ -522,6 +522,13 @@ static const char *MENU_ESX_INSERT[2]    = { "Insert disk\t>\n", "Insertar disco
 static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco\n" };
 #endif
 
+// Network menu item — present on RP2350 only; empty string on RP2040
+#if !PICO_RP2040
+#define MENU_MAIN_NETWORK_ITEM "Network\t>\n"
+#else
+#define MENU_MAIN_NETWORK_ITEM ""
+#endif
+
 #if TFT
 #define MENU_MAIN_EN \
 	"Volume\n"\
@@ -562,6 +569,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Options\t>\n"\
     "Debug\t>\n"\
     "Hardware\t>\n"\
+    MENU_MAIN_NETWORK_ITEM \
     "ZX Keyboard\n"\
     "Help\n"\
     "About\n"
@@ -575,6 +583,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Opciones\t>\n"\
 	"Depurar\t>\n"\
     "Hardware\t>\n"\
+    MENU_MAIN_NETWORK_ITEM \
     "Teclado ZX\n"\
     "Ayuda\n"\
     "Acerca de\n"
@@ -591,6 +600,7 @@ static const char *MENU_MAIN[2] = { MENU_MAIN_EN, MENU_MAIN_ES };
     "Options\t>\n"\
     "Debug\t>\n"\
     "Hardware\t>\n"\
+    MENU_MAIN_NETWORK_ITEM \
     "ZX Keyboard\n"\
     "Help\n"\
     "About\n"
@@ -604,6 +614,7 @@ static const char *MENU_MAIN[2] = { MENU_MAIN_EN, MENU_MAIN_ES };
     "Opciones\t>\n"\
     "Depurar\t>\n"\
     "Hardware\t>\n"\
+    MENU_MAIN_NETWORK_ITEM \
     "Teclado ZX\n"\
     "Ayuda\n"\
     "Acerca de\n"
@@ -960,6 +971,10 @@ static const char *MENU_GS_CLOCK_SEL[2]  = {
     "Indicadores LED\t>\n"\
     "LED tarjeta SD\t>\n"
 static const char *MENU_OTHER[2] = { MENU_OTHER_EN, MENU_OTHER_ES };
+// RP2350-only extra row appended to the Other menu at runtime (Pentagon/Profi
+// Mr Gluk MC146818 clock + battery-backed CMOS persisted to SD).
+static const char *MENU_OTHER_RTC[2] = { "RTC + NVRAM\t>\n", "RTC + NVRAM\t>\n" };
+static const char *MENU_RTC[2]       = { "RTC + NVRAM\n",    "RTC + NVRAM\n" };
 
 #ifdef PICO_RP2040
 #define MENU_CPU_MHZ \
@@ -2224,5 +2239,75 @@ const uint8_t ESPectrum_logo[] = {
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00,
 };
+
+
+// ─── ZiFi / Network menu strings ─────────────────────────────────────────────
+#if !PICO_RP2040
+
+#define MENU_NETWORK_EN \
+    "Network\n"\
+    "Status\n"\
+    "Sync time (SNTP)\n"\
+    "Time zone\t>\n"\
+    "ZiFi NIC\t>\n"
+#define MENU_NETWORK_ES \
+    "Red\n"\
+    "Estado\n"\
+    "Sincronizar hora\n"\
+    "Zona horaria\t>\n"\
+    "ZiFi NIC\t>\n"
+static const char *MENU_NETWORK[2] = { MENU_NETWORK_EN, MENU_NETWORK_ES };
+
+#define MENU_ZIFI_NIC_EN "ZiFi NIC\n"\
+    "Off\n"\
+    "On\n"
+#define MENU_ZIFI_NIC_ES "ZiFi NIC\n"\
+    "Apagado\n"\
+    "Encendido\n"
+static const char *MENU_ZIFI_NIC[2] = { MENU_ZIFI_NIC_EN, MENU_ZIFI_NIC_ES };
+
+static const char *MSG_WIFI_CONNECTING[2]    = { "Connecting...",     "Conectando..."      };
+static const char *MSG_WIFI_CONNECTED[2]     = { "Connected",         "Conectado"          };
+static const char *MSG_WIFI_DISCONNECTED[2]  = { "Disconnected",      "Desconectado"       };
+static const char *MSG_WIFI_CONNECT_ERR[2]   = { "Connect failed",    "Error al conectar"  };
+static const char *MSG_WIFI_NO_CFG[2]        = { "No /wifi.cfg found","Sin /wifi.cfg"      };
+static const char *MSG_WIFI_CFG_RELOADED[2]  = { "wifi.cfg reloaded", "wifi.cfg recargado" };
+static const char *MSG_RTC_SYNCING[2]        = { "Syncing time...",   "Sincronizando..."   };
+static const char *MSG_RTC_SYNCED[2]         = { "Time set:",         "Hora ajustada:"     };
+static const char *MSG_RTC_SYNC_ERR[2]       = { "Time sync failed",  "Error de hora"      };
+static const char *MSG_WIFI_SCANNING[2]      = { "Scanning...",       "Buscando..."        };
+static const char *MSG_WIFI_NO_NETS[2]       = { "No networks found", "Sin redes"          };
+static const char *MSG_WIFI_PASS_LABEL[2]    = { "Pass:",             "Clave:"             };
+static const char *MSG_WIFI_DISCONNECT_Q[2]  = { "Disconnect?",       "\xA8" "Desconectar?" };
+static const char *MENU_WIFI_LIST_TITLE[2]   = { "Wi-Fi networks",    "Redes Wi-Fi"        };
+static const char *MENU_TZ_TITLE[2]          = { "Time zone (UTC)",   "Zona horaria (UTC)" };
+static const char *MENU_ZIFI_GPIO_TITLE[2]   = { "ZiFi UART GPIO",    "ZiFi UART GPIO"     };
+static const char *MENU_ESP01_TITLE[2]       = { "ESP-01(S)",         "ESP-01(S)"          };
+static const char *MENU_BAUD_TITLE[2]        = { "UART baud rate",    "Velocidad UART"     };
+
+// ─── File transfer (FTP/SFTP) client strings ────────────────────────────────
+static const char *MENU_NET_PROTO[2]         = { "Protocol\nFTP\nSFTP\n", "Protocolo\nFTP\nSFTP\n" };
+static const char *MSG_NET_FT_NOWIFI[2]      = { "Connect Wi-Fi first", "Conecte Wi-Fi primero" };
+static const char *MSG_NET_HOST_LABEL[2]     = { "Host:",   "Host:"     };
+static const char *MSG_NET_USER_LABEL[2]     = { "User:",   "Usuario:"  };
+static const char *MSG_NET_PORT_LABEL[2]     = { "Port:",   "Puerto:"   };
+static const char *MSG_NET_PASS_LABEL[2]     = { "Pass:",   "Clave:"    };
+static const char *MSG_PASS_TAB[2]           = { "TAB:show","TAB:ver"   };
+static const char *MSG_NET_CONNECTING[2]     = { "Connecting...",    "Conectando..."     };
+static const char *MSG_NET_CONN_ERR[2]       = { "Connection failed","Error de conexion" };
+static const char *MSG_NET_TRUST_Q[2]        = { "Trust this host key?", "\xA8" "Confiar en la clave?" };
+static const char *MSG_NET_HOSTKEY_BAD[2]    = { "HOST KEY CHANGED!\nPossible MITM", "\xA8" "CLAVE CAMBIADA!\nPosible MITM" };
+static const char *MSG_NET_DOWNLOADING[2]    = { "Downloading...",   "Descargando..."    };
+static const char *MSG_NET_UPLOADING[2]      = { "Uploading...",     "Subiendo..."       };
+static const char *MSG_NET_XFER_OK[2]        = { "Transfer complete","Transferencia OK"  };
+static const char *MSG_NET_XFER_ERR[2]       = { "Transfer failed",  "Fallo al transferir" };
+static const char *MSG_NET_EMPTY_DIR[2]      = { "(empty)",          "(vacio)"           };
+static const char *MSG_NET_DL_OR_UL[2]       = { "Download\nUpload here\n", "Descargar\nSubir aqui\n" };
+static const char *MENU_NET_BROWSE_TITLE[2]  = { "Remote files",     "Archivos remotos"  };
+static const char *MSG_NET_DELETE_Q[2]       = { "Delete?",          "\xA8" "Borrar?"     };
+static const char *MSG_NET_FOOTER[2]         = { "F5 copy  F8 delete","F5 copiar F8 borrar" };
+static const char *MSG_NET_COPYING[2]        = { "Copying...",       "Copiando..."        };
+
+#endif // !PICO_RP2040
 
 #endif // ESPECTRUM_MESSAGES_h

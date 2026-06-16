@@ -58,6 +58,9 @@ using namespace std;
 
 #include "Debug.h"
 #include "PinSerialData_595.h"
+#if ZIFI_NET_CLIENT
+#include "RemoteFs.h"
+#endif
 
 extern Font Font6x8;
 
@@ -1239,3 +1242,357 @@ void OSD::fd_PrintRow(uint8_t virtual_row_num, uint8_t line_type, const vector<s
 
     VIDEO::vga.print(" ");
 }
+
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+// ─── Remote (FTP/SFTP) file browser ─────────────────────────────────────────
+// Bounded RAM for any directory size: each listing is streamed straight into a
+// sorted_files SD index (fixed 256-byte records, on-disk quicksort, dirs first),
+// and only the visible window is read back per redraw — mirrors how fileDialog
+// handles huge SD directories. No vector / no giant menu string in RAM.
+
+// listStream callback: push one entry into the index (DIR_MARKER prefix = dir,
+// so the on-disk sort groups directories first).
+static void rfd_push(void* ctx, const char* name, bool isDir, uint32_t size) {
+    (void)size;
+    sorted_files* idx = (sorted_files*)ctx;
+    std::string rec;
+    if (isDir) rec += (char)DIR_MARKER;
+    rec += name;
+    idx->push(rec);
+}
+
+// Transfer progress: update the dialog; Esc/F1 aborts.
+static string rfd_xfer_title;
+static bool rfd_progress(uint32_t done, uint32_t total) {
+    int pct = total ? (int)((uint64_t)done * 100 / total) : 0;
+    if (pct > 100) pct = 100;
+    OSD::progressDialog(rfd_xfer_title, "", pct, 1);
+    fabgl::VirtualKeyItem k;
+    if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable() && ESPectrum::readKbd(&k))
+        if (k.down && is_back(k.vk)) return false;
+    return true;
+}
+
+// Shared windowed scroller over an SD index. Rows [0,nsynth) are the synthetic
+// labels in `synth` (e.g. "[Upload]", ".."); rows [nsynth..) are idx entries (a
+// leading DIR_MARKER byte = directory → shown with a "/" suffix). Only the
+// visible window is read from the index per redraw, so RAM stays bounded.
+// Returns the chosen absolute row index, or -1 on Esc. If `footer` is set it is
+// shown as a hotkey hint line at the bottom. If `delPressed`/`copyPressed` are
+// given, F8/Del and F5 return the current index with the respective flag set.
+static int rfd_scroll(const string& title, sorted_files& idx,
+                      const char* const* synth, int nsynth,
+                      const char* footer = nullptr, bool* delPressed = nullptr,
+                      bool* copyPressed = nullptr) {
+    if (delPressed)  *delPressed = false;
+    if (copyPressed) *copyPressed = false;
+    const int cols_n = 36, MAXVIS = 16;
+    int total = nsynth + (int)idx.size();
+    int vis   = total < MAXVIS ? total : MAXVIS;
+    if (vis < 1) vis = 1;
+    int foot = footer ? 1 : 0;
+
+    int w = (cols_n + 2) * OSD_FONT_W + 2;
+    int h = (vis + 1 + foot) * OSD_FONT_H + 2;
+    int wx = OSD::scrAlignCenterX(w), wy = OSD::scrAlignCenterY(h);
+    int cursor = 0, top = 0;
+    VIDEO::SaveRect.save(wx, wy, w, h);
+
+    auto redraw = [&]() {
+        VIDEO::vga.setFont(Font6x8);
+        VIDEO::vga.rect(wx, wy, w, h, zxColor(0, 0));
+        VIDEO::vga.fillRect(wx + 1, wy + 1, w - 2, OSD_FONT_H, zxColor(0, 0));
+        VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(0, 0));
+        VIDEO::vga.setCursor(wx + 1 + OSD_FONT_W, wy + 1);
+        string t = title;
+        if ((int)t.size() > cols_n) t = "..." + t.substr(t.size() - (cols_n - 3));
+        VIDEO::vga.print(t.c_str());
+        for (int r = 0; r < vis; r++) {
+            int ab = top + r;
+            VIDEO::vga.setTextColor(zxColor(0, 1), ab == cursor ? zxColor(5, 1) : zxColor(7, 1));
+            VIDEO::vga.setCursor(wx + 1, wy + 1 + OSD_FONT_H + r * OSD_FONT_H);
+            string disp;
+            if (ab < nsynth)        disp = synth[ab];
+            else if (ab < total) {
+                string rec = idx.get(ab - nsynth);
+                if (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER) disp = rec.substr(1) + "/";
+                else disp = rec;
+            }
+            if ((int)disp.size() > cols_n) disp = disp.substr(0, cols_n);
+            VIDEO::vga.print(" ");
+            VIDEO::vga.print(disp.c_str());
+            for (int i = (int)disp.size(); i < cols_n + 1; i++) VIDEO::vga.print(" ");
+        }
+        // Right-edge scrollbar when the list doesn't fit (track + proportional thumb).
+        if (total > vis) {
+            int sbx = wx + w - OSD_FONT_W - 1;
+            int sby = wy + 1 + OSD_FONT_H;
+            int sbh = OSD_FONT_H * vis;
+            VIDEO::vga.fillRect(sbx, sby, OSD_FONT_W, sbh, zxColor(7, 0));
+            int bar_h = sbh * vis / total; if (bar_h < 3) bar_h = 3;
+            int bar_y = (total > vis) ? (sbh - bar_h) * top / (total - vis) : 0;
+            VIDEO::vga.fillRect(sbx + 1, sby + bar_y, OSD_FONT_W - 2, bar_h, zxColor(0, 0));
+        }
+        // Footer hotkey hint line (matches menuRun's footer style).
+        if (footer) {
+            int fy = wy + 1 + (vis + 1) * OSD_FONT_H;
+            VIDEO::vga.fillRect(wx + 1, fy, w - 2, OSD_FONT_H, zxColor(5, 1));
+            VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
+            VIDEO::vga.setCursor(wx + 1 + OSD_FONT_W, fy);
+            string fs = footer;
+            if ((int)fs.size() > cols_n) fs = fs.substr(0, cols_n);
+            VIDEO::vga.print(fs.c_str());
+        }
+    };
+    redraw();
+
+    while (1) {
+        if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
+            fabgl::VirtualKeyItem k;
+            if (!ESPectrum::readKbd(&k) || !k.down) continue;
+            int oc = cursor;
+            if (is_up(k.vk))            cursor--;
+            else if (is_down(k.vk))     cursor++;
+            else if (k.vk == fabgl::VK_PAGEUP)   cursor -= vis;
+            else if (k.vk == fabgl::VK_PAGEDOWN) cursor += vis;
+            else if (is_home(k.vk))     cursor = 0;
+            else if (k.vk == fabgl::VK_END) cursor = total - 1;
+            else if (is_enter(k.vk))    { OSD::click(); VIDEO::SaveRect.restore_last(); return cursor; }
+            else if (is_back(k.vk))     { OSD::click(); VIDEO::SaveRect.restore_last(); return -1; }
+            else if (delPressed && (k.vk == fabgl::VK_F8 || k.vk == fabgl::VK_DELETE)) {
+                *delPressed = true; OSD::click(); VIDEO::SaveRect.restore_last(); return cursor;
+            }
+            else if (copyPressed && k.vk == fabgl::VK_F5) {
+                *copyPressed = true; OSD::click(); VIDEO::SaveRect.restore_last(); return cursor;
+            }
+            else continue;
+            if (cursor < 0) cursor = 0;
+            if (cursor > total - 1) cursor = total - 1;
+            if (cursor < top) top = cursor;
+            if (cursor >= top + vis) top = cursor - vis + 1;
+            if (top > total - vis) top = total - vis;
+            if (top < 0) top = 0;
+            if (cursor != oc) { redraw(); OSD::click(); }
+        }
+        sleep_ms(5);
+    }
+}
+
+// Pick a destination folder on the SD card (for downloads). Navigates local
+// directories with the same bounded-RAM scroller. Returns the chosen absolute
+// path, or "" if cancelled.
+static string rfd_choose_folder(const string& start) {
+    string cur = start.empty() ? "/" : start;
+    sorted_files idx;
+    idx.init("__sdfolder__");
+    const char* synth[2] = { Config::lang ? "[Elegir esta carpeta]" : "[Select this folder]", ".." };
+    while (1) {
+        idx.unlink();
+        DIR dp; FILINFO fno;
+        if (f_opendir(&dp, cur.c_str()) == FR_OK) {
+            while (f_readdir(&dp, &fno) == FR_OK && fno.fname[0]) {
+                if (fno.fattrib & AM_DIR) {
+                    string rec; rec += (char)DIR_MARKER; rec += fno.fname;
+                    idx.push(rec);
+                }
+            }
+            f_closedir(&dp);
+        }
+        idx.sort();
+        int sel = rfd_scroll(cur, idx, synth, 2);
+        if (sel < 0)  { idx.unlink(); return ""; }   // cancel
+        if (sel == 0) { idx.unlink(); return cur; }  // choose current
+        if (sel == 1) {                              // parent
+            size_t s = cur.find_last_of('/');
+            cur = (s == 0 || s == string::npos) ? "/" : cur.substr(0, s);
+            continue;
+        }
+        string rec = idx.get(sel - 2);
+        string name = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER) ? rec.substr(1) : rec;
+        if (cur.back() != '/') cur += '/';
+        cur += name;
+    }
+}
+
+// Pick ANY file on the SD card (for uploads) — unlike fileDialog, no extension
+// filter, so the user can upload arbitrary files. Navigates dirs + files with
+// the bounded-RAM scroller. Returns the chosen absolute file path, or "".
+static string rfd_choose_file(const string& start) {
+    string cur = start.empty() ? "/" : start;
+    sorted_files idx;
+    idx.init("__sdfile__");
+    const char* synth[1] = { ".." };
+    while (1) {
+        idx.unlink();
+        DIR dp; FILINFO fno;
+        if (f_opendir(&dp, cur.c_str()) == FR_OK) {
+            while (f_readdir(&dp, &fno) == FR_OK && fno.fname[0]) {
+                string rec;
+                if (fno.fattrib & AM_DIR) rec += (char)DIR_MARKER;
+                rec += fno.fname;
+                idx.push(rec);
+            }
+            f_closedir(&dp);
+        }
+        idx.sort();
+        int sel = rfd_scroll(cur, idx, synth, 1);
+        if (sel < 0)  { idx.unlink(); return ""; }   // cancel
+        if (sel == 0) {                              // parent
+            size_t s = cur.find_last_of('/');
+            cur = (s == 0 || s == string::npos) ? "/" : cur.substr(0, s);
+            continue;
+        }
+        string rec = idx.get(sel - 1);
+        bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
+        string name = isDir ? rec.substr(1) : rec;
+        if (cur.back() != '/') cur += '/';
+        if (isDir) { cur += name; continue; }
+        idx.unlink();
+        return cur + name; // a file → return its full path
+    }
+}
+
+// Collect a directory's entries into a vector (one recursion level at a time) —
+// we can't recurse inside listStream's callback (channel reentrancy), so we
+// enumerate first, then act. Bounded per-level (fine for typical folders).
+static void rfd_copy_collect(void* ctx, const char* name, bool isDir, uint32_t sz) {
+    (void)sz;
+    auto v = (std::vector<std::string>*)ctx;
+    std::string rec; if (isDir) rec += (char)DIR_MARKER; rec += name;
+    v->push_back(rec);
+}
+
+// Recursively copy the CURRENT remote directory into the SD path `destSd`
+// (created by the caller). cwd is restored to where it started. Returns false on
+// error or user abort (Esc during a file).
+static bool rfd_copy_tree(RemoteFs* fs, const std::string& destSd, int depth) {
+    if (depth > 16) return false; // runaway guard
+    std::vector<std::string> names;
+    if (!fs->listStream("", rfd_copy_collect, &names)) return false;
+    for (auto& rec : names) {
+        bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
+        std::string nm = isDir ? rec.substr(1) : rec;
+        std::string dst = destSd + "/" + nm;
+        if (isDir) {
+            FileUtils::mkdirParents(dst.c_str());
+            if (!fs->cwd(nm)) return false;
+            bool ok = rfd_copy_tree(fs, dst, depth + 1);
+            fs->cwd("..");
+            if (!ok) return false;
+        } else {
+            rfd_xfer_title = MSG_NET_COPYING[Config::lang];
+            OSD::progressDialog(rfd_xfer_title, nm, 0, 0);
+            bool got = fs->get(nm, dst, rfd_progress);
+            OSD::progressDialog("", "", 0, 2);
+            if (!got) return false;
+        }
+    }
+    return true;
+}
+
+void OSD::remoteFileDialog(RemoteFs* fs) {
+    sorted_files idx;
+    idx.init("__netfs__");           // /tmp/.__netfs__.idx
+    const char* synth[2] = { Config::lang ? "[Subir archivo aqui]" : "[Upload file here]", ".." };
+
+    while (1) {
+        // ── (Re)build the index for the current directory (streamed) ──
+        OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], fs->cwdPath(), 0, 0);
+        idx.unlink();                // truncate to empty (also (re)creates the file)
+        bool ok = fs->listStream("", rfd_push, &idx);
+        OSD::progressDialog("", "", 0, 2);
+        if (!ok) { OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000); idx.unlink(); return; }
+        idx.sort();
+
+        bool del = false, copy = false;
+        int sel = rfd_scroll(fs->cwdPath(), idx, synth, 2, MSG_NET_FOOTER[Config::lang], &del, &copy);
+        if (sel < 0) { idx.unlink(); return; } // Esc → leave browser
+
+        if (del) {                       // F8/Del → delete a remote entry
+            if (sel >= 2) {
+                string rec = idx.get(sel - 2);
+                bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
+                string nm = isDir ? rec.substr(1) : rec;
+                if (OSD::msgDialog(nm, MSG_NET_DELETE_Q[Config::lang]) == DLG_YES) {
+                    bool rok = fs->remove(nm, isDir);
+                    OSD::osdCenteredMsg(rok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
+                                        rok ? LEVEL_INFO : LEVEL_WARN, 1500);
+                }
+            }
+            continue; // re-list
+        }
+
+        if (copy) {                      // F5 → copy file/folder to a chosen SD folder
+            if (sel >= 2) {
+                string rec = idx.get(sel - 2);
+                bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
+                string nm = isDir ? rec.substr(1) : rec;
+                string destBase = rfd_choose_folder(Config::net_dl_dir);
+                if (!destBase.empty()) {
+                    Config::net_dl_dir = destBase;
+                    Config::saveWifiConfig();
+                    bool ok;
+                    if (isDir) {                 // recursive folder copy
+                        string dst = destBase + (destBase.back() == '/' ? "" : "/") + nm;
+                        FileUtils::mkdirParents(dst.c_str());
+                        fs->cwd(nm);
+                        ok = rfd_copy_tree(fs, dst, 0);
+                        fs->cwd("..");
+                    } else {                     // single file
+                        string dst = destBase + (destBase.back() == '/' ? "" : "/") + nm;
+                        rfd_xfer_title = MSG_NET_COPYING[Config::lang];
+                        OSD::progressDialog(rfd_xfer_title, nm, 0, 0);
+                        ok = fs->get(nm, dst, rfd_progress);
+                        OSD::progressDialog("", "", 0, 2);
+                    }
+                    OSD::osdCenteredMsg(ok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
+                                        ok ? LEVEL_INFO : LEVEL_WARN, 1800);
+                }
+            }
+            continue; // re-list
+        }
+
+        if (sel == 0) {                  // Upload a local SD file into this dir
+            string local = rfd_choose_file(Config::net_ul_dir);
+            if (!local.empty()) {
+                size_t s = local.find_last_of('/');
+                Config::net_ul_dir = (s == 0 || s == string::npos) ? "/" : local.substr(0, s);
+                Config::saveWifiConfig(); // remember the upload folder across reboots
+                string base = local.substr(local.find_last_of('/') + 1);
+                rfd_xfer_title = MSG_NET_UPLOADING[Config::lang];
+                OSD::progressDialog(rfd_xfer_title, base, 0, 0);
+                bool put_ok = fs->put(local, base, rfd_progress);
+                OSD::progressDialog("", "", 0, 2);
+                OSD::osdCenteredMsg(put_ok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
+                                    put_ok ? LEVEL_INFO : LEVEL_WARN, 1800);
+            }
+        } else if (sel == 1) {           // Parent directory
+            fs->cwd("..");
+        } else {
+            string rec = idx.get(sel - 2);
+            bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
+            string nm = isDir ? rec.substr(1) : rec;
+            if (isDir) {
+                fs->cwd(nm);
+            } else {
+                // Pick the SD destination folder, then download into it.
+                string destDir = rfd_choose_folder(Config::net_dl_dir);
+                if (!destDir.empty()) {
+                    Config::net_dl_dir = destDir;
+                    Config::saveWifiConfig(); // remember the download folder across reboots
+                    FileUtils::mkdirParents(destDir.c_str());
+                    string localp = destDir + (destDir.back() == '/' ? "" : "/") + nm;
+                    rfd_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
+                    OSD::progressDialog(rfd_xfer_title, nm, 0, 0);
+                    bool got = fs->get(nm, localp, rfd_progress);
+                    OSD::progressDialog("", "", 0, 2);
+                    OSD::osdCenteredMsg(got ? (string(MSG_NET_XFER_OK[Config::lang]) + "\n" + localp)
+                                            : MSG_NET_XFER_ERR[Config::lang],
+                                        got ? LEVEL_INFO : LEVEL_WARN, 2200);
+                }
+            }
+        }
+        // loop → re-list current directory
+    }
+}
+#endif // !PICO_RP2040 && ZIFI_NET_CLIENT
