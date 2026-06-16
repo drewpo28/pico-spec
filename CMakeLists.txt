@@ -40,6 +40,7 @@ option(GS_PERF_TRACE "Enable General Sound per-second perf counters (GS.cpp)" OF
 option(GS_DEBUG_TRACE "Enable General Sound port-IO trace ring + auto-dumps (~50 KB SRAM)" OFF)
 option(ZIFI_TRACE "Enable ZiFi (ESP-01S WiFi NIC) port/UART tracing" ON)
 option(ZIFI_NET_CLIENT "Enable FTP/SFTP/SSH client over ZiFi (RP2350 only, uses mbedTLS)" ON)
+option(ZIFI_NET_VERBOSE "Per-packet trace of the ZiFi net client (+IPD/chanSend); floods logs" OFF)
 
 # Per-board Debug-Probe UART toggles (logging over UART). Declared here together;
 # the board-specific `if(<board>_DBG_UART)` blocks below consume them (they call
@@ -419,6 +420,9 @@ endif()
 # `#if !PICO_RP2040 && ZIFI_NET_CLIENT` so RP2040 builds get zero footprint.
 if (ZIFI_NET_CLIENT AND NOT PICO_PLATFORM STREQUAL "rp2040")
     target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_NET_CLIENT=1)
+    if (ZIFI_NET_VERBOSE)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_NET_VERBOSE=1)
+    endif ()
     # MBEDTLS_CONFIG_FILE is supplied by the SDK from PICO_MBEDTLS_CONFIG_FILE
     # (set before pico_sdk_init above) — do not redefine it here, that collides
     # with pico_mbedtls_headers' INTERFACE define.

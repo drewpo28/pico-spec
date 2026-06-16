@@ -120,7 +120,7 @@ void ZiFiSock::pump(uint32_t budget_ms) {
                     ipd_len  = ipd_field;
                     ipd_link = (ipd_nfld >= 1) ? ipd_tmp_id : 0;
                     if (ipd_link < 0 || ipd_link >= N_LINKS) ipd_link = 0;
-#if ZIFI_TRACE
+#if ZIFI_NET_VERBOSE
                     Debug::log("ZiFiSock +IPD link=%d len=%d", ipd_link, ipd_len);
 #endif
                     st = (ipd_len > 0) ? ST_IPD_PAYLOAD : ST_SCAN;

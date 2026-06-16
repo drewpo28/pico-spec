@@ -567,7 +567,7 @@ int Ssh::openSubsystem(const char* name) {
 
 int Ssh::channelSend(int ch, const uint8_t* buf, size_t len) {
     if (!chan_open || ch != chan_local) { Debug::log("SSH: chanSend bad state open=%d ch=%d", chan_open, ch); return -1; }
-#if ZIFI_TRACE
+#if ZIFI_NET_VERBOSE
     Debug::log("SSH: chanSend len=%u win_out=%u", (unsigned)len, (unsigned)chan_window_out);
 #endif
     size_t sent = 0;
