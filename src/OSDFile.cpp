@@ -1394,7 +1394,7 @@ static string rfd_choose_folder(const string& start) {
             f_closedir(&dp);
         }
         idx.sort();
-        int sel = rfd_scroll(cur, idx, synth, 2, MSG_NET_FOOTER_PICK[Config::lang]);
+        int sel = rfd_scroll(cur, idx, synth, 2);
         if (sel < 0)  { idx.unlink(); return ""; }   // cancel
         if (sel == 0) { idx.unlink(); return cur; }  // choose current
         if (sel == 1) {                              // parent
@@ -1430,7 +1430,7 @@ static string rfd_choose_file(const string& start) {
             f_closedir(&dp);
         }
         idx.sort();
-        int sel = rfd_scroll(cur, idx, synth, 1, MSG_NET_FOOTER_PICK[Config::lang]);
+        int sel = rfd_scroll(cur, idx, synth, 1);
         if (sel < 0)  { idx.unlink(); return ""; }   // cancel
         if (sel == 0) {                              // parent
             size_t s = cur.find_last_of('/');

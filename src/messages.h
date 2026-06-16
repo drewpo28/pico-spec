@@ -2282,7 +2282,7 @@ static const char *MSG_WIFI_DISCONNECT_Q[2]  = { "Disconnect?",       "\xA8" "De
 static const char *MENU_WIFI_LIST_TITLE[2]   = { "Wi-Fi networks",    "Redes Wi-Fi"        };
 static const char *MENU_TZ_TITLE[2]          = { "Time zone (UTC)",   "Zona horaria (UTC)" };
 static const char *MENU_ZIFI_GPIO_TITLE[2]   = { "ZiFi UART GPIO",    "ZiFi UART GPIO"     };
-static const char *MENU_ESP01_TITLE[2]       = { "ESP-01S",           "ESP-01S"            };
+static const char *MENU_ESP01_TITLE[2]       = { "ESP-01(S)",         "ESP-01(S)"          };
 static const char *MENU_BAUD_TITLE[2]        = { "UART baud rate",    "Velocidad UART"     };
 
 // ─── File transfer (FTP/SFTP) client strings ────────────────────────────────
@@ -2305,8 +2305,7 @@ static const char *MSG_NET_EMPTY_DIR[2]      = { "(empty)",          "(vacio)"  
 static const char *MSG_NET_DL_OR_UL[2]       = { "Download\nUpload here\n", "Descargar\nSubir aqui\n" };
 static const char *MENU_NET_BROWSE_TITLE[2]  = { "Remote files",     "Archivos remotos"  };
 static const char *MSG_NET_DELETE_Q[2]       = { "Delete?",          "\xA8" "Borrar?"     };
-static const char *MSG_NET_FOOTER[2]         = { "Enter:open Del:del Esc:back", "Enter:abrir Del:bor Esc:atr" };
-static const char *MSG_NET_FOOTER_PICK[2]    = { "Enter:select  Esc:cancel",    "Enter:elegir  Esc:cancelar"  };
+static const char *MSG_NET_FOOTER[2]         = { "F8 delete",        "F8 borrar"          };
 
 #endif // !PICO_RP2040
 
