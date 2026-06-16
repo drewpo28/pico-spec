@@ -75,6 +75,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Ftp.h"
 #include "Sftp.h"
 #include "Ssh.h"
+#include "Ftpd.h"
 #endif
 #include "kbd_img.h"
 extern "C" void graphics_set_scanlines(uint8_t level);
@@ -503,6 +504,98 @@ static void netFileTransfer() {
     void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7); // 8-byte aligned top
     net_call_on_stack(top, netSessionRun, &ctx);
     free(stk);
+}
+
+// ── FTP server: share the SD card to the LAN ─────────────────────────────────
+// Scrolling log ring for the on-screen terminal. Fixed char[][] (no heap churn),
+// holding the most recent lines; the renderer always shows the tail (auto-scroll).
+#define FTPD_LOG_LINES 40
+#define FTPD_LOG_COLS  72
+static char ftpd_log[FTPD_LOG_LINES][FTPD_LOG_COLS];
+static int  ftpd_log_count = 0;  // total lines pushed (monotonic)
+static bool ftpd_log_dirty = true;
+static void ftpdLogLine(const char* s) {
+    int slot = ftpd_log_count % FTPD_LOG_LINES;
+    strncpy(ftpd_log[slot], s ? s : "", FTPD_LOG_COLS - 1);
+    ftpd_log[slot][FTPD_LOG_COLS - 1] = '\0';
+    ftpd_log_count++;
+    ftpd_log_dirty = true;
+}
+
+// Open the FTP server, show details + a live log terminal, and run a blocking
+// loop until ESC. The Z80 stays frozen the whole time (we never call CPU::loop).
+static void ftpServerRun() {
+    string ssid, ip;
+    if (!ZiFiAT::getStatus(ssid, ip)) {
+        OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200);
+        return;
+    }
+
+    ftpd_log_count = 0; ftpd_log_dirty = true;
+    if (!Ftpd::begin(21, ftpdLogLine)) {
+        OSD::osdCenteredMsg(Config::lang ? "Error al iniciar FTP" : "FTP server start failed", LEVEL_WARN, 2500);
+        Ftpd::stop();
+        return;
+    }
+    ftpdLogLine(Config::lang ? "Servidor FTP iniciado" : "FTP server started");
+    char det[FTPD_LOG_COLS];
+    snprintf(det, sizeof(det), "ftp://%s:21  user: anonymous", ip.c_str());
+    ftpdLogLine(det);
+    ftpdLogLine(Config::lang ? "Modo ACTIVO. ESC para parar." : "Use ACTIVE mode. ESC to stop.");
+
+    unsigned short sx = OSD::scrAlignCenterX(OSD_W);
+    unsigned short sy = OSD::scrAlignCenterY(OSD_H);
+    VIDEO::SaveRect.save(sx, sy, OSD_W, OSD_H);
+
+    string sub = "ftp://" + ip + ":21  anon  ESC:stop";
+
+    auto draw = [&]() {
+        OSD::drawOSD(true);
+        int visCols = OSD::osdMaxCols(); if (visCols > 40) visCols = 40;
+        int visRows = OSD::osdMaxRows() - 4;
+        char row[42];
+        // Subtitle (row 1): connection string + hint.
+        OSD::osdAt(1, 0);
+        VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(1, 0));
+        snprintf(row, sizeof(row), " %s", sub.c_str());
+        int hl = strlen(row); while (hl < visCols) row[hl++] = ' '; row[visCols] = '\0';
+        VIDEO::vga.print(row);
+        // Separator (row 2).
+        OSD::osdAt(2, 0);
+        VIDEO::vga.setTextColor(zxColor(5, 0), zxColor(1, 0));
+        memset(row, '-', visCols); row[0] = ' '; row[visCols] = '\0';
+        VIDEO::vga.print(row);
+        // Log tail (rows 3..): the most recent visRows lines.
+        int first = ftpd_log_count > visRows ? ftpd_log_count - visRows : 0;
+        VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
+        for (int r = 0; r < visRows; r++) {
+            OSD::osdAt(3 + r, 0);
+            int li = first + r;
+            if (li < ftpd_log_count) {
+                const char* s = ftpd_log[li % FTPD_LOG_LINES];
+                int len = strlen(s); if (len > visCols) len = visCols;
+                memcpy(row, s, len); memset(row + len, ' ', visCols - len);
+            } else memset(row, ' ', visCols);
+            row[visCols] = '\0';
+            VIDEO::vga.print(row);
+        }
+    };
+    draw();
+
+    for (;;) {
+        Ftpd::poll();
+        if (ftpd_log_dirty) { draw(); ftpd_log_dirty = false; }
+        if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
+            fabgl::VirtualKeyItem k;
+            ESPectrum::PS2Controller.keyboard()->getNextVirtualKey(&k);
+            if (k.down && is_back(k.vk)) break;
+        }
+        sleep_ms(2);
+    }
+
+    Ftpd::stop();
+    OSD::osdCenteredMsg(Config::lang ? "Servidor FTP detenido" : "FTP server stopped", LEVEL_INFO, 1200);
+    VIDEO::SaveRect.restore_last();
 }
 #endif // ZIFI_NET_CLIENT
 #endif
@@ -6032,8 +6125,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                               + st + "\n";                                        // 2 WiFi
 #if ZIFI_NET_CLIENT
                     nm += (Config::lang ? "Transferir archivos\t>\n" : "File transfer\t>\n"); // 3
+                    nm += (Config::lang ? "Servidor FTP\t>\n" : "FTP Server\t>\n");           // 4
 #endif
-                    nm += "ZiFi NIC\t>\n";                                        // 3 or 4
+                    nm += "ZiFi NIC\t>\n";                                        // 3 or 5
 
                     uint8_t net_opt = menuRun(nm);
                     if (net_opt == 0) break;
@@ -6042,7 +6136,8 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     else if (net_opt == 2) doWifi();
 #if ZIFI_NET_CLIENT
                     else if (net_opt == 3) { netFileTransfer(); }
-                    else if (net_opt == 4) doNic();
+                    else if (net_opt == 4) { ftpServerRun(); }
+                    else if (net_opt == 5) doNic();
 #else
                     else if (net_opt == 3) doNic();
 #endif

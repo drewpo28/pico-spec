@@ -42,11 +42,30 @@ public:
     // Close a connection (AT+CIPCLOSE). Safe to call on an already-closed link.
     static void sock_close(int id);
 
+    // True once the peer (or we) have closed link `id` — lets callers tell a real
+    // EOF from a transient empty sock_recv (which both return 0).
+    static bool sock_closed(int id);
+
     // End the session: optionally reset CIPMUX back to 0 and drop buffers.
     static void end();
 
     // True once begin() has succeeded and the ESP is in a known mux mode.
     static bool ready();
+
+    // ── Server side (FTP server) ───────────────────────────────────────────────
+    // Multi-connection mode + start a TCP server: AT+CIPMUX=1, AT+CIPSERVER=1,port.
+    // Returns false if the ESP doesn't ack. After this, server_accept() waits for
+    // inbound control connections and sock_open() still opens OUTBOUND data links
+    // (active-mode FTP — the ESP can't host a second listening port).
+    static bool server_listen(uint16_t port);
+
+    // Wait up to timeout_ms for an inbound "<id>,CONNECT". Claims the link and
+    // returns its id (>=0), or -1 on timeout. Buffered command bytes that arrive
+    // right behind CONNECT are preserved (the ring is not flushed on accept).
+    static int  server_accept(uint32_t timeout_ms);
+
+    // Stop the server (AT+CIPSERVER=0) and tear everything down (like end()).
+    static void server_stop();
 
     // Max concurrent links we demux. FTP needs 2 (control id0 + PASV data id1);
     // SSH uses single mode (link 0). Each gets its own 2 KB assembly ring so the
@@ -62,6 +81,7 @@ private:
     static bool     opened[N_LINKS];   // per-link open flag
     static bool     mux_mode;
     static bool     is_ready;
+    static int      accepted_link;    // server: id of a freshly accepted inbound link, else -1
 
     // Pull available UART bytes from ZiFi and run them through the +IPD state
     // machine, routing payloads to per-link rings and status lines to flags.
