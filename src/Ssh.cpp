@@ -527,8 +527,15 @@ int Ssh::openSubsystem(const char* name) {
             break;
         }
         if (m == MSG_CHANNEL_OPEN_FAILURE) { Debug::log("SSH: CHANNEL_OPEN_FAILURE"); return -1; }
+        if (m == MSG_CHANNEL_WINDOW_ADJUST) {
+            Reader r(resp); uint8_t t; r.u8(t); uint32_t c, add; r.u32(c); r.u32(add);
+            chan_window_out += add;
+        }
     }
     if (!chan_open) { Debug::log("SSH: chanopen no confirmation"); return -1; }
+#if ZIFI_TRACE
+    Debug::log("SSH: chan open, win_out=%u", (unsigned)chan_window_out);
+#endif
 
     // Request the subsystem.
     Buf req;
@@ -545,22 +552,30 @@ int Ssh::openSubsystem(const char* name) {
 #if ZIFI_TRACE
         Debug::log("SSH: subsys rx msg=%d", m);
 #endif
-        if (m == MSG_CHANNEL_SUCCESS) { Debug::log("SSH: subsystem ok (ch=%d)", chan_local); return chan_local; }
+        if (m == MSG_CHANNEL_SUCCESS) { Debug::log("SSH: subsystem ok (ch=%d win_out=%u)", chan_local, (unsigned)chan_window_out); return chan_local; }
         if (m == MSG_CHANNEL_FAILURE) { Debug::log("SSH: CHANNEL_FAILURE (subsystem)"); return -1; }
-        // ignore window-adjust/data that may arrive before the reply
+        // Capture an early window grant (OpenSSH advertises window 0 in the open
+        // confirmation and grants the real send window via WINDOW_ADJUST).
+        if (m == MSG_CHANNEL_WINDOW_ADJUST) {
+            Reader r(resp); uint8_t t; r.u8(t); uint32_t c, add; r.u32(c); r.u32(add);
+            chan_window_out += add;
+        }
     }
     Debug::log("SSH: subsystem no reply");
     return -1;
 }
 
 int Ssh::channelSend(int ch, const uint8_t* buf, size_t len) {
-    if (!chan_open || ch != chan_local) return -1;
+    if (!chan_open || ch != chan_local) { Debug::log("SSH: chanSend bad state open=%d ch=%d", chan_open, ch); return -1; }
+#if ZIFI_TRACE
+    Debug::log("SSH: chanSend len=%u win_out=%u", (unsigned)len, (unsigned)chan_window_out);
+#endif
     size_t sent = 0;
     while (sent < len) {
         // Respect the peer's window; pump window-adjust messages if exhausted.
         while (chan_window_out == 0) {
             std::string m;
-            if (!readPacket(m, 12000) || m.empty()) return -1;
+            if (!readPacket(m, 12000) || m.empty()) { Debug::log("SSH: chanSend window stall"); return -1; }
             if ((uint8_t)m[0] == MSG_CHANNEL_WINDOW_ADJUST) {
                 Reader r(m); uint8_t t; r.u8(t); uint32_t c, add; r.u32(c); r.u32(add);
                 chan_window_out += add;
