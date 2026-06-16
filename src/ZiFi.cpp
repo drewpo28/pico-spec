@@ -214,6 +214,11 @@ void ZiFi::init() {
     if (Config::zifi_baud && Config::zifi_baud != ZIFI_BAUD)
         zifi_set_baud(Config::zifi_baud);
     irq_set_exclusive_handler(g_uart_irq, uart_rx_irq_handler);
+    // High baud (460800/921600) leaves only ~350 us of RX-FIFO headroom (32 bytes);
+    // if video/audio IRQs delay this handler the FIFO overflows and bytes are lost,
+    // which SSH then catches as a MAC mismatch and drops the session. Give the RX
+    // IRQ an elevated priority so it preempts and drains the FIFO promptly.
+    irq_set_priority(g_uart_irq, 0x40); // < default 0x80 → higher priority
     uart_set_irq_enables(g_uart, true, false); // RX IRQ only
     irq_set_enabled(g_uart_irq, true);
     Debug::log("ZiFi: UART%d init TX=%d RX=%d baud=%u", inst, tx, rx, (unsigned)g_cur_baud);
