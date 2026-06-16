@@ -2308,6 +2308,11 @@ static const char *MSG_NET_DELETE_Q[2]       = { "Delete?",          "\xA8" "Bor
 static const char *MSG_NET_FOOTER[2]         = { "F5 copy  F8 delete","F5 copiar F8 borrar" };
 static const char *MSG_NET_COPYING[2]        = { "Copying...",       "Copiando..."        };
 
+// ─── Archive download (catalog server) strings ──────────────────────────────
+static const char *MENU_ARCH_SITE_TITLE[2]   = { "Archive source",   "Fuente de archivo" };
+static const char *MSG_ARCH_SERVER_LABEL[2]  = { "Catalog server:",  "Servidor catalogo:" };
+static const char *MSG_ARCH_SITES_ERR[2]     = { "No sources found",  "Sin fuentes"       };
+
 #endif // !PICO_RP2040
 
 #endif // ESPECTRUM_MESSAGES_h
