@@ -64,6 +64,8 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - esxDOS support (DivMMC, DivIDE, DivSD) — [esxdos.org](https://esxdos.org/index.html).
 - Z-Controller emulation: raw SD card access via ports #57/#77, mutually exclusive with esxDOS and MB-02+ (RP2350 only).
 - FDD activity LED indicator and mechanical head click/seek sound emulation (optional, toggled via Betadisk menu).
+- ZiFi WiFi network interface via an ESP-01S module (stock Espressif AT firmware — no reflash): network access for ZX-Spectrum software (e.g. the MRF terminal), plus an MC146818 RTC (Pentagon "Mr Gluk" TimeKeeper) with SNTP time sync over WiFi (RP2350 only).
+- Network file transfer client (Network menu): FTP, SFTP and SSH straight from the OSD — browse remote servers and download / upload / copy (recursive) / delete files on the SD card. SSH/SFTP crypto (curve25519, AES-CTR, HMAC-SHA256) runs on the RP2350 via mbedTLS; SFTP host-key trust-on-first-use; selectable ESP-01S UART baud up to 921600 (RP2350 only). See [docs/en/menu/10-network.md](docs/en/menu/10-network.md).
 - Realtime (with OSD) TZX, TAP and PZX file loading.
 - Flashload of TZX/TAP/PZX files (standard loaders only).
 - Rodolfo Guerra's ROMs fast load routines support with on the fly standard speed blocks translation.
@@ -191,6 +193,16 @@ MIDI_TX_PIN  ──────────── GPIO 15 (RXD, pin 10)
 +5V          ──────────── +5V (e.g. pin 2)
 GND          ──────────── GND (e.g. pin 6)
 ```
+
+## Network (ZiFi / ESP-01S)
+
+On RP2350 boards, an **ESP-01S** (ESP8266) module on the UART adds networking. It runs the **stock Espressif AT firmware** — no reflashing needed. Configured under the OSD **Network** menu:
+
+- **ZiFi NIC** — network interface for ZX-Spectrum software (port `#EF`, 16550-UART window); works with the **MRF** terminal/drivers (<https://zxart.ee/eng/software/prikladnoe-po/mrf/tabs:releases/>).
+- **WiFi** — scan / connect / autoconnect; **SNTP** time sync into the RTC.
+- **File transfer** — FTP / SFTP / SSH client: browse remote dirs, download / upload / copy (recursive) / delete to SD; masked password (TAB reveals); SFTP host-key TOFU; baud 115200–921600.
+
+Wiring is just **4 wires** (TX, RX, GND, 3V3 — TX/RX crossover; EN/RST/GPIO0/GPIO2 left unconnected). Per-board default pins and full details: **[docs/en/menu/10-network.md](docs/en/menu/10-network.md)** ([RU](docs/ru/menu/10-network.md)).
 
 ## How to build
 ### Windows 10+

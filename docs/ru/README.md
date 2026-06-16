@@ -17,6 +17,7 @@
 | ⚙️ [Options](menu/06-options.md) | Модель/ROM по умолчанию, джойстик, язык, обновление |
 | 🐞 [Debug](menu/07-debug.md) | Отладчик, дампы, трассировка |
 | 🔧 [Hardware](menu/08-hardware.md) | Инфо о чипе/плате, HID, Speed Test, Overclock |
+| 🌐 [Network](menu/10-network.md) | ESP-01S: WiFi, SNTP, ZiFi NIC, FTP/SFTP/SSH (RP2350) |
 | 📦 [Прочее](menu/09-other.md) | Volume, ZX Keyboard, Help, About, TFT |
 
 ## Сквозные темы

@@ -20,6 +20,7 @@ feature the same way you see it on screen.
 | ⚙️ [Options](menu/06-options.md) | Default machine/ROM, joystick, language, update |
 | 🐞 [Debug](menu/07-debug.md) | Debugger, dumps, tracing |
 | 🔧 [Hardware](menu/08-hardware.md) | Chip/Board info, HID, Speed Test, Overclock |
+| 🌐 [Network](menu/10-network.md) | ESP-01S: WiFi, SNTP, ZiFi NIC, FTP/SFTP/SSH (RP2350) |
 | 📦 [Other](menu/09-other.md) | Volume, ZX Keyboard, Help, About, TFT |
 
 ## Cross-cutting topics
