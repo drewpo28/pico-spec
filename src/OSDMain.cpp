@@ -184,8 +184,9 @@ unsigned short OSD::scrAlignCenterY(unsigned short pixel_height) { return (scrH 
 // Draws each character individually; cursor shown as highlighted block under current char.
 // Returns entered string on Enter, "\x1B" on Escape, "" if Enter pressed with empty field.
 // Ignores VK_MENU_* synthetic events to avoid double-fires from kbdExtraMapping.
-string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_text) {
+string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_text, bool mask) {
     string text = initial_text;
+    bool reveal = false; // password mask: false → show '*', toggled with TAB
     auto Kbd = ESPectrum::PS2Controller.keyboard();
     // Drain any keys still in the queue (e.g. the Enter that triggered the save action)
     { fabgl::VirtualKeyItem drain; while (Kbd->virtualKeyAvailable()) Kbd->getNextVirtualKey(&drain); }
@@ -204,7 +205,10 @@ string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_tex
             else
                 VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
             VIDEO::vga.setCursor(ex + p * OSD_FONT_W, ey);
-            char ch[2] = { display[p], 0 };
+            // Masked password: render '*' for the typed characters until revealed.
+            char dch = display[p];
+            if (mask && !reveal && p < cur) dch = '*';
+            char ch[2] = { dch, 0 };
             VIDEO::vga.print(ch);
         }
     };
@@ -224,6 +228,8 @@ string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_tex
         if (!ek.down) continue;
         // Skip synthetic VK_MENU_* events
         if (ek.vk >= fabgl::VK_MENU_UP && ek.vk <= fabgl::VK_MENU_BS) continue;
+        // TAB toggles password reveal (only relevant in masked fields).
+        if (ek.vk == fabgl::VK_TAB) { if (mask) { reveal = !reveal; redraw(true); } continue; }
         if (ek.vk == fabgl::VK_RETURN || ek.vk == fabgl::VK_KP_ENTER) return text;
         if (ek.vk == fabgl::VK_ESCAPE) return "\x1B";
         if (ek.vk == fabgl::VK_BACKSPACE) {
@@ -303,10 +309,14 @@ static string wifiAskPassword(const string& ssid) {
     VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(0, 0));
     VIDEO::vga.setCursor(x + OSD_FONT_W + 1, y + 1);
     VIDEO::vga.print(ssid.substr(0, cols - 2).c_str());
+    // TAB-reveal hint, right-aligned in the title bar.
+    const char* hint = MSG_PASS_TAB[Config::lang];
+    VIDEO::vga.setCursor(x + w - 1 - (int)(strlen(hint) + 1) * OSD_FONT_W, y + 1);
+    VIDEO::vga.print(hint);
     VIDEO::vga.setTextColor(zxColor(0, 0), zxColor(7, 1));
     VIDEO::vga.setCursor(x + OSD_FONT_W, y + 1 + OSD_FONT_H + 1);
     VIDEO::vga.print(MSG_WIFI_PASS_LABEL[Config::lang]);
-    string pass = OSD::inlineTextEdit(x + OSD_FONT_W * (label + 1), y + 1 + OSD_FONT_H + 1, field, "");
+    string pass = OSD::inlineTextEdit(x + OSD_FONT_W * (label + 1), y + 1 + OSD_FONT_H + 1, field, "", true);
     VIDEO::SaveRect.restore_last();
     return pass;
 }
@@ -315,7 +325,7 @@ static string wifiAskPassword(const string& ssid) {
 // ─── Network file-transfer client (FTP / SFTP) ──────────────────────────────
 // A centred single-line text-entry dialog (host / user / port). Returns the
 // typed text, or "\x1B" if Esc was pressed. Generalises wifiAskPassword().
-static string netAskField(const string& label, const string& initial) {
+static string netAskField(const string& label, const string& initial, bool mask = false) {
     const int field = 30;
     const int lbl = (int)label.size();
     const unsigned short cols = lbl + field + 2;
@@ -331,8 +341,13 @@ static string netAskField(const string& label, const string& initial) {
     VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(0, 0));
     VIDEO::vga.setCursor(x + OSD_FONT_W + 1, y + 1);
     VIDEO::vga.print(label.c_str());
+    if (mask) { // TAB-reveal hint, right-aligned in the title bar
+        const char* hint = MSG_PASS_TAB[Config::lang];
+        VIDEO::vga.setCursor(x + w - 1 - (int)(strlen(hint) + 1) * OSD_FONT_W, y + 1);
+        VIDEO::vga.print(hint);
+    }
     VIDEO::vga.setTextColor(zxColor(0, 0), zxColor(7, 1));
-    string r = OSD::inlineTextEdit(x + OSD_FONT_W, y + 1 + OSD_FONT_H + 1, field, initial);
+    string r = OSD::inlineTextEdit(x + OSD_FONT_W, y + 1 + OSD_FONT_H + 1, field, initial, mask);
     VIDEO::SaveRect.restore_last();
     return r;
 }
@@ -464,7 +479,7 @@ static void netFileTransfer() {
     string ports = netAskField(MSG_NET_PORT_LABEL[Config::lang], pbuf);
     if (ports == "\x1B") return;
     uint16_t port = (uint16_t)atoi(ports.c_str()); if (!port) port = defport;
-    string pass = netAskField(MSG_NET_PASS_LABEL[Config::lang], "");
+    string pass = netAskField(MSG_NET_PASS_LABEL[Config::lang], "", true); // masked
     if (pass == "\x1B") return;
 
     Config::net_host = host; Config::net_user = user; Config::net_port = port;

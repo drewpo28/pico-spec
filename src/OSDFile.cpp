@@ -1381,10 +1381,47 @@ static string rfd_choose_folder(const string& start) {
     }
 }
 
+// Pick ANY file on the SD card (for uploads) — unlike fileDialog, no extension
+// filter, so the user can upload arbitrary files. Navigates dirs + files with
+// the bounded-RAM scroller. Returns the chosen absolute file path, or "".
+static string rfd_choose_file(const string& start) {
+    string cur = start.empty() ? "/" : start;
+    sorted_files idx;
+    idx.init("__sdfile__");
+    const char* synth[1] = { ".." };
+    while (1) {
+        idx.unlink();
+        DIR dp; FILINFO fno;
+        if (f_opendir(&dp, cur.c_str()) == FR_OK) {
+            while (f_readdir(&dp, &fno) == FR_OK && fno.fname[0]) {
+                string rec;
+                if (fno.fattrib & AM_DIR) rec += (char)DIR_MARKER;
+                rec += fno.fname;
+                idx.push(rec);
+            }
+            f_closedir(&dp);
+        }
+        idx.sort();
+        int sel = rfd_scroll(cur, idx, synth, 1);
+        if (sel < 0)  { idx.unlink(); return ""; }   // cancel
+        if (sel == 0) {                              // parent
+            size_t s = cur.find_last_of('/');
+            cur = (s == 0 || s == string::npos) ? "/" : cur.substr(0, s);
+            continue;
+        }
+        string rec = idx.get(sel - 1);
+        bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
+        string name = isDir ? rec.substr(1) : rec;
+        if (cur.back() != '/') cur += '/';
+        if (isDir) { cur += name; continue; }
+        idx.unlink();
+        return cur + name; // a file → return its full path
+    }
+}
+
 void OSD::remoteFileDialog(RemoteFs* fs) {
     sorted_files idx;
     idx.init("__netfs__");           // /tmp/.__netfs__.idx
-    static string lastDownloadDir = "/spec"; // remembered across downloads
     const char* synth[2] = { Config::lang ? "[Subir archivo aqui]" : "[Upload file here]", ".." };
 
     while (1) {
@@ -1400,9 +1437,11 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
         if (sel < 0) { idx.unlink(); return; } // Esc → leave browser
 
         if (sel == 0) {                  // Upload a local SD file into this dir
-            string ldir = "/";
-            string local = OSD::fileDialog(ldir, Config::lang ? "Subir" : "Upload", 0, 40, 18);
+            string local = rfd_choose_file(Config::net_ul_dir);
             if (!local.empty()) {
+                size_t s = local.find_last_of('/');
+                Config::net_ul_dir = (s == 0 || s == string::npos) ? "/" : local.substr(0, s);
+                Config::saveWifiConfig(); // remember the upload folder across reboots
                 string base = local.substr(local.find_last_of('/') + 1);
                 rfd_xfer_title = MSG_NET_UPLOADING[Config::lang];
                 OSD::progressDialog(rfd_xfer_title, base, 0, 0);
@@ -1421,9 +1460,10 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
                 fs->cwd(nm);
             } else {
                 // Pick the SD destination folder, then download into it.
-                string destDir = rfd_choose_folder(lastDownloadDir);
+                string destDir = rfd_choose_folder(Config::net_dl_dir);
                 if (!destDir.empty()) {
-                    lastDownloadDir = destDir;
+                    Config::net_dl_dir = destDir;
+                    Config::saveWifiConfig(); // remember the download folder across reboots
                     FileUtils::mkdirParents(destDir.c_str());
                     string localp = destDir + (destDir.back() == '/' ? "" : "/") + nm;
                     rfd_xfer_title = MSG_NET_DOWNLOADING[Config::lang];

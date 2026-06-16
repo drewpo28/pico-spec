@@ -2292,6 +2292,7 @@ static const char *MSG_NET_HOST_LABEL[2]     = { "Host:",   "Host:"     };
 static const char *MSG_NET_USER_LABEL[2]     = { "User:",   "Usuario:"  };
 static const char *MSG_NET_PORT_LABEL[2]     = { "Port:",   "Puerto:"   };
 static const char *MSG_NET_PASS_LABEL[2]     = { "Pass:",   "Clave:"    };
+static const char *MSG_PASS_TAB[2]           = { "TAB:show","TAB:ver"   };
 static const char *MSG_NET_CONNECTING[2]     = { "Connecting...",    "Conectando..."     };
 static const char *MSG_NET_CONN_ERR[2]       = { "Connection failed","Error de conexion" };
 static const char *MSG_NET_TRUST_Q[2]        = { "Trust this host key?", "\xA8" "Confiar en la clave?" };

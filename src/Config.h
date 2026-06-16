@@ -242,6 +242,8 @@ public:
     static string   net_user;   // last username
     static uint16_t net_port;   // last port (0 = protocol default: 21 FTP / 22 SFTP)
     static uint8_t  net_proto;  // 0 = FTP, 1 = SFTP
+    static string   net_dl_dir; // last SD folder a file was downloaded into
+    static string   net_ul_dir; // last SD folder a file was uploaded from
     static void loadWifiConfig();
     static void saveWifiConfig();
 #endif
