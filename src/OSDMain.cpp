@@ -537,9 +537,13 @@ static void netFileTransfer() {
     NetSessCtx ctx; ctx.host = host; ctx.user = user; ctx.pass = pass;
     ctx.port = port; ctx.proto = Config::net_proto;
 
-    size_t stksz = 24 * 1024;
+    // Modest alt stack: mbedTLS curve25519/P256/RSA-verify peaks at only a few KB,
+    // and the heap must keep enough for the handshake's mbedTLS allocations + SSH
+    // objects + the dir listing (free heap here is ~30-38 KB). Too big a stack
+    // starved the heap → "Out of memory" panic mid-handshake.
+    size_t stksz = 12 * 1024;
     uint8_t* stk = (uint8_t*)malloc(stksz);
-    if (!stk) { stksz = 16 * 1024; stk = (uint8_t*)malloc(stksz); }
+    if (!stk) { stksz = 8 * 1024; stk = (uint8_t*)malloc(stksz); }
     if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
 
     void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7); // 8-byte aligned top
