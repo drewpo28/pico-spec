@@ -1273,12 +1273,119 @@ static bool rfd_progress(uint32_t done, uint32_t total) {
     return true;
 }
 
+// Shared windowed scroller over an SD index. Rows [0,nsynth) are the synthetic
+// labels in `synth` (e.g. "[Upload]", ".."); rows [nsynth..) are idx entries (a
+// leading DIR_MARKER byte = directory → shown with a "/" suffix). Only the
+// visible window is read from the index per redraw, so RAM stays bounded.
+// Returns the chosen absolute row index, or -1 on Esc.
+static int rfd_scroll(const string& title, sorted_files& idx,
+                      const char* const* synth, int nsynth) {
+    const int cols_n = 36, MAXVIS = 17;
+    int total = nsynth + (int)idx.size();
+    int vis   = total < MAXVIS ? total : MAXVIS;
+    if (vis < 1) vis = 1;
+
+    int w = (cols_n + 2) * OSD_FONT_W + 2;
+    int h = (vis + 1) * OSD_FONT_H + 2;
+    int wx = OSD::scrAlignCenterX(w), wy = OSD::scrAlignCenterY(h);
+    int cursor = 0, top = 0;
+    VIDEO::SaveRect.save(wx, wy, w, h);
+
+    auto redraw = [&]() {
+        VIDEO::vga.setFont(Font6x8);
+        VIDEO::vga.rect(wx, wy, w, h, zxColor(0, 0));
+        VIDEO::vga.fillRect(wx + 1, wy + 1, w - 2, OSD_FONT_H, zxColor(0, 0));
+        VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(0, 0));
+        VIDEO::vga.setCursor(wx + 1 + OSD_FONT_W, wy + 1);
+        string t = title;
+        if ((int)t.size() > cols_n) t = "..." + t.substr(t.size() - (cols_n - 3));
+        VIDEO::vga.print(t.c_str());
+        for (int r = 0; r < vis; r++) {
+            int ab = top + r;
+            VIDEO::vga.setTextColor(zxColor(0, 1), ab == cursor ? zxColor(5, 1) : zxColor(7, 1));
+            VIDEO::vga.setCursor(wx + 1, wy + 1 + OSD_FONT_H + r * OSD_FONT_H);
+            string disp;
+            if (ab < nsynth)        disp = synth[ab];
+            else if (ab < total) {
+                string rec = idx.get(ab - nsynth);
+                if (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER) disp = rec.substr(1) + "/";
+                else disp = rec;
+            }
+            if ((int)disp.size() > cols_n) disp = disp.substr(0, cols_n);
+            VIDEO::vga.print(" ");
+            VIDEO::vga.print(disp.c_str());
+            for (int i = (int)disp.size(); i < cols_n + 1; i++) VIDEO::vga.print(" ");
+        }
+    };
+    redraw();
+
+    while (1) {
+        if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
+            fabgl::VirtualKeyItem k;
+            if (!ESPectrum::readKbd(&k) || !k.down) continue;
+            int oc = cursor;
+            if (is_up(k.vk))            cursor--;
+            else if (is_down(k.vk))     cursor++;
+            else if (k.vk == fabgl::VK_PAGEUP)   cursor -= vis;
+            else if (k.vk == fabgl::VK_PAGEDOWN) cursor += vis;
+            else if (is_home(k.vk))     cursor = 0;
+            else if (k.vk == fabgl::VK_END) cursor = total - 1;
+            else if (is_enter(k.vk))    { OSD::click(); VIDEO::SaveRect.restore_last(); return cursor; }
+            else if (is_back(k.vk))     { OSD::click(); VIDEO::SaveRect.restore_last(); return -1; }
+            else continue;
+            if (cursor < 0) cursor = 0;
+            if (cursor > total - 1) cursor = total - 1;
+            if (cursor < top) top = cursor;
+            if (cursor >= top + vis) top = cursor - vis + 1;
+            if (top > total - vis) top = total - vis;
+            if (top < 0) top = 0;
+            if (cursor != oc) { redraw(); OSD::click(); }
+        }
+        sleep_ms(5);
+    }
+}
+
+// Pick a destination folder on the SD card (for downloads). Navigates local
+// directories with the same bounded-RAM scroller. Returns the chosen absolute
+// path, or "" if cancelled.
+static string rfd_choose_folder(const string& start) {
+    string cur = start.empty() ? "/" : start;
+    sorted_files idx;
+    idx.init("__sdfolder__");
+    const char* synth[2] = { Config::lang ? "[Elegir esta carpeta]" : "[Select this folder]", ".." };
+    while (1) {
+        idx.unlink();
+        DIR dp; FILINFO fno;
+        if (f_opendir(&dp, cur.c_str()) == FR_OK) {
+            while (f_readdir(&dp, &fno) == FR_OK && fno.fname[0]) {
+                if (fno.fattrib & AM_DIR) {
+                    string rec; rec += (char)DIR_MARKER; rec += fno.fname;
+                    idx.push(rec);
+                }
+            }
+            f_closedir(&dp);
+        }
+        idx.sort();
+        int sel = rfd_scroll(cur, idx, synth, 2);
+        if (sel < 0)  { idx.unlink(); return ""; }   // cancel
+        if (sel == 0) { idx.unlink(); return cur; }  // choose current
+        if (sel == 1) {                              // parent
+            size_t s = cur.find_last_of('/');
+            cur = (s == 0 || s == string::npos) ? "/" : cur.substr(0, s);
+            continue;
+        }
+        string rec = idx.get(sel - 2);
+        string name = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER) ? rec.substr(1) : rec;
+        if (cur.back() != '/') cur += '/';
+        cur += name;
+    }
+}
+
 void OSD::remoteFileDialog(RemoteFs* fs) {
     sorted_files idx;
     idx.init("__netfs__");           // /tmp/.__netfs__.idx
-
-    const int cols_n = 36;           // visible name columns
-    const int MAXVIS = 17;
+    static string lastDownloadDir = "/spec"; // remembered across downloads
+    const char* synth[2] = { Config::lang ? "[Subir archivo aqui]" : "[Upload file here]", ".." };
 
     while (1) {
         // ── (Re)build the index for the current directory (streamed) ──
@@ -1289,82 +1396,10 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
         if (!ok) { OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000); idx.unlink(); return; }
         idx.sort();
 
-        int nfiles = (int)idx.size();
-        int total  = nfiles + 2;     // [0]=upload, [1]="..", [2..]=entries
-        int vis    = total < MAXVIS ? total : MAXVIS;
+        int sel = rfd_scroll(fs->cwdPath(), idx, synth, 2);
+        if (sel < 0) { idx.unlink(); return; } // Esc → leave browser
 
-        int w = (cols_n + 2) * OSD_FONT_W + 2;
-        int h = (vis + 1) * OSD_FONT_H + 2;     // +1 title row
-        int wx = scrAlignCenterX(w), wy = scrAlignCenterY(h);
-
-        int cursor = 0, top = 0;
-        VIDEO::SaveRect.save(wx, wy, w, h);
-
-        // Draw the whole window (title + visible rows). Cheap (<=17 rows).
-        auto redraw = [&]() {
-            VIDEO::vga.setFont(Font6x8);
-            VIDEO::vga.rect(wx, wy, w, h, zxColor(0, 0));
-            // Title bar = current remote dir.
-            VIDEO::vga.fillRect(wx + 1, wy + 1, w - 2, OSD_FONT_H, zxColor(0, 0));
-            VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(0, 0));
-            VIDEO::vga.setCursor(wx + 1 + OSD_FONT_W, wy + 1);
-            string title = fs->cwdPath();
-            if ((int)title.size() > cols_n) title = "..." + title.substr(title.size() - (cols_n - 3));
-            VIDEO::vga.print(title.c_str());
-            // Rows.
-            for (int r = 0; r < vis; r++) {
-                int abs = top + r;
-                bool foc = (abs == cursor);
-                VIDEO::vga.setTextColor(zxColor(0, 1), foc ? zxColor(5, 1) : zxColor(7, 1));
-                VIDEO::vga.setCursor(wx + 1, wy + 1 + OSD_FONT_H + r * OSD_FONT_H);
-                string disp;
-                if (abs == 0)      disp = Config::lang ? "[Subir archivo aqui]" : "[Upload file here]";
-                else if (abs == 1) disp = "..";
-                else if (abs < total) {
-                    string rec = idx.get(abs - 2);
-                    if (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER) disp = rec.substr(1) + "/";
-                    else disp = rec;
-                }
-                if ((int)disp.size() > cols_n) disp = disp.substr(0, cols_n);
-                VIDEO::vga.print(" ");
-                VIDEO::vga.print(disp.c_str());
-                for (int i = (int)disp.size(); i < cols_n + 1; i++) VIDEO::vga.print(" ");
-            }
-        };
-        redraw();
-
-        // ── Key loop ──
-        bool do_action = false;
-        while (1) {
-            if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
-                fabgl::VirtualKeyItem k;
-                if (!ESPectrum::readKbd(&k) || !k.down) continue;
-                int oc = cursor;
-                if (is_up(k.vk))            cursor--;
-                else if (is_down(k.vk))     cursor++;
-                else if (k.vk == fabgl::VK_PAGEUP)   cursor -= vis;
-                else if (k.vk == fabgl::VK_PAGEDOWN) cursor += vis;
-                else if (is_home(k.vk))     cursor = 0;
-                else if (k.vk == fabgl::VK_END) cursor = total - 1;
-                else if (is_enter(k.vk))    { do_action = true; click(); break; }
-                else if (is_back(k.vk))     { VIDEO::SaveRect.restore_last(); click(); idx.unlink(); return; }
-                else continue;
-                if (cursor < 0) cursor = 0;
-                if (cursor > total - 1) cursor = total - 1;
-                if (cursor < top) top = cursor;
-                if (cursor >= top + vis) top = cursor - vis + 1;
-                if (top > total - vis) top = total - vis;
-                if (top < 0) top = 0;
-                if (cursor != oc) { redraw(); click(); }
-            }
-            sleep_ms(5);
-        }
-
-        // ── Handle the selection ──
-        VIDEO::SaveRect.restore_last();
-        if (!do_action) continue;
-
-        if (cursor == 0) {               // Upload a local SD file into this dir
+        if (sel == 0) {                  // Upload a local SD file into this dir
             string ldir = "/";
             string local = OSD::fileDialog(ldir, Config::lang ? "Subir" : "Upload", 0, 40, 18);
             if (!local.empty()) {
@@ -1376,24 +1411,29 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
                 OSD::osdCenteredMsg(put_ok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
                                     put_ok ? LEVEL_INFO : LEVEL_WARN, 1800);
             }
-        } else if (cursor == 1) {        // Parent directory
+        } else if (sel == 1) {           // Parent directory
             fs->cwd("..");
         } else {
-            string rec = idx.get(cursor - 2);
+            string rec = idx.get(sel - 2);
             bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
             string nm = isDir ? rec.substr(1) : rec;
             if (isDir) {
                 fs->cwd(nm);
-            } else if (OSD::msgDialog(nm, MSG_NET_DOWNLOADING[Config::lang]) == DLG_YES) {
-                FileUtils::mkdirParents("/spec");
-                string localp = "/spec/" + nm;
-                rfd_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
-                OSD::progressDialog(rfd_xfer_title, nm, 0, 0);
-                bool got = fs->get(nm, localp, rfd_progress);
-                OSD::progressDialog("", "", 0, 2);
-                OSD::osdCenteredMsg(got ? (string(MSG_NET_XFER_OK[Config::lang]) + "\n" + localp)
-                                        : MSG_NET_XFER_ERR[Config::lang],
-                                    got ? LEVEL_INFO : LEVEL_WARN, 2200);
+            } else {
+                // Pick the SD destination folder, then download into it.
+                string destDir = rfd_choose_folder(lastDownloadDir);
+                if (!destDir.empty()) {
+                    lastDownloadDir = destDir;
+                    FileUtils::mkdirParents(destDir.c_str());
+                    string localp = destDir + (destDir.back() == '/' ? "" : "/") + nm;
+                    rfd_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
+                    OSD::progressDialog(rfd_xfer_title, nm, 0, 0);
+                    bool got = fs->get(nm, localp, rfd_progress);
+                    OSD::progressDialog("", "", 0, 2);
+                    OSD::osdCenteredMsg(got ? (string(MSG_NET_XFER_OK[Config::lang]) + "\n" + localp)
+                                            : MSG_NET_XFER_ERR[Config::lang],
+                                        got ? LEVEL_INFO : LEVEL_WARN, 2200);
+                }
             }
         }
         // loop → re-list current directory

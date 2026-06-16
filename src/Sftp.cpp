@@ -165,26 +165,61 @@ bool Sftp::listStream(const std::string& path, RemoteListCb cb, void* ctx) {
     Reader hr(b); uint32_t hid; std::string handle;
     if (!hr.u32(hid) || !hr.str(handle)) return false; // FXP_HANDLE: u32 req-id, string handle
 
+    // A single READDIR reply (FXP_NAME) can pack tens of KB of entries; buffering
+    // the whole packet (recvPacket) blows the tight heap. Instead stream it off the
+    // channel field-by-field, keeping only one filename in RAM at a time.
+    auto rdU32 = [&](uint32_t& v) -> bool {
+        uint8_t x[4]; if (!readChan(x, 4, 12000)) return false;
+        v = (x[0]<<24)|(x[1]<<16)|(x[2]<<8)|x[3]; return true;
+    };
+    auto rdSkip = [&](uint32_t n) -> bool {
+        uint8_t tmp[64];
+        while (n) { uint32_t c = n < sizeof(tmp) ? n : sizeof(tmp); if (!readChan(tmp, c, 12000)) return false; n -= c; }
+        return true;
+    };
+    auto rdStr = [&](std::string& s) -> bool {   // keep (bounded — caps absurd lengths)
+        uint32_t l; if (!rdU32(l)) return false;
+        if (l > 1024) { s.clear(); return rdSkip(l); }
+        s.resize(l); return l == 0 || readChan((uint8_t*)s.data(), l, 12000);
+    };
+    auto rdSkipStr = [&]() -> bool { uint32_t l; if (!rdU32(l)) return false; return rdSkip(l); };
+    auto rdAttrs = [&](uint32_t& perms) -> bool {
+        uint32_t f, a, bb; if (!rdU32(f)) return false; perms = 0;
+        if (f & ATTR_SIZE)        { if (!rdU32(a) || !rdU32(bb)) return false; }   // u64 size
+        if (f & ATTR_UIDGID)      { if (!rdU32(a) || !rdU32(bb)) return false; }
+        if (f & ATTR_PERMISSIONS) { if (!rdU32(perms)) return false; }
+        if (f & ATTR_ACMODTIME)   { if (!rdU32(a) || !rdU32(bb)) return false; }
+        if (f & ATTR_EXTENDED)    { uint32_t c; if (!rdU32(c)) return false;
+                                    for (uint32_t i = 0; i < c; i++) if (!rdSkipStr() || !rdSkipStr()) return false; }
+        return true;
+    };
+
+    bool ok = true;
     for (;;) {
         Buf rd; rd.u32(next_id++); rd.str(handle);
-        if (!sendPacket(FXP_READDIR, rd.d)) break;
-        if (!recvPacket(t, b)) break;
-        if (t == FXP_STATUS) break;       // SSH_FX_EOF → done
-        if (t != FXP_NAME) break;
-        Reader r(b); uint32_t id, count;
-        if (!r.u32(id) || !r.u32(count)) break;
+        if (!sendPacket(FXP_READDIR, rd.d)) { ok = false; break; }
+        // SFTP packet header: u32 length, u8 type, u32 request-id.
+        uint8_t hdr[5]; if (!readChan(hdr, 5, 12000)) { ok = false; break; }
+        uint32_t plen = (hdr[0]<<24)|(hdr[1]<<16)|(hdr[2]<<8)|hdr[3];
+        uint8_t  ptype = hdr[4];
+        uint32_t reqid; if (!rdU32(reqid)) { ok = false; break; }
+        uint32_t remaining = plen - 1 - 4; // bytes after type + request-id
+        if (ptype == FXP_STATUS) { rdSkip(remaining); break; } // SSH_FX_EOF → done
+        if (ptype != FXP_NAME)   { rdSkip(remaining); ok = false; break; }
+        uint32_t count; if (!rdU32(count)) { ok = false; break; }
+        if (count > 100000) { ok = false; break; } // sanity
         for (uint32_t i = 0; i < count; i++) {
-            std::string name, longname;
-            uint64_t sz; uint32_t perms;
-            if (!r.str(name) || !r.str(longname) || !r.attrs(sz, perms)) break;
+            std::string name; uint32_t perms;
+            if (!rdStr(name) || !rdSkipStr() /*longname*/ || !rdAttrs(perms)) { ok = false; break; }
             if (name == "." || name == "..") continue;
-            cb(ctx, name.c_str(), (perms & S_IFDIR_MASK) != 0, (uint32_t)sz);
+            cb(ctx, name.c_str(), (perms & S_IFDIR_MASK) != 0, 0);
         }
+        if (!ok) break;
     }
     Buf cl; cl.u32(next_id++); cl.str(handle);
     sendPacket(FXP_CLOSE, cl.d);
     recvPacket(t, b); // status
-    return true;
+    return ok;
 }
 
 bool Sftp::get(const std::string& remote, const std::string& localSdPath, XferProgressCb cb) {

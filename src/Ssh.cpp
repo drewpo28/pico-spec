@@ -37,7 +37,10 @@ enum {
 
 static const char* CLIENT_ID = "SSH-2.0-picospec_1.0";
 static const uint32_t CHAN_WINDOW = 0x100000; // 1 MB advertised window
-static const uint32_t CHAN_MAXPKT = 16384;
+// Small max packet keeps each inbound CHANNEL_DATA (and channelRecv's leftover
+// buffer + readPacket's per-packet std::string) bounded — the heap is tight
+// (~18 KB free behind the SSH alt-stack). 2 KB is fine over a 115200-baud link.
+static const uint32_t CHAN_MAXPKT = 2048;
 
 Ssh::HostKeyCb Ssh::host_key_cb = nullptr;
 

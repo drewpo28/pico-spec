@@ -302,10 +302,15 @@ bool ZiFiSock::sock_recv_line(int id, char* buf, size_t maxlen, uint32_t timeout
 
 void ZiFiSock::sock_close(int id) {
     if (id < 0 || id >= N_LINKS || !opened[id]) return;
-    char cmd[24];
-    if (mux_mode) snprintf(cmd, sizeof(cmd), "AT+CIPCLOSE=%d", id);
-    else          snprintf(cmd, sizeof(cmd), "AT+CIPCLOSE");
-    atCmd(cmd, "OK", 2000);
+    // If the peer already closed (e.g. an FTP server drops the PASV data link at
+    // end of transfer), AT+CIPCLOSE would just return ERROR on an already-closed
+    // link — skip it to avoid the spurious error/log noise.
+    if (!closed[id]) {
+        char cmd[24];
+        if (mux_mode) snprintf(cmd, sizeof(cmd), "AT+CIPCLOSE=%d", id);
+        else          snprintf(cmd, sizeof(cmd), "AT+CIPCLOSE");
+        atCmd(cmd, "OK", 2000);
+    }
     opened[id] = false;
     closed[id] = true;
     rx_head[id] = rx_tail[id] = 0;
