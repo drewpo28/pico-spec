@@ -22,6 +22,7 @@ public:
     std::string cwdPath() const override { return cur_dir; }
     bool get(const std::string& remote, const std::string& localSdPath, XferProgressCb cb) override;
     bool put(const std::string& localSdPath, const std::string& remote, XferProgressCb cb) override;
+    bool remove(const std::string& name, bool isDir) override;
     void disconnect() override;
 
 private:

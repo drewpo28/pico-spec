@@ -13,7 +13,7 @@
 enum {
     FXP_INIT = 1, FXP_VERSION = 2, FXP_OPEN = 3, FXP_CLOSE = 4, FXP_READ = 5,
     FXP_WRITE = 6, FXP_LSTAT = 7, FXP_FSTAT = 8, FXP_OPENDIR = 11, FXP_READDIR = 12,
-    FXP_REMOVE = 13, FXP_MKDIR = 14, FXP_REALPATH = 16, FXP_STAT = 17,
+    FXP_REMOVE = 13, FXP_MKDIR = 14, FXP_RMDIR = 15, FXP_REALPATH = 16, FXP_STAT = 17,
     FXP_STATUS = 101, FXP_HANDLE = 102, FXP_DATA = 103, FXP_NAME = 104, FXP_ATTRS = 105,
 };
 enum { FXF_READ = 0x01, FXF_WRITE = 0x02, FXF_CREAT = 0x08, FXF_TRUNC = 0x10 };
@@ -294,6 +294,17 @@ bool Sftp::put(const std::string& localSdPath, const std::string& remote, XferPr
     fclose2(f);
     Buf cl; cl.u32(next_id++); cl.str(handle); sendPacket(FXP_CLOSE, cl.d); recvPacket(t, b);
     return ok;
+}
+
+bool Sftp::remove(const std::string& name, bool isDir) {
+    if (!up) return false;
+    std::string path = absPath(name);
+    Buf req; req.u32(next_id++); req.str(path);
+    if (!sendPacket(isDir ? FXP_RMDIR : FXP_REMOVE, req.d)) return false;
+    uint8_t t; std::string b;
+    if (!recvPacket(t, b) || t != FXP_STATUS) return false;
+    Reader r(b); uint32_t id, code;
+    return r.u32(id) && r.u32(code) && code == FX_OK;
 }
 
 void Sftp::disconnect() {

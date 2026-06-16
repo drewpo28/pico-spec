@@ -2304,6 +2304,9 @@ static const char *MSG_NET_XFER_ERR[2]       = { "Transfer failed",  "Fallo al t
 static const char *MSG_NET_EMPTY_DIR[2]      = { "(empty)",          "(vacio)"           };
 static const char *MSG_NET_DL_OR_UL[2]       = { "Download\nUpload here\n", "Descargar\nSubir aqui\n" };
 static const char *MENU_NET_BROWSE_TITLE[2]  = { "Remote files",     "Archivos remotos"  };
+static const char *MSG_NET_DELETE_Q[2]       = { "Delete?",          "\xA8" "Borrar?"     };
+static const char *MSG_NET_FOOTER[2]         = { "Enter:open Del:del Esc:back", "Enter:abrir Del:bor Esc:atr" };
+static const char *MSG_NET_FOOTER_PICK[2]    = { "Enter:select  Esc:cancel",    "Enter:elegir  Esc:cancelar"  };
 
 #endif // !PICO_RP2040
 

@@ -231,6 +231,12 @@ bool Ftp::put(const std::string& localSdPath, const std::string& remote, XferPro
     return ok;
 }
 
+bool Ftp::remove(const std::string& name, bool isDir) {
+    if (!connected) return false;
+    std::string reply;
+    return command(isDir ? "RMD" : "DELE", name.c_str(), reply) / 100 == 2;
+}
+
 void Ftp::disconnect() {
     if (connected) {
         std::string reply;

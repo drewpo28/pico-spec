@@ -1277,16 +1277,21 @@ static bool rfd_progress(uint32_t done, uint32_t total) {
 // labels in `synth` (e.g. "[Upload]", ".."); rows [nsynth..) are idx entries (a
 // leading DIR_MARKER byte = directory → shown with a "/" suffix). Only the
 // visible window is read from the index per redraw, so RAM stays bounded.
-// Returns the chosen absolute row index, or -1 on Esc.
+// Returns the chosen absolute row index, or -1 on Esc. If `footer` is set it is
+// shown as a hotkey hint line at the bottom. If `delPressed` is given, F8/Del
+// returns the current index with *delPressed=true (otherwise Del is ignored).
 static int rfd_scroll(const string& title, sorted_files& idx,
-                      const char* const* synth, int nsynth) {
-    const int cols_n = 36, MAXVIS = 17;
+                      const char* const* synth, int nsynth,
+                      const char* footer = nullptr, bool* delPressed = nullptr) {
+    if (delPressed) *delPressed = false;
+    const int cols_n = 36, MAXVIS = 16;
     int total = nsynth + (int)idx.size();
     int vis   = total < MAXVIS ? total : MAXVIS;
     if (vis < 1) vis = 1;
+    int foot = footer ? 1 : 0;
 
     int w = (cols_n + 2) * OSD_FONT_W + 2;
-    int h = (vis + 1) * OSD_FONT_H + 2;
+    int h = (vis + 1 + foot) * OSD_FONT_H + 2;
     int wx = OSD::scrAlignCenterX(w), wy = OSD::scrAlignCenterY(h);
     int cursor = 0, top = 0;
     VIDEO::SaveRect.save(wx, wy, w, h);
@@ -1326,6 +1331,16 @@ static int rfd_scroll(const string& title, sorted_files& idx,
             int bar_y = (total > vis) ? (sbh - bar_h) * top / (total - vis) : 0;
             VIDEO::vga.fillRect(sbx + 1, sby + bar_y, OSD_FONT_W - 2, bar_h, zxColor(0, 0));
         }
+        // Footer hotkey hint line (matches menuRun's footer style).
+        if (footer) {
+            int fy = wy + 1 + (vis + 1) * OSD_FONT_H;
+            VIDEO::vga.fillRect(wx + 1, fy, w - 2, OSD_FONT_H, zxColor(5, 1));
+            VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
+            VIDEO::vga.setCursor(wx + 1 + OSD_FONT_W, fy);
+            string fs = footer;
+            if ((int)fs.size() > cols_n) fs = fs.substr(0, cols_n);
+            VIDEO::vga.print(fs.c_str());
+        }
     };
     redraw();
 
@@ -1342,6 +1357,9 @@ static int rfd_scroll(const string& title, sorted_files& idx,
             else if (k.vk == fabgl::VK_END) cursor = total - 1;
             else if (is_enter(k.vk))    { OSD::click(); VIDEO::SaveRect.restore_last(); return cursor; }
             else if (is_back(k.vk))     { OSD::click(); VIDEO::SaveRect.restore_last(); return -1; }
+            else if (delPressed && (k.vk == fabgl::VK_F8 || k.vk == fabgl::VK_DELETE)) {
+                *delPressed = true; OSD::click(); VIDEO::SaveRect.restore_last(); return cursor;
+            }
             else continue;
             if (cursor < 0) cursor = 0;
             if (cursor > total - 1) cursor = total - 1;
@@ -1376,7 +1394,7 @@ static string rfd_choose_folder(const string& start) {
             f_closedir(&dp);
         }
         idx.sort();
-        int sel = rfd_scroll(cur, idx, synth, 2);
+        int sel = rfd_scroll(cur, idx, synth, 2, MSG_NET_FOOTER_PICK[Config::lang]);
         if (sel < 0)  { idx.unlink(); return ""; }   // cancel
         if (sel == 0) { idx.unlink(); return cur; }  // choose current
         if (sel == 1) {                              // parent
@@ -1412,7 +1430,7 @@ static string rfd_choose_file(const string& start) {
             f_closedir(&dp);
         }
         idx.sort();
-        int sel = rfd_scroll(cur, idx, synth, 1);
+        int sel = rfd_scroll(cur, idx, synth, 1, MSG_NET_FOOTER_PICK[Config::lang]);
         if (sel < 0)  { idx.unlink(); return ""; }   // cancel
         if (sel == 0) {                              // parent
             size_t s = cur.find_last_of('/');
@@ -1443,8 +1461,23 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
         if (!ok) { OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000); idx.unlink(); return; }
         idx.sort();
 
-        int sel = rfd_scroll(fs->cwdPath(), idx, synth, 2);
+        bool del = false;
+        int sel = rfd_scroll(fs->cwdPath(), idx, synth, 2, MSG_NET_FOOTER[Config::lang], &del);
         if (sel < 0) { idx.unlink(); return; } // Esc → leave browser
+
+        if (del) {                       // F8/Del → delete a remote entry
+            if (sel >= 2) {
+                string rec = idx.get(sel - 2);
+                bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
+                string nm = isDir ? rec.substr(1) : rec;
+                if (OSD::msgDialog(nm, MSG_NET_DELETE_Q[Config::lang]) == DLG_YES) {
+                    bool rok = fs->remove(nm, isDir);
+                    OSD::osdCenteredMsg(rok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
+                                        rok ? LEVEL_INFO : LEVEL_WARN, 1500);
+                }
+            }
+            continue; // re-list
+        }
 
         if (sel == 0) {                  // Upload a local SD file into this dir
             string local = rfd_choose_file(Config::net_ul_dir);

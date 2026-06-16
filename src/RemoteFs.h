@@ -40,6 +40,9 @@ public:
     virtual bool put(const std::string& localSdPath, const std::string& remote,
                      XferProgressCb cb) = 0;
 
+    // Delete a remote entry (file or empty directory). Returns false on error.
+    virtual bool remove(const std::string& name, bool isDir) = 0;
+
     virtual void disconnect() = 0;
 };
 
