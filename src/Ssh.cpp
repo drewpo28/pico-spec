@@ -220,11 +220,19 @@ bool Ssh::readPacket(std::string& payload, uint32_t timeout_ms) {
 bool Ssh::versionExchange() {
     char idline[64];
     snprintf(idline, sizeof(idline), "%s\r\n", CLIENT_ID);
-    if (ZiFiSock::sock_send(sockfd, (const uint8_t*)idline, strlen(idline), 8000) < 0) return false;
+    int s = ZiFiSock::sock_send(sockfd, (const uint8_t*)idline, strlen(idline), 8000);
+#if ZIFI_TRACE
+    Debug::log("SSH: sent banner (send=%d)", s);
+#endif
+    if (s < 0) return false;
     // Read server banner lines until one starting with "SSH-".
     char line[256];
     for (int i = 0; i < 10; i++) {
-        if (!ZiFiSock::sock_recv_line(sockfd, line, sizeof(line), 12000)) return false;
+        bool got = ZiFiSock::sock_recv_line(sockfd, line, sizeof(line), 12000);
+#if ZIFI_TRACE
+        Debug::log("SSH: banner rx[%d] got=%d: %s", i, got, got ? line : "(none)");
+#endif
+        if (!got) return false;
         if (strncmp(line, "SSH-", 4) == 0) { server_id = line; return true; }
     }
     return false;
@@ -273,8 +281,12 @@ bool Ssh::doKex() {
     if (!writePacket(my_kexinit)) return false;
 
     std::string srv_kexinit;
-    if (!readPacket(srv_kexinit, 12000) || srv_kexinit.empty() ||
-        (uint8_t)srv_kexinit[0] != MSG_KEXINIT) return false;
+    bool kok = readPacket(srv_kexinit, 12000);
+#if ZIFI_TRACE
+    Debug::log("SSH: KEXINIT rx ok=%d len=%u type=%d", kok, (unsigned)srv_kexinit.size(),
+               srv_kexinit.empty() ? -1 : (uint8_t)srv_kexinit[0]);
+#endif
+    if (!kok || srv_kexinit.empty() || (uint8_t)srv_kexinit[0] != MSG_KEXINIT) return false;
     // We negotiate by offering single choices the server is expected to support;
     // a stricter implementation would parse and intersect the name-lists here.
 
@@ -292,7 +304,12 @@ bool Ssh::doKex() {
     if (!writePacket(init.d)) { mbedtls_ecdh_free(&ecdh); return false; }
 
     std::string reply;
-    if (!readPacket(reply, 12000) || reply.empty() || (uint8_t)reply[0] != MSG_KEX_ECDH_REPLY) {
+    bool rok = readPacket(reply, 12000);
+#if ZIFI_TRACE
+    Debug::log("SSH: ECDH_REPLY rx ok=%d len=%u type=%d", rok, (unsigned)reply.size(),
+               reply.empty() ? -1 : (uint8_t)reply[0]);
+#endif
+    if (!rok || reply.empty() || (uint8_t)reply[0] != MSG_KEX_ECDH_REPLY) {
         mbedtls_ecdh_free(&ecdh); return false;
     }
     Reader r(reply); uint8_t t; r.u8(t);
@@ -327,11 +344,18 @@ bool Ssh::doKex() {
 
     if (session_id.empty()) session_id.assign((const char*)H, 32);
 
-    if (!verifyHostKey(K_S, sig, std::string((const char*)H, 32))) return false;
+    if (!verifyHostKey(K_S, sig, std::string((const char*)H, 32))) {
+        Debug::log("SSH: host-key rejected/verify failed");
+        return false;
+    }
 
     // Expect NEWKEYS from server; send ours.
     std::string nk;
-    if (!readPacket(nk, 12000) || nk.empty() || (uint8_t)nk[0] != MSG_NEWKEYS) return false;
+    bool nok = readPacket(nk, 12000);
+#if ZIFI_TRACE
+    Debug::log("SSH: NEWKEYS rx ok=%d type=%d", nok, nk.empty() ? -1 : (uint8_t)nk[0]);
+#endif
+    if (!nok || nk.empty() || (uint8_t)nk[0] != MSG_NEWKEYS) return false;
     std::string mynk; mynk.push_back((char)MSG_NEWKEYS);
     if (!writePacket(mynk)) return false;
 
@@ -463,12 +487,15 @@ bool Ssh::userauthPassword(const char* user, const char* pass) {
 
 bool Ssh::connect(const char* host, uint16_t port, const char* user, const char* pass) {
     hostname = host;
-    if (!ZiFiSock::begin(false)) return false; // single connection mode
+    if (!ZiFiSock::begin(false)) { Debug::log("SSH: begin (CIPMUX) failed"); return false; }
     sockfd = ZiFiSock::sock_open(host, port, false, 12000);
-    if (sockfd < 0) return false;
-    if (!versionExchange()) { disconnect(); return false; }
-    if (!doKex())           { disconnect(); return false; }
-    if (!userauthPassword(user, pass)) { disconnect(); return false; }
+    if (sockfd < 0) { Debug::log("SSH: sock_open failed"); return false; }
+    if (!versionExchange()) { Debug::log("SSH: versionExchange FAILED"); disconnect(); return false; }
+    Debug::log("SSH: version ok (%s)", server_id.c_str());
+    if (!doKex())           { Debug::log("SSH: doKex FAILED"); disconnect(); return false; }
+    Debug::log("SSH: kex+hostkey ok");
+    if (!userauthPassword(user, pass)) { Debug::log("SSH: userauth FAILED"); disconnect(); return false; }
+    Debug::log("SSH: AUTH OK");
     return true;
 }
 

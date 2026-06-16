@@ -120,6 +120,9 @@ void ZiFiSock::pump(uint32_t budget_ms) {
                     ipd_len  = ipd_field;
                     ipd_link = (ipd_nfld >= 1) ? ipd_tmp_id : 0;
                     if (ipd_link < 0 || ipd_link >= N_LINKS) ipd_link = 0;
+#if ZIFI_TRACE
+                    Debug::log("ZiFiSock +IPD link=%d len=%d", ipd_link, ipd_len);
+#endif
                     st = (ipd_len > 0) ? ST_IPD_PAYLOAD : ST_SCAN;
                 } else {
                     // Malformed header — bail back to SCAN.
@@ -235,14 +238,26 @@ int ZiFiSock::sock_send(int id, const uint8_t* buf, size_t len, uint32_t timeout
         // Wait for the '>' prompt.
         absolute_time_t pdl = make_timeout_time_ms(timeout_ms);
         while (!flag_prompt && !flag_error && !time_reached(pdl)) pump(20);
-        if (!flag_prompt) return sent ? (int)sent : -1;
+        if (!flag_prompt) {
+#if ZIFI_TRACE
+            Debug::log("sock_send: NO '>' prompt (id=%d chunk=%u err=%d last=%s)",
+                       id, (unsigned)chunk, flag_error, last_line);
+#endif
+            return sent ? (int)sent : -1;
+        }
 
         // Send the payload bytes verbatim, then wait for SEND OK.
         ZiFi::sendRaw(buf + sent, chunk);
         flag_send_ok = flag_error = false;
         absolute_time_t sdl = make_timeout_time_ms(timeout_ms);
         while (!flag_send_ok && !flag_error && !time_reached(sdl)) pump(20);
-        if (!flag_send_ok) return sent ? (int)sent : -1;
+        if (!flag_send_ok) {
+#if ZIFI_TRACE
+            Debug::log("sock_send: NO 'SEND OK' (id=%d chunk=%u err=%d last=%s)",
+                       id, (unsigned)chunk, flag_error, last_line);
+#endif
+            return sent ? (int)sent : -1;
+        }
 
         sent += chunk;
     }
