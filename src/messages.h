@@ -2313,6 +2313,14 @@ static const char *MENU_ARCH_SITE_TITLE[2]   = { "Archive source",   "Fuente de 
 static const char *MSG_ARCH_SERVER_LABEL[2]  = { "Catalog server:",  "Servidor catalogo:" };
 static const char *MSG_ARCH_SITES_ERR[2]     = { "No sources found",  "Sin fuentes"       };
 
+// ─── HTTP test ("curl") strings ─────────────────────────────────────────────
+static const char *MENU_HTTP_TEST_ITEM[2]    = { "HTTP test (curl)\t>\n", "Prueba HTTP (curl)\t>\n" };
+static const char *MENU_HTTP_SCHEME[2]       = { "Scheme\nhttps\nhttp\n", "Esquema\nhttps\nhttp\n" };
+static const char *MSG_HTTP_HOST_LABEL[2]    = { "Host:", "Host:" };
+static const char *MSG_HTTP_PATH_LABEL[2]    = { "Path:", "Ruta:" };
+static const char *MSG_HTTP_TESTING[2]       = { "Requesting...", "Solicitando..." };
+static const char *MSG_HTTP_TEST_TITLE[2]    = { "HTTP test", "Prueba HTTP" };
+
 #endif // !PICO_RP2040
 
 #endif // ESPECTRUM_MESSAGES_h

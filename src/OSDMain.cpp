@@ -76,6 +76,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Sftp.h"
 #include "Ssh.h"
 #include "HttpCatalogFs.h"
+#include "HttpsGet.h"
 #endif
 #include "kbd_img.h"
 extern "C" void graphics_set_scanlines(uint8_t level);
@@ -326,8 +327,7 @@ static string wifiAskPassword(const string& ssid) {
 // ─── Network file-transfer client (FTP / SFTP) ──────────────────────────────
 // A centred single-line text-entry dialog (host / user / port). Returns the
 // typed text, or "\x1B" if Esc was pressed. Generalises wifiAskPassword().
-static string netAskField(const string& label, const string& initial, bool mask = false) {
-    const int field = 30;
+static string netAskField(const string& label, const string& initial, bool mask = false, int field = 30) {
     const int lbl = (int)label.size();
     const unsigned short cols = lbl + field + 2;
     const unsigned short w = (cols * OSD_FONT_W) + 2;
@@ -554,6 +554,96 @@ static void netDownloadArchive() {
     if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
     void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7);
     net_call_on_stack(top, archSessionRun, nullptr);
+    free(stk);
+}
+
+// ── HTTP test ("curl") ──────────────────────────────────────────────────────
+// A diagnostic: GET an arbitrary URL and show the result. Exercises HttpsGet ->
+// TlsSock (host-TLS over the ESP plain-TCP pipe) on real hardware — the Step-0
+// spike that can't be validated off-target. Output is a summary only (no SD file).
+extern size_t getFreeHeap(void);
+
+namespace {
+struct HttpTestCtx { std::string url; };
+// Preview accumulator passed to the sink as ctx (lives on the alt-stack, no BSS).
+struct HttpPreview { char* buf; size_t cap; size_t n; };
+
+// Collects a printable preview of the first bytes; drains the rest (return true)
+// so the whole body still streams (and Content-Length is satisfied).
+bool httpTestSink(void* ctx, const uint8_t* data, size_t len) {
+    HttpPreview* pv = (HttpPreview*)ctx;
+    while (pv->n + 1 < pv->cap && len) {
+        uint8_t b = *data++; len--;
+        bool printable = (b >= 32 && b < 127) || b == '\n' || b == '\t';
+        pv->buf[pv->n++] = printable ? (char)b : '.';
+    }
+    return true;
+}
+
+void httpTestRun(void* p) {
+    HttpTestCtx* c = (HttpTestCtx*)p;
+    // Buffers live on this alt-stack (12 KB) — no permanent SRAM/BSS. Kept modest
+    // so they don't crowd the mbedTLS handshake sharing the same stack.
+    char preview[512];
+    char summary[1024];
+    HttpPreview pv = { preview, sizeof(preview), 0 };
+
+    OSD::progressDialog(MSG_HTTP_TESTING[Config::lang], c->url, 0, 0);
+    size_t heap0 = getFreeHeap();
+    HttpsGet::Result r = HttpsGet::get(c->url.c_str(), httpTestSink, &pv,
+                                       CONFIG_DIR "/cacert.pem");
+    size_t heap1 = getFreeHeap();
+    OSD::progressDialog("", "", 0, 2);
+    preview[pv.n] = '\0';
+    Debug::log("netHttpTest: status=%d len=%lu recv=%lu ok=%d heap before/after=%u/%u",
+               r.status, (unsigned long)r.length, (unsigned long)r.received, r.ok,
+               (unsigned)heap0, (unsigned)heap1);
+    snprintf(summary, sizeof(summary),
+             "%s\n\nstatus: %d\nContent-Length: %lu\nreceived: %lu\nok: %s\n"
+             "free heap: %u -> %u\n\n--- body ---\n%s",
+             c->url.c_str(), r.status, (unsigned long)r.length,
+             (unsigned long)r.received, r.ok ? "yes" : "no",
+             (unsigned)heap0, (unsigned)heap1, preview);
+    OSD::showTextDialog(MSG_HTTP_TEST_TITLE[Config::lang], summary);
+}
+} // namespace
+
+static void netHttpTest() {
+    string ssid, ip;
+    if (!ZiFiAT::getStatus(ssid, ip)) {
+        OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200);
+        return;
+    }
+    // Scheme.
+    OSD::menu_level = 2; OSD::menu_saverect = true; OSD::menu_curopt = 1;
+    uint8_t sc = OSD::menuRun(MENU_HTTP_SCHEME[Config::lang]);
+    if (sc == 0) return;
+    VIDEO::SaveRect.restore_last();
+    const char* scheme = (sc == 1) ? "https" : "http";
+
+    // Host[:port] (<=30) — prefilled with the catalog host for convenience.
+    string host = netAskField(MSG_HTTP_HOST_LABEL[Config::lang], Config::catalog_host);
+    if (host == "\x1B" || host.empty()) return;
+
+    // Path — wider field, clamped so the dialog still fits the screen width.
+    int pathField = (int)OSD::osdMaxCols() - (int)strlen(MSG_HTTP_PATH_LABEL[Config::lang]) - 4;
+    if (pathField < 20) pathField = 20;
+    if (pathField > 64) pathField = 64;
+    string path = netAskField(MSG_HTTP_PATH_LABEL[Config::lang], "/", false, pathField);
+    if (path == "\x1B") return;
+    if (path.empty() || path[0] != '/') path = "/" + path;
+
+    HttpTestCtx ctx;
+    ctx.url = string(scheme) + "://" + host + path;
+
+    // Run the GET (and its TLS handshake) on a large heap stack, like the FTP/
+    // archive sessions — the 4 KB core stack can't hold the mbedTLS handshake.
+    size_t stksz = 12 * 1024;
+    uint8_t* stk = (uint8_t*)malloc(stksz);
+    if (!stk) { stksz = 8 * 1024; stk = (uint8_t*)malloc(stksz); }
+    if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
+    void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7);
+    net_call_on_stack(top, httpTestRun, &ctx);
     free(stk);
 }
 #endif // ZIFI_NET_CLIENT
@@ -6085,8 +6175,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if ZIFI_NET_CLIENT
                     nm += (Config::lang ? "Transferir archivos\t>\n" : "File transfer\t>\n"); // 3
                     nm += (Config::lang ? "Descargar archivo\t>\n"   : "Download archive\t>\n"); // 4
+                    nm += string(MENU_HTTP_TEST_ITEM[Config::lang]);              // 5
 #endif
-                    nm += "ZiFi NIC\t>\n";                                        // 3 or 5
+                    nm += "ZiFi NIC\t>\n";                                        // 3 or 6
 
                     uint8_t net_opt = menuRun(nm);
                     if (net_opt == 0) break;
@@ -6096,7 +6187,8 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if ZIFI_NET_CLIENT
                     else if (net_opt == 3) { netFileTransfer(); }
                     else if (net_opt == 4) { netDownloadArchive(); }
-                    else if (net_opt == 5) doNic();
+                    else if (net_opt == 5) { netHttpTest(); }
+                    else if (net_opt == 6) doNic();
 #else
                     else if (net_opt == 3) doNic();
 #endif

@@ -338,6 +338,20 @@ over the ESP-01 and save to SD, with minimal SRAM. RP2350-only, behind
   Content-Length / first body bytes. Use to validate TLS-over-ESP on hardware
   before building `HttpCatalogFs`/menu (next: Commit 1).
 
+### On-device "curl" test (`netHttpTest` in `OSDMain.cpp`)
+- Network menu row **"HTTP test (curl)"** (RP2350, under `#if ZIFI_NET_CLIENT`).
+  Prompts scheme (https/http) + host[:port] + path as **separate fields** (because
+  `inlineTextEdit` caps text at the field width — a full URL won't fit one field;
+  `netAskField` gained an optional `field` width arg). GETs via `HttpsGet`, shows a
+  summary (status / Content-Length / received / ok / **free-heap before→after**) +
+  body preview in `OSD::showTextDialog`. This is the on-hardware trigger for the
+  TLS-over-ESP spike. Output is summary-only (no SD file).
+- **Memory**: curl's preview/summary buffers are alt-stack locals (no permanent
+  BSS). mbedTLS stays on the libc heap (heap-first; SSH already runs there). The
+  free-heap log lets us see if a TLS handshake (IN16K+OUT4K + alt-stack, all from
+  heap) is too tight — if so, route mbedTLS allocs to PSRAM (`PSRAM_DATA`) later.
+  SD-swap is NOT usable for TLS buffers (no MMU/demand-paging on RP2350).
+
 ## RTC / Time (Pentagon Mr Gluk TimeKeeper)
 
 - `src/RTC.*` — MC146818 emulation (RP2350-only). Ports (Pentagon/Profi):
