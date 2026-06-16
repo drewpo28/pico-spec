@@ -139,6 +139,8 @@ uint16_t Config::net_port = 0;
 uint8_t  Config::net_proto = 0;
 string   Config::net_dl_dir = "/spec";
 string   Config::net_ul_dir = "/spec";
+string   Config::catalog_host;
+uint16_t Config::catalog_port = 0;
 #endif
 
 uint8_t Config::scanlines = 0;
@@ -460,6 +462,8 @@ void Config::loadWifiConfig() {
                 else if (key == "net_proto") net_proto = (uint8_t)atoi(val.c_str());
                 else if (key == "net_dl")    { if (!val.empty()) net_dl_dir = val; }
                 else if (key == "net_ul")    { if (!val.empty()) net_ul_dir = val; }
+                else if (key == "catalog_host") catalog_host = val;
+                else if (key == "catalog_port") catalog_port = (uint16_t)atoi(val.c_str());
                 else if (key == "baud")      { zifi_baud = (uint32_t)strtoul(val.c_str(), nullptr, 10); if (!zifi_baud) zifi_baud = 115200; }
             }
             line.clear();
@@ -474,16 +478,17 @@ void Config::saveWifiConfig() {
     FileUtils::mkdirParents(CONFIG_DIR);
     FIL* f = fopen2(WIFI_CFG_PATH, FA_WRITE | FA_CREATE_ALWAYS);
     if (!f) return;
-    char buf[512];
+    char buf[768];
     int n = snprintf(buf, sizeof(buf),
                      "ssid=%s\npass=%s\ntz=%d\nautoconnect=%d\n"
                      "net_host=%s\nnet_user=%s\nnet_port=%u\nnet_proto=%u\nbaud=%u\n"
-                     "net_dl=%s\nnet_ul=%s\n",
+                     "net_dl=%s\nnet_ul=%s\ncatalog_host=%s\ncatalog_port=%u\n",
                      wifi_ssid.c_str(), wifi_pass.c_str(),
                      (int)wifi_tz, wifi_autoconnect ? 1 : 0,
                      net_host.c_str(), net_user.c_str(),
                      (unsigned)net_port, (unsigned)net_proto, (unsigned)zifi_baud,
-                     net_dl_dir.c_str(), net_ul_dir.c_str());
+                     net_dl_dir.c_str(), net_ul_dir.c_str(),
+                     catalog_host.c_str(), (unsigned)catalog_port);
     UINT bw;
     if (n > 0) f_write(f, buf, n, &bw);
     fclose2(f);

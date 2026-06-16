@@ -76,6 +76,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Sftp.h"
 #include "Ssh.h"
 #include "Ftpd.h"
+#include "HttpCatalogFs.h"
 #endif
 #include "kbd_img.h"
 extern "C" void graphics_set_scanlines(uint8_t level);
@@ -611,6 +612,57 @@ static void ftpServerRun() {
     if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
     void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7); // 8-byte aligned top
     net_call_on_stack(top, ftpdSessionRun, &ctx);
+    free(stk);
+}
+
+// ── Download archive (catalog server over plain HTTP) ───────────────────────
+// Browses the pico-spec catalog server (HttpCatalogFs) with the same generic
+// remoteFileDialog used for FTP/SFTP. Runs on the large heap stack like the
+// FTP/SFTP session — no crypto here, but the SD-indexed browser is the heavy
+// part, so we keep off the 4 KB core stack for safety + consistency.
+static void archSessionRun(void* p) {
+    (void)p;
+    OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], Config::catalog_host, 0, 0);
+    static string site_ids[12];
+    static string site_names[12];
+    int n = HttpCatalogFs::fetchSites(site_ids, site_names, 12);
+    OSD::progressDialog("", "", 0, 2);
+    if (n <= 0) { OSD::osdCenteredMsg(MSG_ARCH_SITES_ERR[Config::lang], LEVEL_WARN, 2200); return; }
+
+    string m = string(MENU_ARCH_SITE_TITLE[Config::lang]) + "\n";
+    for (int i = 0; i < n; i++) m += site_names[i] + "\n";
+    OSD::menu_level = 2; OSD::menu_saverect = true; OSD::menu_curopt = 1;
+    uint8_t sel = OSD::menuRun(m);
+    if (sel == 0) return;
+    VIDEO::SaveRect.restore_last();
+
+    HttpCatalogFs* fs = new HttpCatalogFs(site_ids[sel - 1].c_str());
+    OSD::remoteFileDialog(fs); // SD-indexed browser (bounded RAM); F5 saves to SD
+    fs->disconnect();
+    delete fs;
+}
+
+// Top-level entry: require an active WiFi link + a configured catalog server,
+// then browse. The server host is prompted on first use (saved to wifi.cfg).
+static void netDownloadArchive() {
+    string ssid, ip;
+    if (!ZiFiAT::getStatus(ssid, ip)) {
+        OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200);
+        return;
+    }
+    if (Config::catalog_host.empty()) {
+        string h = netAskField(MSG_ARCH_SERVER_LABEL[Config::lang], "");
+        if (h == "\x1B" || h.empty()) return;
+        Config::catalog_host = h;
+        Config::saveWifiConfig();
+    }
+
+    size_t stksz = 12 * 1024;
+    uint8_t* stk = (uint8_t*)malloc(stksz);
+    if (!stk) { stksz = 8 * 1024; stk = (uint8_t*)malloc(stksz); }
+    if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
+    void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7);
+    net_call_on_stack(top, archSessionRun, nullptr);
     free(stk);
 }
 #endif // ZIFI_NET_CLIENT
@@ -6153,6 +6205,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if ZIFI_NET_CLIENT
                     nm += (Config::lang ? "Transferir archivos\t>\n" : "File transfer\t>\n"); // 3
                     nm += (Config::lang ? "Servidor FTP\t>\n" : "FTP Server\t>\n");           // 4
+                    nm += (Config::lang ? "Descargar archivo\t>\n"   : "Download archive\t>\n"); // 4
 #endif
                     nm += "ZiFi NIC\t>\n";                                        // 3 or 5
 
@@ -6164,7 +6217,8 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if ZIFI_NET_CLIENT
                     else if (net_opt == 3) { netFileTransfer(); }
                     else if (net_opt == 4) { ftpServerRun(); }
-                    else if (net_opt == 5) doNic();
+                    else if (net_opt == 5) { netDownloadArchive(); }
+                    else if (net_opt == 6) doNic();
 #else
                     else if (net_opt == 3) doNic();
 #endif
