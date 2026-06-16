@@ -5875,7 +5875,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             if (p) { Config::zifi_tx_pin = p->tx; Config::zifi_rx_pin = p->rx; conflict = p->note[0] != 0; }
                         }
                         Config::save();
-                        if (Config::zifi_enabled) { ZiFi::deinit(); ZiFi::init(); }
+                        // Re-apply the pins now whenever the link is up — for the NIC
+                        // *or* for WiFi (they're independent users of the shared UART).
+                        // Was gated on zifi_enabled, so with the NIC off a pin change
+                        // only took effect after a reboot.
+                        if (ZiFi::linkUp()) { ZiFi::deinit(); ZiFi::init(); }
                         refreshNetStatus();
                         if (conflict && OSD::msgDialog(MENU_ZIFI_GPIO_TITLE[Config::lang],
                                                        OSD_DLG_APPLYREBOOT[Config::lang]) == DLG_YES)
@@ -5898,7 +5902,8 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             Config::zifi_baud = nb;
                             Config::saveWifiConfig();
                             // deinit resets the ESP to 115200, init re-handshakes at the new rate.
-                            if (Config::zifi_enabled) { ZiFi::deinit(); ZiFi::init(); }
+                            // Apply now whenever the link is up (NIC or WiFi), not just for the NIC.
+                            if (ZiFi::linkUp()) { ZiFi::deinit(); ZiFi::init(); }
                             refreshNetStatus();
                         }
                     }
@@ -6002,7 +6007,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     uint8_t zn = menuRun(MENU_ZIFI_NIC[Config::lang]);
                     if (zn > 0) {
                         Config::zifi_enabled = zn - 1;
-                        if (Config::zifi_enabled) ZiFi::init(); else ZiFi::deinit();
+                        ZiFi::enabled = Config::zifi_enabled; // runtime mirror gates tick()+ports
+                        // The NIC toggle ONLY gates the 0xEF port emulation — it is
+                        // independent of WiFi. Bring the shared UART link up when the NIC
+                        // goes on; when it goes off only tear the link down if WiFi isn't
+                        // using it, otherwise we'd disconnect WiFi as a side effect.
+                        if (Config::zifi_enabled) ZiFi::init();
+                        else if (!ZiFiAT::connected) ZiFi::deinit();
                         Config::save();
                         VIDEO::SaveRect.restore_last();
                         refreshNetStatus();

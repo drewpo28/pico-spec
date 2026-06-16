@@ -10,6 +10,12 @@ public:
     static void init();
     static void deinit();
 
+    // True when the physical ESP UART link is currently up (brought up by the
+    // NIC *or* by WiFi/ZiFiAT). The NIC toggle and WiFi are independent users of
+    // this shared link; callers use this to decide whether a pin/baud change must
+    // be re-applied right now (deinit+init) rather than only at the next boot.
+    static bool linkUp();
+
     // Called from Ports::input/output — IRAM-safe
     static uint8_t read(uint8_t hi);
     static void    write(uint8_t hi, uint8_t data);

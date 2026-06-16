@@ -228,6 +228,8 @@ void ZiFi::init() {
     hw_initialized = true;
 }
 
+bool ZiFi::linkUp() { return hw_initialized; }
+
 void ZiFi::deinit() {
     if (!hw_initialized) return;
     if (g_uart) {
