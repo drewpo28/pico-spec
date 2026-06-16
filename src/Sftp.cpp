@@ -130,8 +130,8 @@ uint32_t Sftp::statSize(const std::string& path, bool& isDir, bool& ok) {
     if (!sendPacket(FXP_STAT, req.d)) return 0;
     uint8_t t; std::string b;
     if (!recvPacket(t, b) || t != FXP_ATTRS) return 0;
-    Reader r(b); uint64_t sz; uint32_t perms;
-    if (!r.attrs(sz, perms)) return 0;
+    Reader r(b); uint32_t sid; uint64_t sz; uint32_t perms;
+    if (!r.u32(sid) || !r.attrs(sz, perms)) return 0; // FXP_ATTRS: u32 req-id, then ATTRS
     ok = true; isDir = (perms & S_IFDIR_MASK) != 0;
     return (uint32_t)sz;
 }
@@ -155,8 +155,8 @@ bool Sftp::list(const std::string& path, std::vector<RemoteEntry>& out) {
     if (!sendPacket(FXP_OPENDIR, op.d)) return false;
     uint8_t t; std::string b;
     if (!recvPacket(t, b) || t != FXP_HANDLE) return false;
-    Reader hr(b); std::string handle;
-    if (!hr.str(handle)) return false;
+    Reader hr(b); uint32_t hid; std::string handle;
+    if (!hr.u32(hid) || !hr.str(handle)) return false; // FXP_HANDLE: u32 req-id, string handle
 
     for (;;) {
         Buf rd; rd.u32(next_id++); rd.str(handle);
@@ -190,7 +190,8 @@ bool Sftp::get(const std::string& remote, const std::string& localSdPath, XferPr
     if (!sendPacket(FXP_OPEN, op.d)) return false;
     uint8_t t; std::string b;
     if (!recvPacket(t, b) || t != FXP_HANDLE) return false;
-    Reader hr(b); std::string handle; if (!hr.str(handle)) return false;
+    Reader hr(b); uint32_t hid; std::string handle;
+    if (!hr.u32(hid) || !hr.str(handle)) return false; // FXP_HANDLE: u32 req-id, string handle
 
     FIL* f = fopen2(localSdPath.c_str(), FA_WRITE | FA_CREATE_ALWAYS);
     if (!f) { Buf cl; cl.u32(next_id++); cl.str(handle); sendPacket(FXP_CLOSE, cl.d); recvPacket(t,b); return false; }
@@ -226,7 +227,8 @@ bool Sftp::put(const std::string& localSdPath, const std::string& remote, XferPr
     if (!sendPacket(FXP_OPEN, op.d)) { fclose2(f); return false; }
     uint8_t t; std::string b;
     if (!recvPacket(t, b) || t != FXP_HANDLE) { fclose2(f); return false; }
-    Reader hr(b); std::string handle; if (!hr.str(handle)) { fclose2(f); return false; }
+    Reader hr(b); uint32_t hid; std::string handle;
+    if (!hr.u32(hid) || !hr.str(handle)) { fclose2(f); return false; } // skip req-id
 
     uint64_t off = 0; bool ok = true;
     // Static (not stack): READ_CHUNK is 8 KB but PICO_STACK_SIZE is only 4 KB.
