@@ -36,6 +36,7 @@
 #define MBEDTLS_ECP_DP_SECP256R1_ENABLED   // ecdsa-sha2-nistp256 host keys (fallback)
 #define MBEDTLS_ECDSA_C
 #define MBEDTLS_ASN1_PARSE_C               // ECDSA signature DER
+#define MBEDTLS_ASN1_WRITE_C               // dependency of MBEDTLS_ECDSA_C (check_config)
 // RSA host keys (rsa-sha2-256) — common on older servers.
 #define MBEDTLS_RSA_C
 #define MBEDTLS_PKCS1_V15
@@ -48,6 +49,8 @@
 // Keep error strings out of flash (we map to our own messages).
 // #define MBEDTLS_ERROR_C
 
-#include "mbedtls/build_info.h"
+// NOTE: a config file is included *by* mbedtls/build_info.h, so it must NOT
+// include build_info.h itself. Wired in via the SDK's PICO_MBEDTLS_CONFIG_FILE
+// (see CMakeLists.txt), which sets MBEDTLS_CONFIG_FILE to this file's path.
 
 #endif // MBEDTLS_CONFIG_PICOSPEC_H

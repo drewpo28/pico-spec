@@ -168,6 +168,17 @@ project(${PROJECT_NAME} C CXX ASM)
 # SCRATCH_Y exactly); pin core1 at 2 KB so SCRATCH_X is unchanged.
 add_compile_definitions(PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x800)
 
+# ZiFi network client (FTP/SFTP/SSH) uses the SDK-vendored mbedTLS as a crypto
+# primitive library. Point the SDK's mbedTLS at our trimmed config via an
+# ABSOLUTE path BEFORE pico_sdk_init() — the pico_mbedtls CMakeLists reads
+# PICO_MBEDTLS_CONFIG_FILE at SDK-init time and propagates it (as
+# MBEDTLS_CONFIG_FILE) to both our TUs and the mbedTLS library's own sources.
+# Absolute path means it resolves regardless of per-target include dirs. Harmless
+# on builds that don't link pico_mbedtls (RP2040 / ZIFI_NET_CLIENT=OFF).
+if (ZIFI_NET_CLIENT AND NOT PICO_PLATFORM STREQUAL "rp2040")
+    set(PICO_MBEDTLS_CONFIG_FILE "${CMAKE_CURRENT_LIST_DIR}/src/mbedtls_config_picospec.h")
+endif ()
+
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
@@ -407,9 +418,10 @@ endif()
 # Sftp.cpp) auto-compile via the GLOB; each file body is wrapped in
 # `#if !PICO_RP2040 && ZIFI_NET_CLIENT` so RP2040 builds get zero footprint.
 if (ZIFI_NET_CLIENT AND NOT PICO_PLATFORM STREQUAL "rp2040")
-    target_compile_definitions(${PROJECT_NAME} PRIVATE
-        ZIFI_NET_CLIENT=1
-        MBEDTLS_CONFIG_FILE="mbedtls_config_picospec.h")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_NET_CLIENT=1)
+    # MBEDTLS_CONFIG_FILE is supplied by the SDK from PICO_MBEDTLS_CONFIG_FILE
+    # (set before pico_sdk_init above) — do not redefine it here, that collides
+    # with pico_mbedtls_headers' INTERFACE define.
     target_link_libraries(${PROJECT_NAME} PRIVATE
         pico_mbedtls          # crypto primitives from pico-sdk's vendored mbedTLS
         pico_rand)            # hardware RNG for SSH ephemeral keys / padding
