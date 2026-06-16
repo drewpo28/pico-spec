@@ -2305,7 +2305,8 @@ static const char *MSG_NET_EMPTY_DIR[2]      = { "(empty)",          "(vacio)"  
 static const char *MSG_NET_DL_OR_UL[2]       = { "Download\nUpload here\n", "Descargar\nSubir aqui\n" };
 static const char *MENU_NET_BROWSE_TITLE[2]  = { "Remote files",     "Archivos remotos"  };
 static const char *MSG_NET_DELETE_Q[2]       = { "Delete?",          "\xA8" "Borrar?"     };
-static const char *MSG_NET_FOOTER[2]         = { "F8 delete",        "F8 borrar"          };
+static const char *MSG_NET_FOOTER[2]         = { "F5 copy  F8 delete","F5 copiar F8 borrar" };
+static const char *MSG_NET_COPYING[2]        = { "Copying...",       "Copiando..."        };
 
 #endif // !PICO_RP2040
 

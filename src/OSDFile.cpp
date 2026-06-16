@@ -1278,12 +1278,14 @@ static bool rfd_progress(uint32_t done, uint32_t total) {
 // leading DIR_MARKER byte = directory → shown with a "/" suffix). Only the
 // visible window is read from the index per redraw, so RAM stays bounded.
 // Returns the chosen absolute row index, or -1 on Esc. If `footer` is set it is
-// shown as a hotkey hint line at the bottom. If `delPressed` is given, F8/Del
-// returns the current index with *delPressed=true (otherwise Del is ignored).
+// shown as a hotkey hint line at the bottom. If `delPressed`/`copyPressed` are
+// given, F8/Del and F5 return the current index with the respective flag set.
 static int rfd_scroll(const string& title, sorted_files& idx,
                       const char* const* synth, int nsynth,
-                      const char* footer = nullptr, bool* delPressed = nullptr) {
-    if (delPressed) *delPressed = false;
+                      const char* footer = nullptr, bool* delPressed = nullptr,
+                      bool* copyPressed = nullptr) {
+    if (delPressed)  *delPressed = false;
+    if (copyPressed) *copyPressed = false;
     const int cols_n = 36, MAXVIS = 16;
     int total = nsynth + (int)idx.size();
     int vis   = total < MAXVIS ? total : MAXVIS;
@@ -1359,6 +1361,9 @@ static int rfd_scroll(const string& title, sorted_files& idx,
             else if (is_back(k.vk))     { OSD::click(); VIDEO::SaveRect.restore_last(); return -1; }
             else if (delPressed && (k.vk == fabgl::VK_F8 || k.vk == fabgl::VK_DELETE)) {
                 *delPressed = true; OSD::click(); VIDEO::SaveRect.restore_last(); return cursor;
+            }
+            else if (copyPressed && k.vk == fabgl::VK_F5) {
+                *copyPressed = true; OSD::click(); VIDEO::SaveRect.restore_last(); return cursor;
             }
             else continue;
             if (cursor < 0) cursor = 0;
@@ -1447,6 +1452,44 @@ static string rfd_choose_file(const string& start) {
     }
 }
 
+// Collect a directory's entries into a vector (one recursion level at a time) —
+// we can't recurse inside listStream's callback (channel reentrancy), so we
+// enumerate first, then act. Bounded per-level (fine for typical folders).
+static void rfd_copy_collect(void* ctx, const char* name, bool isDir, uint32_t sz) {
+    (void)sz;
+    auto v = (std::vector<std::string>*)ctx;
+    std::string rec; if (isDir) rec += (char)DIR_MARKER; rec += name;
+    v->push_back(rec);
+}
+
+// Recursively copy the CURRENT remote directory into the SD path `destSd`
+// (created by the caller). cwd is restored to where it started. Returns false on
+// error or user abort (Esc during a file).
+static bool rfd_copy_tree(RemoteFs* fs, const std::string& destSd, int depth) {
+    if (depth > 16) return false; // runaway guard
+    std::vector<std::string> names;
+    if (!fs->listStream("", rfd_copy_collect, &names)) return false;
+    for (auto& rec : names) {
+        bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
+        std::string nm = isDir ? rec.substr(1) : rec;
+        std::string dst = destSd + "/" + nm;
+        if (isDir) {
+            FileUtils::mkdirParents(dst.c_str());
+            if (!fs->cwd(nm)) return false;
+            bool ok = rfd_copy_tree(fs, dst, depth + 1);
+            fs->cwd("..");
+            if (!ok) return false;
+        } else {
+            rfd_xfer_title = MSG_NET_COPYING[Config::lang];
+            OSD::progressDialog(rfd_xfer_title, nm, 0, 0);
+            bool got = fs->get(nm, dst, rfd_progress);
+            OSD::progressDialog("", "", 0, 2);
+            if (!got) return false;
+        }
+    }
+    return true;
+}
+
 void OSD::remoteFileDialog(RemoteFs* fs) {
     sorted_files idx;
     idx.init("__netfs__");           // /tmp/.__netfs__.idx
@@ -1461,8 +1504,8 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
         if (!ok) { OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000); idx.unlink(); return; }
         idx.sort();
 
-        bool del = false;
-        int sel = rfd_scroll(fs->cwdPath(), idx, synth, 2, MSG_NET_FOOTER[Config::lang], &del);
+        bool del = false, copy = false;
+        int sel = rfd_scroll(fs->cwdPath(), idx, synth, 2, MSG_NET_FOOTER[Config::lang], &del, &copy);
         if (sel < 0) { idx.unlink(); return; } // Esc → leave browser
 
         if (del) {                       // F8/Del → delete a remote entry
@@ -1474,6 +1517,36 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
                     bool rok = fs->remove(nm, isDir);
                     OSD::osdCenteredMsg(rok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
                                         rok ? LEVEL_INFO : LEVEL_WARN, 1500);
+                }
+            }
+            continue; // re-list
+        }
+
+        if (copy) {                      // F5 → copy file/folder to a chosen SD folder
+            if (sel >= 2) {
+                string rec = idx.get(sel - 2);
+                bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
+                string nm = isDir ? rec.substr(1) : rec;
+                string destBase = rfd_choose_folder(Config::net_dl_dir);
+                if (!destBase.empty()) {
+                    Config::net_dl_dir = destBase;
+                    Config::saveWifiConfig();
+                    bool ok;
+                    if (isDir) {                 // recursive folder copy
+                        string dst = destBase + (destBase.back() == '/' ? "" : "/") + nm;
+                        FileUtils::mkdirParents(dst.c_str());
+                        fs->cwd(nm);
+                        ok = rfd_copy_tree(fs, dst, 0);
+                        fs->cwd("..");
+                    } else {                     // single file
+                        string dst = destBase + (destBase.back() == '/' ? "" : "/") + nm;
+                        rfd_xfer_title = MSG_NET_COPYING[Config::lang];
+                        OSD::progressDialog(rfd_xfer_title, nm, 0, 0);
+                        ok = fs->get(nm, dst, rfd_progress);
+                        OSD::progressDialog("", "", 0, 2);
+                    }
+                    OSD::osdCenteredMsg(ok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
+                                        ok ? LEVEL_INFO : LEVEL_WARN, 1800);
                 }
             }
             continue; // re-list
