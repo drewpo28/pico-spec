@@ -174,6 +174,7 @@ bool Ftp::list(const std::string& path, std::vector<RemoteEntry>& out) {
         if (nl == std::string::npos) break;
         start = nl + 1;
     }
+    sortRemoteEntries(out);
     return true;
 }
 

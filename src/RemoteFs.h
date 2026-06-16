@@ -8,12 +8,22 @@
 #include <inttypes.h>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <strings.h>
 
 struct RemoteEntry {
     std::string name;
     bool        isDir;
     uint32_t    size;
 };
+
+// Sort a listing for display: directories first, then case-insensitive by name.
+inline void sortRemoteEntries(std::vector<RemoteEntry>& v) {
+    std::sort(v.begin(), v.end(), [](const RemoteEntry& a, const RemoteEntry& b) {
+        if (a.isDir != b.isDir) return a.isDir && !b.isDir; // dirs before files
+        return strcasecmp(a.name.c_str(), b.name.c_str()) < 0;
+    });
+}
 
 // Progress callback for get/put: (done, total). total==0 means unknown. Return
 // false to abort the transfer (e.g. user pressed Esc).

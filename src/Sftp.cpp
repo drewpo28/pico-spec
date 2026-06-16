@@ -6,6 +6,8 @@
 #include "ff.h"
 #include <string.h>
 #include <stdio.h>
+#include <algorithm>
+#include <strings.h>
 
 // SFTP v3 protocol constants (draft-ietf-secsh-filexfer-02).
 enum {
@@ -19,7 +21,11 @@ enum { ATTR_SIZE = 0x01, ATTR_UIDGID = 0x02, ATTR_PERMISSIONS = 0x04, ATTR_ACMOD
        ATTR_EXTENDED = 0x80000000u };
 enum { FX_OK = 0, FX_EOF = 1 };
 #define S_IFDIR_MASK 0040000u
-static const uint32_t READ_CHUNK = 8192; // bytes per SFTP READ/WRITE
+// Bytes per SFTP READ/WRITE. Kept modest: each READ reply is buffered in heap
+// std::strings, and we run on a 12 KB alt-stack that leaves only ~20 KB heap —
+// 8 KB chunks (×transient copies) overflowed it (OOM). 2 KB is plenty over a
+// 115200-baud link and keeps per-op heap churn small.
+static const uint32_t READ_CHUNK = 2048;
 
 namespace {
 struct Buf {
@@ -73,14 +79,15 @@ bool Sftp::sendPacket(uint8_t type, const std::string& body) {
 }
 
 bool Sftp::recvPacket(uint8_t& out_type, std::string& out_body, uint32_t timeout_ms) {
-    uint8_t lenb[4];
-    if (!readChan(lenb, 4, timeout_ms)) return false;
-    uint32_t len = (lenb[0]<<24)|(lenb[1]<<16)|(lenb[2]<<8)|lenb[3];
+    uint8_t hdr[5]; // length(4) + type(1)
+    if (!readChan(hdr, 5, timeout_ms)) return false;
+    uint32_t len = (hdr[0]<<24)|(hdr[1]<<16)|(hdr[2]<<8)|hdr[3];
     if (len < 1 || len > 65535 + 64) return false;
-    std::string pkt; pkt.resize(len);
-    if (!readChan((uint8_t*)pkt.data(), len, timeout_ms)) return false;
-    out_type = (uint8_t)pkt[0];
-    out_body = pkt.substr(1);
+    out_type = hdr[4];
+    // Read the body straight into out_body — no extra packet+substr copy (the
+    // download path is heap-tight; see READ_CHUNK).
+    out_body.resize(len - 1);
+    if (len > 1 && !readChan((uint8_t*)out_body.data(), len - 1, timeout_ms)) return false;
     return true;
 }
 
@@ -178,6 +185,7 @@ bool Sftp::list(const std::string& path, std::vector<RemoteEntry>& out) {
     Buf cl; cl.u32(next_id++); cl.str(handle);
     sendPacket(FXP_CLOSE, cl.d);
     recvPacket(t, b); // status
+    sortRemoteEntries(out);
     return true;
 }
 
@@ -203,13 +211,16 @@ bool Sftp::get(const std::string& remote, const std::string& localSdPath, XferPr
         if (!recvPacket(t, b)) { ok = false; break; }
         if (t == FXP_STATUS) break; // EOF
         if (t != FXP_DATA) { ok = false; break; }
-        Reader r(b); uint32_t id; std::string data;
-        if (!r.u32(id) || !r.str(data)) { ok = false; break; }
+        // FXP_DATA body = u32 req-id, string data. Write straight out of `b` (no
+        // extra copy): data length is at offset 4, payload at offset 8.
+        if (b.size() < 8) { ok = false; break; }
+        uint32_t dlen = ((uint8_t)b[4]<<24)|((uint8_t)b[5]<<16)|((uint8_t)b[6]<<8)|(uint8_t)b[7];
+        if (dlen > b.size() - 8) dlen = (uint32_t)(b.size() - 8);
         UINT bw;
-        if (f_write(f, data.data(), data.size(), &bw) != FR_OK || bw != data.size()) { ok = false; break; }
-        off += data.size();
+        if (f_write(f, b.data() + 8, dlen, &bw) != FR_OK || bw != dlen) { ok = false; break; }
+        off += dlen;
         if (cb && !cb((uint32_t)off, total)) { ok = false; break; }
-        if (data.size() < READ_CHUNK) break; // short read → EOF
+        if (dlen < READ_CHUNK) break; // short read → EOF
     }
     fclose2(f);
     Buf cl; cl.u32(next_id++); cl.str(handle); sendPacket(FXP_CLOSE, cl.d); recvPacket(t, b);
