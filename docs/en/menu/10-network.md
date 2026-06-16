@@ -9,8 +9,11 @@ AT firmware** — no reflashing needed. The RP2350 side implements:
 
 - **ZiFi NIC** — a network interface for ZX-Spectrum software (port `#EF`, 16550-UART
   window). Compatible with the **MRF** terminal/drivers (see [Software](#software)).
-- **WiFi** — join an access point (scan, password, autoconnect).
-- **SNTP time sync** → built-in clock (RTC / Mr Gluk TimeKeeper).
+- **WiFi** — join an access point (scan, password). Credentials are saved and
+  reconnected automatically on the next boot.
+- **SNTP time sync** → built-in clock (RTC / Mr Gluk TimeKeeper) — runs
+  automatically right after a WiFi connect and at boot, or on demand. Needs the
+  RTC enabled (**Options → Other → RTC + NVRAM**).
 - **File transfer** — an **FTP / SFTP / SSH** client right in the OSD: browse remote
   directories, download/upload files to SD, copy folders, delete. SSH crypto
   (curve25519, AES-CTR, HMAC-SHA256) runs on the RP2350 via mbedTLS;
@@ -37,8 +40,8 @@ Network
 | ESP01 › GPIO | board TX/RX pairs | board-specific | UART pins to the ESP. Conflicting pairs are tagged (e.g. `off: NESPAD`) — changing one needs a reboot |
 | ESP01 › Baud | 115200 / 230400 / 460800 / 921600 | 115200 | UART speed. Higher = faster transfers (~8× at 921600). Applied live via `AT+UART_CUR` |
 | ESP01 › Time zone | UTC−12 … UTC+14 | UTC+0 | Timezone for SNTP |
-| ESP01 › Sync time | — | — | One-shot time sync (needs WiFi) |
-| WiFi | — | — | Disconnected → scan + password; connected → show SSID/IP, disconnect |
+| ESP01 › Sync time | — | — | On-demand SNTP sync (needs WiFi + RTC enabled). Also auto-runs on connect/boot |
+| WiFi | — | — | Disconnected → scan + password → connect (+ auto time-sync); connected → show SSID/IP, disconnect |
 | ZiFi NIC | Off / On | Off | Enables the network interface. Stored in NVS |
 
 > On speed: **921600** is the fastest, but with no hardware flow control (the ESP-01S
@@ -47,6 +50,9 @@ Network
 > **460800** or lower.
 
 ## File transfer (FTP / SFTP)
+
+Requires WiFi connected (the **ZiFi NIC** toggle is independent — File transfer works
+whether it's on or off).
 
 **Network → File transfer** → pick the protocol (FTP / SFTP) → enter host, user, port
 and password. The password is shown as **asterisks**; **TAB** reveals/hides it. For
@@ -110,6 +116,19 @@ For the **ZiFi NIC** (networking inside ZX-Spectrum programs) use the **MRF**
 terminal/drivers:
 
 - **MRF (Moon Rabbit Firmware / terminal)**: <https://zxart.ee/eng/software/prikladnoe-po/mrf/tabs:releases/>
+
+## Files on SD
+
+| Path | Purpose |
+|------|---------|
+| `/.config/pico-spec/wifi.cfg` | WiFi + network settings (keys below). Legacy `/wifi.cfg` is still read as a fallback |
+| `/.config/pico-spec/known_hosts` | SFTP host-key trust (TOFU): one `host base64(SHA-256)` line per server |
+| `/spec` | Default download / copy destination |
+
+`wifi.cfg` keys (`key=value`, one per line): `ssid`, `pass` (WiFi password), `tz`,
+`autoconnect`, `baud`, `net_host`, `net_user`, `net_port`, `net_proto` (0=FTP, 1=SFTP),
+`net_dl` / `net_ul` (last download/upload folders). The FTP/SFTP **server** password is
+**not** stored — it's re-prompted each session.
 
 ## Links
 
