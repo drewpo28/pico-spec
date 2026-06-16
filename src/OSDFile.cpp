@@ -1316,6 +1316,16 @@ static int rfd_scroll(const string& title, sorted_files& idx,
             VIDEO::vga.print(disp.c_str());
             for (int i = (int)disp.size(); i < cols_n + 1; i++) VIDEO::vga.print(" ");
         }
+        // Right-edge scrollbar when the list doesn't fit (track + proportional thumb).
+        if (total > vis) {
+            int sbx = wx + w - OSD_FONT_W - 1;
+            int sby = wy + 1 + OSD_FONT_H;
+            int sbh = OSD_FONT_H * vis;
+            VIDEO::vga.fillRect(sbx, sby, OSD_FONT_W, sbh, zxColor(7, 0));
+            int bar_h = sbh * vis / total; if (bar_h < 3) bar_h = 3;
+            int bar_y = (total > vis) ? (sbh - bar_h) * top / (total - vis) : 0;
+            VIDEO::vga.fillRect(sbx + 1, sby + bar_y, OSD_FONT_W - 2, bar_h, zxColor(0, 0));
+        }
     };
     redraw();
 
