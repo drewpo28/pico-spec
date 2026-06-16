@@ -84,7 +84,7 @@ DISK_FTYPE FileUtils::fileTypes[6] = {
     {".tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.zip,.ZIP",2,2,0,""},
     {".trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.td0,.TD0,.mbd,.MBD,.pro,.PRO,.zip,.ZIP",2,2,0,""},
     {".rom,.ROM,.bin,.BIN",2,2,0,""},
-    {".mmc,.MMC,.hdf,.HDF,.hdd,.HDD,.vhd,.VHD,.zip,.ZIP",2,2,0,""},
+    {".mmc,.MMC,.hdf,.HDF,.hdd,.HDD,.vhd,.VHD,.iso,.ISO,.zip,.ZIP",2,2,0,""},
     {".sna,.SNA,.z80,.Z80,.p,.P,.tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.td0,.TD0,.mbd,.MBD,.pro,.PRO,.mmc,.MMC,.hdf,.HDF,.zip,.ZIP",2,2,0,""}
 #endif
 };

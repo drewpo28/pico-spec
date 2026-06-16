@@ -19,6 +19,8 @@ uint8_t IDE::scheme = IDE::OFF;
 
 FIL  IDE::file[2];
 bool IDE::file_open[2] = { false, false };
+bool IDE::is_atapi[2]  = { false, false };
+bool IDE::sig_valid[2] = { false, false };
 
 uint32_t IDE::data_offset[2] = { 0, 0 };
 uint16_t IDE::cylinders[2] = { 0, 0 };
@@ -45,6 +47,20 @@ bool IDE::data_discard = false;
 uint8_t IDE::latch_read = 0;
 uint8_t IDE::latch_write = 0;
 
+int      IDE::atapi_phase = 0;
+uint8_t  IDE::cdb[12] = { 0 };
+int      IDE::cdb_index = 0;
+int      IDE::xfer_len = 0;
+int      IDE::xfer_index = 0;
+uint32_t IDE::atapi_lba = 0;
+uint32_t IDE::atapi_blocks = 0;
+uint8_t  IDE::sense_key = 0;
+uint8_t  IDE::sense_asc = 0;
+uint8_t  IDE::sense_ascq = 0;
+
+// ATAPI logical block size.
+#define ATAPI_BLOCK 2048
+
 // Profi HiDD standard geometry. The Profi BIOS always reads cylinder=1 with
 // this fixed geometry to locate the ProfiHiDD header (no IDENTIFY before first
 // read). The header itself then reports the actual partition geometry.
@@ -68,6 +84,18 @@ static const uint16_t PROFI_SECTORS = 16;
 // "Ready" status a real fixed disk reports at rest: DRDY + DSC.
 #define IDE_STATUS_READY (IDE_STATUS_DRDY | IDE_STATUS_DSC)
 #define IDE_CONTROL_SRST 0x04
+
+// ATAPI signature placed in the cylinder registers after reset (0xEB14).
+#define ATAPI_SIG_CYL_LO 0x14
+#define ATAPI_SIG_CYL_HI 0xEB
+
+// SCSI sense keys / additional sense codes used by the boot-minimal CD.
+#define SENSE_NO_SENSE        0x00
+#define SENSE_ILLEGAL_REQUEST 0x05
+#define SENSE_UNIT_ATTENTION  0x06
+#define ASC_INVALID_CMD       0x20  // INVALID COMMAND OPERATION CODE
+#define ASC_LBA_OUT_OF_RANGE  0x21  // LOGICAL BLOCK ADDRESS OUT OF RANGE
+#define ASC_MEDIUM_CHANGED    0x28  // NOT READY TO READY CHANGE / MEDIUM MAY HAVE CHANGED
 
 // ============================================================
 // Image open / format detection
@@ -121,7 +149,31 @@ bool IDE::open_image(int slot, const char* path) {
 
     // Defaults: raw image — data at offset 0, geometry from size.
     data_offset[slot] = 0;
+    is_atapi[slot] = false;
     uint32_t total_lba = (uint32_t)(fsize / 512);
+
+    // --- ATAPI CD-ROM (.iso) detection ---
+    // An ISO9660 image is recognised either by the .iso extension or by the
+    // "CD001" volume-descriptor identifier at LBA 16 (byte offset 0x8000+1).
+    // Mounting it makes the slot answer as an ATAPI CD-ROM rather than an ATA HDD.
+    {
+        bool is_iso = ext_is(path, "iso");
+        if (!is_iso && fsize >= 0x8000 + 6) {
+            uint8_t vd[6];
+            f_lseek(&file[slot], 0x8000);
+            if (f_read(&file[slot], vd, 6, &br) == FR_OK && br == 6)
+                is_iso = (memcmp(vd + 1, "CD001", 5) == 0); // vd[0]=descriptor type
+        }
+        if (is_iso) {
+            is_atapi[slot] = true;
+            data_offset[slot] = 0;
+            cylinders[slot] = heads[slot] = sectors[slot] = 0; // geometry N/A for ATAPI
+            memset(identity[slot], 0, 106);
+            Debug::log("IDE hd%d: ATAPI CD-ROM %s (%u blocks of %u)",
+                       slot, path, (unsigned)(fsize / ATAPI_BLOCK), ATAPI_BLOCK);
+            return true;
+        }
+    }
 
     // --- HDF detection (RS-IDE header at start) ---
     uint8_t hdr[128];
@@ -223,7 +275,9 @@ void IDE::init() {
     scheme = Config::ide_scheme;
     if (scheme == OFF) return;
 
-    if (!buffer)   buffer   = (uint8_t*)calloc(512, 1);
+    // 2048 B: 512 B suffices for ATA, but ATAPI transfers a full 2048-byte
+    // logical block, so the shared buffer is sized for the larger case.
+    if (!buffer)   buffer   = (uint8_t*)calloc(ATAPI_BLOCK, 1);
     if (!identity) identity = (uint8_t(*)[106])calloc(2 * 106, 1);
     if (!buffer || !identity) {
         Debug::log("IDE: OOM allocating buffers");
@@ -269,6 +323,7 @@ uint32_t IDE::geomLBA(int slot) {
     return (uint32_t)cylinders[slot]*heads[slot]*sectors[slot];
 }
 uint32_t IDE::sizeBytes(int slot) { return (slot>=0&&slot<2)?size_bytes[slot]:0; }
+bool IDE::isCD(int slot) { return (slot>=0&&slot<2) && file_open[slot] && is_atapi[slot]; }
 
 bool IDE::createImage(const char* path, uint32_t megabytes,
                       void (*progress)(uint32_t, uint32_t)) {
@@ -304,17 +359,31 @@ bool IDE::createImage(const char* path, uint32_t megabytes,
     return true;
 }
 
-// Place the ATA reset/diagnostic signature in the registers (ATA-3: a
-// hard/soft reset or EXECUTE DEVICE DIAGNOSTIC leaves count=sec=err=1, cyl=0,
-// and DRDY|DSC status on a working HDD). Profi BIOS checks this after reset.
+// Place the reset/diagnostic signature for the *currently selected* device in
+// the shared register file. The register file is shared between master/slave,
+// so detection (select device -> read cylinder signature) needs each device to
+// present its own signature; this is reloaded on device-select (write8 reg 6).
+//   ATA HDD (ATA-3): count=sec=err=1, cyl=0, DRDY|DSC status. Profi BIOS checks this.
+//   ATAPI CD-ROM:    count=sec=err=1, cyl=0xEB14 (ATAPI magic), status=0 (DRDY clear
+//                    at rest; the cylinder signature is the canonical detection).
+// Uses per-device presence (file_open[dev]) — an absent selected slot reads 0.
 void IDE::reset_signature() {
+    int d = drive();
     reg_sector_count = 1;
     reg_sector = 1;
     reg_error = 1;        // diagnostic code 01 = device 0 passed
-    reg_cyl_lo = 0;
-    reg_cyl_hi = 0;
-    reg_head = 0;
-    reg_status = present() ? IDE_STATUS_READY : 0x00;
+    // NB: reg_head is left untouched — when this is called from a device-select
+    // reload (write8 reg 6) it must preserve the DEV bit the host just wrote.
+    // The full reset() clears reg_head to select the master itself.
+    if (file_open[d] && is_atapi[d]) {
+        reg_cyl_lo = ATAPI_SIG_CYL_LO;
+        reg_cyl_hi = ATAPI_SIG_CYL_HI;
+        reg_status = 0x00;
+    } else {
+        reg_cyl_lo = 0;
+        reg_cyl_hi = 0;
+        reg_status = file_open[d] ? IDE_STATUS_READY : 0x00;
+    }
 }
 
 void IDE::reset() {
@@ -325,6 +394,18 @@ void IDE::reset() {
     data_discard = false;
     latch_read = 0;
     latch_write = 0;
+    reg_head = 0;                  // power-on/SRST selects the master
+    atapi_phase = 0;
+    cdb_index = 0;
+    xfer_len = xfer_index = 0;
+    atapi_blocks = 0;
+    // After reset both devices present their power-on signature until the host
+    // writes a task-file/command register to them.
+    sig_valid[0] = sig_valid[1] = true;
+    // Media-change: a freshly-reset CD reports UNIT ATTENTION on the first poll.
+    sense_key = present() ? SENSE_UNIT_ATTENTION : SENSE_NO_SENSE;
+    sense_asc = present() ? ASC_MEDIUM_CHANGED : 0;
+    sense_ascq = 0;
     reset_signature();
 }
 
@@ -336,8 +417,11 @@ void IDE::close() {
         }
         data_offset[d] = 0;
         cylinders[d] = heads[d] = sectors[d] = 0;
+        is_atapi[d] = false;
+        sig_valid[d] = false;
     }
     data_index = -1;
+    atapi_phase = 0;
 }
 
 bool IDE::present() {
@@ -483,6 +567,27 @@ void IDE::execute_command(uint8_t cmd) {
     reg_error = 0;
     reg_status = IDE_STATUS_READY;
 
+    // ATAPI CD-ROM device: only the packet command set is valid. Everything
+    // else (including ATA IDENTIFY 0xEC and READ SECTOR) must abort — that is
+    // exactly how a host distinguishes an ATAPI CD from an ATA HDD.
+    if (file_open[drive()] && is_atapi[drive()]) {
+        switch (cmd) {
+            case 0x08: // DEVICE RESET — succeeds, reloads the ATAPI signature.
+                reset_signature();
+                return;
+            case 0xA1: // IDENTIFY PACKET DEVICE
+                atapi_identify();
+                return;
+            case 0xA0: // PACKET — host will write a 12-byte SCSI CDB next.
+                atapi_packet_begin();
+                return;
+            default:
+                reg_error = IDE_ERROR_ABRT;
+                reg_status = IDE_STATUS_READY | IDE_STATUS_ERR;
+                return;
+        }
+    }
+
     switch (cmd) {
         // CMD 0x08 (DEVICE RESET) is ATAPI-only — for ATA HDD it MUST abort.
         // Drivers (e.g. WDC, CD/HDD-detection code from zxpress AUTORUN spec)
@@ -609,12 +714,299 @@ void IDE::execute_command(uint8_t cmd) {
 }
 
 // ============================================================
+// ATAPI (CD-ROM) — SCSI-over-ATA PACKET
+// ============================================================
+
+// Begin a PIO data-in transfer of `len` bytes already placed in `buffer`.
+// ATAPI returns the byte count for this DRQ block in the cylinder registers
+// (the "byte count" / interrupt-reason fields).
+void IDE::atapi_start_data(int len) {
+    if (len <= 0) {
+        // No data — command complete.
+        atapi_phase = 0;
+        xfer_len = xfer_index = 0;
+        reg_status = IDE_STATUS_READY;
+        return;
+    }
+    xfer_len = len;
+    xfer_index = 0;
+    atapi_phase = 2;
+    reg_cyl_lo = len & 0xFF;
+    reg_cyl_hi = (len >> 8) & 0xFF;
+    // Interrupt reason (= sector count): I/O=1 (device->host), C/D=0 (data phase).
+    reg_sector_count = 0x02;
+    reg_status = IDE_STATUS_READY | IDE_STATUS_DRQ;
+#if IDE_PORT_TRACE
+    {
+        uint32_t sum = 0;
+        for (int i = 0; i < len && i < ATAPI_BLOCK; i++) sum += buffer[i];
+        Debug::log("IDE ATAPI DATA-IN len=%d first=%02X %02X %02X %02X sum=%u",
+                   len, buffer[0], buffer[1], buffer[2], buffer[3], (unsigned)sum);
+    }
+#endif
+}
+
+void IDE::atapi_check_condition(uint8_t sense, uint8_t asc, uint8_t ascq) {
+    sense_key = sense; sense_asc = asc; sense_ascq = ascq;
+    atapi_phase = 0;
+    xfer_len = xfer_index = 0;
+    reg_error  = (uint8_t)(sense << 4) | IDE_ERROR_ABRT;  // SK in high nibble
+    reg_sector_count = 0x03;     // I/O=1, C/D=1: command complete (with error)
+    reg_status = IDE_STATUS_READY | IDE_STATUS_ERR;
+}
+
+// IDENTIFY PACKET DEVICE (0xA1): 512-byte block describing the CD-ROM.
+void IDE::atapi_identify() {
+    int d = drive();
+    memset(buffer, 0, 512);
+    auto setw = [&](int wi, uint16_t v) {
+        buffer[wi*2]   = v & 0xFF;
+        buffer[wi*2+1] = (v >> 8) & 0xFF;
+    };
+    auto setstr = [&](int wi, int nwords, const char* s) {
+        char tmp[64]; int len = nwords * 2;
+        if (len > (int)sizeof(tmp)) len = sizeof(tmp);
+        for (int i = 0; i < len; i++) tmp[i] = ' ';
+        for (int i = 0; s[i] && i < len; i++) tmp[i] = s[i];
+        for (int i = 0; i < nwords; i++) {
+            buffer[(wi+i)*2]   = tmp[i*2+1];
+            buffer[(wi+i)*2+1] = tmp[i*2];
+        }
+    };
+    // word0: 10b=ATAPI device, type 0x05=CD-ROM, DRQ within 3ms, 12-byte CDB.
+    setw(0, 0x85C0);
+    setstr(10, 10, "PSPECCD0000000000001");   // serial (20)
+    setstr(23, 4, "1.0     ");                 // firmware (8)
+    setstr(27, 20, "PICO-SPEC CD-ROM                        "); // model (40)
+    setw(49, 0x0200);                          // capabilities: LBA
+    setw(53, 0x0006);                          // words 64-70 + 88 valid
+    setw(64, 0x0001);                          // PIO mode 3 supported (advisory)
+    (void)d;
+    data_index = -1;            // ATAPI uses the phase-2 path, not the ATA FIFO
+    data_write = false;
+    reg_sector_count = 0;
+    atapi_start_data(512);
+    Debug::log("IDE ATAPI IDENTIFY PACKET hd%d", drive());
+}
+
+// PACKET (0xA0): device raises DRQ and waits for the 12-byte SCSI CDB which the
+// host writes to the data register.
+void IDE::atapi_packet_begin() {
+#if IDE_PORT_TRACE
+    if (atapi_phase == 2 && xfer_index < xfer_len)
+        Debug::log("IDE ATAPI prev transfer ABORTED at %d/%d bytes", xfer_index, xfer_len);
+#endif
+    atapi_phase = 1;
+    cdb_index = 0;
+    memset(cdb, 0, sizeof(cdb));
+    // Interrupt reason: C/D=1 (command), I/O=0 (host->device). Byte count = 12.
+    reg_sector_count = 0x01;
+    reg_cyl_lo = 12;
+    reg_cyl_hi = 0;
+    reg_status = IDE_STATUS_READY | IDE_STATUS_DRQ;
+#if IDE_PORT_TRACE
+    Debug::log("IDE ATAPI PACKET begin (await CDB)");
+#endif
+}
+
+// Refill `buffer` with the next 2048-byte logical block for a multi-block READ.
+void IDE::atapi_fill_block() {
+    int d = drive();
+    memset(buffer, 0, ATAPI_BLOCK);
+    if (file_open[d]) {
+        FSIZE_t pos = (FSIZE_t)atapi_lba * ATAPI_BLOCK;
+        UINT br;
+        f_lseek(&file[d], pos);
+        f_read(&file[d], buffer, ATAPI_BLOCK, &br);
+    }
+    atapi_lba++;
+    if (atapi_blocks) atapi_blocks--;
+}
+
+// Dispatch a completed 12-byte SCSI CDB (boot-minimal data-CD command set).
+void IDE::atapi_exec_cdb() {
+    int d = drive();
+    uint8_t op = cdb[0];
+#if IDE_PORT_TRACE
+    Debug::log("IDE ATAPI CDB %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+               cdb[0],cdb[1],cdb[2],cdb[3],cdb[4],cdb[5],cdb[6],cdb[7],cdb[8],cdb[9],cdb[10],cdb[11]);
+#endif
+    uint32_t total_blocks = file_open[d] ? (uint32_t)(f_size(&file[d]) / ATAPI_BLOCK) : 0;
+
+    switch (op) {
+        case 0x00: // TEST UNIT READY
+            atapi_phase = 0;
+            reg_status = IDE_STATUS_READY;
+            break;
+
+        case 0x12: { // INQUIRY
+            int alloc = cdb[4];
+            memset(buffer, 0, 96);
+            buffer[0] = 0x05;          // peripheral device type: CD-ROM
+            buffer[1] = 0x80;          // RMB: removable medium
+            buffer[2] = 0x00;          // version
+            buffer[3] = 0x21;          // response data format (ATAPI) + HiSup
+            buffer[4] = 0x1F;          // additional length (n-4 = 31)
+            memcpy(buffer + 8,  "PICOSPEC", 8);            // vendor id (8)
+            memcpy(buffer + 16, "CD-ROM          ", 16);   // product id (16)
+            memcpy(buffer + 32, "1.0 ", 4);                // product rev (4)
+            int len = 36; if (alloc && alloc < len) len = alloc;
+            atapi_start_data(len);
+            break;
+        }
+
+        case 0x25: { // READ CAPACITY (10)
+            uint32_t last = total_blocks ? total_blocks - 1 : 0;
+            buffer[0] = (last >> 24) & 0xFF; buffer[1] = (last >> 16) & 0xFF;
+            buffer[2] = (last >> 8) & 0xFF;  buffer[3] = last & 0xFF;
+            buffer[4] = (ATAPI_BLOCK >> 24) & 0xFF; buffer[5] = (ATAPI_BLOCK >> 16) & 0xFF;
+            buffer[6] = (ATAPI_BLOCK >> 8) & 0xFF;  buffer[7] = ATAPI_BLOCK & 0xFF;
+            atapi_start_data(8);
+            break;
+        }
+
+        case 0x28:    // READ(10)
+        case 0xA8: {  // READ(12)
+            uint32_t lba = ((uint32_t)cdb[2] << 24) | ((uint32_t)cdb[3] << 16) |
+                           ((uint32_t)cdb[4] << 8)  | cdb[5];
+            uint32_t blocks = (op == 0x28)
+                ? (((uint32_t)cdb[7] << 8) | cdb[8])
+                : (((uint32_t)cdb[6] << 24) | ((uint32_t)cdb[7] << 16) |
+                   ((uint32_t)cdb[8] << 8)  | cdb[9]);
+            if (blocks == 0) { atapi_phase = 0; reg_status = IDE_STATUS_READY; break; }
+            if (lba >= total_blocks) {
+                atapi_check_condition(SENSE_ILLEGAL_REQUEST, ASC_LBA_OUT_OF_RANGE, 0);
+                break;
+            }
+            if (lba + blocks > total_blocks) blocks = total_blocks - lba;
+            atapi_lba = lba;
+            atapi_blocks = blocks;
+            atapi_fill_block();                       // load first block into buffer
+            // Total bytes for the whole READ; the host pulls block by block and
+            // read8(0) refills via atapi_fill_block() at each 2048-byte boundary.
+            atapi_start_data((int)(blocks * ATAPI_BLOCK));
+            // NB: byte count register holds the per-DRQ count; clamp to one block.
+            reg_cyl_lo = ATAPI_BLOCK & 0xFF;
+            reg_cyl_hi = (ATAPI_BLOCK >> 8) & 0xFF;
+            break;
+        }
+
+        case 0x43: { // READ TOC / PMA / ATIP
+            uint8_t fmt = cdb[2] & 0x0F;
+            bool msf = (cdb[1] & 0x02) != 0;
+            if (fmt == 0 || fmt == 1) { // formatted TOC (single data track + lead-out)
+                uint8_t* b = buffer;
+                memset(b, 0, 20);
+                // TOC data length (excludes the 2 length bytes themselves).
+                b[2] = 0x01;  // first track
+                b[3] = 0x01;  // last track
+                int p = 4;
+                // Track 1 descriptor: ADR=1, control=4 (data track).
+                b[p++] = 0x00; b[p++] = 0x14; b[p++] = 0x01; b[p++] = 0x00;
+                if (msf) { b[p++]=0; b[p++]=0; b[p++]=2; b[p++]=0; }
+                else     { b[p++]=0; b[p++]=0; b[p++]=0; b[p++]=0; } // track 1 @ LBA 0
+                // Lead-out descriptor (track 0xAA).
+                b[p++] = 0x00; b[p++] = 0x14; b[p++] = 0xAA; b[p++] = 0x00;
+                uint32_t lead = total_blocks;
+                if (msf) { b[p++]=0; b[p++]=(lead>>16)&0xFF; b[p++]=(lead>>8)&0xFF; b[p++]=lead&0xFF; }
+                else     { b[p++]=(lead>>24)&0xFF; b[p++]=(lead>>16)&0xFF; b[p++]=(lead>>8)&0xFF; b[p++]=lead&0xFF; }
+                int total = p;
+                b[0] = ((total - 2) >> 8) & 0xFF;
+                b[1] = (total - 2) & 0xFF;
+                int alloc = ((int)cdb[7] << 8) | cdb[8];
+                if (alloc && alloc < total) total = alloc;
+                atapi_start_data(total);
+            } else {
+                atapi_check_condition(SENSE_ILLEGAL_REQUEST, ASC_INVALID_CMD, 0);
+            }
+            break;
+        }
+
+        case 0x03: { // REQUEST SENSE
+            int alloc = cdb[4];
+            memset(buffer, 0, 18);
+            buffer[0] = 0x70;          // current error, fixed format
+            buffer[2] = sense_key;     // sense key
+            buffer[7] = 10;            // additional sense length
+            buffer[12] = sense_asc;
+            buffer[13] = sense_ascq;
+            int len = 18; if (alloc && alloc < len) len = alloc;
+            // After reporting, the condition is cleared.
+            sense_key = SENSE_NO_SENSE; sense_asc = 0; sense_ascq = 0;
+            atapi_start_data(len);
+            break;
+        }
+
+        case 0x1B: // START STOP UNIT
+        case 0x1E: // PREVENT/ALLOW MEDIUM REMOVAL
+        case 0x2B: // SEEK(10)
+        case 0x35: // SYNCHRONIZE CACHE
+        case 0xBB: // SET CD SPEED — optional; succeed as a no-op
+            atapi_phase = 0;
+            reg_sector_count = 0x03;  // command complete
+            reg_status = IDE_STATUS_READY;
+            break;
+
+        case 0x1A: { // MODE SENSE(6)
+            int alloc = cdb[4];
+            memset(buffer, 0, 8);
+            buffer[0] = 3;             // mode data length
+            buffer[1] = 0x01;          // medium type: 120mm data CD
+            int len = 4; if (alloc && alloc < len) len = alloc;
+            atapi_start_data(len);
+            break;
+        }
+        case 0x5A: { // MODE SENSE(10)
+            int alloc = ((int)cdb[7] << 8) | cdb[8];
+            memset(buffer, 0, 8);
+            buffer[1] = 6;             // mode data length (low)
+            buffer[2] = 0x01;          // medium type
+            int len = 8; if (alloc && alloc < len) len = alloc;
+            atapi_start_data(len);
+            break;
+        }
+        case 0x4A: { // GET EVENT STATUS NOTIFICATION
+            int alloc = ((int)cdb[7] << 8) | cdb[8];
+            memset(buffer, 0, 8);
+            buffer[0] = 0x00; buffer[1] = 0x06;  // event descriptor length
+            buffer[2] = 0x80;                    // NEA: no event available
+            buffer[3] = 0x1E;                    // supported event classes
+            int len = 8; if (alloc && alloc < len) len = alloc;
+            atapi_start_data(len);
+            break;
+        }
+
+        default:
+            Debug::log("IDE ATAPI CDB %02X UNSUPPORTED -> CHECK", op);
+            atapi_check_condition(SENSE_ILLEGAL_REQUEST, ASC_INVALID_CMD, 0);
+            break;
+    }
+}
+
+// ============================================================
 // 8-bit register access (R0..R8)
 // ============================================================
 
 uint8_t IDE::read8(uint8_t reg) {
     switch (reg) {
         case 0: // Data
+            // ATAPI data-in: stream from `buffer`, refilling each 2048-byte
+            // logical block for multi-block READs; drop DRQ when done.
+            if (atapi_phase == 2) {
+                if (xfer_index >= xfer_len) return 0xFF;
+                int pos = xfer_index % ATAPI_BLOCK;
+                uint8_t val = buffer[pos];
+                xfer_index++;
+                if (xfer_index >= xfer_len) {
+                    atapi_phase = 0;
+                    reg_sector_count = 0x03;          // I/O=1, C/D=1: command complete
+                    reg_status = IDE_STATUS_READY;   // transfer complete (DRQ dropped)
+                } else if ((xfer_index % ATAPI_BLOCK) == 0) {
+                    // Crossed a 2048-byte boundary inside a multi-block READ.
+                    if (atapi_blocks) atapi_fill_block();
+                }
+                return val;
+            }
             if (data_index >= 0 && !data_write) {
                 uint8_t val = buffer[data_index++];
                 if (data_index >= 512) {
@@ -662,6 +1054,12 @@ void IDE::write8(uint8_t reg, uint8_t value) {
 #endif
     switch (reg) {
         case 0: // Data
+            // ATAPI command phase: collect the 12-byte SCSI CDB, then dispatch.
+            if (atapi_phase == 1) {
+                if (cdb_index < (int)sizeof(cdb)) cdb[cdb_index++] = value;
+                if (cdb_index >= (int)sizeof(cdb)) atapi_exec_cdb();
+                break;
+            }
             if (data_index >= 0 && data_write) {
                 buffer[data_index++] = value;
                 if (data_index >= 512) {
@@ -682,13 +1080,29 @@ void IDE::write8(uint8_t reg, uint8_t value) {
                 }
             }
             break;
-        case 1: reg_feature = value;      break;
-        case 2: reg_sector_count = value; break;
-        case 3: reg_sector = value;       break;
-        case 4: reg_cyl_lo = value;       break;
-        case 5: reg_cyl_hi = value;       break;
-        case 6: reg_head = value;         break;
-        case 7: execute_command(value);   break;
+        // Writes to the task-file registers mean the host is programming a
+        // command, so the post-reset signature for the selected device is no
+        // longer valid (don't reload it on the next device-select). See reg 6.
+        case 1: reg_feature = value;      sig_valid[drive()] = false; break;
+        case 2: reg_sector_count = value; sig_valid[drive()] = false; break;
+        case 3: reg_sector = value;       sig_valid[drive()] = false; break;
+        case 4: reg_cyl_lo = value;       sig_valid[drive()] = false; break;
+        case 5: reg_cyl_hi = value;       sig_valid[drive()] = false; break;
+        case 6: {
+            // Device select (DEV = bit 4). If the selected device changed and the
+            // newly-selected device still holds its post-reset signature, reload
+            // it into the shared register file so the host reads the correct
+            // per-device signature (ATA cyl=0 vs ATAPI cyl=0xEB14). The reload
+            // preserves reg_head (set below) — we set it first so reset_signature
+            // and drive() observe the new selection.
+            int prev = drive();
+            reg_head = value;
+            int now = drive();
+            if (now != prev && sig_valid[now])
+                reset_signature();   // uses drive()==now, keeps reg_head
+            break;
+        }
+        case 7: sig_valid[drive()] = false; execute_command(value); break;
         case 8: { // control register (nIEN/SRST)
             uint8_t prev = reg_control;
             reg_control = value;

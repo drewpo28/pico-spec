@@ -31,6 +31,9 @@ public:
 
     static bool present();  // true if at least one image is open
 
+    // True if the slot holds an ATAPI CD-ROM (.iso). Used by the OSD menu/info.
+    static bool isCD(int slot);
+
     // Geometry accessors for the OSD menu (per slot 0/1). After init(), these
     // reflect the effective geometry (auto-detected or Config override).
     static uint16_t geomC(int slot);
@@ -68,11 +71,23 @@ private:
     static void write_sector_done();
     static void execute_command(uint8_t cmd);
     static void advance_lba();
-    static void reset_signature();   // ATA reset/diagnostic signature in registers
+    static void reset_signature();   // ATA/ATAPI reset/diagnostic signature in registers
+
+    // ATAPI (CD-ROM) — SCSI-over-ATA PACKET protocol.
+    static void atapi_identify();          // cmd 0xA1 -> 512-byte IDENTIFY PACKET DEVICE
+    static void atapi_packet_begin();      // cmd 0xA0 -> raise DRQ, await 12-byte CDB
+    static void atapi_exec_cdb();          // CDB complete -> dispatch SCSI command
+    static void atapi_fill_block();        // refill `buffer` with next 2048-byte block
+    static void atapi_start_data(int len); // begin data-in phase of `len` bytes from buffer
+    static void atapi_check_condition(uint8_t sense, uint8_t asc, uint8_t ascq);
 
     // Image files (independent from DivMMC's mmc_file[]).
     static FIL  file[2];
     static bool file_open[2];
+
+    // Per-slot device type + post-reset signature validity (master/slave).
+    static bool is_atapi[2];   // slot is an ATAPI CD-ROM (.iso)
+    static bool sig_valid[2];  // device still presenting its post-reset signature
 
     // Per-drive geometry / format.
     static uint32_t data_offset[2];   // byte offset to sector data (HDF header, else 0)
@@ -93,7 +108,8 @@ private:
     static uint8_t reg_error;
     static uint8_t reg_control;   // R8: nIEN/SRST
 
-    // Sector transfer buffer (512 B, heap) + position.
+    // Sector transfer buffer (2048 B heap: 512 B for ATA, full 2048 B logical
+    // block for ATAPI) + position.
     static uint8_t* buffer;
     static int  data_index;     // byte position (-1 = no transfer)
     static bool data_write;     // true = PIO_OUT (host writes), false = PIO_IN
@@ -102,6 +118,19 @@ private:
     // 16-bit high-byte latch (NEMO/PROFI).
     static uint8_t latch_read;
     static uint8_t latch_write;
+
+    // ATAPI transfer state (one active transfer at a time, like the ATA FIFO).
+    static int     atapi_phase;     // 0=idle, 1=awaiting 12-byte CDB, 2=data-in to host
+    static uint8_t cdb[12];
+    static int     cdb_index;
+    static int     xfer_len;        // total bytes to return in the data-in phase
+    static int     xfer_index;      // bytes already returned
+    static uint32_t atapi_lba;      // current logical block for multi-block READ
+    static uint32_t atapi_blocks;   // blocks remaining for multi-block READ
+    // REQUEST SENSE data for the last check-condition.
+    static uint8_t sense_key;
+    static uint8_t sense_asc;
+    static uint8_t sense_ascq;
 };
 
 #endif // !PICO_RP2040

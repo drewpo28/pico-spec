@@ -2814,6 +2814,15 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     // Geometry row: shows effective C/H/S, LBA and size; "auto" when no override.
                                     {
                                         char geo[48];
+                                        if (IDE::isCD(slot)) {
+                                            // ATAPI CD-ROM: no CHS geometry; show type + size.
+                                            uint32_t mb = (uint32_t)(((uint64_t)IDE::sizeBytes(slot)) / (1024*1024));
+                                            snprintf(geo, sizeof(geo), "Type\tCD-ROM\n");
+                                            drvmenu += geo;
+                                            char szr[48];
+                                            snprintf(szr, sizeof(szr), "Size\t%u MB (ISO)\n", (unsigned)mb);
+                                            drvmenu += szr;
+                                        } else {
                                         uint16_t oc=Config::ide_chs[slot][0], oh=Config::ide_chs[slot][1], os=Config::ide_chs[slot][2];
                                         uint16_t C=IDE::geomC(slot), H=IDE::geomH(slot), S=IDE::geomS(slot);
                                         bool over = (oc&&oh&&os);
@@ -2826,6 +2835,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         char lbar[48];
                                         snprintf(lbar, sizeof(lbar), "LBA\t%u (%u MB)\n", (unsigned)lba, (unsigned)(((uint64_t)lba*512)/(1024*1024)));
                                         drvmenu += lbar;
+                                        }
                                     }
                                     uint8_t opt2 = menuRun(drvmenu);
                                     if (opt2 == 1) {
@@ -2851,8 +2861,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         Config::save();
                                         menu_curopt = opt2;
                                         menu_saverect = false;
-                                    } else if (opt2 == 3) {
+                                    } else if (opt2 == 3 && !IDE::isCD(slot)) {
                                         // Edit CHS override. Empty input = auto-detect (0/0/0).
+                                        // (Skipped for ATAPI CD-ROM — geometry N/A.)
                                         char cur[20];
                                         if (Config::ide_chs[slot][0] && Config::ide_chs[slot][1] && Config::ide_chs[slot][2])
                                             snprintf(cur, sizeof(cur), "%u/%u/%u",
