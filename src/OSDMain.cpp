@@ -75,6 +75,8 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Ftp.h"
 #include "Sftp.h"
 #include "Ssh.h"
+#include "HttpCatalogFs.h"
+#include "HttpsGet.h"
 #include "Ftpd.h"
 #include "HttpCatalogFs.h"
 #include "HttpsGet.h"
