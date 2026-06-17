@@ -17,6 +17,7 @@ bool    ZiFiSock::closed[ZiFiSock::N_LINKS]  = {false};
 bool    ZiFiSock::opened[ZiFiSock::N_LINKS]  = {false};
 bool    ZiFiSock::mux_mode = false;
 bool    ZiFiSock::is_ready = false;
+int     ZiFiSock::accepted_link = -1;
 
 // ── +IPD demux state machine (file-scope) ───────────────────────────────────
 // The ESP delivers inbound TCP as "\r\n+IPD,<len>:<bytes>" (single mode) or
@@ -41,6 +42,7 @@ bool     flag_prompt = false; // saw the CIPSEND '>' prompt
 bool     flag_send_ok= false;
 bool     flag_error  = false;
 int      pending_close = -1;  // link id seen as CLOSED on the last status line, else -1
+int      pending_connect = -1; // link id seen as "<id>,CONNECT" (server accept), else -1
 
 void reset_parser() {
     st = ST_SCAN; linelen = 0; ipd_len = 0; ipd_link = 0;
@@ -48,6 +50,7 @@ void reset_parser() {
     last_line[0] = '\0';
     flag_prompt = flag_send_ok = flag_error = false;
     pending_close = -1;
+    pending_connect = -1;
 }
 } // namespace
 
@@ -79,6 +82,13 @@ static void process_status_line(const char* L) {
         if (L[0] >= '0' && L[0] <= '9' && L[1] == ',') id = L[0] - '0';
         if (id >= 0 && id < ZiFiSock::N_LINKS) pending_close = id;
     }
+    // "<id>,CONNECT" — a client linked to our AT+CIPSERVER. Exclude "WIFI
+    // CONNECTED" (no "<digit>," prefix), "CONNECT FAIL" and "ALREADY CONNECTED".
+    if (L[0] >= '0' && L[0] <= '9' && L[1] == ',' && strstr(L, "CONNECT") &&
+        !strstr(L, "FAIL") && !strstr(L, "ALREADY")) {
+        int id = L[0] - '0';
+        if (id >= 0 && id < ZiFiSock::N_LINKS) pending_connect = id;
+    }
 }
 
 void ZiFiSock::pump(uint32_t budget_ms) {
@@ -97,6 +107,9 @@ void ZiFiSock::pump(uint32_t budget_ms) {
                     linebuf[linelen] = '\0';
                     process_status_line(linebuf);
                     if (pending_close >= 0) { closed[pending_close] = true; pending_close = -1; }
+                    // Hand a fresh inbound link to server_accept(); don't touch the
+                    // ring here so any command bytes trailing CONNECT survive.
+                    if (pending_connect >= 0) { accepted_link = pending_connect; pending_connect = -1; }
                     linelen = 0;
                     break;
                 }
@@ -314,6 +327,61 @@ void ZiFiSock::sock_close(int id) {
     opened[id] = false;
     closed[id] = true;
     rx_head[id] = rx_tail[id] = 0;
+}
+
+bool ZiFiSock::sock_closed(int id) {
+    if (id < 0 || id >= N_LINKS) return true;
+    // Drain anything pending so a CLOSED line that's already on the wire is seen.
+    pump(0);
+    return closed[id];
+}
+
+// ── Server side ──────────────────────────────────────────────────────────────
+bool ZiFiSock::server_listen(uint16_t port) {
+    ZiFi::init(); // idempotent — bring the UART backend up
+    reset_parser();
+    for (int i = 0; i < N_LINKS; i++) {
+        rx_head[i] = rx_tail[i] = 0;
+        closed[i] = opened[i] = false;
+    }
+    mux_mode = true;
+    accepted_link = -1;
+    uint8_t junk[64];
+    while (ZiFi::recvRaw(junk, sizeof(junk)) > 0) {}
+
+    if (!atCmd("AT+CIPMUX=1", "OK", 2000)) { is_ready = false; return false; }
+    char cmd[40];
+    snprintf(cmd, sizeof(cmd), "AT+CIPSERVER=1,%u", (unsigned)port);
+    is_ready = atCmd(cmd, "OK", 3000);
+    return is_ready;
+}
+
+int ZiFiSock::server_accept(uint32_t timeout_ms) {
+    if (!is_ready) return -1;
+    accepted_link = -1;
+    absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+    do {
+        pump(50);
+        if (accepted_link >= 0) {
+            int id = accepted_link;
+            accepted_link = -1;
+            if (id < 0 || id >= N_LINKS) return -1;
+            closed[id] = false;
+            opened[id] = true; // ring left intact: early command bytes are preserved
+            return id;
+        }
+    } while (!time_reached(deadline));
+    return -1;
+}
+
+void ZiFiSock::server_stop() {
+    for (int i = 0; i < N_LINKS; i++)
+        if (opened[i]) sock_close(i);
+    atCmd("AT+CIPSERVER=0", "OK", 2000);
+    if (mux_mode) atCmd("AT+CIPMUX=0", "OK", 1000);
+    reset_parser();
+    accepted_link = -1;
+    is_ready = false;
 }
 
 void ZiFiSock::end() {

@@ -18,6 +18,10 @@ AT firmware** — no reflashing needed. The RP2350 side implements:
   directories, download/upload files to SD, copy folders, delete. SSH crypto
   (curve25519, AES-CTR, HMAC-SHA256) runs on the RP2350 via mbedTLS;
   the ESP is just a TCP bridge.
+- **FTP server** — share the SD card to the LAN. A PC connects to the device, browses
+  the SD and uploads/downloads files (the reverse of File transfer). A live log
+  terminal shows activity; emulation is paused until you press **ESC**. Anonymous,
+  active mode only.
 
 ## Menu structure
 
@@ -30,6 +34,7 @@ Network
 │   └── Sync time (SNTP)  one-shot clock sync
 ├── WiFi <status>         connect / disconnect (shows SSID + IP)
 ├── File transfer ▸       FTP / SFTP client (see below)
+├── FTP Server ▸          share the SD card to the LAN (see below)
 └── ZiFi NIC ▸            Off / On — enable the network interface
 ```
 
@@ -42,6 +47,7 @@ Network
 | ESP01 › Time zone | UTC−12 … UTC+14 | UTC+0 | Timezone for SNTP |
 | ESP01 › Sync time | — | — | On-demand SNTP sync (needs WiFi + RTC enabled). Also auto-runs on connect/boot |
 | WiFi | — | — | Disconnected → scan + password → connect (+ auto time-sync); connected → show SSID/IP, disconnect |
+| FTP Server | — | — | Share the SD card to the LAN over FTP (anonymous, active mode). Emulation pauses; **ESC** stops |
 | ZiFi NIC | Off / On | Off | Enables the network interface. Stored in NVS |
 
 > On speed: **921600** is the fastest, but with no hardware flow control (the ESP-01S
@@ -76,20 +82,85 @@ browser):
 The last upload/download folders are remembered (in `wifi.cfg`). Downloads default to
 `/spec`.
 
+## FTP server (sharing the SD card)
+
+The reverse of File transfer: the device becomes an **FTP server** that shares the
+**whole SD card** to the LAN, so a PC can browse it and upload/download files.
+Requires WiFi connected.
+
+**Network → FTP Server** starts a server on **port 21** and opens a live **log
+terminal** showing the connection details (`ftp://<ip>:21`, user `anonymous`) and each
+command/response. The ZX-Spectrum emulation is **paused** the whole time; press
+**ESC** to stop the server and resume.
+
+- **Anonymous** — any username/password is accepted (e.g. `anonymous` with an empty
+  password). Full read/write access to the SD.
+- **Active mode only.** ESP-AT firmware exposes a single listening port, so the data
+  connection is opened **outbound** to the client. Set your FTP client to **active**
+  (not passive) mode. On a LAN this just works; behind NAT/firewall it may not.
+- **One client at a time.** Binary transfers only (`TYPE I`).
+- Supported commands: list (`LIST`/`NLST`), download (`RETR`), upload (`STOR`/`APPE`),
+  delete (`DELE`), make/remove directory (`MKD`/`RMD`), rename (`RNFR`/`RNTO`),
+  `SIZE`, `CWD`/`CDUP`, `PWD`.
+
+Command-line `ftp` example:
+
+```
+ftp> open <device-ip> 21
+Name: anonymous
+Password:           (just press Enter)
+ftp> binary
+ftp> ls
+ftp> get game.tap
+ftp> put snapshot.z80
+ftp> bye
+```
+
+> **FileZilla / GUI clients:** set *Active* mode (Site Manager → Transfer Settings →
+> Active) and *Anonymous* logon — passive mode will fail to open the data connection.
+
+No persistent settings: the FTP server is a transient action with no config of its own.
+
 ## ESP-01S wiring
 
-Just **4 wires**. Both sides are **3.3 V** logic — no level shifter needed.
-**TX and RX cross over.**
+Just **4 wires** — power (VCC, GND) and a serial pair (TX, RX). Both sides are
+**3.3 V** logic, so **no level shifter** is needed.
+
+**The serial pair crosses over:** each side's **TX → the other side's RX**.
+
+The diagram below uses the **PICO_DV** default pins (UART0: GPIO 0 = TX, GPIO 1 = RX).
+For other boards only the GPIO numbers change — see the table below.
 
 ```
-   ESP-01S                       RP2350 (pins — see table below)
-   TX   ───────────────────────►  RX    (zifi_rx, odd pin = tx+1)
-   RX   ◄───────────────────────  TX    (zifi_tx, even pin)
-   GND  ───── GND
-   VCC  ───── 3V3                 (stable 3.3 V)
+        ESP-01S                              RP2350  (example: PICO_DV)
+   ┌───────────────────┐
+   │  ((( antenna )))  │
+   │   ┌──────────┐    │
+   │   │ ESP8266  │    │
+   │   └──────────┘    │
+   │              TX ●─┼──────────────────●  GPIO 1   ( Pico RX )
+   │              RX ●─┼──────────────────●  GPIO 0   ( Pico TX )
+   │             GND ●─┼──────────────────●  GND
+   │             VCC ●─┼──────────────────●  3V3   ( solid 3.3 V — see note )
+   │                   │
+   └───────────────────┘
+   EN / RST / GPIO0 / GPIO2 on the ESP — leave unconnected
 
-   EN/CH_PD, RST, GPIO0, GPIO2 — leave unconnected
+   The crossover is baked into the labels:  ESP TX → Pico RX,  ESP RX → Pico TX.
 ```
+
+Connection list (PICO_DV):
+
+| ESP-01S |   | RP2350 (PICO_DV) | meaning |
+|---------|---|------------------|---------|
+| **TX**  | ──► | **GPIO 1** | ESP TX → Pico **RX** |
+| **RX**  | ◄── | **GPIO 0** | ESP RX ← Pico **TX** |
+| **GND** | ─── | **GND** | common ground |
+| **VCC** | ─── | **3V3** | 3.3 V power |
+
+> **The crossover rule never changes** (only the GPIO numbers do): **Pico TX (even
+> pin) → ESP RX**, and **Pico RX (odd pin) → ESP TX**. Connecting TX→TX / RX→RX is the
+> #1 reason "nothing happens".
 
 > **Power.** The ESP-01S draws bursts up to ~300 mA on WiFi TX. Feed it from a solid
 > 3.3 V rail and add a **100–470 µF** cap at VCC — otherwise expect brownout resets.
