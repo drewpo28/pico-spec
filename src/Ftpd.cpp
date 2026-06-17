@@ -24,6 +24,7 @@ static char     g_data_ip[20] = {0};         // active-mode client address (from
 static uint16_t g_data_port = 0;
 static bool     g_have_port = false;
 static std::string g_rnfr;                   // pending RNFR source path
+static uint32_t g_rest = 0;                  // pending REST offset for the next RETR/STOR
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 static void ftplog(const char* fmt, ...) {
@@ -103,7 +104,31 @@ static void fmtLsLine(const FILINFO& fi, std::string& out) {
     out += line;
 }
 
-static void doList(const char* arg, bool nameOnly) {
+// FatFS date/time → "YYYYMMDDhhmmss" (RFC 3659 timeval).
+static void fmtMtime(const FILINFO& fi, char* out, size_t n) {
+    int yr = 1980 + ((fi.fdate >> 9) & 0x7F);
+    int mo = (fi.fdate >> 5) & 0x0F; if (mo < 1) mo = 1; if (mo > 12) mo = 12;
+    int dy =  fi.fdate       & 0x1F; if (dy < 1) dy = 1;
+    int hh = (fi.ftime >> 11) & 0x1F;
+    int mm = (fi.ftime >> 5)  & 0x3F;
+    int ss = ( fi.ftime       & 0x1F) * 2;
+    snprintf(out, n, "%04d%02d%02d%02d%02d%02d", yr, mo, dy, hh, mm, ss);
+}
+
+// One MLSD machine-listing fact line for a FILINFO (RFC 3659).
+static void fmtMlsdLine(const FILINFO& fi, std::string& out) {
+    char mt[16]; fmtMtime(fi, mt, sizeof(mt));
+    static char line[400]; // static: off the 4 KB core stack
+    if (fi.fattrib & AM_DIR)
+        snprintf(line, sizeof(line), "type=dir;modify=%s; %s\r\n", mt, fi.fname);
+    else
+        snprintf(line, sizeof(line), "type=file;size=%lu;modify=%s; %s\r\n",
+                 (unsigned long)fi.fsize, mt, fi.fname);
+    out += line;
+}
+
+// fmt: 0 = LIST (ls -l), 1 = NLST (bare names), 2 = MLSD (machine listing).
+static void doList(const char* arg, int fmt) {
     std::string path = resolve(arg && arg[0] && arg[0] != '-' ? arg : nullptr); // ignore "-l" etc.
     DIR dir;
     if (f_opendir(&dir, path.c_str()) != FR_OK) { reply(550, "Failed to open directory"); return; }
@@ -117,8 +142,9 @@ static void doList(const char* arg, bool nameOnly) {
     bool ok = true;
     while (f_readdir(&dir, &fi) == FR_OK && fi.fname[0]) {
         if (!strcmp(fi.fname, ".") || !strcmp(fi.fname, "..")) continue;
-        if (nameOnly) { buf += fi.fname; buf += "\r\n"; }
-        else          fmtLsLine(fi, buf);
+        if      (fmt == 1) { buf += fi.fname; buf += "\r\n"; }
+        else if (fmt == 2) fmtMlsdLine(fi, buf);
+        else               fmtLsLine(fi, buf);
         if (buf.size() >= 1024) { // flush in chunks to bound RAM
             if (ZiFiSock::sock_send(data, (const uint8_t*)buf.data(), buf.size(), 8000) < 0) { ok = false; break; }
             buf.clear();
@@ -136,6 +162,9 @@ static void doRetr(const char* arg) {
     std::string path = resolve(arg);
     FIL* f = fopen2(path.c_str(), FA_READ);
     if (!f) { reply(550, "File not found"); return; }
+
+    uint32_t rest = g_rest; g_rest = 0; // REST applies to this transfer only
+    if (rest) f_lseek(f, rest);
 
     int data = openData();
     if (data < 0) { fclose2(f); return; } // openData() already sent 425
@@ -158,8 +187,13 @@ static void doRetr(const char* arg) {
 
 static void doStor(const char* arg, bool append) {
     std::string path = resolve(arg);
-    FIL* f = fopen2(path.c_str(), append ? (FA_WRITE | FA_OPEN_APPEND) : (FA_WRITE | FA_CREATE_ALWAYS));
+    uint32_t rest = g_rest; g_rest = 0; // REST applies to this transfer only
+    // With REST, don't truncate (open-always + seek) so the resume offset survives.
+    BYTE mode = append ? (FA_WRITE | FA_OPEN_APPEND)
+              : (rest ? (FA_WRITE | FA_OPEN_ALWAYS) : (FA_WRITE | FA_CREATE_ALWAYS));
+    FIL* f = fopen2(path.c_str(), mode);
     if (!f) { reply(550, "Cannot create file"); return; }
+    if (rest && !append) f_lseek(f, rest);
 
     int data = openData();
     if (data < 0) { fclose2(f); return; } // openData() already sent 425
@@ -218,6 +252,35 @@ static void doEprt(const char* arg) {
     } else reply(522, "Only IPv4 (proto 1) supported");
 }
 
+// ── MDTM / MLST (no data connection) ─────────────────────────────────────────
+static void doMdtm(const char* arg) {
+    static FILINFO fi;
+    if (arg && f_stat(resolve(arg).c_str(), &fi) == FR_OK) {
+        char mt[16]; fmtMtime(fi, mt, sizeof(mt));
+        reply(213, mt);
+    } else reply(550, "File not found");
+}
+
+static void doMlst(const char* arg) {
+    std::string path = resolve(arg);
+    static FILINFO fi;
+    bool isRoot = (path == "/");
+    if (!isRoot && f_stat(path.c_str(), &fi) != FR_OK) { reply(550, "File not found"); return; }
+    char mt[16];
+    bool isDir; unsigned long sz;
+    if (isRoot) { isDir = true; sz = 0; snprintf(mt, sizeof(mt), "19800101000000"); }
+    else { isDir = fi.fattrib & AM_DIR; sz = (unsigned long)fi.fsize; fmtMtime(fi, mt, sizeof(mt)); }
+    static char buf[480];
+    if (isDir)
+        snprintf(buf, sizeof(buf), "250-Listing %s\r\n type=dir;modify=%s; %s\r\n250 End\r\n",
+                 path.c_str(), mt, path.c_str());
+    else
+        snprintf(buf, sizeof(buf), "250-Listing %s\r\n type=file;size=%lu;modify=%s; %s\r\n250 End\r\n",
+                 path.c_str(), sz, mt, path.c_str());
+    if (g_ctrl >= 0) ZiFiSock::sock_send(g_ctrl, (const uint8_t*)buf, strlen(buf), 8000);
+    ftplog("< 250 MLST %s", path.c_str());
+}
+
 // ── Command dispatch ─────────────────────────────────────────────────────────
 static void handle(char* line) {
     // Split into VERB + argument (rest of line). Verb upper-cased.
@@ -233,8 +296,12 @@ static void handle(char* line) {
     else if (!strcmp(line, "PASS")) reply(230, "Login successful (anonymous)");
     else if (!strcmp(line, "SYST")) reply(215, "UNIX Type: L8");
     else if (!strcmp(line, "FEAT")) {
-        // No PASV — clients must fall back to active PORT. Advertise SIZE only.
-        static const char* feat = "211-Features:\r\n SIZE\r\n211 End\r\n";
+        // No PASV (active mode only) — but advertise the machine-listing commands so
+        // clients use MLSD/MLST instead of probing PASV/MLSD and falling back.
+        static const char* feat =
+            "211-Features:\r\n"
+            " SIZE\r\n MDTM\r\n MLST type*;size*;modify*;\r\n REST STREAM\r\n TVFS\r\n"
+            "211 End\r\n";
         ZiFiSock::sock_send(g_ctrl, (const uint8_t*)feat, strlen(feat), 8000);
         ftplog("< 211 FEAT");
     }
@@ -260,8 +327,17 @@ static void handle(char* line) {
     else if (!strcmp(line, "PORT")) doPort(arg);
     else if (!strcmp(line, "EPRT")) doEprt(arg);
     else if (!strcmp(line, "PASV") || !strcmp(line, "EPSV")) reply(502, "Passive mode not supported, use PORT");
-    else if (!strcmp(line, "LIST")) doList(arg, false);
-    else if (!strcmp(line, "NLST")) doList(arg, true);
+    else if (!strcmp(line, "LIST")) doList(arg, 0);
+    else if (!strcmp(line, "NLST")) doList(arg, 1);
+    else if (!strcmp(line, "MLSD")) doList(arg, 2);
+    else if (!strcmp(line, "MLST")) doMlst(arg);
+    else if (!strcmp(line, "MDTM")) doMdtm(arg);
+    else if (!strcmp(line, "REST")) { g_rest = arg ? (uint32_t)strtoul(arg, nullptr, 10) : 0; reply(350, "Restart position accepted"); }
+    else if (!strcmp(line, "ABOR")) reply(226, "No transfer in progress");
+    else if (!strcmp(line, "CLNT")) reply(200, "Noted");
+    else if (!strcmp(line, "ALLO")) reply(200, "OK");
+    else if (!strcmp(line, "STAT")) reply(211, "pico-spec FTP, active mode");
+    else if (!strcmp(line, "HELP")) reply(214, "Anonymous FTP server");
     else if (!strcmp(line, "RETR")) doRetr(arg);
     else if (!strcmp(line, "STOR")) doStor(arg, false);
     else if (!strcmp(line, "APPE")) doStor(arg, true);
@@ -310,6 +386,7 @@ bool Ftpd::begin(uint16_t port, LogCb log) {
     g_cwd = "/";
     g_have_port = false;
     g_rnfr.clear();
+    g_rest = 0;
     return ZiFiSock::server_listen(port);
 }
 
