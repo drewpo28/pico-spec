@@ -9,7 +9,6 @@ import os
 
 from .base import Adapter, Entry  # re-export
 from .local import LocalAdapter
-from .vtrd import VtrdAdapter
 
 
 def build_registry() -> "dict[str, Adapter]":
@@ -19,6 +18,7 @@ def build_registry() -> "dict[str, Adapter]":
         if sid == "local":
             reg["local"] = LocalAdapter(os.environ.get("CATALOG_LOCAL_DIR", "/data/files"))
         elif sid == "vtrd":
+            from .vtrd import VtrdAdapter  # lazy: only this source needs httpx/selectolax
             reg["vtrd"] = VtrdAdapter()
         # Future: zxart (JSON export API), wos (ZXInfo API v3) — add here.
     return reg
