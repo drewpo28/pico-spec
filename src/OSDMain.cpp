@@ -522,14 +522,14 @@ static void ftpdLogLine(const char* s) {
     ftpd_log_dirty = true;
 }
 
-// Open the FTP server, show details + a live log terminal, and run a blocking
-// loop until ESC. The Z80 stays frozen the whole time (we never call CPU::loop).
-static void ftpServerRun() {
-    string ssid, ip;
-    if (!ZiFiAT::getStatus(ssid, ip)) {
-        OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200);
-        return;
-    }
+struct FtpdCtx { const char* ip; };
+
+// Run the server session (details panel + live log terminal) in a blocking loop
+// until ESC. The Z80 stays frozen (we never call CPU::loop). Invoked on a heap
+// alt-stack via net_call_on_stack — FatFS + the OSD draw chain are too deep for
+// the 4 KB core stack when nested under do_OSD (same reason as the net client).
+static void ftpdSessionRun(void* arg) {
+    const char* ip = ((FtpdCtx*)arg)->ip;
 
     ftpd_log_count = 0; ftpd_log_dirty = true;
     if (!Ftpd::begin(21, ftpdLogLine)) {
@@ -539,7 +539,7 @@ static void ftpServerRun() {
     }
     ftpdLogLine(Config::lang ? "Servidor FTP iniciado" : "FTP server started");
     char det[FTPD_LOG_COLS];
-    snprintf(det, sizeof(det), "ftp://%s:21  user: anonymous", ip.c_str());
+    snprintf(det, sizeof(det), "ftp://%s:21  user: anonymous", ip);
     ftpdLogLine(det);
     ftpdLogLine(Config::lang ? "Modo ACTIVO. ESC para parar." : "Use ACTIVE mode. ESC to stop.");
 
@@ -547,7 +547,7 @@ static void ftpServerRun() {
     unsigned short sy = OSD::scrAlignCenterY(OSD_H);
     VIDEO::SaveRect.save(sx, sy, OSD_W, OSD_H);
 
-    string sub = "ftp://" + ip + ":21  anon  ESC:stop";
+    string sub = string("ftp://") + ip + ":21  anon  ESC:stop";
 
     auto draw = [&]() {
         OSD::drawOSD(true);
@@ -596,6 +596,22 @@ static void ftpServerRun() {
     Ftpd::stop();
     OSD::osdCenteredMsg(Config::lang ? "Servidor FTP detenido" : "FTP server stopped", LEVEL_INFO, 1200);
     VIDEO::SaveRect.restore_last();
+}
+
+// Entry: require WiFi, then run the session on a heap alt-stack.
+static void ftpServerRun() {
+    string ssid, ip;
+    if (!ZiFiAT::getStatus(ssid, ip)) {
+        OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200);
+        return;
+    }
+    FtpdCtx ctx; ctx.ip = ip.c_str(); // ip outlives the (synchronous) call below
+    size_t stksz = 8 * 1024;
+    uint8_t* stk = (uint8_t*)malloc(stksz);
+    if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
+    void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7); // 8-byte aligned top
+    net_call_on_stack(top, ftpdSessionRun, &ctx);
+    free(stk);
 }
 #endif // ZIFI_NET_CLIENT
 #endif

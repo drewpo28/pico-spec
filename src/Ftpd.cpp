@@ -28,7 +28,7 @@ static std::string g_rnfr;                   // pending RNFR source path
 // ── Logging ──────────────────────────────────────────────────────────────────
 static void ftplog(const char* fmt, ...) {
     if (!g_log) return;
-    char buf[256];
+    static char buf[256]; // static: core stack is only 4 KB, deep under do_OSD
     va_list ap; va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
@@ -37,7 +37,7 @@ static void ftplog(const char* fmt, ...) {
 
 // ── Control replies ──────────────────────────────────────────────────────────
 static void reply(int code, const char* text) {
-    char buf[320];
+    static char buf[320]; // static: avoid core-stack overflow under do_OSD
     int n = snprintf(buf, sizeof(buf), "%d %s\r\n", code, text);
     if (n < 0) return;
     if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1; // snprintf returns intended length
@@ -96,7 +96,7 @@ static void fmtLsLine(const FILINFO& fi, std::string& out) {
     int day   =  fi.fdate       & 0x1F; if (day < 1) day = 1;
     int hh    = (fi.ftime >> 11) & 0x1F;
     int mm    = (fi.ftime >> 5)  & 0x3F;
-    char line[320];
+    static char line[320]; // static: serial use, keep it off the 4 KB core stack
     snprintf(line, sizeof(line), "%crw-r--r-- 1 ftp ftp %10lu %s %2d %02d:%02d %s\r\n",
              (fi.fattrib & AM_DIR) ? 'd' : '-', (unsigned long)fi.fsize,
              MON[month - 1], day, hh, mm, fi.fname);
@@ -112,7 +112,7 @@ static void doList(const char* arg, bool nameOnly) {
     if (data < 0) { f_closedir(&dir); return; } // openData() already sent 425
     reply(150, "Here comes the directory listing");
 
-    FILINFO fi;
+    static FILINFO fi; // ~285 B with LFN — keep it off the 4 KB core stack
     std::string buf;
     bool ok = true;
     while (f_readdir(&dir, &fi) == FR_OK && fi.fname[0]) {
@@ -244,12 +244,12 @@ static void handle(char* line) {
     else if (!strcmp(line, "MODE")) reply(200, "Mode S ok");
     else if (!strcmp(line, "STRU")) reply(200, "Structure F ok");
     else if (!strcmp(line, "PWD") || !strcmp(line, "XPWD")) {
-        char m[300]; snprintf(m, sizeof(m), "\"%s\" is the current directory", g_cwd.c_str());
+        static char m[300]; snprintf(m, sizeof(m), "\"%s\" is the current directory", g_cwd.c_str());
         reply(257, m);
     }
     else if (!strcmp(line, "CWD") || !strcmp(line, "XCWD")) {
         std::string p = resolve(arg);
-        FILINFO fi;
+        static FILINFO fi; // ~285 B with LFN — static to spare the core stack
         if (p == "/" || (f_stat(p.c_str(), &fi) == FR_OK && (fi.fattrib & AM_DIR))) {
             g_cwd = p; reply(250, "Directory changed");
         } else reply(550, "No such directory");
@@ -266,7 +266,7 @@ static void handle(char* line) {
     else if (!strcmp(line, "STOR")) doStor(arg, false);
     else if (!strcmp(line, "APPE")) doStor(arg, true);
     else if (!strcmp(line, "SIZE")) {
-        FILINFO fi;
+        static FILINFO fi; // ~285 B with LFN — static to spare the core stack
         if (arg && f_stat(resolve(arg).c_str(), &fi) == FR_OK && !(fi.fattrib & AM_DIR)) {
             char m[32]; snprintf(m, sizeof(m), "%lu", (unsigned long)fi.fsize); reply(213, m);
         } else reply(550, "Could not get file size");
@@ -281,11 +281,11 @@ static void handle(char* line) {
     }
     else if (!strcmp(line, "MKD") || !strcmp(line, "XMKD")) {
         if (arg && f_mkdir(resolve(arg).c_str()) == FR_OK) {
-            char m[300]; snprintf(m, sizeof(m), "\"%s\" created", resolve(arg).c_str()); reply(257, m);
+            static char m[300]; snprintf(m, sizeof(m), "\"%s\" created", resolve(arg).c_str()); reply(257, m);
         } else reply(550, "Create directory failed");
     }
     else if (!strcmp(line, "RNFR")) {
-        FILINFO fi;
+        static FILINFO fi; // ~285 B with LFN — static to spare the core stack
         if (arg && f_stat(resolve(arg).c_str(), &fi) == FR_OK) { g_rnfr = resolve(arg); reply(350, "Ready for RNTO"); }
         else reply(550, "File not found");
     }
@@ -326,7 +326,7 @@ void Ftpd::poll() {
         return;
     }
 
-    char line[320];
+    static char line[320]; // static: command buffer off the 4 KB core stack
     if (ZiFiSock::sock_recv_line(g_ctrl, line, sizeof(line), 150)) {
         if (line[0]) handle(line);
     } else if (ZiFiSock::sock_closed(g_ctrl)) {
