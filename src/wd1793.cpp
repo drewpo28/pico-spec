@@ -3078,11 +3078,16 @@ IRAM_ATTR uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control) {
       }
 
       // Load track before checking length.
-      // Don't reload track if an active command is reading/writing bytes
+      // Don't reload mid-stream while bytes are being transferred (ReadByte/
+      // WriteByte) — but DO honor the FDC's selected side when a new sector
+      // search starts (WaitingMark). Previously WaitingMark was lumped in with
+      // the byte-transfer states, which only worked because the old idle path
+      // pre-loaded wd->side every step; once the e1db3d5 idle-rotation early-
+      // return removed that pre-load, keeping the stale side here made side 1
+      // of an already-loaded cylinder unreadable (broke double-sided UDIs).
       {
         uint8_t loadSide = wd->side;
         bool activeCmd = (wd->stepState == kRVMWD177XStepReadByte
-                       || wd->stepState == kRVMWD177XStepWaitingMark
                        || wd->stepState == kRVMWD177XStepWriteByte);
         if (activeCmd && wd->diskLoadedCyl == (int)disk->t && wd->diskLoadedSide >= 0)
             loadSide = (uint8_t)wd->diskLoadedSide;

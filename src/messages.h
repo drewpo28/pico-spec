@@ -291,6 +291,10 @@ static const char *OSD_ZIP_ERR[2] = { OSD_ZIP_ERR_EN,OSD_ZIP_ERR_ES };
 #define OSD_ZIP_EXTRACTING_ES "    Extrayendo...    "
 static const char *OSD_ZIP_EXTRACTING[2] = { OSD_ZIP_EXTRACTING_EN,OSD_ZIP_EXTRACTING_ES };
 
+#define OSD_ZIP_BADMETHOD_EN " ZIP: unsupported compression "
+#define OSD_ZIP_BADMETHOD_ES " ZIP: compresion no admitida "
+static const char *OSD_ZIP_BADMETHOD[2] = { OSD_ZIP_BADMETHOD_EN,OSD_ZIP_BADMETHOD_ES };
+
 #define OSD_PROFI_LOADING_EN "  Loading Profi system...  \n  Please wait (SPI PSRAM)  "
 #define OSD_PROFI_LOADING_ES "  Cargando sistema Profi...  \n  Espere (SPI PSRAM)  "
 static const char *OSD_PROFI_LOADING[2] = { OSD_PROFI_LOADING_EN,OSD_PROFI_LOADING_ES };
@@ -2306,11 +2310,12 @@ static const char *MSG_NET_DL_OR_UL[2]       = { "Download\nUpload here\n", "Des
 static const char *MENU_NET_BROWSE_TITLE[2]  = { "Remote files",     "Archivos remotos"  };
 static const char *MSG_NET_DELETE_Q[2]       = { "Delete?",          "\xA8" "Borrar?"     };
 static const char *MSG_NET_FOOTER[2]         = { "F5 copy  F8 delete","F5 copiar F8 borrar" };
+static const char *MSG_NET_FOOTER_RO[2]      = { "F5 copy",           "F5 copiar"          };
 static const char *MSG_NET_COPYING[2]        = { "Copying...",       "Copiando..."        };
 
 // ─── Archive download (catalog server) strings ──────────────────────────────
 static const char *MENU_ARCH_SITE_TITLE[2]   = { "Archive source",   "Fuente de archivo" };
-static const char *MSG_ARCH_SERVER_LABEL[2]  = { "Catalog server:",  "Servidor catalogo:" };
+static const char *MSG_ARCH_SERVER_LABEL[2]  = { "Catalog:",  "Catalogo:" };
 static const char *MSG_ARCH_SITES_ERR[2]     = { "No sources found",  "Sin fuentes"       };
 
 // ─── HTTP test ("curl") strings ─────────────────────────────────────────────

@@ -152,9 +152,11 @@ public:
 
     static uint8_t msgDialog(const string& title, const string& msg);
     // mask=true → password field: shows '*' until revealed (TAB toggles).
-    static string inlineTextEdit(int ex, int ey, int maxlen, const string& text, bool mask = false);
+    // viscols = visible width in chars; when < maxlen the field scrolls
+    // horizontally so up to maxlen characters can be entered. 0 → viscols=maxlen.
+    static string inlineTextEdit(int ex, int ey, int maxlen, const string& text, bool mask = false, int viscols = 0);
     static bool videoModeConfirm(int timeout_sec = 15);
-    static void progressDialog(const string& title, const string& msg, int percent, int action);
+    static void progressDialog(const string& title, const string& msg, int percent, int action, bool cyrillic = false);
     string inputBox(int x, int y, const string& text);
     static void joyDialog(void);
     static void pokeDialog();

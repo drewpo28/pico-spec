@@ -34,9 +34,15 @@ public:
     // GET an absolute URL, streaming the body to `sink`. For https, `caPath` is an
     // optional PEM CA bundle on SD for certificate verification (nullptr = skip,
     // bring-up only).
+    //
+    // rangeStart>=0 adds a "Range: bytes=START-END" header (END = START+rangeLen-1,
+    // or open-ended when rangeLen<=0) so a large body can be pulled in small, more
+    // reliable pieces. Status is then 206 (partial), 200 (server ignored Range →
+    // full body) or 416 (past EOF). `received` is the bytes delivered this call.
     static Result get(const char* url, SinkCb sink, void* sinkCtx,
                       const char* caPath = nullptr,
-                      ProgressCb progress = nullptr, void* progCtx = nullptr);
+                      ProgressCb progress = nullptr, void* progCtx = nullptr,
+                      long rangeStart = -1, long rangeLen = -1);
 
     // Convenience: download to an SD file (streamed, overwrites).
     static Result getToFile(const char* url, const char* sdPath,

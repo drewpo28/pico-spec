@@ -97,7 +97,18 @@ void ZiFiSock::pump(uint32_t budget_ms) {
         uint8_t b;
         bool got = false;
         // Drain whatever the ZiFi RX pipe has buffered, one byte at a time.
-        while (ZiFi::recvRaw(&b, 1) == 1) {
+        for (;;) {
+            // Backpressure: if we're mid-payload and this link's ring is full, stop
+            // pulling from the ZiFi RX ring — leave the bytes there (it's larger and
+            // SD-spillable) instead of dropping them. recvRaw is destructive, so we
+            // must check BEFORE reading. The consumer drains rx_buf via sock_recv,
+            // then the next pump resumes this payload. Without this, a burst bigger
+            // than RX_SZ corrupts the TLS stream (MAC failure) on large transfers.
+            if (st == ST_IPD_PAYLOAD) {
+                int nt = (rx_tail[ipd_link] + 1) % RX_SZ;
+                if (nt == rx_head[ipd_link]) return; // ring full → let the consumer drain
+            }
+            if (ZiFi::recvRaw(&b, 1) != 1) break;
             got = true;
             switch (st) {
             case ST_SCAN:
@@ -284,11 +295,17 @@ int ZiFiSock::sock_send(int id, const uint8_t* buf, size_t len, uint32_t timeout
 
 int ZiFiSock::sock_recv(int id, uint8_t* buf, size_t maxlen, uint32_t timeout_ms) {
     if (id < 0 || id >= N_LINKS) return -1;
+    // Spill the IRQ ring to the SD swap so it can't overflow. Normally driven
+    // per-frame by ZiFi::tick(), but a blocking transfer (catalog over TLS, OSD
+    // alt-stack, Z80 paused) freezes the main loop — without this, large reads
+    // overrun zifi_in and lose raw TLS bytes (→ MAC failure / stalled records).
+    ZiFi::rxSpill();
     // Fast path: already-buffered payload.
     if (ringFill(id) > 0) return ringPop(id, buf, maxlen);
 
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
     while (!time_reached(deadline)) {
+        ZiFi::rxSpill();
         pump(50);
         if (ringFill(id) > 0) return ringPop(id, buf, maxlen);
         if (closed[id]) return 0; // peer closed and nothing left buffered → EOF

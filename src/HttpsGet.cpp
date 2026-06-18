@@ -4,6 +4,7 @@
 
 #include "TlsSock.h"
 #include "ZiFiSock.h"
+#include "ZiFi.h"        // ZiFi::rxDropped() (RX-ring overflow diagnostic)
 #include "Debug.h"
 #include "ff.h"
 #include <pico/time.h>
@@ -85,7 +86,8 @@ bool readLine(Conn& c, char* buf, size_t maxlen, absolute_time_t deadline) {
 } // namespace
 
 HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
-                               const char* caPath, ProgressCb progress, void* progCtx) {
+                               const char* caPath, ProgressCb progress, void* progCtx,
+                               long rangeStart, long rangeLen) {
     Result res = { false, -1, 0, 0 };
 
     bool https; char host[128]; char path[512]; uint16_t port;
@@ -107,11 +109,21 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
         if (c.link < 0) { ZiFiSock::end(); return res; }
     }
 
+    // Optional Range header — pull a large body in small, reliable pieces.
+    char rangehdr[48] = "";
+    if (rangeStart >= 0) {
+        if (rangeLen > 0)
+            snprintf(rangehdr, sizeof(rangehdr), "Range: bytes=%ld-%ld\r\n",
+                     rangeStart, rangeStart + rangeLen - 1);
+        else
+            snprintf(rangehdr, sizeof(rangehdr), "Range: bytes=%ld-\r\n", rangeStart);
+    }
+
     // Build + send the request.
     char req[768];
     int rl = snprintf(req, sizeof(req),
         "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n"
-        "Accept: */*\r\nConnection: close\r\n\r\n", path, host, UA);
+        "Accept: */*\r\n%sConnection: close\r\n\r\n", path, host, UA, rangehdr);
     if (rl <= 0 || (size_t)rl >= sizeof(req) || c.wr((const uint8_t*)req, rl) != rl) {
         Debug::log("HttpsGet: send request failed");
         goto done;
@@ -139,15 +151,29 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
             chunked = true;
     }
     if (chunked) { Debug::log("HttpsGet: chunked encoding not supported"); res.status = -1; goto done; }
+#if ZIFI_NET_VERBOSE
+    Debug::log("HttpsGet: status=%d len=%lu", res.status, (unsigned long)res.length);
+#endif
 
     // Body: Content-Length when known, else read until EOF (Connection: close).
     uint32_t total = res.length;
+    uint32_t drop0 = ZiFi::rxDropped();  // RX-ring overflow count at body start
     while (total == 0 || res.received < total) {
         size_t want = sizeof(g_http_buf);
         if (total && total - res.received < want) want = total - res.received;
         int n = c.rd(g_http_buf, want);
-        if (n < 0) { res.status = -1; goto done; }
-        if (n == 0) break; // EOF
+        if (n < 0) {  // read error (TLS alert, deadline, or dropped link)
+            Debug::log("HttpsGet: read err @%lu/%lu tlsErr=-0x%04x rxDrop=%lu",
+                       (unsigned long)res.received, (unsigned long)total,
+                       c.tls ? -c.ts->lastError() : 0,
+                       (unsigned long)(ZiFi::rxDropped() - drop0));
+            res.status = -1; goto done;
+        }
+        if (n == 0) { // EOF
+            if (total && res.received < total)
+                Debug::log("HttpsGet: EOF short @%lu/%lu", (unsigned long)res.received, (unsigned long)total);
+            break;
+        }
         if (sink && !sink(sinkCtx, g_http_buf, n)) { res.status = -1; goto done; } // abort
         res.received += n;
         if (progress && !progress(progCtx, res.received, total)) { res.status = -1; goto done; }
@@ -155,6 +181,13 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
 
     res.ok = (res.status >= 200 && res.status < 300) &&
              (total == 0 || res.received == total);
+#if ZIFI_NET_VERBOSE
+    Debug::log("HttpsGet: done status=%d recv=%lu/%lu ok=%d rxDrop=%lu",
+               res.status, (unsigned long)res.received, (unsigned long)total, res.ok,
+               (unsigned long)(ZiFi::rxDropped() - drop0));
+#else
+    (void)drop0;
+#endif
     }
 
 done:

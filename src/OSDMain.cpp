@@ -136,6 +136,7 @@ using namespace std;
 #define OSD_MARGIN 4
 
 extern Font Font6x8;
+extern Font Font6x8Cyr;   // CP1251 Cyrillic face (online-catalog names)
 #ifdef VGA_HDMI
 extern bool SELECT_VGA;
 #endif
@@ -189,7 +190,8 @@ unsigned short OSD::scrAlignCenterY(unsigned short pixel_height) { return (scrH 
 // Draws each character individually; cursor shown as highlighted block under current char.
 // Returns entered string on Enter, "\x1B" on Escape, "" if Enter pressed with empty field.
 // Ignores VK_MENU_* synthetic events to avoid double-fires from kbdExtraMapping.
-string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_text, bool mask) {
+string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_text, bool mask, int viscols) {
+    if (viscols <= 0 || viscols > maxlen) viscols = maxlen; // visible window
     string text = initial_text;
     bool reveal = false; // password mask: false → show '*', toggled with TAB
     auto Kbd = ESPectrum::PS2Controller.keyboard();
@@ -200,19 +202,22 @@ string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_tex
     uint8_t blinkCtr = 7; // triggers first draw immediately (++&0x7==0)
 
     auto redraw = [&](bool cursorOn) {
-        string display = text;
-        while ((int)display.length() < maxlen) display += ' ';
         int cur = (int)text.length();
-        for (int p = 0; p < maxlen; p++) {
-            bool isCursor = (p == cur && cur < maxlen) || (p == maxlen - 1 && cur >= maxlen);
+        bool full = (cur >= maxlen);
+        // Scroll so the cursor cell stays inside the visible window.
+        int scroll = (cur >= viscols) ? (cur - viscols + 1) : 0;
+        if (scroll > maxlen - viscols) scroll = maxlen - viscols;
+        for (int p = 0; p < viscols; p++) {
+            int idx = scroll + p;
+            bool isCursor = (!full && idx == cur) || (full && p == viscols - 1);
             if (isCursor && cursorOn)
                 VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(1, 1));
             else
                 VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
             VIDEO::vga.setCursor(ex + p * OSD_FONT_W, ey);
             // Masked password: render '*' for the typed characters until revealed.
-            char dch = display[p];
-            if (mask && !reveal && p < cur) dch = '*';
+            char dch = (idx < cur) ? text[idx] : ' ';
+            if (mask && !reveal && idx < cur) dch = '*';
             char ch[2] = { dch, 0 };
             VIDEO::vga.print(ch);
         }
@@ -330,7 +335,8 @@ static string wifiAskPassword(const string& ssid) {
 // ─── Network file-transfer client (FTP / SFTP) ──────────────────────────────
 // A centred single-line text-entry dialog (host / user / port). Returns the
 // typed text, or "\x1B" if Esc was pressed. Generalises wifiAskPassword().
-static string netAskField(const string& label, const string& initial, bool mask = false, int field = 30) {
+static string netAskField(const string& label, const string& initial, bool mask = false, int field = 30, int maxlen = 0) {
+    if (maxlen <= 0 || maxlen < field) maxlen = field; // input cap (>= visible width)
     const int lbl = (int)label.size();
     const unsigned short cols = lbl + field + 2;
     const unsigned short w = (cols * OSD_FONT_W) + 2;
@@ -351,7 +357,7 @@ static string netAskField(const string& label, const string& initial, bool mask 
         VIDEO::vga.print(hint);
     }
     VIDEO::vga.setTextColor(zxColor(0, 0), zxColor(7, 1));
-    string r = OSD::inlineTextEdit(x + OSD_FONT_W, y + 1 + OSD_FONT_H + 1, field, initial, mask);
+    string r = OSD::inlineTextEdit(x + OSD_FONT_W, y + 1 + OSD_FONT_H + 1, maxlen, initial, mask, field);
     VIDEO::SaveRect.restore_last();
     return r;
 }
@@ -624,7 +630,7 @@ static void ftpServerRun() {
 // part, so we keep off the 4 KB core stack for safety + consistency.
 static void archSessionRun(void* p) {
     (void)p;
-    OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], Config::catalog_host, 0, 0);
+    OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], "", 0, 0); // no URL (built-in catalog)
     static string site_ids[12];
     static string site_names[12];
     int n = HttpCatalogFs::fetchSites(site_ids, site_names, 12);
@@ -644,19 +650,13 @@ static void archSessionRun(void* p) {
     delete fs;
 }
 
-// Top-level entry: require an active WiFi link + a configured catalog server,
-// then browse. The server host is prompted on first use (saved to wifi.cfg).
+// Top-level entry: require an active WiFi link, then browse the built-in online
+// catalog. The catalog URL is hardcoded (HttpCatalogFs) — nothing to configure.
 static void netDownloadArchive() {
     string ssid, ip;
     if (!ZiFiAT::getStatus(ssid, ip)) {
         OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200);
         return;
-    }
-    if (Config::catalog_host.empty()) {
-        string h = netAskField(MSG_ARCH_SERVER_LABEL[Config::lang], "");
-        if (h == "\x1B" || h.empty()) return;
-        Config::catalog_host = h;
-        Config::saveWifiConfig();
     }
 
     size_t stksz = 12 * 1024;
@@ -732,17 +732,25 @@ static void netHttpTest() {
     VIDEO::SaveRect.restore_last();
     const char* scheme = (sc == 1) ? "https" : "http";
 
-    // Host[:port] (<=30) — prefilled with the catalog host for convenience.
-    string host = netAskField(MSG_HTTP_HOST_LABEL[Config::lang], Config::catalog_host);
-    if (host == "\x1B" || host.empty()) return;
+    // Session-only memory of the last host/path (RAM only — not persisted to NVS).
+    // Survives until the board reboots; no Config default is substituted.
+    static string lastHost;          // empty on first use
+    static string lastPath = "/";
 
-    // Path — wider field, clamped so the dialog still fits the screen width.
+    // Host[:port] — prefilled with whatever was last typed this session.
+    string host = netAskField(MSG_HTTP_HOST_LABEL[Config::lang], lastHost);
+    if (host == "\x1B" || host.empty()) return;
+    lastHost = host;
+
+    // Path — visible width clamped to the screen, but the input cap is larger so
+    // long paths can be typed (the field scrolls horizontally past the window).
     int pathField = (int)OSD::osdMaxCols() - (int)strlen(MSG_HTTP_PATH_LABEL[Config::lang]) - 4;
     if (pathField < 20) pathField = 20;
     if (pathField > 64) pathField = 64;
-    string path = netAskField(MSG_HTTP_PATH_LABEL[Config::lang], "/", false, pathField);
+    string path = netAskField(MSG_HTTP_PATH_LABEL[Config::lang], lastPath, false, pathField, 255);
     if (path == "\x1B") return;
     if (path.empty() || path[0] != '/') path = "/" + path;
+    lastPath = path;
 
     HttpTestCtx ctx;
     ctx.url = string(scheme) + "://" + host + path;
@@ -6288,6 +6296,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         if (avail < 0) avail = 0;
                         if ((int)ssid.size() > avail) ssid.resize(avail);
                         st = string(pre) + ssid + " " + ip;
+                    } else if (ZiFiAT::autoSyncBusy()) {
+                        // Boot auto-connect (CWJAP→SNTP) still running — don't claim "Off".
+                        st = "WiFi connecting...";
                     } else st = "WiFi Off";
                     if (st.size() < 32) st.append(32 - st.size(), ' '); else st.resize(32);
 
@@ -6297,7 +6308,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if ZIFI_NET_CLIENT
                     nm += (Config::lang ? "Transferir archivos\t>\n" : "File transfer\t>\n"); // 3
                     nm += (Config::lang ? "Servidor FTP\t>\n" : "FTP Server\t>\n");           // 4
-                    nm += (Config::lang ? "Descargar archivo\t>\n"   : "Download archive\t>\n"); // 4
+                    nm += (Config::lang ? "Archivos online\t>\n"   : "Online archives\t>\n"); // 4
                     nm += string(MENU_HTTP_TEST_ITEM[Config::lang]);              // 5
 #endif
                     nm += "ZiFi NIC\t>\n";                                        // 3 or 6
@@ -10418,7 +10429,7 @@ void OSD::SpeedTest() {
     }
 }
 
-void OSD::progressDialog(const string& title, const string& msg, int percent, int action) {
+void OSD::progressDialog(const string& title, const string& msg, int percent, int action, bool cyrillic) {
 
     static unsigned short h;
     static unsigned short y;
@@ -10427,15 +10438,23 @@ void OSD::progressDialog(const string& title, const string& msg, int percent, in
     static unsigned short progress_x;
     static unsigned short progress_y;
     static unsigned int j;
+    static bool cyr;   // remembered from SHOW so UPDATE/CLOSE keep the same face
 
     if (action == 0 ) { // SHOW
+
+        cyr = cyrillic;
 
         h = (OSD_FONT_H * 6) + 2;
         y = scrAlignCenterY(h);
 
+        // Transcode Cyrillic (online-catalog names) to CP1251 before measuring/truncating,
+        // so widths are right and we never cut a multibyte UTF-8 sequence.
+        string cmsg = cyr ? FileUtils::utf8ToCp1251(msg) : msg;
+        string ctitle = cyr ? FileUtils::utf8ToCp1251(title) : title;
+
         size_t maxchars = (scrW / 6) - 4;
-        string tmsg = msg.length() > maxchars ? msg.substr(0, maxchars) : msg;
-        string ttitle = title.length() > maxchars ? title.substr(0, maxchars) : title;
+        string tmsg = cmsg.length() > maxchars ? cmsg.substr(0, maxchars) : cmsg;
+        string ttitle = ctitle.length() > maxchars ? ctitle.substr(0, maxchars) : ctitle;
 
         w = (((tmsg.length() > ttitle.length() + 6 ? tmsg.length(): ttitle.length() + 6) + 2) * OSD_FONT_W) + 2;
         x = scrAlignCenterX(w);
@@ -10444,7 +10463,7 @@ void OSD::progressDialog(const string& title, const string& msg, int percent, in
         VIDEO::SaveRect.save(x, y, w, h);
 
         // Set font
-        VIDEO::vga.setFont(Font6x8);
+        VIDEO::vga.setFont(cyr ? Font6x8Cyr : Font6x8);
 
         // Menu border
         VIDEO::vga.rect(x, y, w, h, zxColor(0, 0));
@@ -10483,9 +10502,11 @@ void OSD::progressDialog(const string& title, const string& msg, int percent, in
     } else if (action == 1 ) { // UPDATE
 
         // Msg
+        VIDEO::vga.setFont(cyr ? Font6x8Cyr : Font6x8);
+        string umsg = cyr ? FileUtils::utf8ToCp1251(msg) : msg;
         VIDEO::vga.setTextColor(zxColor(0, 0), zxColor(7, 1));
-        VIDEO::vga.setCursor(scrAlignCenterX(msg.length() * OSD_FONT_W), y + 1 + (OSD_FONT_H * 2));
-        VIDEO::vga.print(msg.c_str());
+        VIDEO::vga.setCursor(scrAlignCenterX(umsg.length() * OSD_FONT_W), y + 1 + (OSD_FONT_H * 2));
+        VIDEO::vga.print(umsg.c_str());
 
         // Progress bar
         int barsize = (70 * percent) / 100;

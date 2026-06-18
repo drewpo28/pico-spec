@@ -3,8 +3,11 @@
 #if !PICO_RP2040 && ZIFI_NET_CLIENT
 
 #include "HttpGet.h"
+#include "HttpsGet.h"
 #include "ZiFiSock.h"
 #include "Config.h"
+#include "FileUtils.h"   // CONFIG_DIR
+#include "Debug.h"
 #include "ff.h"
 #include <string.h>
 #include <stdlib.h>
@@ -13,6 +16,119 @@
 // Shared transfer buffer (static, not stack — PICO_STACK_SIZE is only 4 KB and we
 // run nested under the OSD). One catalog request runs at a time, so it's safe.
 static uint8_t g_http_buf[1024];
+
+// Optional CA bundle on SD for verifying the static (https) endpoint. Missing →
+// HttpsGet falls back to no-verify with a warning (same convention as the curl test).
+#define CATALOG_CA_PATH  CONFIG_DIR "/cacert.pem"
+
+// Built-in online catalog (serverless GitHub-Pages tree). Used when no override is
+// configured — the user never has to type a URL.
+#define CATALOG_DEFAULT_URL "https://drewpo28.github.io/pico-spec-catalog"
+
+// ── static-tree (serverless GitHub-Pages) helpers ───────────────────────────--
+// True when we use the static tree: the built-in default (empty catalog_host) or
+// an override that's a base URL (scheme or a '/' path). A bare "host"/"host:port"
+// override selects the dynamic /v1 service instead.
+static bool isStaticBase() {
+    const std::string& h = Config::catalog_host;
+    if (h.empty()) return true;  // default → built-in Pages catalog
+    return h.rfind("http://", 0) == 0 || h.rfind("https://", 0) == 0 ||
+           h.find('/') != std::string::npos;
+}
+
+// Normalised base URL: the built-in default when unset, else the override with a
+// scheme prepended (https by default) and any trailing '/' trimmed.
+static std::string baseUrl() {
+    if (Config::catalog_host.empty()) return CATALOG_DEFAULT_URL;
+    std::string b = Config::catalog_host;
+    if (b.rfind("http://", 0) != 0 && b.rfind("https://", 0) != 0) b = "https://" + b;
+    while (!b.empty() && b.back() == '/') b.pop_back();
+    return b;
+}
+
+// Mirror of gen_static.py slug(): "" → "_root", '/' → '~', keep [A-Za-z0-9._-],
+// everything else → '_'. Must stay byte-identical to the exporter.
+static std::string slugPath(const std::string& path) {
+    if (path.empty()) return "_root";
+    std::string out;
+    out.reserve(path.size());
+    for (unsigned char c : path) {
+        if (c == '/') out += '~';
+        else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                 (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') out += (char)c;
+        else out += '_';
+    }
+    return out;
+}
+
+// Percent-encode a relative locator while preserving '/' separators (file names in
+// the locator may carry spaces/parens; the .tsv slug names are already safe).
+static std::string urlEncodePath(const std::string& s) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+            out += (char)c;
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 0xF];
+        }
+    }
+    return out;
+}
+
+// Stream the body of an https/http URL line-by-line into fn(line,arg), reusing the
+// same per-line parsers as the dynamic path. Bounded RAM: only the current line is
+// held. Returns true on a 2xx response.
+struct LineSink { std::string line; void (*fn)(const char*, void*); void* arg; };
+static bool lineSinkCb(void* ctx, const uint8_t* data, size_t len) {
+    LineSink* ls = (LineSink*)ctx;
+    for (size_t i = 0; i < len; i++) {
+        char c = (char)data[i];
+        if (c == '\n') {
+            if (!ls->line.empty() && ls->line.back() == '\r') ls->line.pop_back();
+            ls->fn(ls->line.c_str(), ls->arg);
+            ls->line.clear();
+        } else {
+            ls->line += c;
+        }
+    }
+    return true;
+}
+// Pull the .tsv in Range chunks (16 KB) rather than one big GET, so each TLS
+// transfer stays small and reliable even at high baud. The SAME LineSink persists
+// across chunks (a line may straddle a chunk boundary) and is flushed only once at
+// the end. Stops at a short chunk / 416 (EOF) or a plain 200 (server ignored Range
+// → whole body in one shot). Returns false only on a real transport error.
+static const long CATALOG_TSV_CHUNK = 16384;
+static bool httpsReadLines(const std::string& url, void (*fn)(const char*, void*), void* arg) {
+    LineSink ls; ls.fn = fn; ls.arg = arg;
+    long off = 0;
+    for (;;) {
+        HttpsGet::Result r = HttpsGet::get(url.c_str(), lineSinkCb, &ls, CATALOG_CA_PATH,
+                                           nullptr, nullptr, off, CATALOG_TSV_CHUNK);
+        if (r.status == 416) break;                         // requested past EOF → done
+        if (!r.ok) return false;                            // real error (not a 2xx)
+        off += r.received;
+        if (r.status == 200) break;                         // Range ignored → got it all
+        if (r.received < (uint32_t)CATALOG_TSV_CHUNK) break; // short chunk → last one
+    }
+    if (!ls.line.empty()) {  // flush a final line with no trailing '\n'
+        if (ls.line.back() == '\r') ls.line.pop_back();
+        fn(ls.line.c_str(), arg);
+    }
+    return true;
+}
+
+// XferProgressCb has no ctx; bridge it to HttpsGet::ProgressCb via a static (one
+// catalog transfer runs at a time, like g_http_buf).
+static XferProgressCb g_xfer_cb = nullptr;
+static bool httpsProgressThunk(void*, uint32_t done, uint32_t total) {
+    return g_xfer_cb ? g_xfer_cb(done, total) : true;
+}
 
 // Percent-encode everything outside the RFC 3986 unreserved set, so file names
 // with spaces / Cyrillic / punctuation survive as query-string values.
@@ -94,6 +210,11 @@ static void sites_line(const char* line, void* arg) {
 }
 
 int HttpCatalogFs::fetchSites(std::string* ids, std::string* names, int maxn) {
+    if (isStaticBase()) {
+        SitesCtx ctx = { ids, names, maxn, 0 };
+        bool ok = httpsReadLines(baseUrl() + "/sites.tsv", sites_line, &ctx);
+        return ok ? ctx.n : -1;
+    }
     std::string host; uint16_t port;
     if (!resolveServer(host, port)) return -1;
     HttpGet http;
@@ -125,6 +246,14 @@ static void list_line(const char* line, void* arg) {
 
 bool HttpCatalogFs::listStream(const std::string& path, RemoteListCb cb, void* ctx) {
     if (!path.empty()) cur_path = (path == "/") ? "" : path;
+
+    if (isStaticBase()) {
+        // <base>/<site>/<slug>.tsv — list_line ignores the extra 4th column.
+        std::string url = baseUrl() + "/" + site + "/" + slugPath(cur_path) + ".tsv";
+        ListCtx lc = { cb, ctx };
+        return httpsReadLines(url, list_line, &lc);
+    }
+
     std::string host; uint16_t port;
     if (!resolveServer(host, port)) return false;
 
@@ -139,6 +268,8 @@ bool HttpCatalogFs::listStream(const std::string& path, RemoteListCb cb, void* c
     http.end();
     return ok;
 }
+
+bool HttpCatalogFs::preSorted() const { return isStaticBase(); }
 
 bool HttpCatalogFs::cwd(const std::string& path) {
     if (path == "..") {
@@ -155,7 +286,56 @@ bool HttpCatalogFs::cwd(const std::string& path) {
     return true;
 }
 
+// Static: find the F-line whose name matches `want` and capture its 4th column
+// (the download locator). Stops at the first match.
+struct LocateCtx { const char* want; std::string url; bool found; };
+static void locate_line(const char* line, void* arg) {
+    LocateCtx* lc = (LocateCtx*)arg;
+    if (lc->found || line[0] != 'F') return;
+    const char* t1 = strchr(line, '\t');        if (!t1) return; // before name
+    const char* name = t1 + 1;
+    const char* t2 = strchr(name, '\t');         if (!t2) return; // before size
+    const char* t3 = strchr(t2 + 1, '\t');       if (!t3) return; // before locator
+    if ((size_t)(t2 - name) != strlen(lc->want) || strncmp(name, lc->want, t2 - name) != 0)
+        return;
+    lc->url.assign(t3 + 1);                       // 4th column (empty if not mirrored)
+    lc->found = true;
+}
+
 bool HttpCatalogFs::get(const std::string& remote, const std::string& localSdPath, XferProgressCb cb) {
+    if (isStaticBase()) {
+        // Re-read the current listing to resolve the file's locator (no RAM map).
+        std::string listUrl = baseUrl() + "/" + site + "/" + slugPath(cur_path) + ".tsv";
+        LocateCtx loc = { remote.c_str(), std::string(), false };
+        if (!httpsReadLines(listUrl, locate_line, &loc)) return false;
+        if (!loc.found || loc.url.empty()) return false; // unknown or not mirrored
+        std::string fileUrl =
+            (loc.url.rfind("http://", 0) == 0 || loc.url.rfind("https://", 0) == 0)
+                ? loc.url                                   // absolute (direct source)
+                : baseUrl() + "/" + urlEncodePath(loc.url); // relative to Pages root
+
+        // Save the archive AS-IS under its original source filename (no unzip, no
+        // rename) in the user's chosen folder.
+        std::string fname = loc.url;
+        size_t sl = fname.find_last_of('/');
+        if (sl != std::string::npos) fname.erase(0, sl + 1);
+        if (fname.empty()) fname = remote;
+        std::string destDir = localSdPath;
+        size_t ds = destDir.find_last_of('/');
+        destDir = (ds == std::string::npos) ? "" : destDir.substr(0, ds);
+        std::string savePath = destDir.empty() ? fname : (destDir + "/" + fname);
+#if ZIFI_NET_VERBOSE
+        Debug::log("catalog get: url=%s save=%s", fileUrl.c_str(), savePath.c_str());
+#endif
+
+        g_xfer_cb = cb;
+        HttpsGet::Result r = HttpsGet::getToFile(fileUrl.c_str(), savePath.c_str(),
+                                                 CATALOG_CA_PATH, httpsProgressThunk, nullptr);
+        g_xfer_cb = nullptr;
+        if (!r.ok) { f_unlink(savePath.c_str()); return false; }
+        return true;
+    }
+
     std::string host; uint16_t port;
     if (!resolveServer(host, port)) return false;
 

@@ -111,6 +111,11 @@ public:
     static void deleteFilesWithExtension(const char *folder_path, const char *extension);
     static bool deleteDirRecursive(const char *path);
 
+    // UTF-8 → CP1251 (Cyrillic) for OSD display with the Font6x8Cyr face. ASCII
+    // passes through; Russian letters map to their CP1251 byte; other codepoints
+    // become '?'; invalid sequences pass through unchanged.
+    static string utf8ToCp1251(const string& s);
+
     static string MountPoint;
     static bool SDReady;
 

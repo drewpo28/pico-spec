@@ -123,6 +123,11 @@ void ZiFi::rxReset() {
     f_unlink(ZIFI_SWAP_PATH);
 }
 
+// Public wrappers (let other modules drive the spill / read the drop counter
+// without exposing the internals).
+void     ZiFi::rxSpill()   { rxSpillTick(); }
+uint32_t ZiFi::rxDropped() { return rx_dropped; }
+
 // Per-frame: once the ring backs up, spill it to the SD swap file so it becomes
 // an effectively unbounded FIFO. Leaves SD mode when the backlog is fully drained.
 void ZiFi::rxSpillTick() {

@@ -36,12 +36,19 @@ public:
     static uint8_t uart16550Read(uint8_t reg_hi);
     static void    uart16550Write(uint8_t reg_hi, uint8_t data);
 
+    // Drive the SD-backed RX spill from a blocking recv loop (e.g. ZiFiSock during
+    // a TLS catalog transfer) when the per-frame tick() can't run. Public wrapper.
+    static void     rxSpill();
+    // RX-ring overflow byte count (diagnostic; 0 = no bytes lost).
+    static uint32_t rxDropped();
+
 private:
-    // RX ring: IRQ landing zone. Big enough (4 KB) to absorb a frame's worth of
-    // 115200-baud data (~230 B) plus SD-write latency spikes between tick() calls.
+    // RX ring: IRQ landing zone. 8 KB so it absorbs SD-write/decrypt latency spikes
+    // between drains even at high baud (460800/921600) — at 4 KB a blocking TLS
+    // catalog read lost ~55 B near the end of a 29 KB body (rxDrop>0 → MAC/stall).
     // The real (unbounded) buffering is the SD swap file — see rxSpillTick()/
     // rxPop(). Free-running uint16_t indices, power-of-2 size → mask on access.
-    static const uint16_t ZIFI_IN_SZ = 4096;
+    static const uint16_t ZIFI_IN_SZ = 8192;
     static uint8_t zifi_in_buf[ZIFI_IN_SZ];
     static volatile uint16_t zifi_in_head;  // written by RX IRQ
     static volatile uint16_t zifi_in_tail;  // consumed by rxSpillTick()/rxPop()

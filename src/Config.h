@@ -244,9 +244,12 @@ public:
     static uint8_t  net_proto;  // 0 = FTP, 1 = SFTP
     static string   net_dl_dir; // last SD folder a file was downloaded into
     static string   net_ul_dir; // last SD folder a file was uploaded from
-    // Archive download catalog server (Network → Download archive). Plain HTTP.
-    static string   catalog_host; // host (optionally "host:port"); empty = unset
-    static uint16_t catalog_port; // port (0 = 80)
+    // Archive download catalog (Network → Download archive). Either a bare
+    // "host"/"host:port" → dynamic /v1 server over plain HTTP, or a base URL with
+    // a path (e.g. "drewpo28.github.io/pico-spec-catalog", https assumed) → static
+    // GitHub-Pages tree fetched over TLS. See HttpCatalogFs. Empty = unset.
+    static string   catalog_host;
+    static uint16_t catalog_port; // dynamic mode only (0 = 80)
     static void loadWifiConfig();
     static void saveWifiConfig();
 #endif

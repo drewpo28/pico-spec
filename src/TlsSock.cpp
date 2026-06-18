@@ -12,6 +12,22 @@
 
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
+#include "mbedtls/pk.h"
+#ifdef MBEDTLS_DEBUG_C
+#include "mbedtls/debug.h"
+// Handshake tracing (enabled only when MBEDTLS_DEBUG_C is defined in the config).
+// Echoes mbedTLS's step-by-step log (ciphersuite, curve, sig alg, failing point)
+// to the serial console so we can diagnose why a specific host's handshake fails.
+static void tlsDbg(void*, int level, const char* file, int line, const char* str) {
+    (void)level; (void)file; (void)line;
+    char buf[160];
+    size_t n = 0;
+    for (const char* p = str; *p && n < sizeof(buf) - 1; ++p)
+        if (*p != '\n' && *p != '\r') buf[n++] = *p;
+    buf[n] = '\0';
+    Debug::log("mbedtls: %s", buf);
+}
+#endif
 
 // How long a single BIO read blocks waiting for the next byte from the ESP pipe
 // before reporting "no data yet" to mbedTLS. The ESP delivers +IPD frames in
@@ -70,7 +86,12 @@ void TlsSock::freeAll() {
 
 bool TlsSock::loadCaFile(const char* sdPath) {
     FIL* f = fopen2(sdPath, FA_READ);
-    if (!f) { Debug::log("TlsSock: CA file not found: %s", sdPath); return false; }
+    if (!f) {
+#if ZIFI_NET_VERBOSE
+        Debug::log("TlsSock: CA file not found: %s", sdPath);
+#endif
+        return false;
+    }
     uint32_t sz = f_size(f);
     if (sz == 0 || sz > 256 * 1024) { fclose2(f); return false; }
     // mbedtls_x509_crt_parse() expects the PEM buffer length to INCLUDE the
@@ -117,9 +138,34 @@ bool TlsSock::connect(const char* host, uint16_t port, uint32_t timeout_ms) {
         mbedtls_ssl_conf_ca_chain(&conf, &cacert, nullptr);
     } else {
         mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+#if ZIFI_NET_VERBOSE
         Debug::log("TlsSock: WARNING no CA loaded — server cert NOT verified");
+#endif
     }
     mbedtls_ssl_conf_rng(&conf, rng, nullptr);
+
+    // Restrict the advertised signature algorithms to curve↔hash pairs we verify
+    // correctly. mbedTLS 3.x uses TLS-1.3 SignatureScheme codepoints even for TLS
+    // 1.2; the default list includes ecdsa_secp521r1_sha512 (0x0603), which in 1.3
+    // semantics BINDS the P-521 curve. A TLS-1.2 server with a P-256 ECDSA cert
+    // (e.g. spectrumcomputing.co.uk) signs the ServerKeyExchange as (sha512,ecdsa)
+    // = 0x0603, and mbedTLS then rejects it as a P-521 sig over a P-256 key
+    // (mbedtls_pk_verify → -0x4E00 ECP_VERIFY_FAILED). Advertising only the matched
+    // pairs makes such a server sign with ecdsa_secp256r1_sha256 instead.
+    static const uint16_t kSigAlgs[] = {
+        MBEDTLS_TLS1_3_SIG_ECDSA_SECP256R1_SHA256,
+        MBEDTLS_TLS1_3_SIG_ECDSA_SECP384R1_SHA384,
+        MBEDTLS_TLS1_3_SIG_RSA_PSS_RSAE_SHA256,
+        MBEDTLS_TLS1_3_SIG_RSA_PKCS1_SHA256,
+        MBEDTLS_TLS1_3_SIG_RSA_PSS_RSAE_SHA384,
+        MBEDTLS_TLS1_3_SIG_RSA_PKCS1_SHA384,
+        MBEDTLS_TLS1_3_SIG_NONE,
+    };
+    mbedtls_ssl_conf_sig_algs(&conf, kSigAlgs);
+#ifdef MBEDTLS_DEBUG_C
+    mbedtls_ssl_conf_dbg(&conf, tlsDbg, nullptr);
+    mbedtls_debug_set_threshold(3);   // 0=off … 4=verbose; 3 shows the protocol flow
+#endif
 
     r = mbedtls_ssl_setup(&ssl, &conf);
     if (r != 0) { last_err = r; Debug::log("TlsSock: ssl_setup -0x%04x", -r); close(); return false; }
@@ -141,6 +187,19 @@ bool TlsSock::connect(const char* host, uint16_t port, uint32_t timeout_ms) {
         }
         last_err = r;
         Debug::log("TlsSock: handshake failed -0x%04x", -r);
+#ifdef MBEDTLS_DEBUG_C
+        // Dump the peer cert chain mbedTLS actually built (count + key type/bits per
+        // cert) to see whether the P-256 leaf is present or was dropped.
+        {
+            const mbedtls_x509_crt* pc = mbedtls_ssl_get_peer_cert(&ssl);
+            int idx = 0;
+            for (; pc; pc = pc->next, ++idx)
+                Debug::log("TlsSock: peer cert[%d] pktype=%d bits=%u",
+                           idx, (int)mbedtls_pk_get_type(&pc->pk),
+                           (unsigned)mbedtls_pk_get_bitlen(&pc->pk));
+            if (idx == 0) Debug::log("TlsSock: peer cert chain empty");
+        }
+#endif
         close();
         return false;
     }
@@ -153,8 +212,10 @@ bool TlsSock::connect(const char* host, uint16_t port, uint32_t timeout_ms) {
     }
 
     is_up = true;
+#if ZIFI_NET_VERBOSE
     Debug::log("TlsSock: connected %s:%u (%s)", host, port,
                ca_loaded ? "verified" : "UNVERIFIED");
+#endif
     return true;
 }
 
