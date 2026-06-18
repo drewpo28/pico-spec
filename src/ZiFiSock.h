@@ -79,7 +79,9 @@ public:
 
 private:
     static const int RX_SZ = 2048;
-    static uint8_t  rx_buf[N_LINKS][RX_SZ];
+    // Heap-backed (alloc in begin(), freed in end()) so the 4 KB isn't permanently
+    // reserved when the NIC is off — frees SRAM for memory-tight machines (Profi).
+    static uint8_t (*rx_buf)[RX_SZ];   // [N_LINKS][RX_SZ]
     static int      rx_head[N_LINKS];  // next byte to hand to sock_recv
     static int      rx_tail[N_LINKS];  // next free slot for the demux
     static bool     closed[N_LINKS];   // per-link EOF flags (CLOSED seen)

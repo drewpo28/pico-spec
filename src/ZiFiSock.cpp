@@ -10,7 +10,7 @@
 #include <stdlib.h>
 
 // ── Static storage ───────────────────────────────────────────────────────────
-uint8_t ZiFiSock::rx_buf[ZiFiSock::N_LINKS][ZiFiSock::RX_SZ];
+uint8_t (*ZiFiSock::rx_buf)[ZiFiSock::RX_SZ] = nullptr;  // heap, alloc in begin()
 int     ZiFiSock::rx_head[ZiFiSock::N_LINKS] = {0};
 int     ZiFiSock::rx_tail[ZiFiSock::N_LINKS] = {0};
 bool    ZiFiSock::closed[ZiFiSock::N_LINKS]  = {false};
@@ -92,6 +92,7 @@ static void process_status_line(const char* L) {
 }
 
 void ZiFiSock::pump(uint32_t budget_ms) {
+    if (!rx_buf) return;   // not begun (or buffers freed) — nothing to demux into
     absolute_time_t deadline = make_timeout_time_ms(budget_ms);
     do {
         uint8_t b;
@@ -202,6 +203,8 @@ bool ZiFiSock::atCmd(const char* cmd, const char* expect, uint32_t timeout_ms) {
 // ── Public API ───────────────────────────────────────────────────────────────
 bool ZiFiSock::begin(bool mux) {
     ZiFi::init(); // idempotent — ensure the UART backend is up
+    if (!rx_buf) rx_buf = (uint8_t(*)[RX_SZ])malloc((size_t)N_LINKS * RX_SZ);
+    if (!rx_buf) return false;   // OOM (shouldn't happen — begin runs with heap free)
     reset_parser();
     for (int i = 0; i < N_LINKS; i++) {
         rx_head[i] = rx_tail[i] = 0;
@@ -412,6 +415,7 @@ void ZiFiSock::end() {
     if (mux_mode) atCmd("AT+CIPMUX=0", "OK", 1000);
     reset_parser();
     is_ready = false;
+    free(rx_buf); rx_buf = nullptr;   // return the 4 KB to the heap
 }
 
 #endif // !PICO_RP2040 && ZIFI_NET_CLIENT

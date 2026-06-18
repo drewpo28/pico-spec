@@ -12,10 +12,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <memory>
 
-// Shared transfer buffer (static, not stack — PICO_STACK_SIZE is only 4 KB and we
-// run nested under the OSD). One catalog request runs at a time, so it's safe.
-static uint8_t g_http_buf[1024];
+// Transfer-buffer size. Allocated on the heap per dynamic-mode call (not a permanent
+// static) so the NIC reserves no SRAM when idle — headroom for memory-tight machines
+// (Profi). Only the legacy /v1 path uses it; the static-tree path streams via LineSink.
+static const size_t HTTP_BUF_SZ = 1024;
 
 // Optional CA bundle on SD for verifying the static (https) endpoint. Missing →
 // HttpsGet falls back to no-verify with a warning (same convention as the curl test).
@@ -167,13 +169,14 @@ static bool resolveServer(std::string& host, uint16_t& port) {
 // `fn(line, arg)`. Bounded RAM: only the current line is held. Returns false on
 // transport error.
 static bool readLines(HttpGet& http, void (*fn)(const char*, void*), void* arg) {
+    auto buf = std::make_unique<uint8_t[]>(HTTP_BUF_SZ);
     std::string line;
     for (;;) {
-        int n = http.read(g_http_buf, sizeof(g_http_buf), 12000);
+        int n = http.read(buf.get(), HTTP_BUF_SZ, 12000);
         if (n < 0) return false;
         if (n == 0) break; // EOF
         for (int i = 0; i < n; i++) {
-            char c = (char)g_http_buf[i];
+            char c = (char)buf[i];
             if (c == '\n') {
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 fn(line.c_str(), arg);
@@ -351,17 +354,18 @@ bool HttpCatalogFs::get(const std::string& remote, const std::string& localSdPat
     FIL* f = fopen2(localSdPath.c_str(), FA_WRITE | FA_CREATE_ALWAYS);
     if (!f) { http.end(); return false; }
 
+    auto dlbuf = std::make_unique<uint8_t[]>(HTTP_BUF_SZ);
     uint32_t done = 0;
     bool ok = true;
     for (;;) {
-        int n = http.read(g_http_buf, sizeof(g_http_buf), 12000);
+        int n = http.read(dlbuf.get(), HTTP_BUF_SZ, 12000);
         if (n < 0) { ok = false; break; }
         if (n == 0) { // EOF (server sent Connection: close) — or a stall
             if (cl > 0 && done < total) ok = false; // closed before all bytes → truncated
             break;
         }
         UINT bw;
-        if (f_write(f, g_http_buf, n, &bw) != FR_OK || (int)bw != n) { ok = false; break; }
+        if (f_write(f, dlbuf.get(), n, &bw) != FR_OK || (int)bw != n) { ok = false; break; }
         done += n;
         if (cb && !cb(done, total)) { ok = false; break; } // user abort
         if (cl > 0 && done >= total) break;                // got the whole body

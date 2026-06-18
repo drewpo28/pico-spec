@@ -4748,6 +4748,16 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     VIDEO::disableGigascreenForProfi();
                                     OSD::osdCenteredMsg("Gigascreen disabled", LEVEL_INFO, 1500);
                                 }
+                                // Switching into Profi: turn the ZiFi NIC off and free its
+                                // ~12 KB of heap rings — Profi forces ~80 KB of SRAM pages
+                                // and OOMs at VIDEO::Init otherwise. Persist Off so the boot
+                                // into Profi has the room (boot also skips ZiFi on Profi).
+                                if (Config::arch == "Profi" && Config::zifi_enabled) {
+                                    Config::zifi_enabled = 0;
+                                    ZiFi::enabled = 0;
+                                    if (!ZiFiAT::connected) { ZiFiSock::end(); ZiFi::deinit(); }
+                                    OSD::osdCenteredMsg("ZiFi NIC disabled", LEVEL_INFO, 1500);
+                                }
 #endif
                                 Config::save();
 #if !PICO_RP2040

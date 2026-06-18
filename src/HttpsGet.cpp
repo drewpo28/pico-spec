@@ -12,10 +12,12 @@
 #include <strings.h>   // strncasecmp
 #include <stdlib.h>
 #include <ctype.h>
+#include <memory>
 
-// Streaming buffer kept off the stack (mirrors Ftp.cpp's g_ftp_buf). Single
-// in-flight request at a time, all from the OSD/main thread.
-static uint8_t g_http_buf[1024];
+// Streaming buffer size. Allocated on the heap per-request (see get()) rather than
+// a permanent static, so the NIC costs no SRAM when idle — that headroom matters
+// for memory-tight machines like Profi. Single in-flight request at a time.
+static const size_t HTTP_BUF_SZ = 1024;
 
 // User-Agent: some archive sites (vtrd.in) 403 non-browser agents, so present a
 // plausible browser string.
@@ -90,6 +92,8 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
                                long rangeStart, long rangeLen) {
     Result res = { false, -1, 0, 0 };
 
+    auto g_http_buf = std::make_unique<uint8_t[]>(HTTP_BUF_SZ);  // RAII: freed on every exit
+
     bool https; char host[128]; char path[512]; uint16_t port;
     if (!parseUrl(url, https, host, sizeof(host), port, path, sizeof(path))) {
         Debug::log("HttpsGet: bad URL: %s", url);
@@ -159,9 +163,9 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
     uint32_t total = res.length;
     uint32_t drop0 = ZiFi::rxDropped();  // RX-ring overflow count at body start
     while (total == 0 || res.received < total) {
-        size_t want = sizeof(g_http_buf);
+        size_t want = HTTP_BUF_SZ;
         if (total && total - res.received < want) want = total - res.received;
-        int n = c.rd(g_http_buf, want);
+        int n = c.rd(g_http_buf.get(), want);
         if (n < 0) {  // read error (TLS alert, deadline, or dropped link)
             Debug::log("HttpsGet: read err @%lu/%lu tlsErr=-0x%04x rxDrop=%lu",
                        (unsigned long)res.received, (unsigned long)total,
@@ -174,7 +178,7 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
                 Debug::log("HttpsGet: EOF short @%lu/%lu", (unsigned long)res.received, (unsigned long)total);
             break;
         }
-        if (sink && !sink(sinkCtx, g_http_buf, n)) { res.status = -1; goto done; } // abort
+        if (sink && !sink(sinkCtx, g_http_buf.get(), n)) { res.status = -1; goto done; } // abort
         res.received += n;
         if (progress && !progress(progCtx, res.received, total)) { res.status = -1; goto done; }
     }

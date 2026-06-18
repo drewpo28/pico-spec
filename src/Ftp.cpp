@@ -8,10 +8,12 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <memory>
 
-// Shared transfer buffer (static, not stack — PICO_STACK_SIZE is only 4 KB).
-// One FTP transfer runs at a time from the OSD, so a single buffer is safe.
-static uint8_t g_ftp_buf[1024];
+// Transfer-buffer size. Allocated on the heap per-transfer (not a permanent static)
+// so the NIC reserves no SRAM when idle — headroom for memory-tight machines (Profi).
+// One FTP transfer runs at a time from the OSD.
+static const size_t FTP_BUF_SZ = 1024;
 
 Ftp::Ftp() : connected(false), cur_dir("/") {}
 Ftp::~Ftp() { disconnect(); }
@@ -153,9 +155,10 @@ bool Ftp::listStream(const std::string& path, RemoteListCb cb, void* ctx) {
 
     // Read the listing off the data connection, parsing one line at a time so we
     // never hold the whole directory in RAM (only the current line).
+    auto g_ftp_buf = std::make_unique<uint8_t[]>(FTP_BUF_SZ);
     std::string line;
     for (;;) {
-        int n = ZiFiSock::sock_recv(DATA, g_ftp_buf, sizeof(g_ftp_buf), 8000);
+        int n = ZiFiSock::sock_recv(DATA, g_ftp_buf.get(), FTP_BUF_SZ, 8000);
         if (n <= 0) break; // EOF / error
         for (int i = 0; i < n; i++) {
             char c = (char)g_ftp_buf[i];
@@ -188,14 +191,15 @@ bool Ftp::get(const std::string& remote, const std::string& localSdPath, XferPro
     FIL* f = fopen2(localSdPath.c_str(), FA_WRITE | FA_CREATE_ALWAYS);
     if (!f) { ZiFiSock::sock_close(DATA); return false; }
 
+    auto g_ftp_buf = std::make_unique<uint8_t[]>(FTP_BUF_SZ);
     uint32_t done = 0;
     bool ok = true;
     for (;;) {
-        int n = ZiFiSock::sock_recv(DATA, g_ftp_buf, sizeof(g_ftp_buf), 10000);
+        int n = ZiFiSock::sock_recv(DATA, g_ftp_buf.get(), FTP_BUF_SZ, 10000);
         if (n < 0) { ok = false; break; }
         if (n == 0) break; // EOF
         UINT bw;
-        if (f_write(f, g_ftp_buf, n, &bw) != FR_OK || (int)bw != n) { ok = false; break; }
+        if (f_write(f, g_ftp_buf.get(), n, &bw) != FR_OK || (int)bw != n) { ok = false; break; }
         done += n;
         if (cb && !cb(done, total)) { ok = false; break; } // user abort
     }
@@ -215,13 +219,14 @@ bool Ftp::put(const std::string& localSdPath, const std::string& remote, XferPro
     std::string reply;
     if (command("STOR", remote.c_str(), reply) / 100 != 1) { ZiFiSock::sock_close(DATA); fclose2(f); return false; }
 
+    auto g_ftp_buf = std::make_unique<uint8_t[]>(FTP_BUF_SZ);
     uint32_t done = 0;
     bool ok = true;
     for (;;) {
         UINT br;
-        if (f_read(f, g_ftp_buf, sizeof(g_ftp_buf), &br) != FR_OK) { ok = false; break; }
+        if (f_read(f, g_ftp_buf.get(), FTP_BUF_SZ, &br) != FR_OK) { ok = false; break; }
         if (br == 0) break; // EOF
-        if (ZiFiSock::sock_send(DATA, g_ftp_buf, br, 12000) != (int)br) { ok = false; break; }
+        if (ZiFiSock::sock_send(DATA, g_ftp_buf.get(), br, 12000) != (int)br) { ok = false; break; }
         done += br;
         if (cb && !cb(done, total)) { ok = false; break; }
     }
