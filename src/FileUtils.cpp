@@ -106,6 +106,29 @@ string FileUtils::getLCaseExt(const string& filename) {
     return toLower( extension );
 }
 
+string FileUtils::utf8ToCp1251(const string& s) {
+    string out; out.reserve(s.size());
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) { out += (char)c; i++; continue; }
+        if ((c & 0xE0) == 0xC0 && i + 1 < n && ((unsigned char)s[i+1] & 0xC0) == 0x80) {
+            unsigned cp = ((c & 0x1F) << 6) | ((unsigned char)s[i+1] & 0x3F);
+            char m = 0;
+            if (cp >= 0x0410 && cp <= 0x042F)      m = (char)(0xC0 + (cp - 0x0410)); // А-Я
+            else if (cp >= 0x0430 && cp <= 0x044F) m = (char)(0xE0 + (cp - 0x0430)); // а-я
+            else if (cp == 0x0401)                 m = (char)0xA8;                    // Ё
+            else if (cp == 0x0451)                 m = (char)0xB8;                    // ё
+            out += m ? m : '?';
+            i += 2; continue;
+        }
+        if ((c & 0xF0) == 0xE0 && i + 2 < n) { out += '?'; i += 3; continue; } // other 3-byte
+        if ((c & 0xF8) == 0xF0 && i + 3 < n) { out += '?'; i += 4; continue; } // 4-byte
+        out += (char)c; i++; // lone high byte — not UTF-8, leave as-is
+    }
+    return out;
+}
+
 DiskIface FileUtils::ifaceForExt(const string& lcExt) {
     if (lcExt == "trd" || lcExt == "scl" || lcExt == "fdi" || lcExt == "udi"
      || lcExt == "td0" || lcExt == "pro") return IFACE_BETA;

@@ -1,0 +1,12 @@
+services:
+  catalog:
+    build: .
+    image: pico-spec-catalog:latest
+    ports:
+      - "8080:8080"           # device points catalog_host at http://<host>:8080
+    environment:
+      CATALOG_SITES: "local,vtrd"
+      CATALOG_LOCAL_DIR: "/data/files"
+    volumes:
+      - ./data/files:/data/files   # drop .trd/.tap files here for the "local" source
+    restart: unless-stopped

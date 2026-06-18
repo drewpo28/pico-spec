@@ -175,6 +175,11 @@ typedef struct
     // byte offsets within the (decompressed) stream are stored in
     // fdiTrackHdrOffsets[]; td0Stream is the FIL to seek/read. Read-only. RP2350.
     bool IsTD0File;
+    // TR-DOS auto-boot: set when an SCL lacks a "boot" file and we synthesised one
+    // into the in-RAM catalog (SCLtoTRD). The boot's single data sector is served
+    // from flash (kTrdosBootSector) for track 0 / sector 9. TRD images get the boot
+    // written directly into the file at insert, so they don't need this flag.
+    bool bootInjected;
     FIL* td0Stream;          // file to stream track records from (Diskfile or temp)
     bool td0OwnsStream;      // true if td0Stream is a temp file we must close+unlink
     std::string td0TempPath; // temp file path to unlink on eject (if owned)

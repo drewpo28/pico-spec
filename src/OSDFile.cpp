@@ -60,9 +60,11 @@ using namespace std;
 #include "PinSerialData_595.h"
 #if ZIFI_NET_CLIENT
 #include "RemoteFs.h"
+#include "Snapshot.h"
 #endif
 
 extern Font Font6x8;
+extern Font Font6x8Cyr;   // CP1251 Cyrillic face for the online-catalog browser
 
 // Sort version: bump to invalidate cached .idx files when sort order changes
 #define SORT_VERSION 1
@@ -1259,6 +1261,11 @@ static void rfd_push(void* ctx, const char* name, bool isDir, uint32_t size) {
     if (isDir) rec += (char)DIR_MARKER;
     rec += name;
     idx->push(rec);
+    // The listing fetch has no byte-level progress, so pulse the dialog's bar as
+    // entries stream in — visible proof it's loading (not a frozen empty bar).
+    static unsigned tick = 0;
+    if ((++tick & 0x7) == 0)
+        OSD::progressDialog("", "", (int)((tick >> 3) % 20) * 5, 1); // 0,5,…,95, wrap
 }
 
 // Transfer progress: update the dialog; Esc/F1 aborts.
@@ -1283,9 +1290,11 @@ static bool rfd_progress(uint32_t done, uint32_t total) {
 static int rfd_scroll(const string& title, sorted_files& idx,
                       const char* const* synth, int nsynth,
                       const char* footer = nullptr, bool* delPressed = nullptr,
-                      bool* copyPressed = nullptr) {
+                      bool* copyPressed = nullptr, bool utf8 = false,
+                      bool* altPressed = nullptr) {
     if (delPressed)  *delPressed = false;
     if (copyPressed) *copyPressed = false;
+    if (altPressed)  *altPressed = false;
     const int cols_n = 36, MAXVIS = 16;
     int total = nsynth + (int)idx.size();
     int vis   = total < MAXVIS ? total : MAXVIS;
@@ -1296,33 +1305,44 @@ static int rfd_scroll(const string& title, sorted_files& idx,
     int h = (vis + 1 + foot) * OSD_FONT_H + 2;
     int wx = OSD::scrAlignCenterX(w), wy = OSD::scrAlignCenterY(h);
     int cursor = 0, top = 0;
+    int hscroll = 0, hdelay = 0, hstep = 0;  // horizontal marquee of the focused over-long row
     VIDEO::SaveRect.save(wx, wy, w, h);
 
+    // Draw one visible row r (0..vis-1). The focused row, when its text overflows the
+    // window, is shifted left by `hscroll` (the idle-loop marquee advances it).
+    auto drawRow = [&](int r) {
+        int ab = top + r;
+        VIDEO::vga.setFont(utf8 ? Font6x8Cyr : Font6x8);   // marquee calls this outside redraw()
+        VIDEO::vga.setTextColor(zxColor(0, 1), ab == cursor ? zxColor(5, 1) : zxColor(7, 1));
+        VIDEO::vga.setCursor(wx + 1, wy + 1 + OSD_FONT_H + r * OSD_FONT_H);
+        string disp;
+        if (ab < nsynth)        disp = synth[ab];
+        else if (ab < total) {
+            string rec = idx.get(ab - nsynth);
+            if (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER) disp = rec.substr(1) + "/";
+            else disp = rec;
+            if (utf8) disp = FileUtils::utf8ToCp1251(disp);   // Cyrillic names → CP1251 for the font
+        }
+        if (ab == cursor && (int)disp.size() > cols_n && hscroll > 0) {
+            int maxoff = (int)disp.size() - cols_n;
+            disp = disp.substr(hscroll > maxoff ? maxoff : hscroll);
+        }
+        if ((int)disp.size() > cols_n) disp = disp.substr(0, cols_n);
+        VIDEO::vga.print(" ");
+        VIDEO::vga.print(disp.c_str());
+        for (int i = (int)disp.size(); i < cols_n + 1; i++) VIDEO::vga.print(" ");
+    };
+
     auto redraw = [&]() {
-        VIDEO::vga.setFont(Font6x8);
+        VIDEO::vga.setFont(utf8 ? Font6x8Cyr : Font6x8);
         VIDEO::vga.rect(wx, wy, w, h, zxColor(0, 0));
         VIDEO::vga.fillRect(wx + 1, wy + 1, w - 2, OSD_FONT_H, zxColor(0, 0));
         VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(0, 0));
         VIDEO::vga.setCursor(wx + 1 + OSD_FONT_W, wy + 1);
-        string t = title;
+        string t = utf8 ? FileUtils::utf8ToCp1251(title) : title;
         if ((int)t.size() > cols_n) t = "..." + t.substr(t.size() - (cols_n - 3));
         VIDEO::vga.print(t.c_str());
-        for (int r = 0; r < vis; r++) {
-            int ab = top + r;
-            VIDEO::vga.setTextColor(zxColor(0, 1), ab == cursor ? zxColor(5, 1) : zxColor(7, 1));
-            VIDEO::vga.setCursor(wx + 1, wy + 1 + OSD_FONT_H + r * OSD_FONT_H);
-            string disp;
-            if (ab < nsynth)        disp = synth[ab];
-            else if (ab < total) {
-                string rec = idx.get(ab - nsynth);
-                if (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER) disp = rec.substr(1) + "/";
-                else disp = rec;
-            }
-            if ((int)disp.size() > cols_n) disp = disp.substr(0, cols_n);
-            VIDEO::vga.print(" ");
-            VIDEO::vga.print(disp.c_str());
-            for (int i = (int)disp.size(); i < cols_n + 1; i++) VIDEO::vga.print(" ");
-        }
+        for (int r = 0; r < vis; r++) drawRow(r);
         // Right-edge scrollbar when the list doesn't fit (track + proportional thumb).
         if (total > vis) {
             int sbx = wx + w - OSD_FONT_W - 1;
@@ -1344,6 +1364,17 @@ static int rfd_scroll(const string& title, sorted_files& idx,
             VIDEO::vga.print(fs.c_str());
         }
     };
+
+    // Cached full length of the focused row's text (idx.get is an SD read, so we
+    // compute it only on cursor change — never per idle tick). For a dir entry the
+    // DIR_MARKER byte it carries offsets the "/" we append, so rec.size() == display.
+    auto focusLen = [&]() -> int {
+        if (cursor < nsynth)  return (int)strlen(synth[cursor]);
+        if (cursor >= total)  return 0;
+        string rec = idx.get(cursor - nsynth);
+        return (int)(utf8 ? FileUtils::utf8ToCp1251(rec).size() : rec.size());
+    };
+    int flen = focusLen();
     redraw();
 
     while (1) {
@@ -1357,7 +1388,17 @@ static int rfd_scroll(const string& title, sorted_files& idx,
             else if (k.vk == fabgl::VK_PAGEDOWN) cursor += vis;
             else if (is_home(k.vk))     cursor = 0;
             else if (k.vk == fabgl::VK_END) cursor = total - 1;
-            else if (is_enter(k.vk))    { OSD::click(); VIDEO::SaveRect.restore_last(); return cursor; }
+            else if (is_enter(k.vk))    {
+                // Alt+Enter on a catalog file = download to /tmp and launch (vs. plain
+                // Enter which picks an SD folder and just downloads). Physical Enter is
+                // re-synthesized as VK_MENU_ENTER (main.cpp), which drops the item's
+                // .LALT flag — so query live key state, same as OSD::do_OSD does.
+                auto* kb = ESPectrum::PS2Controller.keyboard();
+                if (altPressed && kb &&
+                    (kb->isVKDown(fabgl::VK_LALT) || kb->isVKDown(fabgl::VK_RALT)))
+                    *altPressed = true;
+                OSD::click(); VIDEO::SaveRect.restore_last(); return cursor;
+            }
             else if (is_back(k.vk))     { OSD::click(); VIDEO::SaveRect.restore_last(); return -1; }
             else if (delPressed && (k.vk == fabgl::VK_F8 || k.vk == fabgl::VK_DELETE)) {
                 *delPressed = true; OSD::click(); VIDEO::SaveRect.restore_last(); return cursor;
@@ -1372,7 +1413,18 @@ static int rfd_scroll(const string& title, sorted_files& idx,
             if (cursor >= top + vis) top = cursor - vis + 1;
             if (top > total - vis) top = total - vis;
             if (top < 0) top = 0;
-            if (cursor != oc) { redraw(); OSD::click(); }
+            if (cursor != oc) { hscroll = hdelay = hstep = 0; flen = focusLen(); redraw(); OSD::click(); }
+        } else if (flen > cols_n) {
+            // Idle: marquee-scroll the focused over-long row — ~1 s pause, then shift
+            // one char every ~250 ms, wrapping back to the start (file-browser style).
+            if (hdelay < 200) hdelay++;
+            else if (++hstep >= 50) {
+                hstep = 0;
+                int over = flen - cols_n;
+                hscroll = (hscroll < over) ? hscroll + 1 : 0;
+                if (hscroll == 0) hdelay = 0;   // re-pause when wrapped to the start
+                drawRow(cursor - top);
+            }
         }
         sleep_ms(5);
     }
@@ -1481,7 +1533,7 @@ static bool rfd_copy_tree(RemoteFs* fs, const std::string& destSd, int depth) {
             if (!ok) return false;
         } else {
             rfd_xfer_title = MSG_NET_COPYING[Config::lang];
-            OSD::progressDialog(rfd_xfer_title, nm, 0, 0);
+            OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
             bool got = fs->get(nm, dst, rfd_progress);
             OSD::progressDialog("", "", 0, 2);
             if (!got) return false;
@@ -1490,27 +1542,91 @@ static bool rfd_copy_tree(RemoteFs* fs, const std::string& destSd, int depth) {
     return true;
 }
 
+// Launch a file that was just downloaded to /tmp (Alt+Enter in the catalog
+// browser). Tape images auto-run (flashload), snapshots auto-run, TR-DOS disk
+// images mount into Drive A. A .zip is unpacked first and its first usable inner
+// file launched. Returns true if something was loaded — the caller then closes
+// the whole OSD so the freshly loaded program runs.
+static bool rfd_launch_tmp(string path) {
+    string ext = FileUtils::getLCaseExt(path);
+
+    // Downloaded archive: unpack to /tmp and launch the first usable inner file.
+    if (ext == "zip") {
+        string inner = ZipExtract::extract(path, DISK_ALLFILE); // → /tmp/...
+        if (inner.empty() || inner == "\x1b") {
+            OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN);
+            return false;
+        }
+        path = inner;
+        ext  = FileUtils::getLCaseExt(path);
+    }
+
+    size_t slash = path.find_last_of('/');
+    string dir   = (slash == string::npos) ? "/" : path.substr(0, slash + 1); // keep trailing '/'
+    string base  = (slash == string::npos) ? path : path.substr(slash + 1);
+
+    if (ext == "tap" || ext == "tzx" || ext == "pzx" || ext == "wav" || ext == "mp3") {
+        FileUtils::TAP_Path = dir;
+        Config::save();
+        Tape::LoadTape("R" + base); // "R" = run (flashload if enabled); LoadTape prepends TAP_Path
+        return true;
+    }
+    if (ext == "sna" || ext == "z80" || ext == "p") {
+        FileUtils::SNA_Path = dir;
+        Config::save();
+        if (!LoadSnapshot(path, "", "")) {
+            OSD::osdCenteredMsg(OSD_PSNA_LOAD_ERR, LEVEL_WARN);
+            return false;
+        }
+        // /tmp snapshots are transient — don't pin them as the Alt+Backspace reload slot.
+        Config::ram_file = NO_RAM_FILE;
+        Config::last_ram_file = NO_RAM_FILE;
+        return true;
+    }
+    if (FileUtils::ifaceForExt(ext) == IFACE_BETA) {
+        FileUtils::DSK_Path = dir;
+        Config::betadisk = true;       // ensure the TR-DOS controller is active for the mount
+        rvmWD1793InsertDisk(&ESPectrum::fdd, 0, path);
+        if (ESPectrum::fdd.disk[0])
+            ESPectrum::fdd.disk[0]->writeprotect =
+                Config::driveWP[0] || ESPectrum::fdd.disk[0]->IsTD0File;
+        Config::save();
+        OSD::bootTrdos();              // cold-boot into TR-DOS so the disk auto-runs
+        return true;
+    }
+    OSD::osdCenteredMsg(string(MSG_NET_UNSUPPORTED[Config::lang]) + " (." + ext + ")",
+                        LEVEL_WARN, 2200);
+    return false;
+}
+
 void OSD::remoteFileDialog(RemoteFs* fs) {
     sorted_files idx;
     idx.init("__netfs__");           // /tmp/.__netfs__.idx
-    const char* synth[2] = { Config::lang ? "[Subir archivo aqui]" : "[Upload file here]", ".." };
+    // Read-only sources (online catalog) hide the upload row + the F8/Del action.
+    const bool ro = fs->readOnly();
+    const char* synth_rw[2] = { Config::lang ? "[Subir archivo aqui]" : "[Upload file here]", ".." };
+    const char* synth_ro[1] = { ".." };
+    const char* const* synth = ro ? synth_ro : synth_rw;
+    const int nsynth = ro ? 1 : 2;   // index of first listing entry
 
     while (1) {
         // ── (Re)build the index for the current directory (streamed) ──
-        OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], fs->cwdPath(), 0, 0);
+        OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], fs->cwdPath(), 0, 0, fs->utf8Names());
         idx.unlink();                // truncate to empty (also (re)creates the file)
         bool ok = fs->listStream("", rfd_push, &idx);
         OSD::progressDialog("", "", 0, 2);
         if (!ok) { OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000); idx.unlink(); return; }
-        idx.sort();
+        if (!fs->preSorted()) idx.sort(); // pre-sorted sources (static catalog) skip the slow on-disk sort
 
-        bool del = false, copy = false;
-        int sel = rfd_scroll(fs->cwdPath(), idx, synth, 2, MSG_NET_FOOTER[Config::lang], &del, &copy);
+        bool del = false, copy = false, alt = false;
+        int sel = rfd_scroll(fs->cwdPath(), idx, synth, nsynth,
+                             ro ? MSG_NET_FOOTER_RO[Config::lang] : MSG_NET_FOOTER[Config::lang],
+                             ro ? nullptr : &del, &copy, fs->utf8Names(), &alt);
         if (sel < 0) { idx.unlink(); return; } // Esc → leave browser
 
         if (del) {                       // F8/Del → delete a remote entry
-            if (sel >= 2) {
-                string rec = idx.get(sel - 2);
+            if (sel >= nsynth) {
+                string rec = idx.get(sel - nsynth);
                 bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
                 string nm = isDir ? rec.substr(1) : rec;
                 if (OSD::msgDialog(nm, MSG_NET_DELETE_Q[Config::lang]) == DLG_YES) {
@@ -1523,8 +1639,8 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
         }
 
         if (copy) {                      // F5 → copy file/folder to a chosen SD folder
-            if (sel >= 2) {
-                string rec = idx.get(sel - 2);
+            if (sel >= nsynth) {
+                string rec = idx.get(sel - nsynth);
                 bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
                 string nm = isDir ? rec.substr(1) : rec;
                 string destBase = rfd_choose_folder(Config::net_dl_dir);
@@ -1541,7 +1657,7 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
                     } else {                     // single file
                         string dst = destBase + (destBase.back() == '/' ? "" : "/") + nm;
                         rfd_xfer_title = MSG_NET_COPYING[Config::lang];
-                        OSD::progressDialog(rfd_xfer_title, nm, 0, 0);
+                        OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
                         ok = fs->get(nm, dst, rfd_progress);
                         OSD::progressDialog("", "", 0, 2);
                     }
@@ -1552,7 +1668,7 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
             continue; // re-list
         }
 
-        if (sel == 0) {                  // Upload a local SD file into this dir
+        if (!ro && sel == 0) {           // Upload a local SD file into this dir (RW only)
             string local = rfd_choose_file(Config::net_ul_dir);
             if (!local.empty()) {
                 size_t s = local.find_last_of('/');
@@ -1566,14 +1682,38 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
                 OSD::osdCenteredMsg(put_ok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
                                     put_ok ? LEVEL_INFO : LEVEL_WARN, 1800);
             }
-        } else if (sel == 1) {           // Parent directory
+        } else if (sel == nsynth - 1) {  // Parent directory ("..", last synth row)
             fs->cwd("..");
         } else {
-            string rec = idx.get(sel - 2);
+            string rec = idx.get(sel - nsynth);
             bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
             string nm = isDir ? rec.substr(1) : rec;
             if (isDir) {
                 fs->cwd(nm);
+            } else if (alt) {
+                // Alt+Enter: download to /tmp and launch straight away. Catalog display
+                // names carry no extension (it lives in the source locator) and the
+                // catalog's get() saves under that source basename — so ask the fs for
+                // the real filename and build the matching /tmp path, otherwise the
+                // launcher can't find the file or tell its type. On success close the
+                // whole OSD so the program runs.
+                string base = fs->downloadBasename(nm);
+                if (base.empty()) base = nm;
+                string tmpp = string("/tmp/") + base;
+                rfd_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
+                OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
+                bool got = fs->get(nm, tmpp, rfd_progress);
+                OSD::progressDialog("", "", 0, 2);
+                if (!got) {
+                    OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000);
+                } else {
+                    OSD::osdCenteredMsg(MSG_NET_LAUNCHING[Config::lang], LEVEL_INFO, 400);
+                    if (rfd_launch_tmp(tmpp)) {
+                        idx.unlink();
+                        OSD::net_launch_close = true; // signal the menu stack to close
+                        return;
+                    }
+                }
             } else {
                 // Pick the SD destination folder, then download into it.
                 string destDir = rfd_choose_folder(Config::net_dl_dir);
@@ -1583,7 +1723,7 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
                     FileUtils::mkdirParents(destDir.c_str());
                     string localp = destDir + (destDir.back() == '/' ? "" : "/") + nm;
                     rfd_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
-                    OSD::progressDialog(rfd_xfer_title, nm, 0, 0);
+                    OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
                     bool got = fs->get(nm, localp, rfd_progress);
                     OSD::progressDialog("", "", 0, 2);
                     OSD::osdCenteredMsg(got ? (string(MSG_NET_XFER_OK[Config::lang]) + "\n" + localp)

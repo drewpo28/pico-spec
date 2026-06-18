@@ -52,6 +52,11 @@ public:
     // True once begin() has succeeded and the ESP is in a known mux mode.
     static bool ready();
 
+    // True if the peer closed link `id` (CLOSED seen) and its ring is drained.
+    // Lets a layered protocol (e.g. TlsSock's BIO recv) tell a clean EOF apart
+    // from a transient "no data yet" return of sock_recv.
+    static bool isClosed(int id);
+
     // ── Server side (FTP server) ───────────────────────────────────────────────
     // Multi-connection mode + start a TCP server: AT+CIPMUX=1, AT+CIPSERVER=1,port.
     // Returns false if the ESP doesn't ack. After this, server_accept() waits for
@@ -74,7 +79,9 @@ public:
 
 private:
     static const int RX_SZ = 2048;
-    static uint8_t  rx_buf[N_LINKS][RX_SZ];
+    // Heap-backed (alloc in begin(), freed in end()) so the 4 KB isn't permanently
+    // reserved when the NIC is off — frees SRAM for memory-tight machines (Profi).
+    static uint8_t (*rx_buf)[RX_SZ];   // [N_LINKS][RX_SZ]
     static int      rx_head[N_LINKS];  // next byte to hand to sock_recv
     static int      rx_tail[N_LINKS];  // next free slot for the demux
     static bool     closed[N_LINKS];   // per-link EOF flags (CLOSED seen)

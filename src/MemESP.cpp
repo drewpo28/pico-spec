@@ -87,14 +87,14 @@ uint8_t* mem_desc_t::to_vram(void) {
         psram_write_page(ba, res); // single SPI CS for full 16KB (32-bit PIO, exact x)
         _int->mem_type = PSRAM_SPI;
     } else {
-        #ifdef PICO_DEFAULT_LED_PIN
+        #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
         gpio_put(PICO_DEFAULT_LED_PIN, true);
         #endif
         UINT bw;
         FSIZE_t lba = ba;
         f_lseek(&f, lba);
         f_write(&f, res, MEM_PG_SZ, &bw);
-        #if PICO_DEFAULT_LED_PIN
+        #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
         gpio_put(PICO_DEFAULT_LED_PIN, false);
         #endif
         _int->mem_type = SWAP;
@@ -135,14 +135,14 @@ void mem_desc_t::_write(uint16_t addr, uint8_t v) {
         write8psram(ba + addr, v);
         return;
     }
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, true);
     #endif
     UINT br;
     FSIZE_t lba = ba;
     f_lseek(&f, lba + addr);
     f_write(&f, &v, 1, &br);
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, false);
     #endif
 }
@@ -179,7 +179,7 @@ void mem_desc_t::from_file(FIL* f_in, size_t sz) {
         }
         return;
     }
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, true);
     #endif
     FSIZE_t lba = ba;
@@ -188,18 +188,18 @@ void mem_desc_t::from_file(FIL* f_in, size_t sz) {
         f_read(f_in, &v, 1, &br);
         f_write(&f, &v, 1, &br);
     }
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, false);
     #endif
 }
 void mem_desc_t::to_file(FIL* f_out, size_t sz) {
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, true);
     #endif
     UINT br;
     if (_int->mem_type == POINTER) {
         f_write(f_out, direct(), sz, &br);
-        #ifdef PICO_DEFAULT_LED_PIN
+        #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
         gpio_put(PICO_DEFAULT_LED_PIN, false);
         #endif
         return;
@@ -211,7 +211,7 @@ void mem_desc_t::to_file(FIL* f_out, size_t sz) {
             v = read8psram(ba + addr);
             f_write(f_out, &v, 1, &br);
         }
-        #ifdef PICO_DEFAULT_LED_PIN
+        #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
         gpio_put(PICO_DEFAULT_LED_PIN, false);
         #endif
         return;
@@ -222,7 +222,7 @@ void mem_desc_t::to_file(FIL* f_out, size_t sz) {
         f_read(&f, &v, 1, &br);
         f_write(f_out, &v, 1, &br);
     }
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, false);
     #endif
 }

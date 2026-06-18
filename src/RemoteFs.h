@@ -26,6 +26,19 @@ public:
     // on error. Never accumulates the whole listing in RAM.
     virtual bool listStream(const std::string& path, RemoteListCb cb, void* ctx) = 0;
 
+    // True if listStream already yields entries in the order to display (the OSD
+    // browser then skips its expensive on-disk sort). Default false → sort.
+    virtual bool preSorted() const { return false; }
+
+    // True for a read-only source (e.g. the online catalog): the OSD browser then
+    // hides the upload row and the F8/Del action. Read-write FTP/SFTP leave it false.
+    virtual bool readOnly() const { return false; }
+
+    // True if listStream yields entry names in UTF-8 (the online catalog). The OSD
+    // browser then transcodes to CP1251 for display so Cyrillic renders; the raw
+    // UTF-8 name is still used for navigation/download. Default false (8-bit names).
+    virtual bool utf8Names() const { return false; }
+
     // Change current directory. Returns false on error.
     virtual bool cwd(const std::string& path) = 0;
 
@@ -35,6 +48,14 @@ public:
     // Download `remote` (relative to cwd or absolute) to SD path `localSdPath`.
     virtual bool get(const std::string& remote, const std::string& localSdPath,
                      XferProgressCb cb) = 0;
+
+    // The local basename get() will actually create for entry `displayName`. The
+    // online-catalog display names carry no extension (the real filename lives in
+    // the source locator), and the catalog's get() saves under that source name —
+    // so Alt+Enter "download to /tmp and run" must ask here for the true filename
+    // (with extension) to know both the saved path and the file type. Default:
+    // echo the name (FTP/SFTP entry names already carry their extension).
+    virtual std::string downloadBasename(const std::string& displayName) { return displayName; }
 
     // Upload SD file `localSdPath` to `remote`.
     virtual bool put(const std::string& localSdPath, const std::string& remote,

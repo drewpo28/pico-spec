@@ -11,6 +11,7 @@
 #include <hardware/irq.h>
 #include <pico/time.h>
 #include <string.h>
+#include <stdlib.h>
 
 // ZiFi port map (A0..A7 == 0xEF, function selected by A8..A15):
 //   0x00..0xBF  DR   R/W  Data register (ZIFI or RS-232 stream)
@@ -60,10 +61,10 @@ static void zifi_set_baud(uint32_t target) {
 
 uint8_t ZiFi::enabled = 0;
 
-uint8_t  ZiFi::zifi_in_buf[ZiFi::ZIFI_IN_SZ];
+uint8_t* ZiFi::zifi_in_buf = nullptr;   // heap, allocated in init()
 volatile uint16_t ZiFi::zifi_in_head  = 0;
 volatile uint16_t ZiFi::zifi_in_tail  = 0;
-uint8_t  ZiFi::zifi_out_buf[256];
+uint8_t* ZiFi::zifi_out_buf = nullptr;  // heap, allocated in init()
 volatile uint8_t ZiFi::zifi_out_head = 0;
 volatile uint8_t ZiFi::zifi_out_tail = 0;
 
@@ -122,6 +123,11 @@ void ZiFi::rxReset() {
     if (g_swap_open) { f_close(&g_swap); g_swap_open = false; }
     f_unlink(ZIFI_SWAP_PATH);
 }
+
+// Public wrappers (let other modules drive the spill / read the drop counter
+// without exposing the internals).
+void     ZiFi::rxSpill()   { rxSpillTick(); }
+uint32_t ZiFi::rxDropped() { return rx_dropped; }
 
 // Per-frame: once the ring backs up, spill it to the SD swap file so it becomes
 // an effectively unbounded FIFO. Leaves SD mode when the backlog is fully drained.
@@ -183,6 +189,17 @@ bool __not_in_flash("zifi") ZiFi::rxAvailable() {
 
 void ZiFi::init() {
     if (hw_initialized) return;
+    // Allocate the RX/TX rings on the heap (freed in deinit) so they cost nothing
+    // when the NIC is off. RP2350 malloc panics on true OOM; ZiFi is only enabled
+    // from the menu (plenty of heap), never during a memory-tight machine boot.
+    if (!zifi_in_buf)  zifi_in_buf  = (uint8_t*)malloc(ZIFI_IN_SZ);
+    if (!zifi_out_buf) zifi_out_buf = (uint8_t*)malloc(256);
+    if (!zifi_in_buf || !zifi_out_buf) {
+        Debug::log("ZiFi: buffer alloc failed — NIC disabled");
+        hw_initialized = true;         // mark done so deinit() runs + frees
+        g_uart = nullptr;
+        return;
+    }
     api_mode = 0;
     rxReset();                         // ring + SD-swap state
     zifi_out_head = zifi_out_tail = 0;
@@ -225,6 +242,14 @@ void ZiFi::init() {
     uart_set_irq_enables(g_uart, true, false); // RX IRQ only
     irq_set_enabled(g_uart_irq, true);
     Debug::log("ZiFi: UART%d init TX=%d RX=%d baud=%u", inst, tx, rx, (unsigned)g_cur_baud);
+    // Diagnostic: confirm the funcsel mux actually latched the UART onto these pins.
+    // fsel should read back 2 (GPIO_FUNC_UART) or 11 (GPIO_FUNC_UART_AUX); if it's
+    // 31 (NULL) the route didn't stick — and NUM_BANK0_GPIOS shows the build package
+    // (30 = RP2350A, 48 = RP2350B) so we can tell if high pins are even in range.
+    Debug::log("ZiFi: pinmux NUM_BANK0_GPIOS=%d want_fsel=%d/%d got_fsel tx=%d rx=%d",
+               (int)NUM_BANK0_GPIOS,
+               (int)UART_FUNCSEL_NUM(g_uart, tx), (int)UART_FUNCSEL_NUM(g_uart, rx),
+               (int)gpio_get_function(tx), (int)gpio_get_function(rx));
     hw_initialized = true;
 }
 
@@ -246,6 +271,9 @@ void ZiFi::deinit() {
         g_tx = g_rx = BoardPins::PIN_OFF;
     }
     rxReset();                         // close/delete swap file, clear buffers
+    // Return the rings to the heap so a memory-tight machine (Profi) regains them.
+    free(zifi_in_buf);  zifi_in_buf  = nullptr;
+    free(zifi_out_buf); zifi_out_buf = nullptr;
     hw_initialized = false;
     api_mode = 0;
 }

@@ -10,7 +10,7 @@
 #include <stdlib.h>
 
 // ── Static storage ───────────────────────────────────────────────────────────
-uint8_t ZiFiSock::rx_buf[ZiFiSock::N_LINKS][ZiFiSock::RX_SZ];
+uint8_t (*ZiFiSock::rx_buf)[ZiFiSock::RX_SZ] = nullptr;  // heap, alloc in begin()
 int     ZiFiSock::rx_head[ZiFiSock::N_LINKS] = {0};
 int     ZiFiSock::rx_tail[ZiFiSock::N_LINKS] = {0};
 bool    ZiFiSock::closed[ZiFiSock::N_LINKS]  = {false};
@@ -92,12 +92,24 @@ static void process_status_line(const char* L) {
 }
 
 void ZiFiSock::pump(uint32_t budget_ms) {
+    if (!rx_buf) return;   // not begun (or buffers freed) — nothing to demux into
     absolute_time_t deadline = make_timeout_time_ms(budget_ms);
     do {
         uint8_t b;
         bool got = false;
         // Drain whatever the ZiFi RX pipe has buffered, one byte at a time.
-        while (ZiFi::recvRaw(&b, 1) == 1) {
+        for (;;) {
+            // Backpressure: if we're mid-payload and this link's ring is full, stop
+            // pulling from the ZiFi RX ring — leave the bytes there (it's larger and
+            // SD-spillable) instead of dropping them. recvRaw is destructive, so we
+            // must check BEFORE reading. The consumer drains rx_buf via sock_recv,
+            // then the next pump resumes this payload. Without this, a burst bigger
+            // than RX_SZ corrupts the TLS stream (MAC failure) on large transfers.
+            if (st == ST_IPD_PAYLOAD) {
+                int nt = (rx_tail[ipd_link] + 1) % RX_SZ;
+                if (nt == rx_head[ipd_link]) return; // ring full → let the consumer drain
+            }
+            if (ZiFi::recvRaw(&b, 1) != 1) break;
             got = true;
             switch (st) {
             case ST_SCAN:
@@ -191,6 +203,8 @@ bool ZiFiSock::atCmd(const char* cmd, const char* expect, uint32_t timeout_ms) {
 // ── Public API ───────────────────────────────────────────────────────────────
 bool ZiFiSock::begin(bool mux) {
     ZiFi::init(); // idempotent — ensure the UART backend is up
+    if (!rx_buf) rx_buf = (uint8_t(*)[RX_SZ])malloc((size_t)N_LINKS * RX_SZ);
+    if (!rx_buf) return false;   // OOM (shouldn't happen — begin runs with heap free)
     reset_parser();
     for (int i = 0; i < N_LINKS; i++) {
         rx_head[i] = rx_tail[i] = 0;
@@ -206,6 +220,11 @@ bool ZiFiSock::begin(bool mux) {
 }
 
 bool ZiFiSock::ready() { return is_ready; }
+
+bool ZiFiSock::isClosed(int id) {
+    if (id < 0 || id >= N_LINKS) return true;
+    return closed[id] && ringFill(id) == 0;
+}
 
 int ZiFiSock::sock_open(const char* host, uint16_t port, bool tls, uint32_t timeout_ms) {
     if (!is_ready) return -1;
@@ -279,11 +298,17 @@ int ZiFiSock::sock_send(int id, const uint8_t* buf, size_t len, uint32_t timeout
 
 int ZiFiSock::sock_recv(int id, uint8_t* buf, size_t maxlen, uint32_t timeout_ms) {
     if (id < 0 || id >= N_LINKS) return -1;
+    // Spill the IRQ ring to the SD swap so it can't overflow. Normally driven
+    // per-frame by ZiFi::tick(), but a blocking transfer (catalog over TLS, OSD
+    // alt-stack, Z80 paused) freezes the main loop — without this, large reads
+    // overrun zifi_in and lose raw TLS bytes (→ MAC failure / stalled records).
+    ZiFi::rxSpill();
     // Fast path: already-buffered payload.
     if (ringFill(id) > 0) return ringPop(id, buf, maxlen);
 
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
     while (!time_reached(deadline)) {
+        ZiFi::rxSpill();
         pump(50);
         if (ringFill(id) > 0) return ringPop(id, buf, maxlen);
         if (closed[id]) return 0; // peer closed and nothing left buffered → EOF
@@ -339,6 +364,12 @@ bool ZiFiSock::sock_closed(int id) {
 // ── Server side ──────────────────────────────────────────────────────────────
 bool ZiFiSock::server_listen(uint16_t port) {
     ZiFi::init(); // idempotent — bring the UART backend up
+    // The 4 KB demux ring is lazy-heaped (Profi OOM fix) and freed by end(). begin()
+    // allocates it for the client path; the FTP-server path comes through here, so it
+    // must allocate it too — otherwise pump() early-returns on a null rx_buf, atCmd()
+    // never sees the AT+CIPMUX=1 "OK", and the server "fails to start".
+    if (!rx_buf) rx_buf = (uint8_t(*)[RX_SZ])malloc((size_t)N_LINKS * RX_SZ);
+    if (!rx_buf) return false; // OOM
     reset_parser();
     for (int i = 0; i < N_LINKS; i++) {
         rx_head[i] = rx_tail[i] = 0;
@@ -377,11 +408,15 @@ int ZiFiSock::server_accept(uint32_t timeout_ms) {
 void ZiFiSock::server_stop() {
     for (int i = 0; i < N_LINKS; i++)
         if (opened[i]) sock_close(i);
-    atCmd("AT+CIPSERVER=0", "OK", 2000);
+    atCmd("AT+CIPSERVER=0", "OK", 2000);          // these still pump() → need rx_buf
     if (mux_mode) atCmd("AT+CIPMUX=0", "OK", 1000);
     reset_parser();
     accepted_link = -1;
     is_ready = false;
+    // Symmetric with server_listen()'s alloc (and end() on the client paths): return
+    // the 4 KB demux ring to the heap so it isn't leaked after the FTP server closes.
+    // The emulated ZiFi NIC uses its own buffers, so this is safe; ZiFi UART stays up.
+    free(rx_buf); rx_buf = nullptr;
 }
 
 void ZiFiSock::end() {
@@ -390,6 +425,7 @@ void ZiFiSock::end() {
     if (mux_mode) atCmd("AT+CIPMUX=0", "OK", 1000);
     reset_parser();
     is_ready = false;
+    free(rx_buf); rx_buf = nullptr;   // return the 4 KB to the heap
 }
 
 #endif // !PICO_RP2040 && ZIFI_NET_CLIENT

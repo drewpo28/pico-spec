@@ -991,7 +991,10 @@ void ESPectrum::setup() {
         Debug::log2SD("setup: Z80DMA::reset");
         Z80DMA::reset();
     }
-    ZiFi::enabled = Config::zifi_enabled;
+    // Profi forces ~80 KB of SRAM pages and OOMs at VIDEO::Init if the NIC's heap
+    // rings (~12 KB) are also up — so never bring ZiFi up on Profi, regardless of a
+    // stale zifi_enabled. (The menu also turns the NIC off when switching to Profi.)
+    ZiFi::enabled = Config::zifi_enabled && Config::arch != "Profi";
     if (ZiFi::enabled)
         ZiFi::init();
 #endif
@@ -2208,7 +2211,7 @@ void ESPectrum::loop() {
     // independent of the RTC — otherwise the only reconnect path was the SNTP sync,
     // so with RTC off the link stayed down and the menu always showed "WiFi Off".
     // The background state machine also runs SNTP, which is harmless when RTC is off.
-    if (!Config::wifi_ssid.empty() &&
+    if (!Config::wifi_ssid.empty() && Config::arch != "Profi" &&
         (Config::wifi_autoconnect || (ZiFi::enabled && Config::rtc_enabled))) {
         if (!rtc_autosync_begun) {
             uint32_t now = to_ms_since_boot(get_absolute_time());

@@ -211,6 +211,7 @@ public:
 
     static bool betadisk;       // TR-DOS interface enabled
     static bool trdosFastMode;
+    static bool trdosAutoBoot;  // inject a "boot" file into TRD/SCL images that lack one
     static uint8_t trdosSoundLed; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
     static uint8_t trdosBios; // 0=5.03, 1=5.04TM, 2=5.05D, 3=Custom (flashable)
     static bool driveWP[4];   // TR-DOS per-slot write protect (Drive A..D)
@@ -244,6 +245,12 @@ public:
     static uint8_t  net_proto;  // 0 = FTP, 1 = SFTP
     static string   net_dl_dir; // last SD folder a file was downloaded into
     static string   net_ul_dir; // last SD folder a file was uploaded from
+    // Archive download catalog (Network → Download archive). Either a bare
+    // "host"/"host:port" → dynamic /v1 server over plain HTTP, or a base URL with
+    // a path (e.g. "drewpo28.github.io/pico-spec-catalog", https assumed) → static
+    // GitHub-Pages tree fetched over TLS. See HttpCatalogFs. Empty = unset.
+    static string   catalog_host;
+    static uint16_t catalog_port; // dynamic mode only (0 = 80)
     static void loadWifiConfig();
     static void saveWifiConfig();
 #endif

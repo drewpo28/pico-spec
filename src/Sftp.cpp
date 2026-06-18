@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <algorithm>
+#include <memory>
 #include <strings.h>
 
 // SFTP v3 protocol constants (draft-ietf-secsh-filexfer-02).
@@ -275,15 +276,15 @@ bool Sftp::put(const std::string& localSdPath, const std::string& remote, XferPr
     if (!hr.u32(hid) || !hr.str(handle)) { fclose2(f); return false; } // skip req-id
 
     uint64_t off = 0; bool ok = true;
-    // Static (not stack): READ_CHUNK is 8 KB but PICO_STACK_SIZE is only 4 KB.
-    // Safe because the OSD calls this single-threaded and non-reentrantly.
-    static uint8_t chunk[READ_CHUNK];
+    // Heap (READ_CHUNK > PICO_STACK_SIZE; not static so it frees when idle → the NIC
+    // costs no SRAM, headroom for memory-tight machines). RAII-freed on every exit.
+    auto chunk = std::make_unique<uint8_t[]>(READ_CHUNK);
     for (;;) {
         UINT br;
-        if (f_read(f, chunk, sizeof(chunk), &br) != FR_OK) { ok = false; break; }
+        if (f_read(f, chunk.get(), READ_CHUNK, &br) != FR_OK) { ok = false; break; }
         if (br == 0) break;
         Buf wr; wr.u32(next_id++); wr.str(handle); wr.u64(off);
-        wr.u32(br); wr.raw(chunk, br);
+        wr.u32(br); wr.raw(chunk.get(), br);
         if (!sendPacket(FXP_WRITE, wr.d)) { ok = false; break; }
         if (!recvPacket(t, b) || t != FXP_STATUS) { ok = false; break; }
         Reader r(b); uint32_t id, code;

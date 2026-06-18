@@ -75,7 +75,11 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Ftp.h"
 #include "Sftp.h"
 #include "Ssh.h"
+#include "HttpCatalogFs.h"
+#include "HttpsGet.h"
 #include "Ftpd.h"
+#include "HttpCatalogFs.h"
+#include "HttpsGet.h"
 #endif
 #include "kbd_img.h"
 extern "C" void graphics_set_scanlines(uint8_t level);
@@ -132,6 +136,7 @@ using namespace std;
 #define OSD_MARGIN 4
 
 extern Font Font6x8;
+extern Font Font6x8Cyr;   // CP1251 Cyrillic face (online-catalog names)
 #ifdef VGA_HDMI
 extern bool SELECT_VGA;
 #endif
@@ -163,6 +168,7 @@ unsigned short OSD::last_begin_row = 0; // To check for changes
 uint8_t OSD::menu_level = 0;
 bool OSD::menu_saverect = false;
 unsigned short OSD::menu_curopt = 1;
+bool OSD::net_launch_close = false;
 bool OSD::menu_del_pressed = false;
 bool OSD::menu_rename_pressed = false;
 bool OSD::menu_quicksave_pressed = false;
@@ -185,7 +191,8 @@ unsigned short OSD::scrAlignCenterY(unsigned short pixel_height) { return (scrH 
 // Draws each character individually; cursor shown as highlighted block under current char.
 // Returns entered string on Enter, "\x1B" on Escape, "" if Enter pressed with empty field.
 // Ignores VK_MENU_* synthetic events to avoid double-fires from kbdExtraMapping.
-string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_text, bool mask) {
+string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_text, bool mask, int viscols) {
+    if (viscols <= 0 || viscols > maxlen) viscols = maxlen; // visible window
     string text = initial_text;
     bool reveal = false; // password mask: false → show '*', toggled with TAB
     auto Kbd = ESPectrum::PS2Controller.keyboard();
@@ -196,19 +203,22 @@ string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_tex
     uint8_t blinkCtr = 7; // triggers first draw immediately (++&0x7==0)
 
     auto redraw = [&](bool cursorOn) {
-        string display = text;
-        while ((int)display.length() < maxlen) display += ' ';
         int cur = (int)text.length();
-        for (int p = 0; p < maxlen; p++) {
-            bool isCursor = (p == cur && cur < maxlen) || (p == maxlen - 1 && cur >= maxlen);
+        bool full = (cur >= maxlen);
+        // Scroll so the cursor cell stays inside the visible window.
+        int scroll = (cur >= viscols) ? (cur - viscols + 1) : 0;
+        if (scroll > maxlen - viscols) scroll = maxlen - viscols;
+        for (int p = 0; p < viscols; p++) {
+            int idx = scroll + p;
+            bool isCursor = (!full && idx == cur) || (full && p == viscols - 1);
             if (isCursor && cursorOn)
                 VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(1, 1));
             else
                 VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(5, 1));
             VIDEO::vga.setCursor(ex + p * OSD_FONT_W, ey);
             // Masked password: render '*' for the typed characters until revealed.
-            char dch = display[p];
-            if (mask && !reveal && p < cur) dch = '*';
+            char dch = (idx < cur) ? text[idx] : ' ';
+            if (mask && !reveal && idx < cur) dch = '*';
             char ch[2] = { dch, 0 };
             VIDEO::vga.print(ch);
         }
@@ -326,8 +336,8 @@ static string wifiAskPassword(const string& ssid) {
 // ─── Network file-transfer client (FTP / SFTP) ──────────────────────────────
 // A centred single-line text-entry dialog (host / user / port). Returns the
 // typed text, or "\x1B" if Esc was pressed. Generalises wifiAskPassword().
-static string netAskField(const string& label, const string& initial, bool mask = false) {
-    const int field = 30;
+static string netAskField(const string& label, const string& initial, bool mask = false, int field = 30, int maxlen = 0) {
+    if (maxlen <= 0 || maxlen < field) maxlen = field; // input cap (>= visible width)
     const int lbl = (int)label.size();
     const unsigned short cols = lbl + field + 2;
     const unsigned short w = (cols * OSD_FONT_W) + 2;
@@ -348,7 +358,7 @@ static string netAskField(const string& label, const string& initial, bool mask 
         VIDEO::vga.print(hint);
     }
     VIDEO::vga.setTextColor(zxColor(0, 0), zxColor(7, 1));
-    string r = OSD::inlineTextEdit(x + OSD_FONT_W, y + 1 + OSD_FONT_H + 1, field, initial, mask);
+    string r = OSD::inlineTextEdit(x + OSD_FONT_W, y + 1 + OSD_FONT_H + 1, maxlen, initial, mask, field);
     VIDEO::SaveRect.restore_last();
     return r;
 }
@@ -522,6 +532,58 @@ static void ftpdLogLine(const char* s) {
     ftpd_log_dirty = true;
 }
 
+// ── Live ESP-01 AT-log window (shown during a blocking WiFi connect) ──────────
+// ZiFiAT::log_cb → wifiLogLine appends each tx/rx line to the shared ftpd_log ring
+// and redraws the tail immediately, so the ESP-01 exchange scrolls live while
+// connect() blocks. Reuses ftpd_log[] (a generic line ring) — the WiFi connect
+// window and the FTP server are never up at the same time.
+static string s_wifilog_sub;
+static void wifiLogDraw() {
+    OSD::drawOSD(true);
+    int visCols = OSD::osdMaxCols(); if (visCols > 40) visCols = 40;
+    int visRows = OSD::osdMaxRows() - 4;
+    char row[42];
+    OSD::osdAt(1, 0);                                   // subtitle: "Connecting <ssid>"
+    VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(1, 0));
+    snprintf(row, sizeof(row), " %s", s_wifilog_sub.c_str());
+    int hl = strlen(row); while (hl < visCols) row[hl++] = ' '; row[visCols] = '\0';
+    VIDEO::vga.print(row);
+    OSD::osdAt(2, 0);                                   // separator
+    VIDEO::vga.setTextColor(zxColor(5, 0), zxColor(1, 0));
+    memset(row, '-', visCols); row[0] = ' '; row[visCols] = '\0';
+    VIDEO::vga.print(row);
+    int first = ftpd_log_count > visRows ? ftpd_log_count - visRows : 0; // tail
+    VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
+    for (int r = 0; r < visRows; r++) {
+        OSD::osdAt(3 + r, 0);
+        int li = first + r;
+        if (li < ftpd_log_count) {
+            const char* s = ftpd_log[li % FTPD_LOG_LINES];
+            int len = strlen(s); if (len > visCols) len = visCols;
+            memcpy(row, s, len); memset(row + len, ' ', visCols - len);
+        } else memset(row, ' ', visCols);
+        row[visCols] = '\0';
+        VIDEO::vga.print(row);
+    }
+}
+static void wifiLogLine(const char* s) { ftpdLogLine(s); wifiLogDraw(); }
+// Append a final line (e.g. an error) and hold the window open until the user
+// presses a key — so a failure stays readable instead of auto-closing.
+static void wifiLogHold(const char* msg) {
+    if (msg && msg[0]) ftpdLogLine(msg);
+    ftpdLogLine(Config::lang ? " -- pulsa una tecla --" : " -- press a key --");
+    wifiLogDraw();
+    auto* kb = ESPectrum::PS2Controller.keyboard();
+    while (kb->virtualKeyAvailable()) { fabgl::VirtualKeyItem k; kb->getNextVirtualKey(&k); } // drain
+    for (;;) {
+        if (kb->virtualKeyAvailable()) {
+            fabgl::VirtualKeyItem k;
+            if (kb->getNextVirtualKey(&k) && k.down) break;
+        }
+        sleep_ms(5);
+    }
+}
+
 struct FtpdCtx { const char* ip; };
 
 // Run the server session (details panel + live log terminal) in a blocking loop
@@ -611,6 +673,149 @@ static void ftpServerRun() {
     if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
     void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7); // 8-byte aligned top
     net_call_on_stack(top, ftpdSessionRun, &ctx);
+    free(stk);
+}
+
+// ── Download archive (catalog server over plain HTTP) ───────────────────────
+// Browses the pico-spec catalog server (HttpCatalogFs) with the same generic
+// remoteFileDialog used for FTP/SFTP. Runs on the large heap stack like the
+// FTP/SFTP session — no crypto here, but the SD-indexed browser is the heavy
+// part, so we keep off the 4 KB core stack for safety + consistency.
+static void archSessionRun(void* p) {
+    (void)p;
+    OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], "", 0, 0); // no URL (built-in catalog)
+    static string site_ids[12];
+    static string site_names[12];
+    int n = HttpCatalogFs::fetchSites(site_ids, site_names, 12);
+    OSD::progressDialog("", "", 0, 2);
+    if (n <= 0) { OSD::osdCenteredMsg(MSG_ARCH_SITES_ERR[Config::lang], LEVEL_WARN, 2200); return; }
+
+    string m = string(MENU_ARCH_SITE_TITLE[Config::lang]) + "\n";
+    for (int i = 0; i < n; i++) m += site_names[i] + "\n";
+    OSD::menu_level = 2; OSD::menu_saverect = true; OSD::menu_curopt = 1;
+    uint8_t sel = OSD::menuRun(m);
+    if (sel == 0) return;
+    VIDEO::SaveRect.restore_last();
+
+    HttpCatalogFs* fs = new HttpCatalogFs(site_ids[sel - 1].c_str());
+    OSD::remoteFileDialog(fs); // SD-indexed browser (bounded RAM); F5 saves to SD
+    fs->disconnect();
+    delete fs;
+}
+
+// Top-level entry: require an active WiFi link, then browse the built-in online
+// catalog. The catalog URL is hardcoded (HttpCatalogFs) — nothing to configure.
+static void netDownloadArchive() {
+    string ssid, ip;
+    if (!ZiFiAT::getStatus(ssid, ip)) {
+        OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200);
+        return;
+    }
+
+    size_t stksz = 12 * 1024;
+    uint8_t* stk = (uint8_t*)malloc(stksz);
+    if (!stk) { stksz = 8 * 1024; stk = (uint8_t*)malloc(stksz); }
+    if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
+    void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7);
+    net_call_on_stack(top, archSessionRun, nullptr);
+    free(stk);
+}
+
+// ── HTTP test ("curl") ──────────────────────────────────────────────────────
+// A diagnostic: GET an arbitrary URL and show the result. Exercises HttpsGet ->
+// TlsSock (host-TLS over the ESP plain-TCP pipe) on real hardware — the Step-0
+// spike that can't be validated off-target. Output is a summary only (no SD file).
+extern size_t getFreeHeap(void);
+
+namespace {
+struct HttpTestCtx { std::string url; };
+// Preview accumulator passed to the sink as ctx (lives on the alt-stack, no BSS).
+struct HttpPreview { char* buf; size_t cap; size_t n; };
+
+// Collects a printable preview of the first bytes; drains the rest (return true)
+// so the whole body still streams (and Content-Length is satisfied).
+bool httpTestSink(void* ctx, const uint8_t* data, size_t len) {
+    HttpPreview* pv = (HttpPreview*)ctx;
+    while (pv->n + 1 < pv->cap && len) {
+        uint8_t b = *data++; len--;
+        bool printable = (b >= 32 && b < 127) || b == '\n' || b == '\t';
+        pv->buf[pv->n++] = printable ? (char)b : '.';
+    }
+    return true;
+}
+
+void httpTestRun(void* p) {
+    HttpTestCtx* c = (HttpTestCtx*)p;
+    // Buffers live on this alt-stack (12 KB) — no permanent SRAM/BSS. Kept modest
+    // so they don't crowd the mbedTLS handshake sharing the same stack.
+    char preview[512];
+    char summary[1024];
+    HttpPreview pv = { preview, sizeof(preview), 0 };
+
+    OSD::progressDialog(MSG_HTTP_TESTING[Config::lang], c->url, 0, 0);
+    size_t heap0 = getFreeHeap();
+    HttpsGet::Result r = HttpsGet::get(c->url.c_str(), httpTestSink, &pv,
+                                       CONFIG_DIR "/cacert.pem");
+    size_t heap1 = getFreeHeap();
+    OSD::progressDialog("", "", 0, 2);
+    preview[pv.n] = '\0';
+    Debug::log("netHttpTest: status=%d len=%lu recv=%lu ok=%d heap before/after=%u/%u",
+               r.status, (unsigned long)r.length, (unsigned long)r.received, r.ok,
+               (unsigned)heap0, (unsigned)heap1);
+    snprintf(summary, sizeof(summary),
+             "%s\n\nstatus: %d\nContent-Length: %lu\nreceived: %lu\nok: %s\n"
+             "free heap: %u -> %u\n\n--- body ---\n%s",
+             c->url.c_str(), r.status, (unsigned long)r.length,
+             (unsigned long)r.received, r.ok ? "yes" : "no",
+             (unsigned)heap0, (unsigned)heap1, preview);
+    OSD::showTextDialog(MSG_HTTP_TEST_TITLE[Config::lang], summary);
+}
+} // namespace
+
+static void netHttpTest() {
+    string ssid, ip;
+    if (!ZiFiAT::getStatus(ssid, ip)) {
+        OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200);
+        return;
+    }
+    // Scheme.
+    OSD::menu_level = 2; OSD::menu_saverect = true; OSD::menu_curopt = 1;
+    uint8_t sc = OSD::menuRun(MENU_HTTP_SCHEME[Config::lang]);
+    if (sc == 0) return;
+    VIDEO::SaveRect.restore_last();
+    const char* scheme = (sc == 1) ? "https" : "http";
+
+    // Session-only memory of the last host/path (RAM only — not persisted to NVS).
+    // Survives until the board reboots; no Config default is substituted.
+    static string lastHost;          // empty on first use
+    static string lastPath = "/";
+
+    // Host[:port] — prefilled with whatever was last typed this session.
+    string host = netAskField(MSG_HTTP_HOST_LABEL[Config::lang], lastHost);
+    if (host == "\x1B" || host.empty()) return;
+    lastHost = host;
+
+    // Path — visible width clamped to the screen, but the input cap is larger so
+    // long paths can be typed (the field scrolls horizontally past the window).
+    int pathField = (int)OSD::osdMaxCols() - (int)strlen(MSG_HTTP_PATH_LABEL[Config::lang]) - 4;
+    if (pathField < 20) pathField = 20;
+    if (pathField > 64) pathField = 64;
+    string path = netAskField(MSG_HTTP_PATH_LABEL[Config::lang], lastPath, false, pathField, 255);
+    if (path == "\x1B") return;
+    if (path.empty() || path[0] != '/') path = "/" + path;
+    lastPath = path;
+
+    HttpTestCtx ctx;
+    ctx.url = string(scheme) + "://" + host + path;
+
+    // Run the GET (and its TLS handshake) on a large heap stack, like the FTP/
+    // archive sessions — the 4 KB core stack can't hold the mbedTLS handshake.
+    size_t stksz = 12 * 1024;
+    uint8_t* stk = (uint8_t*)malloc(stksz);
+    if (!stk) { stksz = 8 * 1024; stk = (uint8_t*)malloc(stksz); }
+    if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
+    void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7);
+    net_call_on_stack(top, httpTestRun, &ctx);
     free(stk);
 }
 #endif // ZIFI_NET_CLIENT
@@ -1038,6 +1243,28 @@ static string hkBindingText(int idx);
 static string expandHotkeys(const char* menu);
 extern const char* const hkDescEN[];
 extern const char* const hkDescES[];
+
+// Cold-boot into TR-DOS for the current architecture. Mirrors the per-arch
+// "Reset to… → TR-DOS" logic (HK_RESET_TO): Profi boots bank1 + SYSEN-style
+// TR-DOS, Pentagon/Profi (incl. Gluk 128Kpg) boots the TR-DOS ROM (bank4) with
+// romLatch + trdos asserted. 48K/128K have no dedicated TR-DOS cold-boot bank
+// (entry is only via the BASIC trap), so they get a plain reset with the disk
+// left mounted. Used by the Alt+Enter "download a disk to /tmp and run" path.
+void OSD::bootTrdos() {
+    Config::ram_file = NO_RAM_FILE;
+    Config::last_ram_file = NO_RAM_FILE;
+    if (Config::arch == "Profi") {
+        ESPectrum::reset(1);
+        MemESP::romLatch = 1;
+        ESPectrum::trdos = true;
+    } else if (Z80Ops::isPentagon || Z80Ops::isProfi) {
+        ESPectrum::reset(4); // TR-DOS ROM
+        MemESP::romLatch = 1;
+        ESPectrum::trdos = true;
+    } else {
+        ESPectrum::reset(0); // 48K/128K: no TR-DOS cold bank — restart, disk stays mounted
+    }
+}
 
 // OSD Main Loop
 void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
@@ -1924,6 +2151,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             // Main menu
             menu_saverect = false;
             menu_level = 0;
+            // An online-archive file was downloaded to /tmp and launched: tear the
+            // whole menu stack down so the freshly loaded program runs immediately.
+            if (OSD::net_launch_close) { OSD::net_launch_close = false; if (VIDEO::OSD) OSD::drawStats(); return; }
             uint8_t opt = menuRun(getMenuPrefix() + Config::arch + "\n" +
                 (!FileUtils::fsMount ? MENU_MAIN_NO_SD[Config::lang] : MENU_MAIN[Config::lang])
             );
@@ -2204,8 +2434,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 string fm = MENU_BETADISK_FASTMODE[Config::lang];
                                 string sl = MENU_BETADISK_SNDLED[Config::lang];
                                 string rm = MENU_BETADISK_ROM[Config::lang];
-                                if (!Config::betadisk) { fm = "\x01" + fm; sl = "\x01" + sl; rm = "\x01" + rm; }
-                                betamenu += fm + sl + rm;
+                                string ab = MENU_BETADISK_AUTOBOOT[Config::lang];
+                                if (!Config::betadisk) { fm = "\x01" + fm; sl = "\x01" + sl; rm = "\x01" + rm; ab = "\x01" + ab; }
+                                betamenu += fm + sl + rm + ab;
                             }
 
                             // Save the backing rect only on the very first draw so the
@@ -2404,6 +2635,40 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         menu_saverect = false;
                                     } else {
                                         menu_curopt = 8;
+                                        menu_level = 2;
+                                        menu_saverect = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            else if (dsk_num == 9) {
+                                // Auto-boot: inject a "boot" file into TRD/SCL images
+                                // that lack one so TR-DOS autostarts after mounting.
+                                menu_level = 3;
+                                menu_curopt = Config::trdosAutoBoot ? 1 : 2;
+                                menu_saverect = true;
+                                while (1) {
+                                    string menu = MENU_AUTOBOOT[Config::lang];
+                                    menu += MENU_YESNO[Config::lang];
+                                    bool prev = Config::trdosAutoBoot;
+                                    if (prev) {
+                                        menu.replace(menu.find("[Y",0),2,"[*");
+                                        menu.replace(menu.find("[N",0),2,"[ ");
+                                    } else {
+                                        menu.replace(menu.find("[Y",0),2,"[ ");
+                                        menu.replace(menu.find("[N",0),2,"[*");
+                                    }
+                                    uint8_t opt2 = menuRun(menu);
+                                    if (opt2) {
+                                        bool nv = (opt2 == 1);
+                                        if (nv != prev) {
+                                            Config::trdosAutoBoot = nv;
+                                            Config::save();
+                                        }
+                                        menu_curopt = opt2;
+                                        menu_saverect = false;
+                                    } else {
+                                        menu_curopt = 9;
                                         menu_level = 2;
                                         menu_saverect = false;
                                         break;
@@ -4596,6 +4861,16 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     VIDEO::disableGigascreenForProfi();
                                     OSD::osdCenteredMsg("Gigascreen disabled", LEVEL_INFO, 1500);
                                 }
+                                // Switching into Profi: turn the ZiFi NIC off and free its
+                                // ~12 KB of heap rings — Profi forces ~80 KB of SRAM pages
+                                // and OOMs at VIDEO::Init otherwise. Persist Off so the boot
+                                // into Profi has the room (boot also skips ZiFi on Profi).
+                                if (Config::arch == "Profi" && Config::zifi_enabled) {
+                                    Config::zifi_enabled = 0;
+                                    ZiFi::enabled = 0;
+                                    if (!ZiFiAT::connected) { ZiFiSock::end(); ZiFi::deinit(); }
+                                    OSD::osdCenteredMsg("ZiFi NIC disabled", LEVEL_INFO, 1500);
+                                }
 #endif
                                 Config::save();
 #if !PICO_RP2040
@@ -6075,38 +6350,69 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             OSD::osdCenteredMsg(MSG_WIFI_DISCONNECTED[Config::lang], LEVEL_INFO, 1500);
                         }
                     } else {
-                        OSD::osdCenteredMsg(MSG_WIFI_SCANNING[Config::lang], LEVEL_INFO, 0);
+                        // ONE live ESP-01 log window for the whole flow: scan → SSID pick
+                        // → password → connect → SNTP. It stays up the entire time (the
+                        // SSID menu and password box draw over it and restore their own
+                        // regions). On error it does NOT auto-close — it holds until a
+                        // keypress so the failure stays readable. SaveRect: the window is
+                        // pushed once here and popped on every exit path. menuRun, on a
+                        // selection, leaves its own save for us to pop (→ window reappears);
+                        // on Esc it restores itself, so we pop only the window.
+                        ftpd_log_count = 0;
+                        s_wifilog_sub = MSG_WIFI_SCANNING[Config::lang];
+                        unsigned short wlx = OSD::scrAlignCenterX(OSD_W);
+                        unsigned short wly = OSD::scrAlignCenterY(OSD_H);
+                        VIDEO::SaveRect.save(wlx, wly, OSD_W, OSD_H);   // [window]
+                        wifiLogDraw();
+                        ZiFiAT::log_cb = wifiLogLine;
                         // static, not on the 4 KB core stack: 24 std::strings (~768 B)
                         // plus the nested connect+SNTP-sync call chain under do_OSD
                         // overflowed the stack (SIGBUS/stackOvf). Single-use, non-reentrant.
                         static string nets[24];
                         int n = ZiFiAT::scan(nets, 24);
-                        if (n <= 0) { OSD::osdCenteredMsg(MSG_WIFI_NO_NETS[Config::lang], LEVEL_WARN, 2000); return; }
+                        ZiFiAT::log_cb = nullptr;             // no AT traffic during menu/password
+                        if (n <= 0) {
+                            wifiLogHold(MSG_WIFI_NO_NETS[Config::lang]); // error → hold open
+                            VIDEO::SaveRect.restore_last();
+                            return;
+                        }
                         string m = string(MENU_WIFI_LIST_TITLE[Config::lang]) + "\n";
                         for (int i = 0; i < n; i++) m += nets[i] + "\n";
                         menu_level = 2; menu_saverect = true; menu_curopt = 1;
-                        uint8_t sel = menuRun(m);
-                        if (sel > 0) {
-                            VIDEO::SaveRect.restore_last();
-                            string chosen = nets[sel - 1];
-                            string pass = wifiAskPassword(chosen);
-                            if (pass != "\x1B") {
-                                OSD::osdCenteredMsg(MSG_WIFI_CONNECTING[Config::lang], LEVEL_INFO, 0);
-                                if (ZiFiAT::connect(chosen, pass) == ZiFiAT::OK) {
-                                    Config::wifi_ssid = chosen; Config::wifi_pass = pass; Config::wifi_autoconnect = true;
-                                    Config::saveWifiConfig();
-                                    // Sync the clock right away, then report it all in one OSD.
-                                    string msg = string(MSG_WIFI_CONNECTED[Config::lang]) + "\n" + ZiFiAT::current_ip;
-                                    if (Config::rtc_enabled) {
-                                        OSD::osdCenteredMsg(MSG_RTC_SYNCING[Config::lang], LEVEL_INFO, 0); // working notice
-                                        string when;
-                                        if (ZiFiAT::syncTime(Config::wifi_tz, when) == ZiFiAT::OK)
-                                            msg += "\n" + when;
-                                    }
-                                    OSD::osdCenteredMsg(msg, LEVEL_INFO, 2500); // single combined result
-                                } else
-                                    OSD::osdCenteredMsg(MSG_WIFI_CONNECT_ERR[Config::lang], LEVEL_WARN, 2500);
-                            }
+                        uint8_t sel = menuRun(m);            // draws over the window
+                        if (sel <= 0) {                      // Esc: menuRun restored its own save
+                            VIDEO::SaveRect.restore_last();  // pop [window]
+                            return;
+                        }
+                        VIDEO::SaveRect.restore_last();      // pop menuRun's save → window reappears
+                        string chosen = nets[sel - 1];
+                        s_wifilog_sub = chosen;
+                        wifiLogDraw();
+                        string pass = wifiAskPassword(chosen); // box draws over the window
+                        if (pass == "\x1B") {                // password cancelled
+                            VIDEO::SaveRect.restore_last();  // pop [window]
+                            return;
+                        }
+                        s_wifilog_sub = string(MSG_WIFI_CONNECTING[Config::lang]) + " " + chosen;
+                        wifiLogDraw();                       // repaint over the box region
+                        ZiFiAT::log_cb = wifiLogLine;
+                        ZiFiAT::Status cst = ZiFiAT::connect(chosen, pass);
+                        string when;
+                        if (cst == ZiFiAT::OK && Config::rtc_enabled)
+                            ZiFiAT::syncTime(Config::wifi_tz, when); // streamed too
+                        ZiFiAT::log_cb = nullptr;
+                        if (cst == ZiFiAT::OK) {
+                            Config::wifi_ssid = chosen; Config::wifi_pass = pass; Config::wifi_autoconnect = true;
+                            Config::saveWifiConfig();
+                            wifiLogLine(MSG_WIFI_CONNECTED[Config::lang]);
+                            sleep_ms(900);                   // brief, then auto-close on success
+                            VIDEO::SaveRect.restore_last();  // pop [window]
+                            string msg = string(MSG_WIFI_CONNECTED[Config::lang]) + "\n" + ZiFiAT::current_ip;
+                            if (!when.empty()) msg += "\n" + when;
+                            OSD::osdCenteredMsg(msg, LEVEL_INFO, 2500);
+                        } else {
+                            wifiLogHold(MSG_WIFI_CONNECT_ERR[Config::lang]); // error → hold open
+                            VIDEO::SaveRect.restore_last();  // pop [window]
                         }
                     }
                 };
@@ -6134,6 +6440,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 
                 refreshNetStatus();
                 while (1) {
+                    if (OSD::net_launch_close) break;   // remoteFileDialog launched a /tmp download → close OSD
                     menu_level = 1;
                     // Row 2: live WiFi status, padded to a fixed width so geometry is stable.
                     string st;
@@ -6144,6 +6451,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         if (avail < 0) avail = 0;
                         if ((int)ssid.size() > avail) ssid.resize(avail);
                         st = string(pre) + ssid + " " + ip;
+                    } else if (ZiFiAT::autoSyncBusy()) {
+                        // Boot auto-connect (CWJAP→SNTP) still running — don't claim "Off".
+                        st = "WiFi connecting...";
                     } else st = "WiFi Off";
                     if (st.size() < 32) st.append(32 - st.size(), ' '); else st.resize(32);
 
@@ -6153,8 +6463,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if ZIFI_NET_CLIENT
                     nm += (Config::lang ? "Transferir archivos\t>\n" : "File transfer\t>\n"); // 3
                     nm += (Config::lang ? "Servidor FTP\t>\n" : "FTP Server\t>\n");           // 4
+                    nm += (Config::lang ? "Archivos online\t>\n"   : "Online archives\t>\n"); // 4
+                    nm += string(MENU_HTTP_TEST_ITEM[Config::lang]);              // 5
 #endif
-                    nm += "ZiFi NIC\t>\n";                                        // 3 or 5
+                    nm += "ZiFi NIC\t>\n";                                        // 3 or 6
 
                     uint8_t net_opt = menuRun(nm);
                     if (net_opt == 0) break;
@@ -6164,7 +6476,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if ZIFI_NET_CLIENT
                     else if (net_opt == 3) { netFileTransfer(); }
                     else if (net_opt == 4) { ftpServerRun(); }
-                    else if (net_opt == 5) doNic();
+                    else if (net_opt == 5) { netDownloadArchive(); }
+                    else if (net_opt == 6) { netHttpTest(); }
+                    else if (net_opt == 7) doNic();
 #else
                     else if (net_opt == 3) doNic();
 #endif
@@ -8898,7 +9212,7 @@ void OSD::HWInfo() {
             " Chip VREG      : %d.%02d V\n"
             " Chip RAM       : 520 KB\n"
             " Free RAM       : %d KB\n",
-            rp2350a ? "A" : "B", (int)cpu_hz,
+            chip_is_rp2350a() ? "A" : "B", (int)cpu_hz,
             mv / 1000, (mv % 1000) / 10,
             (int)(free_heap / 1024));
     }
@@ -9014,7 +9328,7 @@ void OSD::ChipInfo() {
             " VREG voltage   : %d.%02d V\n"
             " Chip RAM       : 520 KB\n"
             " Free RAM       : %d KB\n",
-            rp2350a ? "A" : "B",
+            chip_is_rp2350a() ? "A" : "B",
             (int)cpu_hz,
             mv / 1000, (mv % 1000) / 10,
             (int)(free_heap / 1024));
@@ -9075,7 +9389,7 @@ void OSD::ChipInfo() {
         volatile uint32_t *resets     = (volatile uint32_t *)0x40020000;
         volatile uint32_t *adc_cs     = (volatile uint32_t *)0x400a0000;
         volatile uint32_t *adc_result = (volatile uint32_t *)0x400a0004;
-        uint32_t ts_ch = rp2350a ? 4 : 8;
+        uint32_t ts_ch = chip_is_rp2350a() ? 4 : 8;
     #else // RP2040
         volatile uint32_t *resets     = (volatile uint32_t *)0x4000c000;
         volatile uint32_t *adc_cs     = (volatile uint32_t *)0x4004c000;
@@ -9269,7 +9583,7 @@ void OSD::BoardInfo() {
     pos += snprintf(buf + pos, sizeof(buf) - pos,
         "  NES CLK/LAT/D : %d/%d/%d\n", NES_GPIO_CLK, NES_GPIO_LAT, NES_GPIO_DATA);
 #endif
-#ifdef PICO_DEFAULT_LED_PIN
+#if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     pos += snprintf(buf + pos, sizeof(buf) - pos,
         "  LED           : %d\n", PICO_DEFAULT_LED_PIN);
 #endif
@@ -9685,7 +9999,7 @@ static void __not_in_flash_func(flash_block)(const uint8_t* buffer, size_t flash
     }
     return;
 flash_it:
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, flash_target_offset % (FLASH_SECTOR_SIZE << 2) == 0);
     #endif
     multicore_lockout_start_blocking();
@@ -9696,7 +10010,7 @@ flash_it:
     flash_range_program(flash_target_offset, buffer, 512);
     restore_interrupts(ints);
     multicore_lockout_end_blocking();
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, false);
     #endif
 }
@@ -10270,7 +10584,7 @@ void OSD::SpeedTest() {
     }
 }
 
-void OSD::progressDialog(const string& title, const string& msg, int percent, int action) {
+void OSD::progressDialog(const string& title, const string& msg, int percent, int action, bool cyrillic) {
 
     static unsigned short h;
     static unsigned short y;
@@ -10279,15 +10593,23 @@ void OSD::progressDialog(const string& title, const string& msg, int percent, in
     static unsigned short progress_x;
     static unsigned short progress_y;
     static unsigned int j;
+    static bool cyr;   // remembered from SHOW so UPDATE/CLOSE keep the same face
 
     if (action == 0 ) { // SHOW
+
+        cyr = cyrillic;
 
         h = (OSD_FONT_H * 6) + 2;
         y = scrAlignCenterY(h);
 
+        // Transcode Cyrillic (online-catalog names) to CP1251 before measuring/truncating,
+        // so widths are right and we never cut a multibyte UTF-8 sequence.
+        string cmsg = cyr ? FileUtils::utf8ToCp1251(msg) : msg;
+        string ctitle = cyr ? FileUtils::utf8ToCp1251(title) : title;
+
         size_t maxchars = (scrW / 6) - 4;
-        string tmsg = msg.length() > maxchars ? msg.substr(0, maxchars) : msg;
-        string ttitle = title.length() > maxchars ? title.substr(0, maxchars) : title;
+        string tmsg = cmsg.length() > maxchars ? cmsg.substr(0, maxchars) : cmsg;
+        string ttitle = ctitle.length() > maxchars ? ctitle.substr(0, maxchars) : ctitle;
 
         w = (((tmsg.length() > ttitle.length() + 6 ? tmsg.length(): ttitle.length() + 6) + 2) * OSD_FONT_W) + 2;
         x = scrAlignCenterX(w);
@@ -10296,7 +10618,7 @@ void OSD::progressDialog(const string& title, const string& msg, int percent, in
         VIDEO::SaveRect.save(x, y, w, h);
 
         // Set font
-        VIDEO::vga.setFont(Font6x8);
+        VIDEO::vga.setFont(cyr ? Font6x8Cyr : Font6x8);
 
         // Menu border
         VIDEO::vga.rect(x, y, w, h, zxColor(0, 0));
@@ -10335,9 +10657,11 @@ void OSD::progressDialog(const string& title, const string& msg, int percent, in
     } else if (action == 1 ) { // UPDATE
 
         // Msg
+        VIDEO::vga.setFont(cyr ? Font6x8Cyr : Font6x8);
+        string umsg = cyr ? FileUtils::utf8ToCp1251(msg) : msg;
         VIDEO::vga.setTextColor(zxColor(0, 0), zxColor(7, 1));
-        VIDEO::vga.setCursor(scrAlignCenterX(msg.length() * OSD_FONT_W), y + 1 + (OSD_FONT_H * 2));
-        VIDEO::vga.print(msg.c_str());
+        VIDEO::vga.setCursor(scrAlignCenterX(umsg.length() * OSD_FONT_W), y + 1 + (OSD_FONT_H * 2));
+        VIDEO::vga.print(umsg.c_str());
 
         // Progress bar
         int barsize = (70 * percent) / 100;

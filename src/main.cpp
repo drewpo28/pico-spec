@@ -28,6 +28,7 @@
 #include "GS/GS.h"
 #endif
 #include "MemESP.h"
+#include "ChipPackage.h"
 #include "pwm_audio.h"
 #include "messages.h"
 
@@ -49,7 +50,6 @@
 
 #define HOME_DIR (char*)"\\SPEC"
 
-bool rp2350a = true;
 bool cursor_blink_state = false;
 uint8_t CURSOR_X, CURSOR_Y = 0;
 uint8_t rx[4] = { 0 };
@@ -1265,7 +1265,7 @@ int main() {
     keyboard_init();
 #endif
 
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
     for (int i = 0; i < 6; i++) {
@@ -1277,12 +1277,11 @@ int main() {
     #endif
 
 #if PICO_RP2350
-    rp2350a = (*((io_ro_32*)(SYSINFO_BASE + SYSINFO_PACKAGE_SEL_OFFSET)) & 1);
     #ifdef BUTTER_PSRAM_GPIO
     #if BUTTER_PSRAM_GPIO == 255
         psram_pin = 255;   // PSRAM disabled via CMake kill-switch (set(PSRAM OFF))
     #else
-        psram_pin = rp2350a ? BUTTER_PSRAM_GPIO : 47;
+        psram_pin = chip_is_rp2350a() ? BUTTER_PSRAM_GPIO : 47;
         psram_init(psram_pin);
         butter_psram_size();
     #endif
@@ -1340,7 +1339,7 @@ int main() {
         }
     }
 #endif
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     for (int i = 0; i < 6; i++) {
         sleep_ms(33);
         gpio_put(PICO_DEFAULT_LED_PIN, true);

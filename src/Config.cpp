@@ -112,6 +112,7 @@ uint8_t  Config::throtling = DEFAULT_THROTTLING;
 bool     Config::CursorAsJoy = true;
 bool     Config::betadisk = true;
 bool     Config::trdosFastMode = false;
+bool     Config::trdosAutoBoot = true;
 uint8_t  Config::trdosSoundLed = 0; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
 uint8_t  Config::trdosBios = 2; // Default: 5.05D
 bool     Config::driveWP[4] = { true, true, true, true };
@@ -139,6 +140,8 @@ uint16_t Config::net_port = 0;
 uint8_t  Config::net_proto = 0;
 string   Config::net_dl_dir = "/spec";
 string   Config::net_ul_dir = "/spec";
+string   Config::catalog_host;
+uint16_t Config::catalog_port = 0;
 #endif
 
 uint8_t Config::scanlines = 0;
@@ -460,6 +463,8 @@ void Config::loadWifiConfig() {
                 else if (key == "net_proto") net_proto = (uint8_t)atoi(val.c_str());
                 else if (key == "net_dl")    { if (!val.empty()) net_dl_dir = val; }
                 else if (key == "net_ul")    { if (!val.empty()) net_ul_dir = val; }
+                else if (key == "catalog_host") catalog_host = val;
+                else if (key == "catalog_port") catalog_port = (uint16_t)atoi(val.c_str());
                 else if (key == "baud")      { zifi_baud = (uint32_t)strtoul(val.c_str(), nullptr, 10); if (!zifi_baud) zifi_baud = 115200; }
             }
             line.clear();
@@ -474,16 +479,17 @@ void Config::saveWifiConfig() {
     FileUtils::mkdirParents(CONFIG_DIR);
     FIL* f = fopen2(WIFI_CFG_PATH, FA_WRITE | FA_CREATE_ALWAYS);
     if (!f) return;
-    char buf[512];
+    char buf[768];
     int n = snprintf(buf, sizeof(buf),
                      "ssid=%s\npass=%s\ntz=%d\nautoconnect=%d\n"
                      "net_host=%s\nnet_user=%s\nnet_port=%u\nnet_proto=%u\nbaud=%u\n"
-                     "net_dl=%s\nnet_ul=%s\n",
+                     "net_dl=%s\nnet_ul=%s\ncatalog_host=%s\ncatalog_port=%u\n",
                      wifi_ssid.c_str(), wifi_pass.c_str(),
                      (int)wifi_tz, wifi_autoconnect ? 1 : 0,
                      net_host.c_str(), net_user.c_str(),
                      (unsigned)net_port, (unsigned)net_proto, (unsigned)zifi_baud,
-                     net_dl_dir.c_str(), net_ul_dir.c_str());
+                     net_dl_dir.c_str(), net_ul_dir.c_str(),
+                     catalog_host.c_str(), (unsigned)catalog_port);
     UINT bw;
     if (n > 0) f_write(f, buf, n, &bw);
     fclose2(f);
@@ -687,6 +693,7 @@ void Config::load() {
         nvs_get_b("CursorAsJoy", CursorAsJoy, sts);
         nvs_get_b("betadisk", betadisk, sts);
         nvs_get_b("trdosFastMode", trdosFastMode, sts);
+        nvs_get_b("trdosAutoBoot", trdosAutoBoot, sts);
         if (!nvs_get_u8("trdosSoundLedMode", trdosSoundLed, sts)) {
             // Migrate legacy bool key: true -> Sound+Led (3), false -> Off (0)
             bool old = false;
@@ -1008,6 +1015,7 @@ void Config::save() {
     nvs_set_str(buf,"CursorAsJoy", CursorAsJoy ? "true" : "false");
     nvs_set_str(buf,"betadisk", betadisk ? "true" : "false");
     nvs_set_str(buf,"trdosFastMode", trdosFastMode ? "true" : "false");
+    nvs_set_str(buf,"trdosAutoBoot", trdosAutoBoot ? "true" : "false");
     nvs_set_u8(buf,"trdosSoundLedMode", trdosSoundLed);
     nvs_set_u8(buf,"trdosBios", trdosBios);
     for (int i = 0; i < 4; i++) {
