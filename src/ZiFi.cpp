@@ -242,6 +242,14 @@ void ZiFi::init() {
     uart_set_irq_enables(g_uart, true, false); // RX IRQ only
     irq_set_enabled(g_uart_irq, true);
     Debug::log("ZiFi: UART%d init TX=%d RX=%d baud=%u", inst, tx, rx, (unsigned)g_cur_baud);
+    // Diagnostic: confirm the funcsel mux actually latched the UART onto these pins.
+    // fsel should read back 2 (GPIO_FUNC_UART) or 11 (GPIO_FUNC_UART_AUX); if it's
+    // 31 (NULL) the route didn't stick — and NUM_BANK0_GPIOS shows the build package
+    // (30 = RP2350A, 48 = RP2350B) so we can tell if high pins are even in range.
+    Debug::log("ZiFi: pinmux NUM_BANK0_GPIOS=%d want_fsel=%d/%d got_fsel tx=%d rx=%d",
+               (int)NUM_BANK0_GPIOS,
+               (int)UART_FUNCSEL_NUM(g_uart, tx), (int)UART_FUNCSEL_NUM(g_uart, rx),
+               (int)gpio_get_function(tx), (int)gpio_get_function(rx));
     hw_initialized = true;
 }
 

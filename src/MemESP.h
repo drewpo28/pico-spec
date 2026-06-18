@@ -43,6 +43,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Debug.h"
 #include "Config.h"
 #include "CPU.h"
+#include "ChipPackage.h"
 
 #define MEM_PG_SZ 0x4000
 #if PICO_RP2350
@@ -57,7 +58,6 @@ extern uint8_t* PSRAM_DATA;
 extern uint8_t psram_pin;
 extern volatile uint32_t mem_spi_evict_count; // SPI PSRAM loads per frame
 extern volatile uint32_t mem_spi_evict_page;  // last evicted page index
-extern bool rp2350a;
 uint32_t butter_psram_size();
 extern uint8_t rx[4];
 

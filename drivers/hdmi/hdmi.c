@@ -732,7 +732,8 @@ static inline bool hdmi_init() {
     pio_sm_set_consecutive_pindirs(PIO_VIDEO, SM_video, HDMI_BASE_PIN, 8, true);
     pio_sm_set_consecutive_pindirs(PIO_VIDEO_ADDR, SM_conv, HDMI_BASE_PIN, 8, true);
 
-    uint64_t mask64 = (uint64_t)(3u << beginHDMI_PIN_clk);
+    // clk pins are 38/39 on ZERO2 — shift in 64-bit (3u << 38 would be UB on a 32-bit int)
+    uint64_t mask64 = ((uint64_t)3u << beginHDMI_PIN_clk);
     pio_sm_set_pins_with_mask64(PIO_VIDEO, SM_video, mask64, mask64);
     pio_sm_set_pindirs_with_mask64(PIO_VIDEO, SM_video, mask64, mask64);
     // пины

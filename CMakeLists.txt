@@ -39,8 +39,8 @@ option(SND_PORT_TRACE "Enable per-port I/O histogram (sound-DAC port hunting)" O
 option(PERF_TRACE "Enable per-60-frame CPU/HDMI/FPS performance logging" OFF)
 option(GS_PERF_TRACE "Enable General Sound per-second perf counters (GS.cpp)" OFF)
 option(GS_DEBUG_TRACE "Enable General Sound port-IO trace ring + auto-dumps (~50 KB SRAM)" OFF)
-option(ZIFI_TRACE "Enable ZiFi (ESP-01S WiFi NIC) port/UART tracing" ON)
-option(ZIFI_NET_VERBOSE "Per-packet trace of the ZiFi net client (+IPD/chanSend); floods logs" ON)
+option(ZIFI_TRACE "Enable ZiFi (ESP-01S WiFi NIC) port/UART tracing" OFF)
+option(ZIFI_NET_VERBOSE "Per-packet trace of the ZiFi net client (+IPD/chanSend); floods logs" OFF)
 
 # Per-board Debug-Probe UART toggles (logging over UART). Declared here together;
 # the board-specific `if(<board>_DBG_UART)` blocks below consume them (they call
@@ -50,7 +50,7 @@ set(MURM1_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1)
 set(PICO_PC_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on DBG1 header GP0/GP1 (PICO_PC)")
 set(PICO_DV_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
 set(ZERO_DBG_UART    OFF CACHE BOOL "Enable Debug Probe UART0 on GP16/GP13 (ZERO)")
-set(ZERO2_DBG_UART   ON  CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO2)")
+set(ZERO2_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO2)")
 
 #set(FLASH_SIZE_GREEN ON)
 #set(m1p2launcher ON)
@@ -101,7 +101,12 @@ elseif(MURM2 AND NOT MURM2_P2)
     set(PICO_BOARD pico CACHE STRING "Board type" FORCE)
     set(PICO_PLATFORM rp2040)
 else()
-    set(PICO_BOARD pico2 CACHE STRING "Board type" FORCE)
+    # All remaining RP2350 boards (MURM2_P2, PICO_PC, PICO_DV, MURM1_P2/default)
+    # build for the RP2350B (48-GPIO) package so GPIO 30..47 are valid for any
+    # peripheral. pico2 forces PICO_RP2350A=1, so we use a local B-variant header
+    # (a CMake `set(PICO_RP2350A 0)` is ignored by the SDK — it must be the header).
+    set(PICO_BOARD_HEADER_DIRS ${CMAKE_SOURCE_DIR}/src/boards)
+    set(PICO_BOARD picospec_rp2350b CACHE STRING "Board type" FORCE)
     set(PICO_PLATFORM rp2350-arm-s)
 endif()
 
@@ -806,7 +811,7 @@ ELSEIF(ZERO2)
         # HDMI 8 pins starts from pin:
         HDMI_BASE_PIN=32
 
-        PICO_DEFAULT_LED_PIN=25
+        PICO_DEFAULT_LED_PIN=255
         DEFAULT_THROTTLING=0
     )
 ELSE()

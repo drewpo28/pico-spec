@@ -31,7 +31,9 @@ static const UartPair ZIFI_PAIRS[] = {
     {0, 1, ""},                 // UART0
     {22, 23, "off: MIDI/WAV"},  // UART1
     {26, 27, "off: NESPAD"},    // UART1
-    {38, 39, ""},               // UART1 (free)
+#if IS_RP2350B    
+    {38, 39, ""},               // UART1 (free, RP2350B package)
+#endif
 };
 #elif defined(PICO_PC)
 static const UartPair ZIFI_PAIRS[] = {

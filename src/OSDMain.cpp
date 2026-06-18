@@ -9067,7 +9067,7 @@ void OSD::HWInfo() {
             " Chip VREG      : %d.%02d V\n"
             " Chip RAM       : 520 KB\n"
             " Free RAM       : %d KB\n",
-            rp2350a ? "A" : "B", (int)cpu_hz,
+            chip_is_rp2350a() ? "A" : "B", (int)cpu_hz,
             mv / 1000, (mv % 1000) / 10,
             (int)(free_heap / 1024));
     }
@@ -9183,7 +9183,7 @@ void OSD::ChipInfo() {
             " VREG voltage   : %d.%02d V\n"
             " Chip RAM       : 520 KB\n"
             " Free RAM       : %d KB\n",
-            rp2350a ? "A" : "B",
+            chip_is_rp2350a() ? "A" : "B",
             (int)cpu_hz,
             mv / 1000, (mv % 1000) / 10,
             (int)(free_heap / 1024));
@@ -9244,7 +9244,7 @@ void OSD::ChipInfo() {
         volatile uint32_t *resets     = (volatile uint32_t *)0x40020000;
         volatile uint32_t *adc_cs     = (volatile uint32_t *)0x400a0000;
         volatile uint32_t *adc_result = (volatile uint32_t *)0x400a0004;
-        uint32_t ts_ch = rp2350a ? 4 : 8;
+        uint32_t ts_ch = chip_is_rp2350a() ? 4 : 8;
     #else // RP2040
         volatile uint32_t *resets     = (volatile uint32_t *)0x4000c000;
         volatile uint32_t *adc_cs     = (volatile uint32_t *)0x4004c000;
@@ -9438,7 +9438,7 @@ void OSD::BoardInfo() {
     pos += snprintf(buf + pos, sizeof(buf) - pos,
         "  NES CLK/LAT/D : %d/%d/%d\n", NES_GPIO_CLK, NES_GPIO_LAT, NES_GPIO_DATA);
 #endif
-#ifdef PICO_DEFAULT_LED_PIN
+#if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     pos += snprintf(buf + pos, sizeof(buf) - pos,
         "  LED           : %d\n", PICO_DEFAULT_LED_PIN);
 #endif
@@ -9854,7 +9854,7 @@ static void __not_in_flash_func(flash_block)(const uint8_t* buffer, size_t flash
     }
     return;
 flash_it:
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, flash_target_offset % (FLASH_SECTOR_SIZE << 2) == 0);
     #endif
     multicore_lockout_start_blocking();
@@ -9865,7 +9865,7 @@ flash_it:
     flash_range_program(flash_target_offset, buffer, 512);
     restore_interrupts(ints);
     multicore_lockout_end_blocking();
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, false);
     #endif
 }

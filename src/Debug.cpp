@@ -9,7 +9,7 @@ bool Debug::log_enabled = false;
 
 void Debug::led_blink()
 {
-#if DEBUG
+#if DEBUG && defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     for (int i = 0; i < DEFAULT_BLINK_COUNT; i++) {
         sleep_ms(33);
         gpio_put(PICO_DEFAULT_LED_PIN, true);
@@ -21,14 +21,14 @@ void Debug::led_blink()
 
 void Debug::led_on()
 {
-#if DEBUG
+#if DEBUG && defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, true);
 #endif
 }
 
 void Debug::led_off()
 {
-#if DEBUG
+#if DEBUG && defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, false);
 #endif
 }
