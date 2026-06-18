@@ -42,6 +42,12 @@ public:
     static void autoSyncPoll();
     static bool autoSyncBusy();
 
+    // Optional sink for the AT exchange (tx/rx lines), independent of ZIFI_TRACE.
+    // Set it to mirror the ESP-01 dialog into an OSD window (e.g. live during a
+    // WiFi connect); nullptr (default) = no UI logging. Foreground calls only.
+    typedef void (*LogCb)(const char* line);
+    static LogCb log_cb;
+
     // Last known connected state (updated by connect/disconnect/getStatus).
     static bool connected;
     static string current_ssid;

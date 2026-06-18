@@ -8,10 +8,38 @@
 #include <pico/time.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 bool   ZiFiAT::connected     = false;
 string ZiFiAT::current_ssid;
 string ZiFiAT::current_ip;
+ZiFiAT::LogCb ZiFiAT::log_cb = nullptr;
+
+// Mask the WiFi password in an AT+CWJAP line in place. The ESP echoes the command
+// back, so even a masked tx leaks the password on the rx echo — scrub both:
+//   AT+CWJAP="ssid","pass"[,...]  →  AT+CWJAP="ssid",***
+static void maskCwjap(char* b) {
+    char* p = strstr(b, "CWJAP=");
+    if (!p) return;
+    char* c = strchr(p, ',');           // comma between the ssid and password fields
+    if (!c) return;                      // no password field (query / open AP) — leave it
+    c[1] = '*'; c[2] = '*'; c[3] = '*'; c[4] = '\0';
+}
+
+// Emit one AT-exchange line: to the serial console (only when ZIFI_TRACE) AND to
+// the optional UI sink (always, when set). Lets a WiFi-connect window show the
+// ESP-01 dialog live even in a build with tracing compiled out. Passwords scrubbed.
+static void atLog(const char* fmt, ...) {
+    char b[128];
+    va_list a; va_start(a, fmt);
+    vsnprintf(b, sizeof(b), fmt, a);
+    va_end(a);
+    maskCwjap(b);
+#if ZIFI_TRACE
+    Debug::log("%s", b);
+#endif
+    if (ZiFiAT::log_cb) ZiFiAT::log_cb(b);
+}
 
 // ─── Low-level helpers ────────────────────────────────────────────────────────
 
@@ -44,9 +72,7 @@ bool ZiFiAT::waitFor(const char* token, char* line_buf, size_t bufsz, uint32_t t
         uint32_t remain = absolute_time_diff_us(get_absolute_time(), deadline) / 1000;
         if (remain == 0) break;
         if (recvLine(line_buf, bufsz, remain < 200 ? remain : 200)) {
-#if ZIFI_TRACE
-            Debug::log("ZiFiAT rx: %s", line_buf);
-#endif
+            atLog("ZiFiAT rx: %s", line_buf);
             if (strstr(line_buf, token))
                 return true;
             if (strstr(line_buf, "ERROR") || strstr(line_buf, "FAIL"))
@@ -66,9 +92,7 @@ ZiFiAT::Status ZiFiAT::sendCmd(const char* cmd, const char* expect, uint32_t tim
     ZiFi::sendRaw((const uint8_t*)cmd, len);
     const uint8_t crlf[] = {'\r', '\n'};
     ZiFi::sendRaw(crlf, 2);
-#if ZIFI_TRACE
-    Debug::log("ZiFiAT tx: %s", cmd);
-#endif
+    atLog("ZiFiAT tx: %s", cmd);
 
     if (!expect) return OK;
 
@@ -101,9 +125,7 @@ ZiFiAT::Status ZiFiAT::connect(const string& ssid, const string& pass, uint32_t 
     ZiFi::sendRaw((const uint8_t*)cmd, len);
     const uint8_t crlf[] = {'\r', '\n'};
     ZiFi::sendRaw(crlf, 2);
-#if ZIFI_TRACE
-    Debug::log("ZiFiAT tx: AT+CWJAP=\"%s\",***", ssid.c_str());
-#endif
+    atLog("ZiFiAT tx: AT+CWJAP=\"%s\",***", ssid.c_str());
 
     // Wait for WIFI CONNECTED + WIFI GOT IP, or ERROR
     bool got_connected = false;
@@ -113,9 +135,7 @@ ZiFiAT::Status ZiFiAT::connect(const string& ssid, const string& pass, uint32_t 
         uint32_t remain = absolute_time_diff_us(get_absolute_time(), deadline) / 1000;
         if (remain == 0) break;
         if (recvLine(line, sizeof(line), remain < 300 ? remain : 300)) {
-#if ZIFI_TRACE
-            Debug::log("ZiFiAT rx: %s", line);
-#endif
+            atLog("ZiFiAT rx: %s", line);
             if (strstr(line, "WIFI CONNECTED")) got_connected = true;
             if (strstr(line, "WIFI GOT IP"))    got_ip = true;
             if (strstr(line, "OK") && got_connected && got_ip) {
@@ -165,9 +185,7 @@ ZiFiAT::Status ZiFiAT::syncTime(int tz, string& out_str) {
             uint32_t remain = absolute_time_diff_us(get_absolute_time(), deadline) / 1000;
             if (remain == 0) break;
             if (!recvLine(line, sizeof(line), remain < 200 ? remain : 200)) continue;
-#if ZIFI_TRACE
-            Debug::log("ZiFiAT rx: %s", line);
-#endif
+            atLog("ZiFiAT rx: %s", line);
             // +CIPSNTPTIME:Mon Jan 06 18:30:45 2026
             char* p = strstr(line, "+CIPSNTPTIME:");
             if (p) {
@@ -218,7 +236,7 @@ void as_send(const char* cmd) {
     ZiFi::sendRaw(crlf, 2);
     as_linelen = 0;
 #if ZIFI_TRACE
-    Debug::log("ZiFiAT(bg) tx: %s", cmd);
+    { char lg[128]; snprintf(lg, sizeof(lg), "ZiFiAT(bg) tx: %s", cmd); maskCwjap(lg); Debug::log("%s", lg); }
 #endif
 }
 
@@ -277,7 +295,7 @@ void ZiFiAT::autoSyncPoll() {
         as_line[as_linelen] = '\0';
         char* L = as_line; as_linelen = 0;
 #if ZIFI_TRACE
-        if (L[0]) Debug::log("ZiFiAT(bg) rx: %s", L);
+        if (L[0]) { char lg[128]; snprintf(lg, sizeof(lg), "ZiFiAT(bg) rx: %s", L); maskCwjap(lg); Debug::log("%s", lg); }
 #endif
         switch (as_state) {
             case AS_CWMODE:
@@ -349,9 +367,7 @@ int ZiFiAT::scan(string* out, int maxn, uint32_t timeout_ms) {
             uint32_t remain = absolute_time_diff_us(get_absolute_time(), deadline) / 1000;
             if (remain == 0) break;
             if (!recvLine(line, sizeof(line), remain < 300 ? remain : 300)) continue;
-#if ZIFI_TRACE
-            Debug::log("ZiFiAT rx: %s", line);
-#endif
+            atLog("ZiFiAT rx: %s", line);
             // +CWLAP:(enc,"ssid",rssi,"mac",ch,...)
             char* p = strstr(line, "+CWLAP:");
             if (p) {

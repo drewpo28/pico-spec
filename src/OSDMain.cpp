@@ -532,6 +532,58 @@ static void ftpdLogLine(const char* s) {
     ftpd_log_dirty = true;
 }
 
+// ── Live ESP-01 AT-log window (shown during a blocking WiFi connect) ──────────
+// ZiFiAT::log_cb → wifiLogLine appends each tx/rx line to the shared ftpd_log ring
+// and redraws the tail immediately, so the ESP-01 exchange scrolls live while
+// connect() blocks. Reuses ftpd_log[] (a generic line ring) — the WiFi connect
+// window and the FTP server are never up at the same time.
+static string s_wifilog_sub;
+static void wifiLogDraw() {
+    OSD::drawOSD(true);
+    int visCols = OSD::osdMaxCols(); if (visCols > 40) visCols = 40;
+    int visRows = OSD::osdMaxRows() - 4;
+    char row[42];
+    OSD::osdAt(1, 0);                                   // subtitle: "Connecting <ssid>"
+    VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(1, 0));
+    snprintf(row, sizeof(row), " %s", s_wifilog_sub.c_str());
+    int hl = strlen(row); while (hl < visCols) row[hl++] = ' '; row[visCols] = '\0';
+    VIDEO::vga.print(row);
+    OSD::osdAt(2, 0);                                   // separator
+    VIDEO::vga.setTextColor(zxColor(5, 0), zxColor(1, 0));
+    memset(row, '-', visCols); row[0] = ' '; row[visCols] = '\0';
+    VIDEO::vga.print(row);
+    int first = ftpd_log_count > visRows ? ftpd_log_count - visRows : 0; // tail
+    VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
+    for (int r = 0; r < visRows; r++) {
+        OSD::osdAt(3 + r, 0);
+        int li = first + r;
+        if (li < ftpd_log_count) {
+            const char* s = ftpd_log[li % FTPD_LOG_LINES];
+            int len = strlen(s); if (len > visCols) len = visCols;
+            memcpy(row, s, len); memset(row + len, ' ', visCols - len);
+        } else memset(row, ' ', visCols);
+        row[visCols] = '\0';
+        VIDEO::vga.print(row);
+    }
+}
+static void wifiLogLine(const char* s) { ftpdLogLine(s); wifiLogDraw(); }
+// Append a final line (e.g. an error) and hold the window open until the user
+// presses a key — so a failure stays readable instead of auto-closing.
+static void wifiLogHold(const char* msg) {
+    if (msg && msg[0]) ftpdLogLine(msg);
+    ftpdLogLine(Config::lang ? " -- pulsa una tecla --" : " -- press a key --");
+    wifiLogDraw();
+    auto* kb = ESPectrum::PS2Controller.keyboard();
+    while (kb->virtualKeyAvailable()) { fabgl::VirtualKeyItem k; kb->getNextVirtualKey(&k); } // drain
+    for (;;) {
+        if (kb->virtualKeyAvailable()) {
+            fabgl::VirtualKeyItem k;
+            if (kb->getNextVirtualKey(&k) && k.down) break;
+        }
+        sleep_ms(5);
+    }
+}
+
 struct FtpdCtx { const char* ip; };
 
 // Run the server session (details panel + live log terminal) in a blocking loop
@@ -6298,38 +6350,69 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             OSD::osdCenteredMsg(MSG_WIFI_DISCONNECTED[Config::lang], LEVEL_INFO, 1500);
                         }
                     } else {
-                        OSD::osdCenteredMsg(MSG_WIFI_SCANNING[Config::lang], LEVEL_INFO, 0);
+                        // ONE live ESP-01 log window for the whole flow: scan → SSID pick
+                        // → password → connect → SNTP. It stays up the entire time (the
+                        // SSID menu and password box draw over it and restore their own
+                        // regions). On error it does NOT auto-close — it holds until a
+                        // keypress so the failure stays readable. SaveRect: the window is
+                        // pushed once here and popped on every exit path. menuRun, on a
+                        // selection, leaves its own save for us to pop (→ window reappears);
+                        // on Esc it restores itself, so we pop only the window.
+                        ftpd_log_count = 0;
+                        s_wifilog_sub = MSG_WIFI_SCANNING[Config::lang];
+                        unsigned short wlx = OSD::scrAlignCenterX(OSD_W);
+                        unsigned short wly = OSD::scrAlignCenterY(OSD_H);
+                        VIDEO::SaveRect.save(wlx, wly, OSD_W, OSD_H);   // [window]
+                        wifiLogDraw();
+                        ZiFiAT::log_cb = wifiLogLine;
                         // static, not on the 4 KB core stack: 24 std::strings (~768 B)
                         // plus the nested connect+SNTP-sync call chain under do_OSD
                         // overflowed the stack (SIGBUS/stackOvf). Single-use, non-reentrant.
                         static string nets[24];
                         int n = ZiFiAT::scan(nets, 24);
-                        if (n <= 0) { OSD::osdCenteredMsg(MSG_WIFI_NO_NETS[Config::lang], LEVEL_WARN, 2000); return; }
+                        ZiFiAT::log_cb = nullptr;             // no AT traffic during menu/password
+                        if (n <= 0) {
+                            wifiLogHold(MSG_WIFI_NO_NETS[Config::lang]); // error → hold open
+                            VIDEO::SaveRect.restore_last();
+                            return;
+                        }
                         string m = string(MENU_WIFI_LIST_TITLE[Config::lang]) + "\n";
                         for (int i = 0; i < n; i++) m += nets[i] + "\n";
                         menu_level = 2; menu_saverect = true; menu_curopt = 1;
-                        uint8_t sel = menuRun(m);
-                        if (sel > 0) {
-                            VIDEO::SaveRect.restore_last();
-                            string chosen = nets[sel - 1];
-                            string pass = wifiAskPassword(chosen);
-                            if (pass != "\x1B") {
-                                OSD::osdCenteredMsg(MSG_WIFI_CONNECTING[Config::lang], LEVEL_INFO, 0);
-                                if (ZiFiAT::connect(chosen, pass) == ZiFiAT::OK) {
-                                    Config::wifi_ssid = chosen; Config::wifi_pass = pass; Config::wifi_autoconnect = true;
-                                    Config::saveWifiConfig();
-                                    // Sync the clock right away, then report it all in one OSD.
-                                    string msg = string(MSG_WIFI_CONNECTED[Config::lang]) + "\n" + ZiFiAT::current_ip;
-                                    if (Config::rtc_enabled) {
-                                        OSD::osdCenteredMsg(MSG_RTC_SYNCING[Config::lang], LEVEL_INFO, 0); // working notice
-                                        string when;
-                                        if (ZiFiAT::syncTime(Config::wifi_tz, when) == ZiFiAT::OK)
-                                            msg += "\n" + when;
-                                    }
-                                    OSD::osdCenteredMsg(msg, LEVEL_INFO, 2500); // single combined result
-                                } else
-                                    OSD::osdCenteredMsg(MSG_WIFI_CONNECT_ERR[Config::lang], LEVEL_WARN, 2500);
-                            }
+                        uint8_t sel = menuRun(m);            // draws over the window
+                        if (sel <= 0) {                      // Esc: menuRun restored its own save
+                            VIDEO::SaveRect.restore_last();  // pop [window]
+                            return;
+                        }
+                        VIDEO::SaveRect.restore_last();      // pop menuRun's save → window reappears
+                        string chosen = nets[sel - 1];
+                        s_wifilog_sub = chosen;
+                        wifiLogDraw();
+                        string pass = wifiAskPassword(chosen); // box draws over the window
+                        if (pass == "\x1B") {                // password cancelled
+                            VIDEO::SaveRect.restore_last();  // pop [window]
+                            return;
+                        }
+                        s_wifilog_sub = string(MSG_WIFI_CONNECTING[Config::lang]) + " " + chosen;
+                        wifiLogDraw();                       // repaint over the box region
+                        ZiFiAT::log_cb = wifiLogLine;
+                        ZiFiAT::Status cst = ZiFiAT::connect(chosen, pass);
+                        string when;
+                        if (cst == ZiFiAT::OK && Config::rtc_enabled)
+                            ZiFiAT::syncTime(Config::wifi_tz, when); // streamed too
+                        ZiFiAT::log_cb = nullptr;
+                        if (cst == ZiFiAT::OK) {
+                            Config::wifi_ssid = chosen; Config::wifi_pass = pass; Config::wifi_autoconnect = true;
+                            Config::saveWifiConfig();
+                            wifiLogLine(MSG_WIFI_CONNECTED[Config::lang]);
+                            sleep_ms(900);                   // brief, then auto-close on success
+                            VIDEO::SaveRect.restore_last();  // pop [window]
+                            string msg = string(MSG_WIFI_CONNECTED[Config::lang]) + "\n" + ZiFiAT::current_ip;
+                            if (!when.empty()) msg += "\n" + when;
+                            OSD::osdCenteredMsg(msg, LEVEL_INFO, 2500);
+                        } else {
+                            wifiLogHold(MSG_WIFI_CONNECT_ERR[Config::lang]); // error → hold open
+                            VIDEO::SaveRect.restore_last();  // pop [window]
                         }
                     }
                 };
