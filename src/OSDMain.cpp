@@ -168,6 +168,7 @@ unsigned short OSD::last_begin_row = 0; // To check for changes
 uint8_t OSD::menu_level = 0;
 bool OSD::menu_saverect = false;
 unsigned short OSD::menu_curopt = 1;
+bool OSD::net_launch_close = false;
 bool OSD::menu_del_pressed = false;
 bool OSD::menu_rename_pressed = false;
 bool OSD::menu_quicksave_pressed = false;
@@ -1191,6 +1192,28 @@ static string expandHotkeys(const char* menu);
 extern const char* const hkDescEN[];
 extern const char* const hkDescES[];
 
+// Cold-boot into TR-DOS for the current architecture. Mirrors the per-arch
+// "Reset to… → TR-DOS" logic (HK_RESET_TO): Profi boots bank1 + SYSEN-style
+// TR-DOS, Pentagon/Profi (incl. Gluk 128Kpg) boots the TR-DOS ROM (bank4) with
+// romLatch + trdos asserted. 48K/128K have no dedicated TR-DOS cold-boot bank
+// (entry is only via the BASIC trap), so they get a plain reset with the disk
+// left mounted. Used by the Alt+Enter "download a disk to /tmp and run" path.
+void OSD::bootTrdos() {
+    Config::ram_file = NO_RAM_FILE;
+    Config::last_ram_file = NO_RAM_FILE;
+    if (Config::arch == "Profi") {
+        ESPectrum::reset(1);
+        MemESP::romLatch = 1;
+        ESPectrum::trdos = true;
+    } else if (Z80Ops::isPentagon || Z80Ops::isProfi) {
+        ESPectrum::reset(4); // TR-DOS ROM
+        MemESP::romLatch = 1;
+        ESPectrum::trdos = true;
+    } else {
+        ESPectrum::reset(0); // 48K/128K: no TR-DOS cold bank — restart, disk stays mounted
+    }
+}
+
 // OSD Main Loop
 void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 
@@ -2076,6 +2099,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             // Main menu
             menu_saverect = false;
             menu_level = 0;
+            // An online-archive file was downloaded to /tmp and launched: tear the
+            // whole menu stack down so the freshly loaded program runs immediately.
+            if (OSD::net_launch_close) { OSD::net_launch_close = false; if (VIDEO::OSD) OSD::drawStats(); return; }
             uint8_t opt = menuRun(getMenuPrefix() + Config::arch + "\n" +
                 (!FileUtils::fsMount ? MENU_MAIN_NO_SD[Config::lang] : MENU_MAIN[Config::lang])
             );
@@ -2356,8 +2382,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 string fm = MENU_BETADISK_FASTMODE[Config::lang];
                                 string sl = MENU_BETADISK_SNDLED[Config::lang];
                                 string rm = MENU_BETADISK_ROM[Config::lang];
-                                if (!Config::betadisk) { fm = "\x01" + fm; sl = "\x01" + sl; rm = "\x01" + rm; }
-                                betamenu += fm + sl + rm;
+                                string ab = MENU_BETADISK_AUTOBOOT[Config::lang];
+                                if (!Config::betadisk) { fm = "\x01" + fm; sl = "\x01" + sl; rm = "\x01" + rm; ab = "\x01" + ab; }
+                                betamenu += fm + sl + rm + ab;
                             }
 
                             // Save the backing rect only on the very first draw so the
@@ -2556,6 +2583,40 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         menu_saverect = false;
                                     } else {
                                         menu_curopt = 8;
+                                        menu_level = 2;
+                                        menu_saverect = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            else if (dsk_num == 9) {
+                                // Auto-boot: inject a "boot" file into TRD/SCL images
+                                // that lack one so TR-DOS autostarts after mounting.
+                                menu_level = 3;
+                                menu_curopt = Config::trdosAutoBoot ? 1 : 2;
+                                menu_saverect = true;
+                                while (1) {
+                                    string menu = MENU_AUTOBOOT[Config::lang];
+                                    menu += MENU_YESNO[Config::lang];
+                                    bool prev = Config::trdosAutoBoot;
+                                    if (prev) {
+                                        menu.replace(menu.find("[Y",0),2,"[*");
+                                        menu.replace(menu.find("[N",0),2,"[ ");
+                                    } else {
+                                        menu.replace(menu.find("[Y",0),2,"[ ");
+                                        menu.replace(menu.find("[N",0),2,"[*");
+                                    }
+                                    uint8_t opt2 = menuRun(menu);
+                                    if (opt2) {
+                                        bool nv = (opt2 == 1);
+                                        if (nv != prev) {
+                                            Config::trdosAutoBoot = nv;
+                                            Config::save();
+                                        }
+                                        menu_curopt = opt2;
+                                        menu_saverect = false;
+                                    } else {
+                                        menu_curopt = 9;
                                         menu_level = 2;
                                         menu_saverect = false;
                                         break;
@@ -6296,6 +6357,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 
                 refreshNetStatus();
                 while (1) {
+                    if (OSD::net_launch_close) break;   // remoteFileDialog launched a /tmp download → close OSD
                     menu_level = 1;
                     // Row 2: live WiFi status, padded to a fixed width so geometry is stable.
                     string st;

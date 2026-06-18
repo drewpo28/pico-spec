@@ -211,6 +211,7 @@ public:
 
     static bool betadisk;       // TR-DOS interface enabled
     static bool trdosFastMode;
+    static bool trdosAutoBoot;  // inject a "boot" file into TRD/SCL images that lack one
     static uint8_t trdosSoundLed; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
     static uint8_t trdosBios; // 0=5.03, 1=5.04TM, 2=5.05D, 3=Custom (flashable)
     static bool driveWP[4];   // TR-DOS per-slot write protect (Drive A..D)

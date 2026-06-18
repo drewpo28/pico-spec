@@ -375,6 +375,24 @@ bool HttpCatalogFs::get(const std::string& remote, const std::string& localSdPat
     return ok;
 }
 
+// Resolve the true source filename (with extension) for a display entry. Static
+// catalog display names carry no extension — the real name lives in the locator's
+// last path segment, which is exactly what get() saves the file under. Used by the
+// Alt+Enter "download to /tmp and run" path. Falls back to the display name.
+std::string HttpCatalogFs::downloadBasename(const std::string& displayName) {
+    if (isStaticBase()) {
+        std::string listUrl = baseUrl() + "/" + site + "/" + slugPath(cur_path) + ".tsv";
+        LocateCtx loc = { displayName.c_str(), std::string(), false };
+        if (!httpsReadLines(listUrl, locate_line, &loc) || !loc.found || loc.url.empty())
+            return displayName;
+        std::string fname = loc.url;
+        size_t sl = fname.find_last_of('/');
+        if (sl != std::string::npos) fname.erase(0, sl + 1);
+        return fname.empty() ? displayName : fname;
+    }
+    return displayName; // dynamic backend saves under the caller-chosen path
+}
+
 void HttpCatalogFs::disconnect() {
     ZiFiSock::end();
 }

@@ -422,6 +422,8 @@ static const char *MENU_BETADISK_MODE[2]  = { "Mode", "Modo" };
 static const char *MENU_BETADISK_FASTMODE[2] = { "Fast Mode\t>\n",   "Modo rápido\t>\n" };
 static const char *MENU_BETADISK_SNDLED[2]   = { "Sound & LED\t>\n", "Sonido y LED\t>\n" };
 static const char *MENU_BETADISK_ROM[2]      = { "ROM\t>\n",         "ROM\t>\n" };
+static const char *MENU_BETADISK_AUTOBOOT[2] = { "Auto-boot\t>\n",   "Auto-arranque\t>\n" };
+static const char *MENU_AUTOBOOT[2]          = { "Auto-boot\n",      "Auto-arranque\n" };
 
 // Drive labels used by the dynamic menu builder.
 static const char *MENU_BETA_DRIVE_LETTERS[4] = { "A", "B", "C", "D" };
@@ -2309,9 +2311,11 @@ static const char *MSG_NET_EMPTY_DIR[2]      = { "(empty)",          "(vacio)"  
 static const char *MSG_NET_DL_OR_UL[2]       = { "Download\nUpload here\n", "Descargar\nSubir aqui\n" };
 static const char *MENU_NET_BROWSE_TITLE[2]  = { "Remote files",     "Archivos remotos"  };
 static const char *MSG_NET_DELETE_Q[2]       = { "Delete?",          "\xA8" "Borrar?"     };
-static const char *MSG_NET_FOOTER[2]         = { "F5 copy  F8 delete","F5 copiar F8 borrar" };
-static const char *MSG_NET_FOOTER_RO[2]      = { "F5 copy",           "F5 copiar"          };
+static const char *MSG_NET_FOOTER[2]         = { "F5 copy F8 del Alt+Ent run","F5 copiar F8 bor Alt+Ent" };
+static const char *MSG_NET_FOOTER_RO[2]      = { "F5 copy  Alt+Enter run","F5 copiar Alt+Ent ejec" };
 static const char *MSG_NET_COPYING[2]        = { "Copying...",       "Copiando..."        };
+static const char *MSG_NET_LAUNCHING[2]      = { "Launching...",     "Iniciando..."       };
+static const char *MSG_NET_UNSUPPORTED[2]    = { "Cannot run this type","No ejecutable"     };
 
 // ─── Archive download (catalog server) strings ──────────────────────────────
 static const char *MENU_ARCH_SITE_TITLE[2]   = { "Archive source",   "Fuente de archivo" };

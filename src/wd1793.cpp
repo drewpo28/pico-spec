@@ -40,6 +40,8 @@ THE SOFTWARE.
 #if !PICO_RP2040
 #include "td0.h"
 #include "psram_spi.h"
+#include "trdos_boot.h"
+#include <string.h>
 #endif
 
 static bool sclConvertToTRD(rvmWD1793 *wd);
@@ -1745,6 +1747,75 @@ void rvmWD1793FreeTrackBuf(rvmWD1793 *wd) {
 #endif
 }
 
+#if !PICO_RP2040
+// TR-DOS autostarts a BASIC file named "boot" on cold start. Many TRD images
+// (especially ones pulled off online archives) ship without one, so they drop to
+// the TR-DOS prompt instead of running. If enabled (Config::trdosAutoBoot), and the
+// freshly-mounted TRD is a valid TR-DOS disk with no "boot" file, write one in:
+//  - the 16-byte catalog entry goes into the first free dir slot (index = file count),
+//  - the single data sector goes into track 0's reserved tail (sector 9, offset 2304),
+//    which TR-DOS never allocates for normal files, so existing data in tracks 1+ is
+//    left completely untouched. First-free pointer / free-sector count are left as-is.
+// Runs once: a later mount finds the boot present and skips. cursectbuf (256 B, heap)
+// is used as scratch to avoid blowing the 2 KB core stack.
+static void trdMaybeInjectBoot(rvmwdDisk *disk) {
+    if (!Config::trdosAutoBoot || !disk || !disk->Diskfile) return;
+
+    UINT br, bw;
+    uint8_t *buf = disk->cursectbuf; // 256-byte heap scratch
+
+    // Disk-spec sector (logical sector 9 / track 0, file offset 2048).
+    if (f_lseek(disk->Diskfile, 2048) != FR_OK) return;
+    if (f_read(disk->Diskfile, buf, 256, &br) != FR_OK || br < 256) return;
+    if (buf[0xE7] != 0x10) return;          // not a TR-DOS disk
+    uint8_t fileCount = buf[0xE4];
+    if (fileCount >= 128) return;           // catalog full
+
+    // Scan the active catalog entries (dir sectors 0-7) for an existing "boot    B".
+    int loadedSec = -1;
+    for (int i = 0; i < fileCount; i++) {
+        int sec = i >> 4;
+        if (sec != loadedSec) {
+            if (f_lseek(disk->Diskfile, sec * 256) != FR_OK) return;
+            if (f_read(disk->Diskfile, buf, 256, &br) != FR_OK || br < 256) return;
+            loadedSec = sec;
+        }
+        const uint8_t *ent = buf + ((i & 0x0F) << 4);
+        if (memcmp(ent, "boot    ", 8) == 0 && ent[8] == 'B') return; // already present
+    }
+
+    // No boot file — append the catalog entry at slot = fileCount.
+    int slotSec = fileCount >> 4;
+    int slotOff = (fileCount & 0x0F) << 4;
+    if (f_lseek(disk->Diskfile, slotSec * 256) != FR_OK) return;
+    if (f_read(disk->Diskfile, buf, 256, &br) != FR_OK || br < 256) return;
+    uint8_t *ent = buf + slotOff;
+    memcpy(ent, "boot    ", 8);
+    ent[8]  = 'B';
+    ent[9]  = TRDOS_BOOT_START  & 0xFF; ent[10] = (TRDOS_BOOT_START  >> 8) & 0xFF;
+    ent[11] = TRDOS_BOOT_LENGTH & 0xFF; ent[12] = (TRDOS_BOOT_LENGTH >> 8) & 0xFF;
+    ent[13] = TRDOS_BOOT_SECCNT;
+    ent[14] = 9; // start sector (track 0's reserved tail)
+    ent[15] = 0; // start track
+    if (f_lseek(disk->Diskfile, slotSec * 256) != FR_OK) return;
+    if (f_write(disk->Diskfile, buf, 256, &bw) != FR_OK || bw < 256) return;
+
+    // Bump the file count in the disk spec (re-read: slotSec may have been sector 8).
+    if (f_lseek(disk->Diskfile, 2048) != FR_OK) return;
+    if (f_read(disk->Diskfile, buf, 256, &br) != FR_OK || br < 256) return;
+    buf[0xE4] = fileCount + 1;
+    if (f_lseek(disk->Diskfile, 2048) != FR_OK) return;
+    if (f_write(disk->Diskfile, buf, 256, &bw) != FR_OK || bw < 256) return;
+
+    // Boot data: single sector into track 0 / sector 9 (file offset 2304).
+    if (f_lseek(disk->Diskfile, 2304) != FR_OK) return;
+    f_write(disk->Diskfile, kTrdosBootSector, 256, &bw);
+    f_sync(disk->Diskfile);
+    disk->cursectbufpos = 0xff; // scratch reused — invalidate the sector cache
+    Debug::log("TRD: injected boot file (had %d files)", (int)fileCount);
+}
+#endif
+
 bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string& Filename) {
 
 #if !PICO_RP2040
@@ -2264,6 +2335,16 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
 
     //rewind(wd->disk[UnitNum]->Diskfile);
     f_rewind(wd->disk[UnitNum]->Diskfile);
+
+#if !PICO_RP2040
+    // Plain TRD only (SCL/UDI/FDI/MBD/PRO/TD0 return earlier or are handled in RAM):
+    // inject a "boot" file if the image lacks one, so TR-DOS autostarts.
+    if (!wd->disk[UnitNum]->IsSCLFile && !wd->disk[UnitNum]->IsUDIFile &&
+        !wd->disk[UnitNum]->IsFDIFile && !wd->disk[UnitNum]->IsMBDFile &&
+        !wd->disk[UnitNum]->IsProFile && !wd->disk[UnitNum]->IsTD0File) {
+        trdMaybeInjectBoot(wd->disk[UnitNum]);
+    }
+#endif
 
     wd->disk[UnitNum]->t0s1_info = 0;
     wd->disk[UnitNum]->cursectbufpos = 0xff; // 0xffff;
@@ -3315,6 +3396,10 @@ IRAM_ATTR uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control) {
           // SCL disk -> Read sector to cache from created Track0
           if (cursect < 9)
             memcpy(disk->cursectbuf, t0 + (cursect << 8), 0x100);
+#if !PICO_RP2040
+          else if (cursect == 9 && disk->bootInjected)
+            memcpy(disk->cursectbuf, kTrdosBootSector, 0x100); // injected boot data
+#endif
           else
             memset(disk->cursectbuf, 0, 0x100);
 
@@ -3478,6 +3563,34 @@ void SCLtoTRD(rvmwdDisk *d, unsigned char* track0) {
 
     d->sclDataOffset =  (9 + (numberOfFiles * 14)) - 4096;
 
+#if !PICO_RP2040
+    // Auto-boot: if the SCL has no "boot" file, synthesise one into the in-RAM
+    // catalog. Its single data sector is served from flash (kTrdosBootSector) for
+    // track 0 / sector 9 in the read path — see rvmwdDiskStep. Track 0's tail is
+    // never used by TR-DOS for normal files, so the streamed file data (tracks 1+)
+    // is untouched. The free-sector count stays as computed above (that area isn't
+    // counted), only the file count is bumped.
+    d->bootInjected = false;
+    if (Config::trdosAutoBoot && numberOfFiles < 128) {
+        bool hasBoot = false;
+        for (int i = 0; i < numberOfFiles; i++) {
+            const unsigned char *e = track0 + (i << 4);
+            if (memcmp(e, "boot    ", 8) == 0 && e[8] == 'B') { hasBoot = true; break; }
+        }
+        if (!hasBoot) {
+            unsigned char *e = track0 + (numberOfFiles << 4);
+            memcpy(e, "boot    ", 8);
+            e[8]  = 'B';
+            e[9]  = TRDOS_BOOT_START  & 0xFF; e[10] = (TRDOS_BOOT_START  >> 8) & 0xFF;
+            e[11] = TRDOS_BOOT_LENGTH & 0xFF; e[12] = (TRDOS_BOOT_LENGTH >> 8) & 0xFF;
+            e[13] = TRDOS_BOOT_SECCNT;
+            e[14] = 9; // start sector (track 0's reserved tail)
+            e[15] = 0; // start track
+            track0[2276] = (uint8_t)(numberOfFiles + 1); // bump file count in disk spec
+            d->bootInjected = true;
+        }
+    }
+#endif
 }
 
 // Create an empty formatted TRD disk image at the given path.
@@ -3559,9 +3672,17 @@ static bool sclConvertToTRD(rvmWD1793 *wd) {
     // Write track 0 side 0: 16 sectors from Track0 (first 4096 bytes = 16 * 256)
     f_write(trdFile, t0, 2304, &bw);
     // Pad remaining sectors of track 0 (sectors 9..15 are already in Track0 as zeros,
-    // but Track0 is only 2304 bytes = 9 sectors; pad to 16 sectors = 4096 bytes)
-    for (int s = 9; s < 16; s++)
-        f_write(trdFile, zeroBuf, 256, &bw);
+    // but Track0 is only 2304 bytes = 9 sectors; pad to 16 sectors = 4096 bytes).
+    // If we injected a boot file, sector 9 holds its data (served from flash before
+    // conversion) — write it into the TRD so the catalog entry still resolves.
+    for (int s = 9; s < 16; s++) {
+#if !PICO_RP2040
+        if (s == 9 && disk->bootInjected)
+            f_write(trdFile, kTrdosBootSector, 256, &bw);
+        else
+#endif
+            f_write(trdFile, zeroBuf, 256, &bw);
+    }
 
     // Copy remaining data from SCL using same seek formula as rvmwdDiskStep
     // TRD layout: [T0S0: 16*256][T0S1: 16*256][T1S0: 16*256][T1S1: 16*256]...

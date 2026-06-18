@@ -112,6 +112,7 @@ uint8_t  Config::throtling = DEFAULT_THROTTLING;
 bool     Config::CursorAsJoy = true;
 bool     Config::betadisk = true;
 bool     Config::trdosFastMode = false;
+bool     Config::trdosAutoBoot = true;
 uint8_t  Config::trdosSoundLed = 0; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
 uint8_t  Config::trdosBios = 2; // Default: 5.05D
 bool     Config::driveWP[4] = { true, true, true, true };
@@ -692,6 +693,7 @@ void Config::load() {
         nvs_get_b("CursorAsJoy", CursorAsJoy, sts);
         nvs_get_b("betadisk", betadisk, sts);
         nvs_get_b("trdosFastMode", trdosFastMode, sts);
+        nvs_get_b("trdosAutoBoot", trdosAutoBoot, sts);
         if (!nvs_get_u8("trdosSoundLedMode", trdosSoundLed, sts)) {
             // Migrate legacy bool key: true -> Sound+Led (3), false -> Off (0)
             bool old = false;
@@ -1013,6 +1015,7 @@ void Config::save() {
     nvs_set_str(buf,"CursorAsJoy", CursorAsJoy ? "true" : "false");
     nvs_set_str(buf,"betadisk", betadisk ? "true" : "false");
     nvs_set_str(buf,"trdosFastMode", trdosFastMode ? "true" : "false");
+    nvs_set_str(buf,"trdosAutoBoot", trdosAutoBoot ? "true" : "false");
     nvs_set_u8(buf,"trdosSoundLedMode", trdosSoundLed);
     nvs_set_u8(buf,"trdosBios", trdosBios);
     for (int i = 0; i < 4; i++) {

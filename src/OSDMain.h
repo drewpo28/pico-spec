@@ -156,6 +156,9 @@ public:
     // horizontally so up to maxlen characters can be entered. 0 → viscols=maxlen.
     static string inlineTextEdit(int ex, int ey, int maxlen, const string& text, bool mask = false, int viscols = 0);
     static bool videoModeConfirm(int timeout_sec = 15);
+    // Cold-boot the machine into TR-DOS for the current arch (Pentagon/Profi/Gluk);
+    // other archs fall back to a plain reset. Used after Alt+Enter mounts a disk.
+    static void bootTrdos();
     static void progressDialog(const string& title, const string& msg, int percent, int action, bool cyrillic = false);
     string inputBox(int x, int y, const string& text);
     static void joyDialog(void);
@@ -197,6 +200,7 @@ public:
     static bool menu_rename_pressed;      // Set by menuRun when R pressed on a row
     static bool menu_quicksave_pressed;   // Set by menuRun when F4 pressed on a row
     static bool menu_quickload_pressed;   // Set by menuRun when F3 pressed on a row
+    static bool net_launch_close;         // Set when an online file was downloaded+launched → unwind menus and close OSD
     static string menu_footer;            // Optional hint line drawn below menu (cleared after each menuRun)
     static string menu;                   // Menu string
     static unsigned short begin_row;      // First real displayed row

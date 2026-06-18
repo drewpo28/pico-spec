@@ -49,6 +49,14 @@ public:
     virtual bool get(const std::string& remote, const std::string& localSdPath,
                      XferProgressCb cb) = 0;
 
+    // The local basename get() will actually create for entry `displayName`. The
+    // online-catalog display names carry no extension (the real filename lives in
+    // the source locator), and the catalog's get() saves under that source name —
+    // so Alt+Enter "download to /tmp and run" must ask here for the true filename
+    // (with extension) to know both the saved path and the file type. Default:
+    // echo the name (FTP/SFTP entry names already carry their extension).
+    virtual std::string downloadBasename(const std::string& displayName) { return displayName; }
+
     // Upload SD file `localSdPath` to `remote`.
     virtual bool put(const std::string& localSdPath, const std::string& remote,
                      XferProgressCb cb) = 0;

@@ -60,6 +60,7 @@ using namespace std;
 #include "PinSerialData_595.h"
 #if ZIFI_NET_CLIENT
 #include "RemoteFs.h"
+#include "Snapshot.h"
 #endif
 
 extern Font Font6x8;
@@ -1289,9 +1290,11 @@ static bool rfd_progress(uint32_t done, uint32_t total) {
 static int rfd_scroll(const string& title, sorted_files& idx,
                       const char* const* synth, int nsynth,
                       const char* footer = nullptr, bool* delPressed = nullptr,
-                      bool* copyPressed = nullptr, bool utf8 = false) {
+                      bool* copyPressed = nullptr, bool utf8 = false,
+                      bool* altPressed = nullptr) {
     if (delPressed)  *delPressed = false;
     if (copyPressed) *copyPressed = false;
+    if (altPressed)  *altPressed = false;
     const int cols_n = 36, MAXVIS = 16;
     int total = nsynth + (int)idx.size();
     int vis   = total < MAXVIS ? total : MAXVIS;
@@ -1385,7 +1388,17 @@ static int rfd_scroll(const string& title, sorted_files& idx,
             else if (k.vk == fabgl::VK_PAGEDOWN) cursor += vis;
             else if (is_home(k.vk))     cursor = 0;
             else if (k.vk == fabgl::VK_END) cursor = total - 1;
-            else if (is_enter(k.vk))    { OSD::click(); VIDEO::SaveRect.restore_last(); return cursor; }
+            else if (is_enter(k.vk))    {
+                // Alt+Enter on a catalog file = download to /tmp and launch (vs. plain
+                // Enter which picks an SD folder and just downloads). Physical Enter is
+                // re-synthesized as VK_MENU_ENTER (main.cpp), which drops the item's
+                // .LALT flag — so query live key state, same as OSD::do_OSD does.
+                auto* kb = ESPectrum::PS2Controller.keyboard();
+                if (altPressed && kb &&
+                    (kb->isVKDown(fabgl::VK_LALT) || kb->isVKDown(fabgl::VK_RALT)))
+                    *altPressed = true;
+                OSD::click(); VIDEO::SaveRect.restore_last(); return cursor;
+            }
             else if (is_back(k.vk))     { OSD::click(); VIDEO::SaveRect.restore_last(); return -1; }
             else if (delPressed && (k.vk == fabgl::VK_F8 || k.vk == fabgl::VK_DELETE)) {
                 *delPressed = true; OSD::click(); VIDEO::SaveRect.restore_last(); return cursor;
@@ -1529,6 +1542,63 @@ static bool rfd_copy_tree(RemoteFs* fs, const std::string& destSd, int depth) {
     return true;
 }
 
+// Launch a file that was just downloaded to /tmp (Alt+Enter in the catalog
+// browser). Tape images auto-run (flashload), snapshots auto-run, TR-DOS disk
+// images mount into Drive A. A .zip is unpacked first and its first usable inner
+// file launched. Returns true if something was loaded — the caller then closes
+// the whole OSD so the freshly loaded program runs.
+static bool rfd_launch_tmp(string path) {
+    string ext = FileUtils::getLCaseExt(path);
+
+    // Downloaded archive: unpack to /tmp and launch the first usable inner file.
+    if (ext == "zip") {
+        string inner = ZipExtract::extract(path, DISK_ALLFILE); // → /tmp/...
+        if (inner.empty() || inner == "\x1b") {
+            OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN);
+            return false;
+        }
+        path = inner;
+        ext  = FileUtils::getLCaseExt(path);
+    }
+
+    size_t slash = path.find_last_of('/');
+    string dir   = (slash == string::npos) ? "/" : path.substr(0, slash + 1); // keep trailing '/'
+    string base  = (slash == string::npos) ? path : path.substr(slash + 1);
+
+    if (ext == "tap" || ext == "tzx" || ext == "pzx" || ext == "wav" || ext == "mp3") {
+        FileUtils::TAP_Path = dir;
+        Config::save();
+        Tape::LoadTape("R" + base); // "R" = run (flashload if enabled); LoadTape prepends TAP_Path
+        return true;
+    }
+    if (ext == "sna" || ext == "z80" || ext == "p") {
+        FileUtils::SNA_Path = dir;
+        Config::save();
+        if (!LoadSnapshot(path, "", "")) {
+            OSD::osdCenteredMsg(OSD_PSNA_LOAD_ERR, LEVEL_WARN);
+            return false;
+        }
+        // /tmp snapshots are transient — don't pin them as the Alt+Backspace reload slot.
+        Config::ram_file = NO_RAM_FILE;
+        Config::last_ram_file = NO_RAM_FILE;
+        return true;
+    }
+    if (FileUtils::ifaceForExt(ext) == IFACE_BETA) {
+        FileUtils::DSK_Path = dir;
+        Config::betadisk = true;       // ensure the TR-DOS controller is active for the mount
+        rvmWD1793InsertDisk(&ESPectrum::fdd, 0, path);
+        if (ESPectrum::fdd.disk[0])
+            ESPectrum::fdd.disk[0]->writeprotect =
+                Config::driveWP[0] || ESPectrum::fdd.disk[0]->IsTD0File;
+        Config::save();
+        OSD::bootTrdos();              // cold-boot into TR-DOS so the disk auto-runs
+        return true;
+    }
+    OSD::osdCenteredMsg(string(MSG_NET_UNSUPPORTED[Config::lang]) + " (." + ext + ")",
+                        LEVEL_WARN, 2200);
+    return false;
+}
+
 void OSD::remoteFileDialog(RemoteFs* fs) {
     sorted_files idx;
     idx.init("__netfs__");           // /tmp/.__netfs__.idx
@@ -1548,10 +1618,10 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
         if (!ok) { OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000); idx.unlink(); return; }
         if (!fs->preSorted()) idx.sort(); // pre-sorted sources (static catalog) skip the slow on-disk sort
 
-        bool del = false, copy = false;
+        bool del = false, copy = false, alt = false;
         int sel = rfd_scroll(fs->cwdPath(), idx, synth, nsynth,
                              ro ? MSG_NET_FOOTER_RO[Config::lang] : MSG_NET_FOOTER[Config::lang],
-                             ro ? nullptr : &del, &copy, fs->utf8Names());
+                             ro ? nullptr : &del, &copy, fs->utf8Names(), &alt);
         if (sel < 0) { idx.unlink(); return; } // Esc → leave browser
 
         if (del) {                       // F8/Del → delete a remote entry
@@ -1620,6 +1690,30 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
             string nm = isDir ? rec.substr(1) : rec;
             if (isDir) {
                 fs->cwd(nm);
+            } else if (alt) {
+                // Alt+Enter: download to /tmp and launch straight away. Catalog display
+                // names carry no extension (it lives in the source locator) and the
+                // catalog's get() saves under that source basename — so ask the fs for
+                // the real filename and build the matching /tmp path, otherwise the
+                // launcher can't find the file or tell its type. On success close the
+                // whole OSD so the program runs.
+                string base = fs->downloadBasename(nm);
+                if (base.empty()) base = nm;
+                string tmpp = string("/tmp/") + base;
+                rfd_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
+                OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
+                bool got = fs->get(nm, tmpp, rfd_progress);
+                OSD::progressDialog("", "", 0, 2);
+                if (!got) {
+                    OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000);
+                } else {
+                    OSD::osdCenteredMsg(MSG_NET_LAUNCHING[Config::lang], LEVEL_INFO, 400);
+                    if (rfd_launch_tmp(tmpp)) {
+                        idx.unlink();
+                        OSD::net_launch_close = true; // signal the menu stack to close
+                        return;
+                    }
+                }
             } else {
                 // Pick the SD destination folder, then download into it.
                 string destDir = rfd_choose_folder(Config::net_dl_dir);

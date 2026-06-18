@@ -364,6 +364,12 @@ bool ZiFiSock::sock_closed(int id) {
 // ── Server side ──────────────────────────────────────────────────────────────
 bool ZiFiSock::server_listen(uint16_t port) {
     ZiFi::init(); // idempotent — bring the UART backend up
+    // The 4 KB demux ring is lazy-heaped (Profi OOM fix) and freed by end(). begin()
+    // allocates it for the client path; the FTP-server path comes through here, so it
+    // must allocate it too — otherwise pump() early-returns on a null rx_buf, atCmd()
+    // never sees the AT+CIPMUX=1 "OK", and the server "fails to start".
+    if (!rx_buf) rx_buf = (uint8_t(*)[RX_SZ])malloc((size_t)N_LINKS * RX_SZ);
+    if (!rx_buf) return false; // OOM
     reset_parser();
     for (int i = 0; i < N_LINKS; i++) {
         rx_head[i] = rx_tail[i] = 0;
@@ -402,11 +408,15 @@ int ZiFiSock::server_accept(uint32_t timeout_ms) {
 void ZiFiSock::server_stop() {
     for (int i = 0; i < N_LINKS; i++)
         if (opened[i]) sock_close(i);
-    atCmd("AT+CIPSERVER=0", "OK", 2000);
+    atCmd("AT+CIPSERVER=0", "OK", 2000);          // these still pump() → need rx_buf
     if (mux_mode) atCmd("AT+CIPMUX=0", "OK", 1000);
     reset_parser();
     accepted_link = -1;
     is_ready = false;
+    // Symmetric with server_listen()'s alloc (and end() on the client paths): return
+    // the 4 KB demux ring to the heap so it isn't leaked after the FTP server closes.
+    // The emulated ZiFi NIC uses its own buffers, so this is safe; ZiFi UART stays up.
+    free(rx_buf); rx_buf = nullptr;
 }
 
 void ZiFiSock::end() {
