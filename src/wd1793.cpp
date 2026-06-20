@@ -45,6 +45,9 @@ THE SOFTWARE.
 #endif
 
 static bool sclConvertToTRD(rvmWD1793 *wd);
+#if !PICO_RP2040
+static void mbdFlushTrack(rvmWD1793 *wd); // defined below; also re-declared near its callers
+#endif
 
 // Shared SCL-translated track-0 buffer (was per-fdd Track0[2304], 2 copies).
 // SCL conversion happens lazily once per SCL disk; only one fdd can own the
@@ -760,6 +763,18 @@ case kRVMWD177XWriteData: {
       //   printf("\n");
       // }
       // printf("==================================\n");
+
+#if !PICO_RP2040
+      // MBD (MB-02 BS-DOS): persist the modified track to SD immediately after a
+      // Write Sector completes. Without this the dirty track lingers in
+      // diskTrackBuf and only reaches SD on the next track switch / eject /
+      // reset — so a catalog rewrite done as the LAST disk op (.p defragment,
+      // .e erase) is lost on re-insert, leaving the on-SD catalog out of sync
+      // with the data area ("file not found" / "Sector not found").
+      // mbdFlushTrack re-reads from the buffer + f_sync; it self-clears diskDirty.
+      if (wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsMBDFile && wd->diskDirty)
+          mbdFlushTrack(wd);
+#endif
 
       if(wd->command & 0x10) { // Write sector: Multiple record flag on
         wd->sector++;
