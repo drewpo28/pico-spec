@@ -59,13 +59,17 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - Two real joysticks support (Up to 8 button joysticks).
 - USB HID gamepad support: XInput (Xbox 360/One), DualShock 4 (PS4), DualSense (PS5), generic HID gamepads with auto-detected report descriptors and analog trigger support.
 - Emulation of Betadisk interface with four drives and TRD, SCL, UDI, FDI (read and write) and TD0 (Teledisk, read-only) support. Fast and realtime modes. Per-drive Write Protect, inline drive status in the Drives menu, F5 slot-picker popup (F2 toggle WP, F8 eject) when mounting from the file browser.
+- TR-DOS auto-boot: optionally inject a boot loader into TRD/SCL images that lack one, so downloaded disks auto-start (Storage → Betadisk → Auto-boot) (RP2350 only).
 - IDE/HDD emulation: NEMO and Profi schemes, HDF / raw .hdd / Fixed VHD images, create-empty-image helper, mounted from the Storage → IDE/HDD menu (RP2350 only).
 - MB-02+ disk interface emulation: WD2797 FDC, Z80-DMA, 512KB SRAM paging, BS-DOS 308, MBD disk images, 4 drives, NMI menu (RP2350 only).
 - esxDOS support (DivMMC, DivIDE, DivSD) — [esxdos.org](https://esxdos.org/index.html).
 - Z-Controller emulation: raw SD card access via ports #57/#77, mutually exclusive with esxDOS and MB-02+ (RP2350 only).
 - FDD activity LED indicator and mechanical head click/seek sound emulation (optional, toggled via Betadisk menu).
 - ZiFi WiFi network interface via an ESP-01S module (stock Espressif AT firmware — no reflash): network access for ZX-Spectrum software (e.g. the MRF terminal), plus an MC146818 RTC (Pentagon "Mr Gluk" TimeKeeper) with SNTP time sync over WiFi (RP2350 only).
-- Network file transfer client (Network menu): FTP, SFTP and SSH straight from the OSD — browse remote servers and download / upload / copy (recursive) / delete files on the SD card. SSH/SFTP crypto (curve25519, AES-CTR, HMAC-SHA256) runs on the RP2350 via mbedTLS; SFTP host-key trust-on-first-use; selectable ESP-01S UART baud up to 921600 (RP2350 only). See the [Network wiki page](https://github.com/drewpo28/pico-spec/wiki/EN-Network).
+- Unified F5 file browser with a location chooser (RP2350, when WiFi is configured): **Local (SD)**, **Remote (FTP/SFTP)**, **Web Archives** and **Add Remote** — all rendered in the same "Open File" window. **Enter** quick-starts a file (downloads to RAM and runs/mounts), **F5** saves it to a chosen SD folder; `..`/Backspace go up a level, Esc closes. Per-source listing cache (with manual F2 refresh) and remembered cursor/last location.
+- Network file transfer (FTP / SFTP / SSH client): saved connections with optional alias and start path (passwords optionally stored, masked entry; TAB reveals); browse / download / upload / copy (recursive) / delete; SSH/SFTP crypto (curve25519, AES-CTR, HMAC-SHA256) runs on the RP2350 via mbedTLS; SFTP host-key trust-on-first-use; selectable ESP-01S UART baud up to 921600 (RP2350 only). See the [Network wiki page](https://github.com/drewpo28/pico-spec/wiki/EN-Network).
+- Web Archives: browse and download ZX disk/tape images from online catalogs (Virtual TR-DOS, Spectrum Computing, ZX-Art) over HTTPS straight to SD or RAM. Serverless GitHub-Pages catalog, on-device TLS, Cyrillic titles rendered (RP2350 only).
+- FTP server: share the SD card over the LAN (anonymous, active mode) from the Network menu (RP2350 only).
 - Realtime (with OSD) TZX, TAP and PZX file loading.
 - Flashload of TZX/TAP/PZX files (standard loaders only).
 - Rodolfo Guerra's ROMs fast load routines support with on the fly standard speed blocks translation.
@@ -105,7 +109,7 @@ Default hotkey bindings (all hotkeys except F1 and ALT+F1 are reconfigurable via
 - F2 Load (SNA,Z80,P)
 - F3 Load custom snapshot
 - F4 Save custom snapshot
-- F5 Load file (TAP, TZX, PZX, TRD, SCL, UDI, FDI, MBD, SNA, Z80, MMC, HDF, DSK, ZIP)
+- F5 Load file (TAP, TZX, PZX, TRD, SCL, UDI, FDI, MBD, SNA, Z80, MMC, HDF, DSK, ZIP) — opens a location chooser (Local / Remote / Web Archives) when WiFi is configured (RP2350)
 - F6 Play/Stop tape
 - F7 Tape Browser
 - F8 CPU / Tape load stats ( [CPU] microsecs per CPU cycle, [IDL] idle microsecs, [FPS] Frames per second, [FND] FPS w/no delay applied )
@@ -200,7 +204,17 @@ On RP2350 boards, an **ESP-01S** (ESP8266) module on the UART adds networking. I
 
 - **ZiFi NIC** — network interface for ZX-Spectrum software (port `#EF`, 16550-UART window); works with the **MRF** terminal/drivers (<https://zxart.ee/eng/software/prikladnoe-po/mrf/tabs:releases/>).
 - **WiFi** — scan / connect / autoconnect; **SNTP** time sync into the RTC.
-- **File transfer** — FTP / SFTP / SSH client: browse remote dirs, download / upload / copy (recursive) / delete to SD; masked password (TAB reveals); SFTP host-key TOFU; baud 115200–921600.
+- **FTP server** — share the SD card over the LAN (anonymous, active mode).
+- **HTTP test (curl)** — fetch an arbitrary URL and show the result (TLS-over-ESP diagnostic).
+
+File access (FTP/SFTP and the online archives) lives in the **F5 file browser** when WiFi is configured — a location chooser drawn in the same "Open File" window:
+
+- **Local (SD)** — the SD card.
+- **Remote (FTP/SFTP)** — saved connections (optional alias + start path; password optionally stored, masked entry with TAB reveal, SFTP host-key TOFU). Browse / download / upload / copy (recursive) / delete; baud 115200–921600.
+- **Web Archives** — online ZX catalogs (Virtual TR-DOS, Spectrum Computing, ZX-Art) over HTTPS.
+- **Add Remote** — store a new FTP/SFTP connection.
+
+In any of these, **Enter** quick-starts a file (download to RAM and run/mount) and **F5** saves it to a chosen SD folder; `..`/Backspace go up, Esc closes.
 
 Wiring is just **4 wires** (TX, RX, GND, 3V3 — TX/RX crossover; EN/RST/GPIO0/GPIO2 left unconnected). Per-board default pins and full details: **[Network wiki page](https://github.com/drewpo28/pico-spec/wiki/EN-Network)** ([RU](https://github.com/drewpo28/pico-spec/wiki/Network)).
 
