@@ -5,6 +5,7 @@
 #include "ZiFiSock.h"
 #include "Debug.h"
 #include "ff.h"
+#include "pico/time.h"   // sleep_ms
 #include <string>
 #include <string.h>
 #include <stdio.h>
@@ -28,12 +29,11 @@ static uint32_t g_rest = 0;                  // pending REST offset for the next
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 static void ftplog(const char* fmt, ...) {
-    if (!g_log) return;
     static char buf[256]; // static: core stack is only 4 KB, deep under do_OSD
     va_list ap; va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    g_log(buf);
+    if (g_log) g_log(buf);         // on-screen FTP terminal
 }
 
 // ── Control replies ──────────────────────────────────────────────────────────
@@ -82,9 +82,17 @@ static const char* baseName(const std::string& p) {
 static int openData() {
     if (!g_have_port) { reply(425, "Use PORT first (active mode only)"); return -1; }
     g_have_port = false; // single use per RFC
-    int id = ZiFiSock::sock_open(g_data_ip, g_data_port, false, 8000);
-    if (id < 0) { ftplog("! data connect %s:%u failed", g_data_ip, (unsigned)g_data_port); reply(425, "Can't open data connection"); }
-    return id;
+    // Retry the outbound connect a couple of times: the first CIPSTART often fails
+    // transiently (the client's just-opened listen socket / the ESP isn't ready yet),
+    // which made directory entry "work only on the 2nd/3rd try".
+    for (int attempt = 0; attempt < 3; attempt++) {
+        int id = ZiFiSock::sock_open(g_data_ip, g_data_port, false, 5000);
+        if (id >= 0) return id;
+        ftplog("  data connect %s:%u attempt %d failed", g_data_ip, (unsigned)g_data_port, attempt + 1);
+        sleep_ms(200);
+    }
+    reply(425, "Can't open data connection");
+    return -1;
 }
 
 // ── Directory listing ────────────────────────────────────────────────────────
@@ -195,27 +203,40 @@ static void doStor(const char* arg, bool append) {
     if (!f) { reply(550, "Cannot create file"); return; }
     if (rest && !append) f_lseek(f, rest);
 
+    // Send 150 BEFORE opening the data link. In active mode the client starts pushing
+    // file data the instant we connect (CIPSTART); if we sent 150 after, that control
+    // sock_send would race the incoming +IPD flood on the shared ESP UART, corrupting
+    // the framing (lost SEND OK, false CLOSED) and truncating the upload (~10 KB).
+    reply(150, "Ready to receive data");
     int data = openData();
     if (data < 0) { fclose2(f); return; } // openData() already sent 425
-    reply(150, "Ready to receive data");
 
     bool ok = true;
     uint32_t got = 0;
+    uint32_t drops0 = ZiFiSock::rxBufDropped();
+    int empties = 0;
     for (;;) {
         int n = ZiFiSock::sock_recv(data, g_buf, sizeof(g_buf), 10000);
         if (n > 0) {
             UINT bw;
             if (f_write(f, g_buf, n, &bw) != FR_OK || (int)bw != n) { ok = false; break; }
             got += n;
+            empties = 0;
             continue;
         }
-        // n == 0: real EOF (peer closed) or an idle timeout — stop either way.
+        if (n < 0) { ok = false; break; }            // transport error
+        // n == 0: no data this round. End only on a real close (FTP EOF); a transient
+        // empty read (brief gap, e.g. an SD-write stall) is NOT EOF — keep waiting.
         if (ZiFiSock::sock_closed(data)) break;
-        break;
+        if (++empties >= 3) break;                   // ~30 s of silence on an open link → give up
     }
     fclose2(f);
     ZiFiSock::sock_close(data);
-    ftplog("  STOR %s: %lu bytes", baseName(path), (unsigned long)got);
+    uint32_t drops = ZiFiSock::rxBufDropped() - drops0;
+    // Diagnostic: if the upload truncates, this shows whether it was an early close
+    // (closed=1) or dropped RX bytes (drops>0, ring overflow during SD writes).
+    ftplog("  STOR %s: %lu bytes (closed=%d drops=%lu)", baseName(path),
+           (unsigned long)got, ZiFiSock::sock_closed(data) ? 1 : 0, (unsigned long)drops);
     reply(ok ? 226 : 426, ok ? "Transfer complete" : "Transfer aborted");
 }
 
@@ -398,6 +419,11 @@ void Ftpd::poll() {
             g_cwd = "/";
             g_have_port = false;
             ftplog("Client connected");
+            // The ESP needs a moment after reporting "x,CONNECT" before it will accept a
+            // CIPSEND on the new link — fire the 220 greeting too soon and it fails, so the
+            // client never sees it and "can't connect". (With ZiFi tracing on, the Debug
+            // log flood accidentally provided this delay — hence "works only with logs".)
+            sleep_ms(150);
             reply(220, "pico-spec FTP server ready");
         }
         return;

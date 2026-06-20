@@ -15,6 +15,8 @@ int     ZiFiSock::rx_head[ZiFiSock::N_LINKS] = {0};
 int     ZiFiSock::rx_tail[ZiFiSock::N_LINKS] = {0};
 bool    ZiFiSock::closed[ZiFiSock::N_LINKS]  = {false};
 bool    ZiFiSock::opened[ZiFiSock::N_LINKS]  = {false};
+static uint32_t g_rx_buf_drops = 0;   // per-link ring overflow bytes lost (diagnostic)
+uint32_t ZiFiSock::rxBufDropped() { return g_rx_buf_drops; }
 bool    ZiFiSock::mux_mode = false;
 bool    ZiFiSock::is_ready = false;
 int     ZiFiSock::accepted_link = -1;
@@ -160,6 +162,7 @@ void ZiFiSock::pump(uint32_t budget_ms) {
                 // OSD-side consumer must drain via sock_recv faster than the wire).
                 int nt = (rx_tail[ipd_link] + 1) % RX_SZ;
                 if (nt != rx_head[ipd_link]) { rx_buf[ipd_link][rx_tail[ipd_link]] = b; rx_tail[ipd_link] = nt; }
+                else g_rx_buf_drops++;   // ring full → byte lost (consumer too slow / SD stall)
                 if (--ipd_len <= 0) st = ST_SCAN;
                 break;
             }

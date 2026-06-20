@@ -46,6 +46,10 @@ public:
     // EOF from a transient empty sock_recv (which both return 0).
     static bool sock_closed(int id);
 
+    // Cumulative payload bytes dropped because a per-link RX ring was full (the
+    // consumer couldn't drain fast enough, e.g. during an SD-write stall). Diagnostic.
+    static uint32_t rxBufDropped();
+
     // End the session: optionally reset CIPMUX back to 0 and drop buffers.
     static void end();
 
