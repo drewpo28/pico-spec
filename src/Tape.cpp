@@ -393,6 +393,33 @@ void Tape::Init() {
     tapeFileType = TAPE_FTYPE_EMPTY;
 }
 
+// Re-mount the tape remembered in Config::tape_file, so a tape survives an F11
+// reset / power-cycle the same way a mounted TRD disk does (ESPectrum::reset()
+// otherwise wipes Tape::tapeFileName). Only TAP/TZX/PZX are remembered. Loads
+// with a non-"R" key so flashload never fires here (that would re-run the loader
+// and trash the freshly-reset machine state). Auto-plays when tape_autostart is on.
+void Tape::LoadRemembered() {
+    if (!FileUtils::fsMount) return;
+    string full = Config::tape_file;
+    if (full.empty() || full == "none") return;
+    if (!FileUtils::hasTAPextension(full) &&
+        !FileUtils::hasTZXextension(full) &&
+        !FileUtils::hasPZXextension(full)) return;
+    size_t slash = full.rfind('/');
+    if (slash == string::npos) return;
+    // Verify the file still exists before handing it to LoadTape, which would
+    // otherwise pop an OSD error during a silent boot/reset re-mount. Use the
+    // heap-backed fopen2 (not a stack FIL — the core stack is only 2 KB).
+    FIL* probe = fopen2(full.c_str(), FA_READ);
+    if (!probe) return;
+    fclose2(probe);
+    FileUtils::TAP_Path = full.substr(0, slash + 1);
+    string name = full.substr(slash + 1);
+    LoadTape("L" + name); // "L" = load only, never flashload
+    if (Config::tape_autostart && tapeStatus == TAPE_STOPPED)
+        Play();
+}
+
 typedef struct INFO {
     char INFO[4];
 } INFO_t;
@@ -772,8 +799,9 @@ void Tape::TAP_Open(const string& name) {
     }
     tapeFileSize = f_size(&tape);
     if (tapeFileSize == 0) return;
-    
+
     tapeFileName = name;
+    Config::tape_file = FileUtils::TAP_Path + name; // remember slot, re-mounted after F11/reboot
 
     Tape::TapeListing.clear(); // Clear TapeListing vector
     std::vector<TapeBlock>().swap(TapeListing); // free memory

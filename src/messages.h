@@ -339,7 +339,8 @@ static const char *MENU_SNA[2] = { MENU_SNA_EN, MENU_SNA_ES };
 	"Player mode\t>\n"\
 	"Real sound-in\t>\n"\
 	"Fast tape load\t>\n"\
-	"R.G. ROM timings\t>\n"
+	"R.G. ROM timings\t>\n"\
+	"Auto-start\t>\n"
 #define MENU_TAPE_ES \
     "Casete\n"\
     "Elegir (TAP)\t{HK_LOAD_ANY}>\n"\
@@ -348,7 +349,8 @@ static const char *MENU_SNA[2] = { MENU_SNA_EN, MENU_SNA_ES };
 	"Modo reproductor\t>\n"\
 	"Modo de sonido real\t>\n"\
 	"Carga rapida cinta\t>\n"\
-	"Timings ROM R.G.\t>\n"
+	"Timings ROM R.G.\t>\n"\
+	"Auto-inicio\t>\n"
 static const char *MENU_TAPE[2] = { MENU_TAPE_EN, MENU_TAPE_ES };
 #define MENU_TAPE_NO_SD_EN \
     "Tape menu\n"\
@@ -357,7 +359,8 @@ static const char *MENU_TAPE[2] = { MENU_TAPE_EN, MENU_TAPE_ES };
 	"Player mode\t>\n"\
 	"Real sound-in\t>\n"\
 	"Fast tape load\t>\n"\
-	"R.G. ROM timings\t>\n"
+	"R.G. ROM timings\t>\n"\
+	"Auto-start\t>\n"
 #define MENU_TAPE_NO_SD_ES \
     "Casete\n"\
     "Play/Stop\t{HK_TAPE_PLAY}\n"\
@@ -365,7 +368,8 @@ static const char *MENU_TAPE[2] = { MENU_TAPE_EN, MENU_TAPE_ES };
 	"Modo reproductor\t>\n"\
 	"Modo de sonido real\t>\n"\
 	"Carga rapida cinta\t>\n"\
-	"Timings ROM R.G.\t>\n"
+	"Timings ROM R.G.\t>\n"\
+	"Auto-inicio\t>\n"
 static const char *MENU_TAPE_NO_SD[2] = { MENU_TAPE_NO_SD_EN, MENU_TAPE_NO_SD_ES };
 
 static const char *MENU_TAPEPLAYER[2] = { "Player mode\n", "Modo reproductor\n" };
@@ -901,6 +905,8 @@ static const char *MENU_YESNO[2] = { MENU_YESNO_EN, MENU_YESNO_ES};
 static const char *MENU_FLASHLOAD[2] = { "Fast load\n" , "Carga rapida\n"};
 
 static const char *MENU_RGTIMINGS[2] = { "R.G. Timings\n" , "Timings R.G.\n"};
+
+static const char *MENU_TAPE_AUTOSTART[2] = { "Auto-start\n" , "Auto-inicio\n"};
 
 static const char *MENU_LEDINDICATORS[2] = { "LED indicators\n" , "Indicadores LED\n"};
 

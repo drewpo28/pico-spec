@@ -2491,6 +2491,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         }
                                         Config::save();
                                         Tape::LoadTape(mFile);
+                                        // Auto-start: press Play automatically after a manual
+                                        // mount. Skipped when flashload is on — there the loader
+                                        // has already run the program during LoadTape, and the
+                                        // runtime auto-start heuristic drives real-time loaders.
+                                        if (Config::tape_autostart && !Config::flashload &&
+                                            Tape::tapeStatus == TAPE_STOPPED &&
+                                            Tape::tapeFileName != "none")
+                                            Tape::Play();
                                         return;
                                     }
                                 }
@@ -2669,6 +2677,37 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             menu_saverect = false;
                                         } else {
                                             menu_curopt = FileUtils::fsMount ? 7 : 6;
+                                            menu_level = 2;
+                                            break;
+                                        }
+                                    }
+                                }
+                                else if (tap_num == 8) {
+                                    // Auto-start (remember tape + auto-play on load/restore)
+                                    menu_level = 3;
+                                    menu_curopt = 1;
+                                    menu_saverect = true;
+                                    while (1) {
+                                        string mnu_str = MENU_TAPE_AUTOSTART[Config::lang];
+                                        mnu_str += MENU_YESNO[Config::lang];
+                                        bool prev_opt = Config::tape_autostart;
+                                        if (prev_opt) {
+                                            mnu_str.replace(mnu_str.find("[Y",0),2,"[*");
+                                            mnu_str.replace(mnu_str.find("[N",0),2,"[ ");
+                                        } else {
+                                            mnu_str.replace(mnu_str.find("[Y",0),2,"[ ");
+                                            mnu_str.replace(mnu_str.find("[N",0),2,"[*");
+                                        }
+                                        uint8_t opt2 = menuRun(mnu_str);
+                                        if (opt2) {
+                                            Config::tape_autostart = (opt2 == 1);
+                                            if (Config::tape_autostart != prev_opt) {
+                                                Config::save();
+                                            }
+                                            menu_curopt = opt2;
+                                            menu_saverect = false;
+                                        } else {
+                                            menu_curopt = FileUtils::fsMount ? 8 : 7;
                                             menu_level = 2;
                                             break;
                                         }

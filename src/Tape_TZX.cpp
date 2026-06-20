@@ -446,6 +446,7 @@ void Tape::TZX_Open(const string& name) {
     }
 
     tapeFileName = name;
+    Config::tape_file = FileUtils::TAP_Path + name; // remember slot, re-mounted after F11/reboot
 
     FIL* tape = &Tape::tape;
     fseek(tape, 2, SEEK_CUR); // Jump TZX version bytes

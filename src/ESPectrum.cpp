@@ -1172,6 +1172,11 @@ void ESPectrum::setup() {
     if (FileUtils::fsMount)
       Config::save();
   }
+
+  // Re-mount the tape remembered from a previous session (NVS) so it is present
+  // at cold boot, the same way disk mounts are restored by loadDiskMounts above.
+  Tape::LoadRemembered();
+
   Debug::log("setup: COMPLETE, freeHeap=%u", getFreeHeap());
   Debug::log2SD("setup: COMPLETE, freeHeap=%u", (unsigned)getFreeHeap());
 
@@ -1380,6 +1385,10 @@ void ESPectrum::reset(uint8_t romInUse) {
     memset(Ports::pitChannels, 0, sizeof(Ports::pitChannels));
   }
 #endif
+
+  // Re-mount the remembered tape (reset() wiped it above) so a tape survives an
+  // F11 reset like a mounted disk does. No-op if no tape is remembered.
+  Tape::LoadRemembered();
 }
 
 //=======================================================================================

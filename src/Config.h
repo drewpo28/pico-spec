@@ -81,6 +81,7 @@ public:
     static string   pref_romSetProfi;
     static string   ram_file;
     static string   last_ram_file;
+    static string   tape_file;       // full path of remembered tape, re-mounted after F11/reboot like a disk
     // Provenance of a loaded/mounted file. Transient sources (TMP/REMOTE/WEB) are
     // never pinned as a reload reference (the file is gone after reboot); LOCAL is a
     // real SD path that persists. Old configs lack the tag → default LOCAL.
@@ -116,6 +117,7 @@ public:
     static bool     profi_ext_keys;  // Profi extended keyboard mode (default false)
     static bool     profi_ds80_std_palette_osd; // Use standard ZX palette for OSD over DS80 (default false = keep DS80 background)
     static bool     tape_timing_rg;
+    static bool     tape_autostart;  // auto-play tape on load + after F11/boot re-mount (default true)
     static bool     rightSpace;
     static bool     wasd;
     enum BPType : uint8_t { BP_PC=0, BP_PORT_READ=1, BP_PORT_WRITE=2, BP_MEM_WRITE=3, BP_MEM_READ=4, BP_NONE=0xFF };
