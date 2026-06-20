@@ -13,9 +13,24 @@
 #include <ctype.h>
 #include <stdarg.h>
 
-// One transfer buffer, reused for every RETR/STOR/LIST. Static (not stack —
-// PICO_STACK_SIZE is small) and safe because a single transfer runs at a time.
-static uint8_t g_buf[2048];
+// All FTP-server scratch lives in ONE heap struct allocated in begin() and freed
+// in stop() — the server never runs in the background, so it costs 0 SRAM when
+// idle (critical for the razor-thin Profi heap, which forces ~80 KB of SRAM pages
+// before the framebuffer alloc). These can't go on the stack (PICO_STACK_SIZE is
+// tiny, deep under do_OSD) and sharing is safe: a single command/transfer runs at
+// a time. Buffers with overlapping lifetimes get distinct members; leaf formatters
+// share. g_b is non-null for the whole begin()..stop() window (every deref happens
+// via poll(), which only runs between them).
+struct FtpdBuf {
+    uint8_t  xfer[2048];   // RETR/STOR/LIST data transfer + recv (was g_buf)
+    char     reply[320];   // reply() control-line formatter
+    char     log[256];     // ftplog() line formatter
+    char     ls[400];      // fmtLsLine / fmtMlsdLine (one per loop iteration)
+    char     cmd[320];     // poll() command line — holds `arg` during handle()
+    char     m[480];       // leaf replies: MLST / PWD / MKD
+    FILINFO  fi;           // shared by LIST/CWD/SIZE/RNFR/MDTM/MLST (serial use)
+};
+static FtpdBuf* g_b = nullptr;
 
 // ── Session state (single client) ────────────────────────────────────────────
 static Ftpd::LogCb g_log    = nullptr;
@@ -29,19 +44,21 @@ static uint32_t g_rest = 0;                  // pending REST offset for the next
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 static void ftplog(const char* fmt, ...) {
-    static char buf[256]; // static: core stack is only 4 KB, deep under do_OSD
+    if (!g_b) return;
+    char* buf = g_b->log;
     va_list ap; va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    vsnprintf(buf, sizeof(g_b->log), fmt, ap);
     va_end(ap);
     if (g_log) g_log(buf);         // on-screen FTP terminal
 }
 
 // ── Control replies ──────────────────────────────────────────────────────────
 static void reply(int code, const char* text) {
-    static char buf[320]; // static: avoid core-stack overflow under do_OSD
-    int n = snprintf(buf, sizeof(buf), "%d %s\r\n", code, text);
+    if (!g_b) return;
+    char* buf = g_b->reply;
+    int n = snprintf(buf, sizeof(g_b->reply), "%d %s\r\n", code, text);
     if (n < 0) return;
-    if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1; // snprintf returns intended length
+    if (n >= (int)sizeof(g_b->reply)) n = sizeof(g_b->reply) - 1; // snprintf returns intended length
     if (g_ctrl >= 0) ZiFiSock::sock_send(g_ctrl, (const uint8_t*)buf, n, 8000);
     ftplog("< %d %s", code, text);
 }
@@ -105,8 +122,8 @@ static void fmtLsLine(const FILINFO& fi, std::string& out) {
     int day   =  fi.fdate       & 0x1F; if (day < 1) day = 1;
     int hh    = (fi.ftime >> 11) & 0x1F;
     int mm    = (fi.ftime >> 5)  & 0x3F;
-    static char line[320]; // static: serial use, keep it off the 4 KB core stack
-    snprintf(line, sizeof(line), "%crw-r--r-- 1 ftp ftp %10lu %s %2d %02d:%02d %s\r\n",
+    char* line = g_b->ls;
+    snprintf(line, sizeof(g_b->ls), "%crw-r--r-- 1 ftp ftp %10lu %s %2d %02d:%02d %s\r\n",
              (fi.fattrib & AM_DIR) ? 'd' : '-', (unsigned long)fi.fsize,
              MON[month - 1], day, hh, mm, fi.fname);
     out += line;
@@ -126,11 +143,11 @@ static void fmtMtime(const FILINFO& fi, char* out, size_t n) {
 // One MLSD machine-listing fact line for a FILINFO (RFC 3659).
 static void fmtMlsdLine(const FILINFO& fi, std::string& out) {
     char mt[16]; fmtMtime(fi, mt, sizeof(mt));
-    static char line[400]; // static: off the 4 KB core stack
+    char* line = g_b->ls;
     if (fi.fattrib & AM_DIR)
-        snprintf(line, sizeof(line), "type=dir;modify=%s; %s\r\n", mt, fi.fname);
+        snprintf(line, sizeof(g_b->ls), "type=dir;modify=%s; %s\r\n", mt, fi.fname);
     else
-        snprintf(line, sizeof(line), "type=file;size=%lu;modify=%s; %s\r\n",
+        snprintf(line, sizeof(g_b->ls), "type=file;size=%lu;modify=%s; %s\r\n",
                  (unsigned long)fi.fsize, mt, fi.fname);
     out += line;
 }
@@ -145,7 +162,7 @@ static void doList(const char* arg, int fmt) {
     if (data < 0) { f_closedir(&dir); return; } // openData() already sent 425
     reply(150, "Here comes the directory listing");
 
-    static FILINFO fi; // ~285 B with LFN — keep it off the 4 KB core stack
+    FILINFO& fi = g_b->fi;
     std::string buf;
     bool ok = true;
     while (f_readdir(&dir, &fi) == FR_OK && fi.fname[0]) {
@@ -182,9 +199,9 @@ static void doRetr(const char* arg) {
     uint32_t sent = 0;
     for (;;) {
         UINT br;
-        if (f_read(f, g_buf, sizeof(g_buf), &br) != FR_OK) { ok = false; break; }
+        if (f_read(f, g_b->xfer, sizeof(g_b->xfer), &br) != FR_OK) { ok = false; break; }
         if (br == 0) break; // EOF
-        if (ZiFiSock::sock_send(data, g_buf, br, 12000) != (int)br) { ok = false; break; }
+        if (ZiFiSock::sock_send(data, g_b->xfer, br, 12000) != (int)br) { ok = false; break; }
         sent += br;
     }
     fclose2(f);
@@ -216,10 +233,10 @@ static void doStor(const char* arg, bool append) {
     uint32_t drops0 = ZiFiSock::rxBufDropped();
     int empties = 0;
     for (;;) {
-        int n = ZiFiSock::sock_recv(data, g_buf, sizeof(g_buf), 10000);
+        int n = ZiFiSock::sock_recv(data, g_b->xfer, sizeof(g_b->xfer), 10000);
         if (n > 0) {
             UINT bw;
-            if (f_write(f, g_buf, n, &bw) != FR_OK || (int)bw != n) { ok = false; break; }
+            if (f_write(f, g_b->xfer, n, &bw) != FR_OK || (int)bw != n) { ok = false; break; }
             got += n;
             empties = 0;
             continue;
@@ -275,7 +292,7 @@ static void doEprt(const char* arg) {
 
 // ── MDTM / MLST (no data connection) ─────────────────────────────────────────
 static void doMdtm(const char* arg) {
-    static FILINFO fi;
+    FILINFO& fi = g_b->fi;
     if (arg && f_stat(resolve(arg).c_str(), &fi) == FR_OK) {
         char mt[16]; fmtMtime(fi, mt, sizeof(mt));
         reply(213, mt);
@@ -284,19 +301,19 @@ static void doMdtm(const char* arg) {
 
 static void doMlst(const char* arg) {
     std::string path = resolve(arg);
-    static FILINFO fi;
+    FILINFO& fi = g_b->fi;
     bool isRoot = (path == "/");
     if (!isRoot && f_stat(path.c_str(), &fi) != FR_OK) { reply(550, "File not found"); return; }
     char mt[16];
     bool isDir; unsigned long sz;
     if (isRoot) { isDir = true; sz = 0; snprintf(mt, sizeof(mt), "19800101000000"); }
     else { isDir = fi.fattrib & AM_DIR; sz = (unsigned long)fi.fsize; fmtMtime(fi, mt, sizeof(mt)); }
-    static char buf[480];
+    char* buf = g_b->m;
     if (isDir)
-        snprintf(buf, sizeof(buf), "250-Listing %s\r\n type=dir;modify=%s; %s\r\n250 End\r\n",
+        snprintf(buf, sizeof(g_b->m), "250-Listing %s\r\n type=dir;modify=%s; %s\r\n250 End\r\n",
                  path.c_str(), mt, path.c_str());
     else
-        snprintf(buf, sizeof(buf), "250-Listing %s\r\n type=file;size=%lu;modify=%s; %s\r\n250 End\r\n",
+        snprintf(buf, sizeof(g_b->m), "250-Listing %s\r\n type=file;size=%lu;modify=%s; %s\r\n250 End\r\n",
                  path.c_str(), sz, mt, path.c_str());
     if (g_ctrl >= 0) ZiFiSock::sock_send(g_ctrl, (const uint8_t*)buf, strlen(buf), 8000);
     ftplog("< 250 MLST %s", path.c_str());
@@ -332,12 +349,12 @@ static void handle(char* line) {
     else if (!strcmp(line, "MODE")) reply(200, "Mode S ok");
     else if (!strcmp(line, "STRU")) reply(200, "Structure F ok");
     else if (!strcmp(line, "PWD") || !strcmp(line, "XPWD")) {
-        static char m[300]; snprintf(m, sizeof(m), "\"%s\" is the current directory", g_cwd.c_str());
+        char* m = g_b->m; snprintf(m, sizeof(g_b->m), "\"%s\" is the current directory", g_cwd.c_str());
         reply(257, m);
     }
     else if (!strcmp(line, "CWD") || !strcmp(line, "XCWD")) {
         std::string p = resolve(arg);
-        static FILINFO fi; // ~285 B with LFN — static to spare the core stack
+        FILINFO& fi = g_b->fi;
         if (p == "/" || (f_stat(p.c_str(), &fi) == FR_OK && (fi.fattrib & AM_DIR))) {
             g_cwd = p; reply(250, "Directory changed");
         } else reply(550, "No such directory");
@@ -363,7 +380,7 @@ static void handle(char* line) {
     else if (!strcmp(line, "STOR")) doStor(arg, false);
     else if (!strcmp(line, "APPE")) doStor(arg, true);
     else if (!strcmp(line, "SIZE")) {
-        static FILINFO fi; // ~285 B with LFN — static to spare the core stack
+        FILINFO& fi = g_b->fi;
         if (arg && f_stat(resolve(arg).c_str(), &fi) == FR_OK && !(fi.fattrib & AM_DIR)) {
             char m[32]; snprintf(m, sizeof(m), "%lu", (unsigned long)fi.fsize); reply(213, m);
         } else reply(550, "Could not get file size");
@@ -378,11 +395,11 @@ static void handle(char* line) {
     }
     else if (!strcmp(line, "MKD") || !strcmp(line, "XMKD")) {
         if (arg && f_mkdir(resolve(arg).c_str()) == FR_OK) {
-            static char m[300]; snprintf(m, sizeof(m), "\"%s\" created", resolve(arg).c_str()); reply(257, m);
+            char* m = g_b->m; snprintf(m, sizeof(g_b->m), "\"%s\" created", resolve(arg).c_str()); reply(257, m);
         } else reply(550, "Create directory failed");
     }
     else if (!strcmp(line, "RNFR")) {
-        static FILINFO fi; // ~285 B with LFN — static to spare the core stack
+        FILINFO& fi = g_b->fi;
         if (arg && f_stat(resolve(arg).c_str(), &fi) == FR_OK) { g_rnfr = resolve(arg); reply(350, "Ready for RNTO"); }
         else reply(550, "File not found");
     }
@@ -402,13 +419,16 @@ static void handle(char* line) {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 bool Ftpd::begin(uint16_t port, LogCb log) {
+    if (!g_b) g_b = (FtpdBuf*)malloc(sizeof(FtpdBuf));  // ~4 KB, freed in stop()
+    if (!g_b) return false;                              // OOM
     g_log = log;
     g_ctrl = -1;
     g_cwd = "/";
     g_have_port = false;
     g_rnfr.clear();
     g_rest = 0;
-    return ZiFiSock::server_listen(port);
+    if (!ZiFiSock::server_listen(port)) { free(g_b); g_b = nullptr; return false; }
+    return true;
 }
 
 void Ftpd::poll() {
@@ -429,8 +449,8 @@ void Ftpd::poll() {
         return;
     }
 
-    static char line[320]; // static: command buffer off the 4 KB core stack
-    if (ZiFiSock::sock_recv_line(g_ctrl, line, sizeof(line), 150)) {
+    char* line = g_b->cmd; // command buffer in the heap scratch struct
+    if (ZiFiSock::sock_recv_line(g_ctrl, line, sizeof(g_b->cmd), 150)) {
         if (line[0]) handle(line);
     } else if (ZiFiSock::sock_closed(g_ctrl)) {
         ZiFiSock::sock_close(g_ctrl);
@@ -445,6 +465,7 @@ void Ftpd::stop() {
     if (g_ctrl >= 0) { ZiFiSock::sock_close(g_ctrl); g_ctrl = -1; }
     ZiFiSock::server_stop();
     g_log = nullptr;
+    free(g_b); g_b = nullptr;   // release the ~4 KB scratch — server is fully idle now
 }
 
 #endif // !PICO_RP2040 && ZIFI_NET_CLIENT

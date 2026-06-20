@@ -524,8 +524,17 @@ static void netConnectRemote(const Config::Remote& r, const string& restorePath 
 }
 
 // Shared scratch for the remotes list (avoids a big array on the 4 KB core stack;
-// one network UI runs at a time). ~1.5 KB BSS on RP2350 (acceptable; NIC-only).
-static Config::Remote g_remotes[Config::MAX_REMOTES];
+// one network UI runs at a time). Lazy-heaped — costs 0 SRAM until a network UI
+// actually opens, so it never starves the razor-thin Profi heap at VIDEO::Init.
+// (Profi forces ~80 KB of SRAM pages before the framebuffer alloc; every byte of
+// permanent BSS here pushes it into OOM.) ~2 KB once allocated; never freed (the
+// one allocation persists for the session — it's small and reused).
+static Config::Remote* remotesBuf() {
+    static Config::Remote* p = nullptr;
+    if (!p) p = new (std::nothrow) Config::Remote[Config::MAX_REMOTES];
+    return p;
+}
+#define g_remotes remotesBuf()
 
 // Add Remote: prompt protocol / host / user / port / password (+ "save password")
 // and append the connection to remotes.tsv. Does not connect.
@@ -564,6 +573,7 @@ static void addRemoteForm() {
     string alias = netAskField(MSG_REMOTE_ALIAS_LABEL[Config::lang], "");
     if (alias == "\x1B") return;
 
+    if (!g_remotes) return;   // alloc failed (OOM) — bail out of the form
     int n = Config::loadRemotes(g_remotes, Config::MAX_REMOTES);
     if (n >= Config::MAX_REMOTES) { OSD::osdCenteredMsg(MSG_REMOTE_FULL[Config::lang], LEVEL_WARN, 2000); return; }
     g_remotes[n].host = host; g_remotes[n].user = user; g_remotes[n].port = port;
@@ -584,6 +594,7 @@ static void addRemoteForm() {
 static void remoteHostsBrowse() {
     string ssid, ip;
     if (!ZiFiAT::getStatus(ssid, ip)) { OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200); return; }
+    if (!g_remotes) return;   // alloc failed (OOM) — can't list remotes
     int hf = 2, hb = 2;                               // keep the cursor on the chosen host
     while (1) {
         int n = Config::loadRemotes(g_remotes, Config::MAX_REMOTES);
@@ -668,7 +679,7 @@ static bool f5Locations() {
                 netDownloadArchive();
                 g_web_restore = false;    // clear even if netDownloadArchive bailed early
                 if (OSD::net_launch_close || OSD::net_close_all) return false;
-            } else if (L[0] == 'R' && f.size() >= 6) {       // R \t host \t port \t proto \t user \t path
+            } else if (L[0] == 'R' && f.size() >= 6 && g_remotes) {  // R \t host \t port \t proto \t user \t path
                 int n = Config::loadRemotes(g_remotes, Config::MAX_REMOTES);
                 uint16_t port = (uint16_t)atoi(f[2].c_str());
                 uint8_t  proto = (uint8_t)atoi(f[3].c_str());
@@ -712,10 +723,19 @@ static bool f5Locations() {
 // holding the most recent lines; the renderer always shows the tail (auto-scroll).
 #define FTPD_LOG_LINES 40
 #define FTPD_LOG_COLS  72
-static char ftpd_log[FTPD_LOG_LINES][FTPD_LOG_COLS];
+// Lazy-heaped (2880 B) — costs 0 SRAM until the FTP server / WiFi-connect window
+// actually logs a line, so it never starves the razor-thin Profi heap at
+// VIDEO::Init (Profi forces ~80 KB of SRAM pages before the framebuffer alloc).
+// Readers are gated by `li < ftpd_log_count`, and ftpd_log_count only advances
+// after a successful alloc here, so they never touch a null buffer.
+static char (*ftpd_log)[FTPD_LOG_COLS] = nullptr;
 static int  ftpd_log_count = 0;  // total lines pushed (monotonic)
 static bool ftpd_log_dirty = true;
 static void ftpdLogLine(const char* s) {
+    if (!ftpd_log) {
+        ftpd_log = (char(*)[FTPD_LOG_COLS])calloc(FTPD_LOG_LINES, FTPD_LOG_COLS);
+        if (!ftpd_log) return;   // OOM — drop the line rather than crash
+    }
     int slot = ftpd_log_count % FTPD_LOG_LINES;
     strncpy(ftpd_log[slot], s ? s : "", FTPD_LOG_COLS - 1);
     ftpd_log[slot][FTPD_LOG_COLS - 1] = '\0';
