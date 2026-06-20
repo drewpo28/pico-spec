@@ -367,7 +367,7 @@ over the ESP-01 and save to SD, with minimal SRAM. RP2350-only, behind
 - **"NO CMOS" fix (hw-confirmed)**: Gluk treats CMOS valid only when NVRAM **reg 0x11 == 0xAA** (unpacked-RAM check at 0x6049 `CP 0xAA / JR NZ`); reg 0x12 == 0x47 (`'G'`) gates loading the 27-byte config (regs 0x13–0x2D → RAM 0x63A1). No checksum. Gluk's auto-path writes a bogus 0x55 and never self-validates (real signature written only on menu-save). `RTC::init()` seeds `regs[0x11] = 0xAA` after `loadNVRAM()` so the clock works out of the box; Gluk then reads time regs 0x00–0x09.
 - NVRAM (0x0E–0x3F + reg B) persisted to `CONFIG_DIR/cmos.nvr` (battery emulation): `loadNVRAM()` at init, dirty-flushed from main loop via `RTC::flushNVRAM()`.
 - `RTC_PORT_TRACE` CMake option (default OFF) logs every `..F7` IN/OUT for debugging.
-- **Toggle**: Options → Other → "RTC + NVRAM" (Yes/No → `Config::rtc_enabled`, default on, NVS-persisted). RP2350-only: the menu row is appended at runtime under `#if !PICO_RP2040`; when off, the `#DFF7`/`#BFF7` port handlers are bypassed (Gluk shows "NO CMOS").
+- **Toggle**: Options → Other → "RTC + NVRAM" (Yes/No → `Config::rtc_enabled`, default **off** — `Config::rtc_enabled = false`, NVS-persisted). RP2350-only: the menu row is appended at runtime under `#if !PICO_RP2040`; when off, the `#DFF7`/`#BFF7` port handlers are bypassed (Gluk shows "NO CMOS").
 
 ## Tools
 
@@ -380,7 +380,8 @@ over the ESP-01 and save to SD, with minimal SRAM. RP2350-only, behind
 
 ## Test Files
 
-- `FPGA48all.tap` — SAA1099 test program for ZX Spectrum 128K
+- `FPGA48all.tap` — **ULA test program for ZX Spectrum 48K** (NOT SAA1099 — port
+  `0x01FE` is the ULA port, A0=0; the earlier "SAA1099" label was wrong, per user)
   - Disassembly: `FPGA48all_disasm.txt`
   - Loader at 0x5E00, screen at 0x4000, main code at 0x6200
-  - Main code starts with `CALL 0x817E` (IM 2 setup), uses SAA1099 port 0x01FE
+  - Main code starts with `CALL 0x817E` (IM 2 setup); exercises the ULA via port `0x01FE`

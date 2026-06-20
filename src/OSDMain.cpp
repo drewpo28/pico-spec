@@ -655,10 +655,18 @@ static bool f5Locations() {
         g_f5_restore = false;
         const string& L = Config::last_loc;
         if (!L.empty() && (L[0] == 'W' || L[0] == 'R')) {
+            // Only auto-reopen a network location when the WiFi link is actually up.
+            // Right after a (power-cycle) reboot the ESP may not be associated yet;
+            // diving into a blocking HTTPS revalidate/fetch then would freeze the UI
+            // ("F5 hangs hard"). Not connected → skip the dive and fall through to the
+            // chooser below, so F5 stays responsive.
             std::vector<string> f; splitTabs(L, f);
-            if (L[0] == 'W' && f.size() >= 3) {              // W \t site \t path
+            if (!ZiFiAT::connected) {
+                /* fall through to the chooser */
+            } else if (L[0] == 'W' && f.size() >= 3) {       // W \t site \t path
                 g_web_rsite = f[1]; g_web_rpath = f[2]; g_web_restore = true;
                 netDownloadArchive();
+                g_web_restore = false;    // clear even if netDownloadArchive bailed early
                 if (OSD::net_launch_close || OSD::net_close_all) return false;
             } else if (L[0] == 'R' && f.size() >= 6) {       // R \t host \t port \t proto \t user \t path
                 int n = Config::loadRemotes(g_remotes, Config::MAX_REMOTES);

@@ -1806,6 +1806,20 @@ static bool rfd_launch_tmp(string path) {
     return false;
 }
 
+// Quick-start always reuses a fixed /tmp/_run.<ext>. If a previous quick-start is
+// still holding that exact file open — a disk mounted in the WD1793, or a tape still
+// loaded — re-downloading into it (fopen2 FA_CREATE_ALWAYS over an open file) fails,
+// which showed up as an empty progress bar that never advanced. Release the owner
+// of `tmpp` first so the fresh download can truncate and rewrite it.
+static void rfd_release_tmp(const string& tmpp) {
+    for (int u = 0; u < 4; u++)
+        if (ESPectrum::fdd.disk[u] && ESPectrum::fdd.disk[u]->fname == tmpp)
+            wdDiskEject(&ESPectrum::fdd, u);
+    if (Tape::tapeFileType != TAPE_FTYPE_EMPTY &&
+        FileUtils::TAP_Path + Tape::tapeFileName == tmpp)
+        Tape::Init();   // closes the open tape FIL
+}
+
 // ── Listing-index cache (Remote/Web) ─────────────────────────────────────────
 // Cache key = FNV-1a of "cacheId()|cwdPath()" (per source, per folder), namespaced
 // in /tmp so it survives reboot. Freshness policy: session-fresh (fetch a folder
@@ -2018,6 +2032,7 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
             if (d2 != string::npos) ext = base.substr(d2);
         }
         string tmpp = string("/tmp/_run") + ext;
+        rfd_release_tmp(tmpp);   // free the fixed /tmp target if a prior launch still holds it
         bool got = fs->get(nm, tmpp, rfd_progress);
         OSD::progressDialog("", "", 0, 2);
         if (!got) {

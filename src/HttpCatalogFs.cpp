@@ -292,11 +292,21 @@ bool HttpCatalogFs::listStream(const std::string& path, RemoteListCb cb, void* c
         // raw .tsv to a local cache so a later get() reads the locator from SD.
         std::string url = baseUrl() + "/" + site + "/" + slugPath(cur_path) + ".tsv";
         last_etag.clear();                       // capture this listing's validator
-        FIL* cf = fopen2(tsvCachePath().c_str(), FA_WRITE | FA_CREATE_ALWAYS);
+        // Write to a temp file and rename on success, so a mid-stream failure (or a
+        // power cut) never leaves a partial .catv that a later get() would read as a
+        // truncated/garbled locator table. The final cache is only ever complete.
+        std::string finalPath = tsvCachePath();
+        std::string tmpPath = finalPath + ".tmp";
+        FIL* cf = fopen2(tmpPath.c_str(), FA_WRITE | FA_CREATE_ALWAYS);
         TsvTee tee = { { cb, ctx }, cf };
         bool ok = httpsReadLines(url, tsv_tee, &tee, &last_etag);
         if (cf) fclose2(cf);
-        if (!ok) f_unlink(tsvCachePath().c_str()); // don't keep a partial cache
+        if (ok) {
+            f_unlink(finalPath.c_str());                       // f_rename needs a free target
+            if (f_rename(tmpPath.c_str(), finalPath.c_str()) != FR_OK) f_unlink(tmpPath.c_str());
+        } else {
+            f_unlink(tmpPath.c_str());            // don't keep a partial cache
+        }
         return ok;
     }
 
