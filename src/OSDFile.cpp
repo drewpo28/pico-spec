@@ -303,10 +303,19 @@ static const uint8_t FDLG_SIDE_COLS = 11;
 static const uint8_t FDLG_TOTAL_COLS = FDLG_LIST_COLS + FDLG_SIDE_COLS;
 // Active list column width — set per-dialog (FDLG_LIST_COLS for DISK_ALLFILE, cols otherwise)
 static uint8_t fd_list_cols = 0;
+// When set, fd_PrintRow renders row text via the CP1251 Cyrillic font (online catalog
+// names are UTF-8). Off for SD/FTP/SFTP (8-bit names). Reset by the chrome on exit.
+static bool fd_utf8 = false;
+// SD fileDialog: show a ".." even at root "/" (→ return "" → locations). See OSDMain.h.
+bool OSD::fd_root_parent = false;
+// Last cwd shown by remoteFileDialog (caller records it as the global last F5 location).
+string OSD::net_last_path;
+bool   OSD::net_close_all = false;   // Esc in a net browser → close the whole OSD
 
 // Sidebar key labels — 9 chars each (padded), displayed in the right panel
 // activeKey: VK of currently active action (0=none), shown highlighted
-static const struct { fabgl::VirtualKey vk; const char *label; } fd_sidebar_items[] = {
+struct FdSideItem { fabgl::VirtualKey vk; const char *label; };
+static const FdSideItem fd_sidebar_items[] = {
     { fabgl::VK_F1, "F1 Info   " },
     { fabgl::VK_F3, "F3 Find   " },
     { fabgl::VK_F4, "F4 Unzip  " },
@@ -318,9 +327,39 @@ static const struct { fabgl::VirtualKey vk; const char *label; } fd_sidebar_item
 };
 static const int FDLG_SIDE_ITEMS = 8;
 
+// Per-location sidebar sets for the shared chrome (fdChromeList). English-only, like
+// the SD set above. vk values are real keys so none match the VK_NONE "no highlight".
+static const FdSideItem fd_side_locations[] = {
+    { fabgl::VK_RETURN, "Enter Open" },
+};
+static const FdSideItem fd_side_hosts[] = {
+    { fabgl::VK_RETURN, "Ent Conn " },
+    { fabgl::VK_F8,     "F8 Forget" },
+};
+static const FdSideItem fd_side_remote[] = {
+    { fabgl::VK_RETURN, "Ent Run  " },
+    { fabgl::VK_F2,     "F2 Reload" },
+    { fabgl::VK_F5,     "F5 Save  " },
+    { fabgl::VK_F7,     "F7 Upload" },
+    { fabgl::VK_F8,     "F8 Del   " },
+};
+static const FdSideItem fd_side_web[] = {
+    { fabgl::VK_RETURN, "Ent Run  " },
+    { fabgl::VK_F2,     "F2 Reload" },
+    { fabgl::VK_F5,     "F5 Save  " },
+};
+
+// Current sidebar set used when fd_Redraw repaints the sidebar after a scroll.
+// nullptr → the SD default set (so fileDialog is unaffected). fdChromeNav points it
+// at the per-location set for its lifetime and restores nullptr on exit.
+static const FdSideItem* fd_cur_side = nullptr;
+static int fd_cur_side_n = 0;
+
 // Draw the sidebar panel (right of vertical separator).
 // activeKey: if nonzero, that item is highlighted (action in progress).
-static void fd_DrawSidebar(int ox, int oy, int mf_rows, fabgl::VirtualKey activeKey = fabgl::VK_NONE) {
+// items/nitems: which hotkey set to show (default = the SD set).
+static void fd_DrawSidebar(int ox, int oy, int mf_rows, fabgl::VirtualKey activeKey = fabgl::VK_NONE,
+                           const FdSideItem* items = fd_sidebar_items, int nitems = FDLG_SIDE_ITEMS) {
     VIDEO::vga.setFont(Font6x8);
     int sx = ox + 1 + (FDLG_LIST_COLS + 1) * OSD_FONT_W; // pixel x of sidebar
     // Vertical separator — footer colour
@@ -330,19 +369,22 @@ static void fd_DrawSidebar(int ox, int oy, int mf_rows, fabgl::VirtualKey active
         VIDEO::vga.print("|");
     }
     // Sidebar items: same colour as footer (white on blue); active item inverted
-    for (int i = 0; i < FDLG_SIDE_ITEMS; i++) {
+    for (int i = 0; i < nitems; i++) {
         int row = 1 + i;
         if (row > mf_rows) break;
-        bool active = (fd_sidebar_items[i].vk == activeKey);
+        bool active = (items[i].vk == activeKey);
         VIDEO::vga.setCursor(sx, oy + 1 + row * OSD_FONT_H);
         if (active)
             VIDEO::vga.setTextColor(zxColor(5, 0), zxColor(7, 1)); // inverted when active
         else
             VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(5, 0)); // white on blue (footer)
-        VIDEO::vga.print(fd_sidebar_items[i].label);
+        // Pad/truncate to the sidebar width (10) so a shorter label clears the column
+        // (else stale chars remain at the end, e.g. the stray "n").
+        char lbl[12]; snprintf(lbl, sizeof(lbl), "%-10.10s", items[i].label);
+        VIDEO::vga.print(lbl);
     }
     // Fill remaining sidebar rows with footer background
-    for (int row = 1 + FDLG_SIDE_ITEMS; row <= mf_rows; row++) {
+    for (int row = 1 + nitems; row <= mf_rows; row++) {
         VIDEO::vga.setCursor(sx, oy + 1 + row * OSD_FONT_H);
         VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(5, 0));
         VIDEO::vga.print("          ");
@@ -477,7 +519,7 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
         
             FILINFO fileInfo;
             size_t crc = SORT_VERSION;
-            if (fdir.size() > 1) {
+            if (fdir.size() > 1 || fd_root_parent) {   // ".." (at root too when from locations)
                 ++ndirs;
                 crc += ::crc(string(2, DIR_MARKER) + "..");
             }
@@ -503,7 +545,7 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
             uint32_t rcrc = filenames.crc();
             if (rcrc != crc) { // reindex
                 filenames.unlink();
-                if (fdir.size() > 1) {
+                if (fdir.size() > 1 || fd_root_parent) {
                     filenames.push(string(2, DIR_MARKER) + "..");
                 }
                 if (f_opendir(&f_dir, fdir.c_str()) != FR_OK) break;
@@ -941,6 +983,14 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
                         string filedir = rowGet(menu, FileUtils::fileTypes[ftype].focus);
                         if (filedir[0] == DIR_MARKER) {
                             if (filedir[1] == DIR_MARKER) {
+                                // ".." at the SD root → back to the locations chooser
+                                // (distinct from Esc, which closes the OSD). "\x02UP".
+                                if (fd_root_parent && fdir == "/") {
+                                    if (menu_saverect) { VIDEO::SaveRect.restore_last(); menu_saverect = false; }
+                                    click(); filenames.close(); string().swap(menu);
+                                    if (Config::audio_driver == 3) send_to_595(HIGH(AY_Enable));
+                                    return "\x02UP";
+                                }
                                 // Going up to parent dir — restore saved position
                                 fdir.pop_back();
                                 fdir = fdir.substr(0,fdir.find_last_of("/") + 1);
@@ -1131,7 +1181,10 @@ void OSD::fd_Redraw(const string& title, const string& fdir, uint8_t ftype, cons
             if (fd_list_cols != cols) cols = fd_list_cols;
             menuScrollBar(FileUtils::fileTypes[ftype].begin_row);
             cols = saved_cols;
-            if (fd_list_cols != saved_cols) fd_DrawSidebar(x, y, mf_rows);
+            if (fd_list_cols != saved_cols) {
+                if (fd_cur_side) fd_DrawSidebar(x, y, mf_rows, fabgl::VK_NONE, fd_cur_side, fd_cur_side_n);
+                else fd_DrawSidebar(x, y, mf_rows);   // SD default set
+            }
         } else {
             for (; row < mf_rows; row++) {
                 VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(7, 1));
@@ -1178,6 +1231,10 @@ void OSD::fd_PrintRow(uint8_t virtual_row_num, uint8_t line_type, const vector<s
     // Remove DIR_MARKER prefix before display, preserve spaces in filenames
     while (!line.empty() && line[0] == (char)DIR_MARKER) line.erase(0, 1);
     rtrim(line);
+
+    // Online-catalog names are UTF-8 → transcode to CP1251 and use the Cyrillic
+    // font (transcode BEFORE the width math: it collapses multibyte to one byte).
+    if (fd_utf8) { VIDEO::vga.setFont(Font6x8Cyr); line = FileUtils::utf8ToCp1251(line); }
 
     switch (line_type) {
     case IS_TITLE:
@@ -1245,6 +1302,147 @@ void OSD::fd_PrintRow(uint8_t virtual_row_num, uint8_t line_type, const vector<s
     VIDEO::vga.print(" ");
 }
 
+// ─── Shared file-browser chrome (locations / remotes / remote+web files) ─────
+// Renders the already-populated `filenames` index in the Open File window + the
+// per-location sidebar, then runs a navigation loop. Reuses the SD render path
+// (fd_Redraw/fd_PrintRow/fd_DrawSidebar) so every location looks like the SD
+// browser. Returns the selected row (0-based) or -1; *outKey = FDK_*. Stack-
+// agnostic (pure draw + input) → safe on the core stack AND the net alt-stack.
+int OSD::fdChromeNav(const string& title, const string& subtitle, int side,
+                     bool utf8, int* outKey, int* ioFocus, int* ioBegin) {
+    const FdSideItem* items; int nitems;
+    switch (side) {
+        case FD_SIDE_HOSTS:  items = fd_side_hosts;     nitems = 2; break;
+        case FD_SIDE_REMOTE: items = fd_side_remote;    nitems = 5; break;
+        case FD_SIDE_WEB:    items = fd_side_web;        nitems = 3; break;
+        default:             items = fd_side_locations;  nitems = 1; break;
+    }
+    const bool allowF2  = (side == FD_SIDE_REMOTE || side == FD_SIDE_WEB);
+    const bool allowF5  = (side == FD_SIDE_REMOTE || side == FD_SIDE_WEB);  // F5 Save everywhere
+    const bool allowF7  = (side == FD_SIDE_REMOTE);
+    const bool allowF8  = (side == FD_SIDE_REMOTE || side == FD_SIDE_HOSTS);
+    fd_cur_side = items; fd_cur_side_n = nitems;   // so fd_Redraw repaints the right sidebar
+
+    // Geometry — top-level position, matching fileDialog(DISK_ALLFILE) at menu_level 0
+    // so the window is indistinguishable from the SD browser. menu_saverect=false so
+    // WindowDraw doesn't push an unbalanced backbuffer save (the OSD repaints on close).
+    menu_level = 0; menu_saverect = false;
+    x = (Config::aspect_16_9 ? 24 : 4); y = 4;
+    cols = FDLG_TOTAL_COLS; fd_list_cols = FDLG_LIST_COLS;
+    mf_rows = 22 + (Config::aspect_16_9 ? 0 : 1);
+    w = (cols * OSD_FONT_W) + 2;
+    h = ((mf_rows + 1) * OSD_FONT_H) + 2;
+    if (x + w > scrW) x = scrW - w;
+    if (y + h > scrH) y = scrH - h;
+
+    fd_utf8 = utf8;
+    // Borrow DISK_ALLFILE's position slot; save/restore so the SD scroll position
+    // (persisted across F5 sessions) isn't clobbered by this modal list.
+    DISK_FTYPE& ft = FileUtils::fileTypes[DISK_ALLFILE];
+    DISK_FTYPE saved = ft;
+    ft.fdMode = 0; ft.fileSearch = "";
+
+    int total = (int)filenames.size();
+    real_rows = total + 2;                              // +2 for title + status rows
+    virtual_rows = (real_rows > mf_rows ? mf_rows : real_rows);
+    last_begin_row = last_focus = 0;
+
+    // Restore the caller's remembered cursor (ioBegin/ioFocus), clamped to this list —
+    // so navigating in/out of a folder and re-lists keep the cursor. Default: top.
+    int b = ioBegin ? *ioBegin : 2;
+    int fo = ioFocus ? *ioFocus : 2;
+    int maxBegin = real_rows - virtual_rows + 2; if (maxBegin < 2) maxBegin = 2;
+    if (b < 2) b = 2; if (b > maxBegin) b = maxBegin;
+    if (fo < 2) fo = 2; if (fo > virtual_rows - 1) fo = virtual_rows - 1;
+    ft.begin_row = b; ft.focus = fo;
+
+    vector<string> noexts;
+    // fd_Redraw strips the last char of the path line (SD paths always end with '/'), so
+    // give it a trailing '/' — else "/root" shows as "/roo", "Archive source" loses 'e'.
+    const string sub = subtitle + "/";
+    menu = title + "\n" + sub + "\n";
+    WindowDraw();
+    fd_DrawSidebar(x, y, mf_rows, fabgl::VK_NONE, items, nitems);
+    for (uint8_t row = 2; row < mf_rows; row++) {       // blank list area
+        VIDEO::vga.setTextColor(zxColor(0, 1), zxColor(7, 1));
+        menuAt(row, 0);
+        VIDEO::vga.print(std::string(fd_list_cols, ' ').c_str());
+    }
+    // Bottom status bar (full width, footer colour) — like the SD browser; without it the
+    // last row shows through (transparent). fd_Redraw fills only up to mf_rows-1, so this
+    // row survives redraws.
+    menuAt(mf_rows, 0);
+    VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(5, 0));
+    VIDEO::vga.print(std::string(cols, ' ').c_str());
+    fdScrollPos = 0; timeStartScroll = 0; timeScroll = 0;   // marquee state (before redraw)
+    fd_Redraw(title, sub, DISK_ALLFILE, noexts);
+
+    int result = -1, rkey = FDK_ESC;
+    fabgl::VirtualKeyItem k;
+    while (1) {
+        if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
+            if (!ESPectrum::readKbd(&k) || !k.down) continue;
+            fdScrollPos = 0; timeStartScroll = 0; timeScroll = 0;   // reset marquee on key
+            int curIdx = (ft.begin_row - 2) + (ft.focus - 2);
+            if (is_up(k.vk)) {
+                if (ft.focus == 2 && ft.begin_row > 2) { last_begin_row = ft.begin_row; ft.begin_row--; fd_Redraw(title, sub, DISK_ALLFILE, noexts); }
+                else if (ft.focus > 2) { last_focus = ft.focus; fd_PrintRow(ft.focus--, IS_NORMAL, noexts); fd_PrintRow(ft.focus, IS_FOCUSED, noexts); }
+                click();
+            } else if (is_down(k.vk)) {
+                if (ft.focus == virtual_rows - 1 && ft.begin_row + virtual_rows - 2 < real_rows) { last_begin_row = ft.begin_row; ft.begin_row++; fd_Redraw(title, sub, DISK_ALLFILE, noexts); }
+                else if (ft.focus < virtual_rows - 1) { last_focus = ft.focus; fd_PrintRow(ft.focus++, IS_NORMAL, noexts); fd_PrintRow(ft.focus, IS_FOCUSED, noexts); }
+                click();
+            } else if (k.vk == fabgl::VK_PAGEUP) {
+                ft.focus = 2; ft.begin_row = (ft.begin_row > virtual_rows) ? ft.begin_row - (virtual_rows - 2) : 2;
+                fd_Redraw(title, sub, DISK_ALLFILE, noexts); click();
+            } else if (k.vk == fabgl::VK_PAGEDOWN) {
+                if (real_rows - ft.begin_row - virtual_rows > virtual_rows) { ft.focus = 2; ft.begin_row += virtual_rows - 2; }
+                else { ft.focus = virtual_rows - 1; ft.begin_row = real_rows - virtual_rows + 2; }
+                fd_Redraw(title, sub, DISK_ALLFILE, noexts); click();
+            } else if (is_home(k.vk)) {
+                ft.focus = 2; ft.begin_row = 2; fd_Redraw(title, sub, DISK_ALLFILE, noexts); click();
+            } else if (k.vk == fabgl::VK_END) {
+                ft.focus = virtual_rows - 1; ft.begin_row = real_rows - virtual_rows + 2;
+                fd_Redraw(title, sub, DISK_ALLFILE, noexts); click();
+            } else if (is_enter_fd(k.vk)) {
+                if (total > 0) { result = curIdx; rkey = FDK_ENTER; click(); break; } // Enter = run/open
+                click();
+            } else if (allowF2 && k.vk == fabgl::VK_F2) { result = curIdx; rkey = FDK_F2; click(); break; }
+            else if (allowF8 && (k.vk == fabgl::VK_F8 || k.vk == fabgl::VK_DELETE)) { if (total > 0) { result = curIdx; rkey = FDK_F8; click(); break; } click(); }
+            else if (allowF5 && k.vk == fabgl::VK_F5) { if (total > 0) { result = curIdx; rkey = FDK_F5; click(); break; } click(); }
+            else if (allowF7 && k.vk == fabgl::VK_F7) { result = -1; rkey = FDK_F7; click(); break; }
+            else if (is_backspace(k.vk)) { result = -1; rkey = FDK_BACK; click(); break; }
+            else if (is_back(k.vk)) { result = -1; rkey = FDK_ESC; click(); break; }
+        } else if (timeStartScroll < 200) {
+            timeStartScroll++;
+        }
+        // Marquee-scroll the focused row when it's over-long (idle ~1 s, then ~250 ms/char).
+        if (timeStartScroll == 200) {
+            if (++timeScroll == 50) { fdScrollPos++; fd_PrintRow(ft.focus, IS_FOCUSED, noexts); timeScroll = 0; }
+        }
+        sleep_ms(5);
+    }
+
+    if (ioFocus) *ioFocus = ft.focus;      // hand the cursor position back to the caller
+    if (ioBegin) *ioBegin = ft.begin_row;
+    ft = saved;            // restore SD position slot
+    fd_utf8 = false;
+    fd_cur_side = nullptr; fd_cur_side_n = 0;   // back to the SD default sidebar
+    if (outKey) *outKey = rkey;
+    return result;
+}
+
+int OSD::fdChromeList(const vector<string>& rows, const string& title,
+                      const string& subtitle, int side, bool utf8, int* outKey,
+                      int* ioFocus, int* ioBegin) {
+    filenames.init("__fdvirt__");
+    filenames.unlink();                 // truncate to empty
+    for (const auto& r : rows) filenames.push(r);   // keep caller order (no sort)
+    int sel = fdChromeNav(title, subtitle, side, utf8, outKey, ioFocus, ioBegin);
+    filenames.close();
+    return sel;
+}
+
 #if !PICO_RP2040 && ZIFI_NET_CLIENT
 // ─── Remote (FTP/SFTP) file browser ─────────────────────────────────────────
 // Bounded RAM for any directory size: each listing is streamed straight into a
@@ -1291,10 +1489,11 @@ static int rfd_scroll(const string& title, sorted_files& idx,
                       const char* const* synth, int nsynth,
                       const char* footer = nullptr, bool* delPressed = nullptr,
                       bool* copyPressed = nullptr, bool utf8 = false,
-                      bool* altPressed = nullptr) {
+                      bool* altPressed = nullptr, bool* refreshPressed = nullptr) {
     if (delPressed)  *delPressed = false;
     if (copyPressed) *copyPressed = false;
     if (altPressed)  *altPressed = false;
+    if (refreshPressed) *refreshPressed = false;
     const int cols_n = 36, MAXVIS = 16;
     int total = nsynth + (int)idx.size();
     int vis   = total < MAXVIS ? total : MAXVIS;
@@ -1405,6 +1604,9 @@ static int rfd_scroll(const string& title, sorted_files& idx,
             }
             else if (copyPressed && k.vk == fabgl::VK_F5) {
                 *copyPressed = true; OSD::click(); VIDEO::SaveRect.restore_last(); return cursor;
+            }
+            else if (refreshPressed && k.vk == fabgl::VK_F2) {
+                *refreshPressed = true; OSD::click(); VIDEO::SaveRect.restore_last(); return cursor;
             }
             else continue;
             if (cursor < 0) cursor = 0;
@@ -1532,9 +1734,14 @@ static bool rfd_copy_tree(RemoteFs* fs, const std::string& destSd, int depth) {
             fs->cwd("..");
             if (!ok) return false;
         } else {
+            // Save under the real filename (catalog display names carry no extension);
+            // for FTP/SFTP downloadBasename() returns the name unchanged.
+            std::string fbase = fs->downloadBasename(nm);
+            if (fbase.empty()) fbase = nm;
+            std::string fdst = destSd + "/" + fbase;
             rfd_xfer_title = MSG_NET_COPYING[Config::lang];
             OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
-            bool got = fs->get(nm, dst, rfd_progress);
+            bool got = fs->get(nm, fdst, rfd_progress);
             OSD::progressDialog("", "", 0, 2);
             if (!got) return false;
         }
@@ -1599,140 +1806,230 @@ static bool rfd_launch_tmp(string path) {
     return false;
 }
 
+// ── Listing-index cache (Remote/Web) ─────────────────────────────────────────
+// Cache key = FNV-1a of "cacheId()|cwdPath()" (per source, per folder), namespaced
+// in /tmp so it survives reboot. Freshness policy: session-fresh (fetch a folder
+// once per power session, reuse for the rest of the session) + a cheap revalidate
+// for sources that support one (Web → HTTP 304) on the first visit after reboot +
+// a manual F2 refresh. The session set is RAM-only, so a reboot invalidates it.
+#define NET_CACHE_VERSION 2   // bump to invalidate stale idx (e.g. cached before the ".." row)
+static uint32_t g_net_sess[128];
+static int      g_net_sess_n = 0;
+static bool netSessSeen(uint32_t h) {
+    for (int i = 0; i < g_net_sess_n; i++) if (g_net_sess[i] == h) return true;
+    return false;
+}
+static void netSessAdd(uint32_t h) {
+    if (netSessSeen(h)) return;
+    if (g_net_sess_n < (int)(sizeof(g_net_sess) / sizeof(g_net_sess[0]))) g_net_sess[g_net_sess_n++] = h;
+}
+static void netSessForget(uint32_t h) {
+    for (int i = 0; i < g_net_sess_n; i++)
+        if (g_net_sess[i] == h) { g_net_sess[i] = g_net_sess[--g_net_sess_n]; return; }
+}
+static uint32_t netHash(const std::string& s) {
+    uint32_t h = 2166136261u ^ (uint32_t)NET_CACHE_VERSION;
+    for (unsigned char c : s) { h ^= c; h *= 16777619u; }
+    return h;
+}
+static string netIdxName(uint32_t h) { char b[24]; snprintf(b, sizeof(b), "net_%08lx", (unsigned long)h); return b; }
+static string netValPath(uint32_t h) { char b[40]; snprintf(b, sizeof(b), "/tmp/.net_%08lx.val", (unsigned long)h); return b; }
+static string netValRead(uint32_t h) {
+    FIL* f = fopen2(netValPath(h).c_str(), FA_READ);
+    if (!f) return "";
+    char buf[80]; UINT br = 0; f_read(f, buf, sizeof(buf) - 1, &br); fclose2(f); buf[br] = '\0';
+    return string(buf);
+}
+static void netValWrite(uint32_t h, const string& v) {
+    if (v.empty()) { f_unlink(netValPath(h).c_str()); return; }
+    FIL* f = fopen2(netValPath(h).c_str(), FA_WRITE | FA_CREATE_ALWAYS);
+    if (!f) return;
+    UINT bw; f_write(f, v.data(), v.size(), &bw); fclose2(f);
+}
+
+// Session cursor memory for the net browser (RAM only, NOT persisted to config) — the
+// cursor for the last folder shown, so F5 reopening that folder restores it (like SD's
+// fileTypes slot persists the SD cursor across sessions). Keyed by the folder's path.
+static int    g_net_cur_focus = 2, g_net_cur_begin = 2;
+static string g_net_cur_path;
+
 void OSD::remoteFileDialog(RemoteFs* fs) {
-    sorted_files idx;
-    idx.init("__netfs__");           // /tmp/.__netfs__.idx
-    // Read-only sources (online catalog) hide the upload row + the F8/Del action.
+    // Read-only sources (online catalog) hide upload/delete and use the WEB sidebar.
     const bool ro = fs->readOnly();
-    const char* synth_rw[2] = { Config::lang ? "[Subir archivo aqui]" : "[Upload file here]", ".." };
-    const char* synth_ro[1] = { ".." };
-    const char* const* synth = ro ? synth_ro : synth_rw;
-    const int nsynth = ro ? 1 : 2;   // index of first listing entry
+    const int  side = ro ? FD_SIDE_WEB : FD_SIDE_REMOTE;
+    const string title = MENU_ALL_TITLE[Config::lang];   // same "Open File" window as SD
+
+    // Cursor memory (like the SD browser): curFocus/curBegin persist across re-lists of
+    // the same folder; a small stack saves/restores the position when descending/ascending.
+    int curFocus = 2, curBegin = 2;
+    // Seed from the session memory when reopening the same folder (e.g. F5 restore) so the
+    // cursor lands where it was, not at the top.
+    if (fs->cwdPath() == g_net_cur_path) { curFocus = g_net_cur_focus; curBegin = g_net_cur_begin; }
+    const int MAXDEPTH = 24;
+    int stkF[MAXDEPTH], stkB[MAXDEPTH], stkN = 0;
+    auto pushPos = [&]() { if (stkN < MAXDEPTH) { stkF[stkN] = curFocus; stkB[stkN] = curBegin; stkN++; } curFocus = curBegin = 2; };
+    auto popPos  = [&]() { if (stkN > 0) { stkN--; curFocus = stkF[stkN]; curBegin = stkB[stkN]; } else { curFocus = curBegin = 2; } };
 
     while (1) {
-        // ── (Re)build the index for the current directory (streamed) ──
-        OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], fs->cwdPath(), 0, 0, fs->utf8Names());
-        idx.unlink();                // truncate to empty (also (re)creates the file)
-        bool ok = fs->listStream("", rfd_push, &idx);
-        OSD::progressDialog("", "", 0, 2);
-        if (!ok) { OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000); idx.unlink(); return; }
-        if (!fs->preSorted()) idx.sort(); // pre-sorted sources (static catalog) skip the slow on-disk sort
-
-        bool del = false, copy = false, alt = false;
-        int sel = rfd_scroll(fs->cwdPath(), idx, synth, nsynth,
-                             ro ? MSG_NET_FOOTER_RO[Config::lang] : MSG_NET_FOOTER[Config::lang],
-                             ro ? nullptr : &del, &copy, fs->utf8Names(), &alt);
-        if (sel < 0) { idx.unlink(); return; } // Esc → leave browser
-
-        if (del) {                       // F8/Del → delete a remote entry
-            if (sel >= nsynth) {
-                string rec = idx.get(sel - nsynth);
-                bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
-                string nm = isDir ? rec.substr(1) : rec;
-                if (OSD::msgDialog(nm, MSG_NET_DELETE_Q[Config::lang]) == DLG_YES) {
-                    bool rok = fs->remove(nm, isDir);
-                    OSD::osdCenteredMsg(rok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
-                                        rok ? LEVEL_INFO : LEVEL_WARN, 1500);
-                }
-            }
-            continue; // re-list
+        OSD::net_last_path = fs->cwdPath();   // remembered as the global last F5 location
+        // ── Open (or build) the per-folder listing index into the shared `filenames`
+        // (so the SD render path can draw it). Reuse cache when known-fresh. ──
+        uint32_t key = netHash(fs->cacheId() + "|" + fs->cwdPath());
+        filenames.init(netIdxName(key));    // /tmp/.net_<hash>.idx (may already exist)
+        bool haveCache = (filenames.size() > 0);
+        bool reuse = false;
+        if (haveCache && netSessSeen(key)) {
+            reuse = true;                   // validated earlier this session → instant
+        } else if (haveCache) {
+            // First visit this session but a cache survived reboot — try a cheap
+            // revalidate (Web → 304). FTP/SFTP return UNKNOWN → fall through to refetch.
+            string stored = netValRead(key), fresh;
+            reuse = (fs->revalidate("", stored, fresh) == RemoteFs::CACHE_FRESH);
         }
+        if (!reuse) {
+            OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], fs->cwdPath(), 0, 0, fs->utf8Names());
+            filenames.unlink();          // truncate to empty (also (re)creates the file)
+            // ".." row (double DIR_MARKER → sorts/renders first), like the SD browser:
+            // select it to go up a level, and from the top it exits toward the root.
+            filenames.push(string(2, (char)DIR_MARKER) + "..");
+            bool ok = fs->listStream("", rfd_push, &filenames);
+            OSD::progressDialog("", "", 0, 2);
+            if (!ok) { OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000); filenames.close(); return; }
+            if (!fs->preSorted()) filenames.sort(); // pre-sorted (static catalog) skips the slow sort
+            netValWrite(key, fs->lastValidator()); // persist this fetch's validator (Web; "" else)
+        }
+        netSessAdd(key);
 
-        if (copy) {                      // F5 → copy file/folder to a chosen SD folder
-            if (sel >= nsynth) {
-                string rec = idx.get(sel - nsynth);
-                bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
-                string nm = isDir ? rec.substr(1) : rec;
-                string destBase = rfd_choose_folder(Config::net_dl_dir);
-                if (!destBase.empty()) {
-                    Config::net_dl_dir = destBase;
+        int outKey = FDK_ESC;
+        int sel = fdChromeNav(title, fs->cwdPath(), side, fs->utf8Names(), &outKey, &curFocus, &curBegin);
+        // Remember this folder's cursor for the session (so F5 reopen restores it).
+        g_net_cur_path = fs->cwdPath(); g_net_cur_focus = curFocus; g_net_cur_begin = curBegin;
+
+        // ── Map the chrome's key/selection to an action ──
+        if (sel < 0) {
+            if (outKey == FDK_BACK) {                              // Backspace → parent (same as "..")
+                string before = fs->cwdPath();
+                fs->cwd("..");
+                if (fs->cwdPath() == before) { filenames.close(); return; } // at root → leave
+                popPos();                                          // restore the parent's cursor
+                continue;
+            }
+            if (outKey == FDK_F7 && !ro) {                          // F7 → upload an SD file
+                string local = rfd_choose_file(Config::net_ul_dir);
+                if (!local.empty()) {
+                    size_t s = local.find_last_of('/');
+                    Config::net_ul_dir = (s == 0 || s == string::npos) ? "/" : local.substr(0, s);
                     Config::saveWifiConfig();
-                    bool ok;
-                    if (isDir) {                 // recursive folder copy
-                        string dst = destBase + (destBase.back() == '/' ? "" : "/") + nm;
-                        FileUtils::mkdirParents(dst.c_str());
-                        fs->cwd(nm);
-                        ok = rfd_copy_tree(fs, dst, 0);
-                        fs->cwd("..");
-                    } else {                     // single file
-                        string dst = destBase + (destBase.back() == '/' ? "" : "/") + nm;
-                        rfd_xfer_title = MSG_NET_COPYING[Config::lang];
-                        OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
-                        ok = fs->get(nm, dst, rfd_progress);
-                        OSD::progressDialog("", "", 0, 2);
-                    }
-                    OSD::osdCenteredMsg(ok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
-                                        ok ? LEVEL_INFO : LEVEL_WARN, 1800);
+                    string base = local.substr(local.find_last_of('/') + 1);
+                    rfd_xfer_title = MSG_NET_UPLOADING[Config::lang];
+                    OSD::progressDialog(rfd_xfer_title, base, 0, 0);
+                    bool put_ok = fs->put(local, base, rfd_progress);
+                    OSD::progressDialog("", "", 0, 2);
+                    OSD::osdCenteredMsg(put_ok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
+                                        put_ok ? LEVEL_INFO : LEVEL_WARN, 1800);
+                    if (put_ok) { netSessForget(key); filenames.unlink(); netValWrite(key, ""); }
                 }
+                continue;
             }
-            continue; // re-list
+            OSD::net_close_all = true;    // Esc → close the whole OSD (".."/Backspace climb)
+            filenames.close(); return;
         }
 
-        if (!ro && sel == 0) {           // Upload a local SD file into this dir (RW only)
-            string local = rfd_choose_file(Config::net_ul_dir);
-            if (!local.empty()) {
-                size_t s = local.find_last_of('/');
-                Config::net_ul_dir = (s == 0 || s == string::npos) ? "/" : local.substr(0, s);
-                Config::saveWifiConfig(); // remember the upload folder across reboots
-                string base = local.substr(local.find_last_of('/') + 1);
-                rfd_xfer_title = MSG_NET_UPLOADING[Config::lang];
-                OSD::progressDialog(rfd_xfer_title, base, 0, 0);
-                bool put_ok = fs->put(local, base, rfd_progress);
-                OSD::progressDialog("", "", 0, 2);
-                OSD::osdCenteredMsg(put_ok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
-                                    put_ok ? LEVEL_INFO : LEVEL_WARN, 1800);
+        string rec = filenames.get(sel);
+        string nm = rec;
+        while (!nm.empty() && (uint8_t)nm[0] == DIR_MARKER) nm.erase(0, 1); // strip 1-2 markers
+        bool isDir = (nm.size() < rec.size());
+
+        if (outKey == FDK_F2) {           // F2 → force a re-fetch of the current dir
+            netSessForget(key); filenames.unlink(); netValWrite(key, "");
+            continue;
+        }
+        if (nm == "..") {                 // parent row — Enter goes up; from the top, exit
+            if (outKey == FDK_ENTER) {
+                string before = fs->cwdPath();
+                fs->cwd("..");
+                if (fs->cwdPath() == before) { filenames.close(); return; } // already at root → leave
+                popPos();                 // restore the parent's cursor
             }
-        } else if (sel == nsynth - 1) {  // Parent directory ("..", last synth row)
-            fs->cwd("..");
-        } else {
-            string rec = idx.get(sel - nsynth);
-            bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
-            string nm = isDir ? rec.substr(1) : rec;
-            if (isDir) {
-                fs->cwd(nm);
-            } else if (alt) {
-                // Alt+Enter: download to /tmp and launch straight away. Catalog display
-                // names carry no extension (it lives in the source locator) and the
-                // catalog's get() saves under that source basename — so ask the fs for
-                // the real filename and build the matching /tmp path, otherwise the
-                // launcher can't find the file or tell its type. On success close the
-                // whole OSD so the program runs.
-                string base = fs->downloadBasename(nm);
-                if (base.empty()) base = nm;
-                string tmpp = string("/tmp/") + base;
-                rfd_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
-                OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
-                bool got = fs->get(nm, tmpp, rfd_progress);
-                OSD::progressDialog("", "", 0, 2);
-                if (!got) {
-                    OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000);
-                } else {
-                    OSD::osdCenteredMsg(MSG_NET_LAUNCHING[Config::lang], LEVEL_INFO, 400);
-                    if (rfd_launch_tmp(tmpp)) {
-                        idx.unlink();
-                        OSD::net_launch_close = true; // signal the menu stack to close
-                        return;
-                    }
-                }
-            } else {
-                // Pick the SD destination folder, then download into it.
-                string destDir = rfd_choose_folder(Config::net_dl_dir);
-                if (!destDir.empty()) {
-                    Config::net_dl_dir = destDir;
-                    Config::saveWifiConfig(); // remember the download folder across reboots
-                    FileUtils::mkdirParents(destDir.c_str());
-                    string localp = destDir + (destDir.back() == '/' ? "" : "/") + nm;
+            continue;                     // ignore F5/F8/Alt on ".."
+        }
+        if (outKey == FDK_F8) {           // F8/Del → delete a remote entry
+            if (OSD::msgDialog(nm, MSG_NET_DELETE_Q[Config::lang]) == DLG_YES) {
+                bool rok = fs->remove(nm, isDir);
+                OSD::osdCenteredMsg(rok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
+                                    rok ? LEVEL_INFO : LEVEL_WARN, 1500);
+                if (rok) { netSessForget(key); filenames.unlink(); netValWrite(key, ""); }
+            }
+            continue;
+        }
+        if (outKey == FDK_F5) {           // F5 → save file/folder to a chosen SD folder
+            string destBase = rfd_choose_folder(Config::net_dl_dir);
+            if (!destBase.empty()) {
+                Config::net_dl_dir = destBase;
+                Config::saveWifiConfig();
+                bool ok;
+                if (isDir) {                 // recursive folder copy (keep the dir name)
+                    string dst = destBase + (destBase.back() == '/' ? "" : "/") + nm;
+                    FileUtils::mkdirParents(dst.c_str());
+                    fs->cwd(nm);
+                    ok = rfd_copy_tree(fs, dst, 0);
+                    fs->cwd("..");
+                } else {                     // single file — use the real filename (catalog
+                                             // display names carry no extension)
                     rfd_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
-                    OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
-                    bool got = fs->get(nm, localp, rfd_progress);
+                    OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names()); // show first
+                    string base = fs->downloadBasename(nm);   // (catalog: HTTP listing read)
+                    if (base.empty()) base = nm;
+                    string dst = destBase + (destBase.back() == '/' ? "" : "/") + base;
+                    ok = fs->get(nm, dst, rfd_progress);
                     OSD::progressDialog("", "", 0, 2);
-                    OSD::osdCenteredMsg(got ? (string(MSG_NET_XFER_OK[Config::lang]) + "\n" + localp)
-                                            : MSG_NET_XFER_ERR[Config::lang],
-                                        got ? LEVEL_INFO : LEVEL_WARN, 2200);
                 }
+                OSD::osdCenteredMsg(ok ? MSG_NET_XFER_OK[Config::lang] : MSG_NET_XFER_ERR[Config::lang],
+                                    ok ? LEVEL_INFO : LEVEL_WARN, 1800);
+            }
+            continue;
+        }
+
+        // Enter on the selected row.
+        if (isDir) { pushPos(); fs->cwd(nm); continue; } // descend → save cursor, start at top
+
+        // Plain Enter: quick start — download to /tmp and launch. Always use a fixed
+        // name (per extension) so /tmp isn't filled with one file per launch — it's
+        // overwritten each time. The extension is kept (rfd_launch_tmp needs it to tell
+        // the file type). For a real filename, use F5 Save instead.
+        rfd_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
+        OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
+        // Extension straight from the display name when it looks like a real file
+        // extension (short, alphanumeric) — avoids an extra request. Catalog titles can
+        // contain dots mid-name (e.g. "...3; Demo (SL+SSROM)"), so fall back to
+        // downloadBasename() (the real name from the locator) when the suffix isn't ext-like.
+        string ext;
+        size_t slash = nm.find_last_of('/'), dot = nm.find_last_of('.');
+        if (dot != string::npos && (slash == string::npos || dot > slash)) {
+            string e = nm.substr(dot);                 // includes the '.'
+            bool extLike = (e.size() >= 2 && e.size() <= 5);
+            for (size_t i = 1; extLike && i < e.size(); i++)
+                if (!isalnum((unsigned char)e[i])) extLike = false;
+            if (extLike) ext = e;
+        }
+        if (ext.empty()) {
+            string base = fs->downloadBasename(nm);
+            size_t d2 = base.find_last_of('.');
+            if (d2 != string::npos) ext = base.substr(d2);
+        }
+        string tmpp = string("/tmp/_run") + ext;
+        bool got = fs->get(nm, tmpp, rfd_progress);
+        OSD::progressDialog("", "", 0, 2);
+        if (!got) {
+            OSD::osdCenteredMsg(MSG_NET_XFER_ERR[Config::lang], LEVEL_WARN, 2000);
+        } else {
+            OSD::osdCenteredMsg(MSG_NET_LAUNCHING[Config::lang], LEVEL_INFO, 400);
+            if (rfd_launch_tmp(tmpp)) {
+                OSD::net_launch_close = true; // signal the menu stack to close
+                filenames.close();
+                return;                       // keep the listing cache on disk
             }
         }
-        // loop → re-list current directory
     }
 }
 #endif // !PICO_RP2040 && ZIFI_NET_CLIENT

@@ -106,12 +106,16 @@ static bool lineSinkCb(void* ctx, const uint8_t* data, size_t len) {
 // the end. Stops at a short chunk / 416 (EOF) or a plain 200 (server ignored Range
 // → whole body in one shot). Returns false only on a real transport error.
 static const long CATALOG_TSV_CHUNK = 16384;
-static bool httpsReadLines(const std::string& url, void (*fn)(const char*, void*), void* arg) {
+// `outEtag` (if set) receives the response ETag from the first chunk — the cache
+// layer persists it so a later revalidate() can issue a conditional GET.
+static bool httpsReadLines(const std::string& url, void (*fn)(const char*, void*), void* arg,
+                           std::string* outEtag = nullptr) {
     LineSink ls; ls.fn = fn; ls.arg = arg;
     long off = 0;
     for (;;) {
         HttpsGet::Result r = HttpsGet::get(url.c_str(), lineSinkCb, &ls, CATALOG_CA_PATH,
                                            nullptr, nullptr, off, CATALOG_TSV_CHUNK);
+        if (off == 0 && outEtag && r.etag[0]) *outEtag = r.etag; // validator from 1st chunk
         if (r.status == 416) break;                         // requested past EOF → done
         if (!r.ok) return false;                            // real error (not a 2xx)
         off += r.received;
@@ -247,14 +251,53 @@ static void list_line(const char* line, void* arg) {
     lc->cb(lc->ctx, nm.c_str(), line[0] == 'D', size);
 }
 
+// ── Local .tsv cache (so get()/downloadBasename don't re-fetch over HTTPS) ──────
+static uint32_t catvHash(const std::string& s) {
+    uint32_t h = 2166136261u; for (unsigned char c : s) { h ^= c; h *= 16777619u; } return h;
+}
+std::string HttpCatalogFs::tsvCachePath() const {
+    char b[40]; snprintf(b, sizeof(b), "/tmp/.catv_%08lx.tsv", (unsigned long)catvHash(site + "|" + cur_path));
+    return std::string(b);
+}
+// Feed .tsv lines to fn() from the local cache (fast SD read) if it exists, else
+// fetch the listing over HTTPS. The cache is written by listStream() while browsing.
+static bool readTsvCachedOrHttp(const std::string& cachePath, const std::string& url,
+                                void (*fn)(const char*, void*), void* arg) {
+    FIL* f = fopen2(cachePath.c_str(), FA_READ);
+    if (f) {
+        std::string line; UINT br; char c;
+        while (f_read(f, &c, 1, &br) == FR_OK && br) {
+            if (c == '\n') { fn(line.c_str(), arg); line.clear(); }
+            else if (c != '\r') line += c;
+        }
+        if (!line.empty()) fn(line.c_str(), arg);
+        fclose2(f);
+        return true;
+    }
+    return httpsReadLines(url, fn, arg);
+}
+// Tee used by listStream: write each raw .tsv line to the cache AND emit to list_line.
+struct TsvTee { ListCtx lc; FIL* f; };
+static void tsv_tee(const char* line, void* arg) {
+    TsvTee* t = (TsvTee*)arg;
+    if (t->f) { UINT bw; f_write(t->f, line, (UINT)strlen(line), &bw); char nl = '\n'; f_write(t->f, &nl, 1, &bw); }
+    list_line(line, &t->lc);
+}
+
 bool HttpCatalogFs::listStream(const std::string& path, RemoteListCb cb, void* ctx) {
     if (!path.empty()) cur_path = (path == "/") ? "" : path;
 
     if (isStaticBase()) {
-        // <base>/<site>/<slug>.tsv — list_line ignores the extra 4th column.
+        // <base>/<site>/<slug>.tsv — list_line ignores the extra 4th column. Tee the
+        // raw .tsv to a local cache so a later get() reads the locator from SD.
         std::string url = baseUrl() + "/" + site + "/" + slugPath(cur_path) + ".tsv";
-        ListCtx lc = { cb, ctx };
-        return httpsReadLines(url, list_line, &lc);
+        last_etag.clear();                       // capture this listing's validator
+        FIL* cf = fopen2(tsvCachePath().c_str(), FA_WRITE | FA_CREATE_ALWAYS);
+        TsvTee tee = { { cb, ctx }, cf };
+        bool ok = httpsReadLines(url, tsv_tee, &tee, &last_etag);
+        if (cf) fclose2(cf);
+        if (!ok) f_unlink(tsvCachePath().c_str()); // don't keep a partial cache
+        return ok;
     }
 
     std::string host; uint16_t port;
@@ -273,6 +316,27 @@ bool HttpCatalogFs::listStream(const std::string& path, RemoteListCb cb, void* c
 }
 
 bool HttpCatalogFs::preSorted() const { return isStaticBase(); }
+
+// Discard sink for the conditional-GET probe (we only want status + ETag).
+static bool discardSink(void*, const uint8_t*, size_t) { return true; }
+
+int HttpCatalogFs::revalidate(const std::string& path, const std::string& storedVal,
+                              std::string& newVal) {
+    if (!isStaticBase()) return CACHE_UNKNOWN;   // dynamic /v1 has no cheap validator
+    std::string p = path.empty() ? cur_path : (path == "/" ? "" : path);
+    std::string url = baseUrl() + "/" + site + "/" + slugPath(p) + ".tsv";
+    char hdr[96]; hdr[0] = '\0';
+    if (!storedVal.empty())
+        snprintf(hdr, sizeof(hdr), "If-None-Match: %s\r\n", storedVal.c_str());
+    // Full conditional GET (no Range): 304 short-circuits the body; on 200 we
+    // discard the body and only keep the fresh ETag (the caller re-lists).
+    HttpsGet::Result r = HttpsGet::get(url.c_str(), discardSink, nullptr, CATALOG_CA_PATH,
+                                       nullptr, nullptr, -1, -1,
+                                       storedVal.empty() ? nullptr : hdr);
+    if (r.status == 304) return CACHE_FRESH;
+    if (r.status >= 200 && r.status < 300) { if (r.etag[0]) newVal = r.etag; return CACHE_STALE; }
+    return CACHE_UNKNOWN;                         // network/parse error → session-fresh decides
+}
 
 bool HttpCatalogFs::cwd(const std::string& path) {
     if (path == "..") {
@@ -307,35 +371,28 @@ static void locate_line(const char* line, void* arg) {
 
 bool HttpCatalogFs::get(const std::string& remote, const std::string& localSdPath, XferProgressCb cb) {
     if (isStaticBase()) {
-        // Re-read the current listing to resolve the file's locator (no RAM map).
+        // Resolve the file's locator from the local .tsv cache (written while browsing)
+        // to avoid a slow HTTPS re-fetch; fall back to the network if no cache.
         std::string listUrl = baseUrl() + "/" + site + "/" + slugPath(cur_path) + ".tsv";
         LocateCtx loc = { remote.c_str(), std::string(), false };
-        if (!httpsReadLines(listUrl, locate_line, &loc)) return false;
+        if (!readTsvCachedOrHttp(tsvCachePath(), listUrl, locate_line, &loc)) return false;
         if (!loc.found || loc.url.empty()) return false; // unknown or not mirrored
         std::string fileUrl =
             (loc.url.rfind("http://", 0) == 0 || loc.url.rfind("https://", 0) == 0)
                 ? loc.url                                   // absolute (direct source)
                 : baseUrl() + "/" + urlEncodePath(loc.url); // relative to Pages root
 
-        // Save the archive AS-IS under its original source filename (no unzip, no
-        // rename) in the user's chosen folder.
-        std::string fname = loc.url;
-        size_t sl = fname.find_last_of('/');
-        if (sl != std::string::npos) fname.erase(0, sl + 1);
-        if (fname.empty()) fname = remote;
-        std::string destDir = localSdPath;
-        size_t ds = destDir.find_last_of('/');
-        destDir = (ds == std::string::npos) ? "" : destDir.substr(0, ds);
-        std::string savePath = destDir.empty() ? fname : (destDir + "/" + fname);
+        // Save to exactly the path the caller asked for. Callers pick the filename
+        // (the real source name via downloadBasename(), or a fixed /tmp name for
+        // quick-start) — same contract as the FTP/SFTP get() below.
 #if ZIFI_NET_VERBOSE
-        Debug::log("catalog get: url=%s save=%s", fileUrl.c_str(), savePath.c_str());
+        Debug::log("catalog get: url=%s save=%s", fileUrl.c_str(), localSdPath.c_str());
 #endif
-
         g_xfer_cb = cb;
-        HttpsGet::Result r = HttpsGet::getToFile(fileUrl.c_str(), savePath.c_str(),
+        HttpsGet::Result r = HttpsGet::getToFile(fileUrl.c_str(), localSdPath.c_str(),
                                                  CATALOG_CA_PATH, httpsProgressThunk, nullptr);
         g_xfer_cb = nullptr;
-        if (!r.ok) { f_unlink(savePath.c_str()); return false; }
+        if (!r.ok) { f_unlink(localSdPath.c_str()); return false; }
         return true;
     }
 
@@ -383,7 +440,7 @@ std::string HttpCatalogFs::downloadBasename(const std::string& displayName) {
     if (isStaticBase()) {
         std::string listUrl = baseUrl() + "/" + site + "/" + slugPath(cur_path) + ".tsv";
         LocateCtx loc = { displayName.c_str(), std::string(), false };
-        if (!httpsReadLines(listUrl, locate_line, &loc) || !loc.found || loc.url.empty())
+        if (!readTsvCachedOrHttp(tsvCachePath(), listUrl, locate_line, &loc) || !loc.found || loc.url.empty())
             return displayName;
         std::string fname = loc.url;
         size_t sl = fname.find_last_of('/');

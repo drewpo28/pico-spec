@@ -2311,11 +2311,26 @@ static const char *MSG_NET_EMPTY_DIR[2]      = { "(empty)",          "(vacio)"  
 static const char *MSG_NET_DL_OR_UL[2]       = { "Download\nUpload here\n", "Descargar\nSubir aqui\n" };
 static const char *MENU_NET_BROWSE_TITLE[2]  = { "Remote files",     "Archivos remotos"  };
 static const char *MSG_NET_DELETE_Q[2]       = { "Delete?",          "\xA8" "Borrar?"     };
-static const char *MSG_NET_FOOTER[2]         = { "F5 copy F8 del Alt+Ent run","F5 copiar F8 bor Alt+Ent" };
-static const char *MSG_NET_FOOTER_RO[2]      = { "F5 copy  Alt+Enter run","F5 copiar Alt+Ent ejec" };
+static const char *MSG_NET_FOOTER[2]         = { "Ent:run Alt:SD F5cp F8del F2ref","Ent:ej Alt:SD F5cp F8bor F2act" };
+static const char *MSG_NET_FOOTER_RO[2]      = { "Enter:run  Alt+Ent:SD  F2:refresh","Ent:ejec Alt:SD F2:actualizar" };
 static const char *MSG_NET_COPYING[2]        = { "Copying...",       "Copiando..."        };
 static const char *MSG_NET_LAUNCHING[2]      = { "Launching...",     "Iniciando..."       };
 static const char *MSG_NET_UNSUPPORTED[2]    = { "Cannot run this type","No ejecutable"     };
+static const char *MSG_NET_REFRESHING[2]     = { "Refreshing...",    "Actualizando..."    };
+
+// ─── F5 location picker + saved-remotes manager ─────────────────────────────
+static const char *MENU_F5_LOCATION[2]       = { "Open from",        "Abrir desde"        };
+static const char *MSG_F5_LOCAL[2]           = { "Local (SD)",       "Local (SD)"         };
+static const char *MSG_F5_REMOTE[2]          = { "Remote (FTP/SFTP)","Remoto (FTP/SFTP)"  };
+static const char *MSG_F5_WEB[2]             = { "Web Archives",     "Archivos web"       };
+static const char *MSG_F5_ADD_REMOTE[2]      = { "Add Remote",       "Anadir remoto"      };
+static const char *MENU_REMOTE_TITLE[2]      = { "Remote connections","Conexiones remotas" };
+static const char *MSG_REMOTE_ADD_ROW[2]     = { "[Add Remote]",     "[Anadir remoto]"    };
+static const char *MSG_REMOTE_FORGET_Q[2]    = { "Forget connection?","\xA8" "Olvidar conexion?" };
+static const char *MENU_REMOTE_SAVEPASS[2]   = { "Save password?\nNo\nYes\n", "\xA8" "Guardar clave?\nNo\nSi\n" };
+static const char *MSG_REMOTE_ALIAS_LABEL[2] = { "Alias:", "Alias:" };
+static const char *MSG_REMOTE_PATH_LABEL[2]  = { "Path:",  "Ruta:"  };
+static const char *MSG_REMOTE_FULL[2]        = { "Too many remotes", "Demasiados remotos" };
 
 // ─── Archive download (catalog server) strings ──────────────────────────────
 static const char *MENU_ARCH_SITE_TITLE[2]   = { "Archive source",   "Fuente de archivo" };

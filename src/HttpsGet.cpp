@@ -89,8 +89,8 @@ bool readLine(Conn& c, char* buf, size_t maxlen, absolute_time_t deadline) {
 
 HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
                                const char* caPath, ProgressCb progress, void* progCtx,
-                               long rangeStart, long rangeLen) {
-    Result res = { false, -1, 0, 0 };
+                               long rangeStart, long rangeLen, const char* extraHeaders) {
+    Result res = {}; res.status = -1;
 
     auto g_http_buf = std::make_unique<uint8_t[]>(HTTP_BUF_SZ);  // RAII: freed on every exit
 
@@ -123,11 +123,13 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
             snprintf(rangehdr, sizeof(rangehdr), "Range: bytes=%ld-\r\n", rangeStart);
     }
 
-    // Build + send the request.
+    // Build + send the request. extraHeaders (if any) is verbatim CRLF lines
+    // (e.g. a conditional "If-None-Match: ...\r\n").
     char req[768];
     int rl = snprintf(req, sizeof(req),
         "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n"
-        "Accept: */*\r\n%sConnection: close\r\n\r\n", path, host, UA, rangehdr);
+        "Accept: */*\r\n%s%sConnection: close\r\n\r\n",
+        path, host, UA, rangehdr, extraHeaders ? extraHeaders : "");
     if (rl <= 0 || (size_t)rl >= sizeof(req) || c.wr((const uint8_t*)req, rl) != rl) {
         Debug::log("HttpsGet: send request failed");
         goto done;
@@ -153,6 +155,13 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
             res.length = (uint32_t)strtoul(line + 15, nullptr, 10);
         else if (!strncasecmp(line, "Transfer-Encoding:", 18) && strstr(line, "chunked"))
             chunked = true;
+        else if (!strncasecmp(line, "ETag:", 5)) {
+            const char* v = line + 5; while (*v == ' ') ++v;
+            strncpy(res.etag, v, sizeof(res.etag) - 1); res.etag[sizeof(res.etag) - 1] = '\0';
+        } else if (!strncasecmp(line, "Last-Modified:", 14)) {
+            const char* v = line + 14; while (*v == ' ') ++v;
+            strncpy(res.lastmod, v, sizeof(res.lastmod) - 1); res.lastmod[sizeof(res.lastmod) - 1] = '\0';
+        }
     }
     if (chunked) { Debug::log("HttpsGet: chunked encoding not supported"); res.status = -1; goto done; }
 #if ZIFI_NET_VERBOSE

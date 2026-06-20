@@ -17,6 +17,7 @@ public:
     bool connect(const char* host, uint16_t port, const char* user, const char* pass);
 
     bool listStream(const std::string& path, RemoteListCb cb, void* ctx) override;
+    std::string cacheId() const override { return "ftp_" + host_; }
     bool cwd(const std::string& path) override;
     std::string cwdPath() const override { return cur_dir; }
     bool get(const std::string& remote, const std::string& localSdPath, XferProgressCb cb) override;
@@ -29,6 +30,7 @@ private:
     static const int DATA = 1;
     bool        connected;
     std::string cur_dir;
+    std::string host_;     // remote host, for the listing-cache namespace (cacheId)
 
     // Read a full control reply; returns the 3-digit code (or -1). Captures the
     // first line's text into `msg` (used to parse 227 PASV / 257 PWD).

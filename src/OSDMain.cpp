@@ -191,6 +191,22 @@ unsigned short OSD::scrAlignCenterY(unsigned short pixel_height) { return (scrH 
 // Draws each character individually; cursor shown as highlighted block under current char.
 // Returns entered string on Enter, "\x1B" on Escape, "" if Enter pressed with empty field.
 // Ignores VK_MENU_* synthetic events to avoid double-fires from kbdExtraMapping.
+// US-layout shifted form of a symbol/digit. map_key() returns only unshifted symbol
+// VKs (e.g. VK_MINUS), so Shift+key arrives as the base char — translate it here so
+// '_', '!', '+', '?', etc. can be typed. Letters are handled separately (case).
+static char shiftSymUS(char c) {
+    switch (c) {
+        case '-': return '_'; case '=': return '+';
+        case '[': return '{'; case ']': return '}'; case '\\': return '|';
+        case ';': return ':'; case '\'': return '"'; case '`': return '~';
+        case ',': return '<'; case '.': return '>'; case '/': return '?';
+        case '1': return '!'; case '2': return '@'; case '3': return '#';
+        case '4': return '$'; case '5': return '%'; case '6': return '^';
+        case '7': return '&'; case '8': return '*'; case '9': return '('; case '0': return ')';
+        default:  return c;   // already shifted, or a non-shiftable char
+    }
+}
+
 string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_text, bool mask, int viscols) {
     if (viscols <= 0 || viscols > maxlen) viscols = maxlen; // visible window
     string text = initial_text;
@@ -248,10 +264,12 @@ string OSD::inlineTextEdit(int ex, int ey, int maxlen, const string& initial_tex
         } else if (ek.ASCII >= 32 && ek.ASCII < 127) {
             if ((int)text.length() < maxlen) {
                 char c = ek.ASCII;
+                bool shift = Kbd->isVKDown(fabgl::VK_LSHIFT) || Kbd->isVKDown(fabgl::VK_RSHIFT);
                 if (c >= 'A' && c <= 'Z') {
-                    bool shift = Kbd->isVKDown(fabgl::VK_LSHIFT) || Kbd->isVKDown(fabgl::VK_RSHIFT);
                     bool caps = Kbd->isVKDown(fabgl::VK_CAPSLOCK);
                     if (!shift && !caps) c = c - 'A' + 'a';
+                } else if (shift) {
+                    c = shiftSymUS(c);   // '-'→'_', '1'→'!', … (map_key gives no shift variant)
                 }
                 text += c;
                 redraw(true);
@@ -418,7 +436,13 @@ static Ssh::TrustResult netHostKeyCb(const char* host, const char* keytype,
 // network session on a large heap-allocated stack via a switch trampoline.
 // ARMv8-M (RP2350/Cortex-M33): also clear MSPLIM during the window so the
 // hardware stack-limit check doesn't fault on the alternate stack.
-struct NetSessCtx { string host, user, pass; uint16_t port; uint8_t proto; };
+struct NetSessCtx { string host, user, pass, restorePath; uint16_t port; uint8_t proto; };
+
+// Record the global "last F5 location" (Config::last_loc) — persisted so F5 reopens
+// where you left off. Writes wifi.cfg only when the value actually changes.
+static void lastLocSet(const string& v) {
+    if (Config::last_loc != v) { Config::last_loc = v; Config::saveWifiConfig(); }
+}
 
 static void netSessionRun(void* p) {
     NetSessCtx* c = (NetSessCtx*)p;
@@ -440,9 +464,14 @@ static void netSessionRun(void* p) {
     }
     OSD::progressDialog("", "", 0, 2); // close the "Connecting..." notice
     if (!fs) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
+    if (!c->restorePath.empty() && c->restorePath != fs->cwdPath())
+        fs->cwd(c->restorePath);               // reopen at the last folder for this remote
     OSD::remoteFileDialog(fs); // SD-indexed browser (bounded RAM); runs on this alt-stack
     fs->disconnect();
     delete fs;
+    // Remember this remote + the folder we left off in, as the global last F5 location.
+    char b[32]; snprintf(b, sizeof(b), "%u\t%u", (unsigned)c->port, (unsigned)c->proto);
+    lastLocSet("R\t" + c->host + "\t" + b + "\t" + c->user + "\t" + OSD::net_last_path);
 }
 
 // Call fn(arg) with MSP switched to new_top (8-byte aligned highest address of a
@@ -466,54 +495,208 @@ void net_call_on_stack(void* new_top, void (*fn)(void*), void* arg) {
     );
 }
 
-// Top-level entry: pick protocol, gather credentials, connect, browse.
-static void netFileTransfer() {
-    // Require an active WiFi link — that's the real prerequisite. The ZiFi NIC
-    // toggle is independent (it's for ZX-Spectrum software); getStatus() brings
-    // the ESP UART up and confirms we're associated with an IP.
-    string ssid, ip;
-    if (!ZiFiAT::getStatus(ssid, ip)) {
-        OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200);
-        return;
+// Connect to a saved remote (prompting the password if it wasn't stored) and run
+// the connect + browse session on a large heap stack (see net_call_on_stack). The
+// crypto/listing path can't live on the 4 KB core stack.
+static void netConnectRemote(const Config::Remote& r, const string& restorePath = "") {
+    string pass = r.pass;
+    if (!r.savepass) {
+        pass = netAskField(MSG_NET_PASS_LABEL[Config::lang], "", true); // masked
+        if (pass == "\x1B") return;
     }
+    // Remember as the "last used" defaults (prefill the Add-Remote form next time).
+    Config::net_host = r.host; Config::net_user = r.user;
+    Config::net_port = r.port; Config::net_proto = r.proto;
+    Config::saveWifiConfig();
+
+    NetSessCtx ctx; ctx.host = r.host; ctx.user = r.user; ctx.pass = pass;
+    ctx.port = r.port; ctx.proto = r.proto; ctx.restorePath = restorePath;
+
+    // Modest alt stack: mbedTLS curve25519/P256/RSA-verify peaks at only a few KB,
+    // and the heap must keep enough for the handshake + SSH objects + the listing.
+    size_t stksz = 12 * 1024;
+    uint8_t* stk = (uint8_t*)malloc(stksz);
+    if (!stk) { stksz = 8 * 1024; stk = (uint8_t*)malloc(stksz); }
+    if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
+    void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7); // 8-byte aligned top
+    net_call_on_stack(top, netSessionRun, &ctx);
+    free(stk);
+}
+
+// Shared scratch for the remotes list (avoids a big array on the 4 KB core stack;
+// one network UI runs at a time). ~1.5 KB BSS on RP2350 (acceptable; NIC-only).
+static Config::Remote g_remotes[Config::MAX_REMOTES];
+
+// Add Remote: prompt protocol / host / user / port / password (+ "save password")
+// and append the connection to remotes.tsv. Does not connect.
+static void addRemoteForm() {
+    string ssid, ip;
+    if (!ZiFiAT::getStatus(ssid, ip)) { OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200); return; }
 
     OSD::menu_level = 2; OSD::menu_saverect = true; OSD::menu_curopt = Config::net_proto + 1;
     uint8_t proto = OSD::menuRun(MENU_NET_PROTO[Config::lang]); // 1=FTP, 2=SFTP
     if (proto == 0) return;
     VIDEO::SaveRect.restore_last();
-    Config::net_proto = proto - 1;
+    uint8_t pr = proto - 1;
 
+    // Field order: Host → Port → User → Pass (→ save-password → Alias below).
     string host = netAskField(MSG_NET_HOST_LABEL[Config::lang], Config::net_host);
     if (host == "\x1B" || host.empty()) return;
-    string user = netAskField(MSG_NET_USER_LABEL[Config::lang], Config::net_user);
-    if (user == "\x1B") return;
-    uint16_t defport = Config::net_proto ? 22 : 21;
+    uint16_t defport = pr ? 22 : 21;
     char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%u", Config::net_port ? Config::net_port : defport);
     string ports = netAskField(MSG_NET_PORT_LABEL[Config::lang], pbuf);
     if (ports == "\x1B") return;
     uint16_t port = (uint16_t)atoi(ports.c_str()); if (!port) port = defport;
+    string user = netAskField(MSG_NET_USER_LABEL[Config::lang], Config::net_user);
+    if (user == "\x1B") return;
     string pass = netAskField(MSG_NET_PASS_LABEL[Config::lang], "", true); // masked
     if (pass == "\x1B") return;
 
-    Config::net_host = host; Config::net_user = user; Config::net_port = port;
+    OSD::menu_level = 2; OSD::menu_saverect = true; OSD::menu_curopt = 1;
+    uint8_t sp = OSD::menuRun(MENU_REMOTE_SAVEPASS[Config::lang]); // 1=No, 2=Yes
+    if (sp == 0) return;
+    VIDEO::SaveRect.restore_last();
+    bool savepass = (sp == 2);
+
+    // Optional start directory, then display name — Enter to leave empty, Esc cancels.
+    string path = netAskField(MSG_REMOTE_PATH_LABEL[Config::lang], "");
+    if (path == "\x1B") return;
+    string alias = netAskField(MSG_REMOTE_ALIAS_LABEL[Config::lang], "");
+    if (alias == "\x1B") return;
+
+    int n = Config::loadRemotes(g_remotes, Config::MAX_REMOTES);
+    if (n >= Config::MAX_REMOTES) { OSD::osdCenteredMsg(MSG_REMOTE_FULL[Config::lang], LEVEL_WARN, 2000); return; }
+    g_remotes[n].host = host; g_remotes[n].user = user; g_remotes[n].port = port;
+    g_remotes[n].proto = pr; g_remotes[n].savepass = savepass;
+    g_remotes[n].pass = savepass ? pass : ""; g_remotes[n].alias = alias; g_remotes[n].path = path;
+    Config::saveRemotes(g_remotes, n + 1);
+
+    Config::net_host = host; Config::net_user = user; Config::net_port = port; Config::net_proto = pr;
     Config::saveWifiConfig();
+}
 
-    // Run the connect + browse session on a large heap stack (see net_call_on_stack).
-    NetSessCtx ctx; ctx.host = host; ctx.user = user; ctx.pass = pass;
-    ctx.port = port; ctx.proto = Config::net_proto;
+// Remote (FTP/SFTP): list saved connections; Enter connects (prompting the
+// password if not stored), F8 forgets a connection, and a trailing "[Add Remote]"
+// row opens the Add-Remote form.
+// Remote (FTP/SFTP) saved-connection list — rendered in the file-browser window
+// (FD_SIDE_HOSTS sidebar) so it matches SD. Enter connects (alt-stack browse),
+// F8 forgets, the trailing [Add Remote] row opens the form.
+static void remoteHostsBrowse() {
+    string ssid, ip;
+    if (!ZiFiAT::getStatus(ssid, ip)) { OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200); return; }
+    int hf = 2, hb = 2;                               // keep the cursor on the chosen host
+    while (1) {
+        int n = Config::loadRemotes(g_remotes, Config::MAX_REMOTES);
+        std::vector<string> rows;
+        rows.push_back(string(2, (char)DIR_MARKER) + "..");  // row 0: ".." → locations root
+        for (int i = 0; i < n; i++) {
+            if (!g_remotes[i].alias.empty()) {        // show the alias when set
+                rows.push_back(g_remotes[i].alias);
+            } else {
+                char b[96];
+                snprintf(b, sizeof(b), "%s@%s:%u (%s)", g_remotes[i].user.c_str(),
+                         g_remotes[i].host.c_str(), (unsigned)g_remotes[i].port,
+                         g_remotes[i].proto ? "sftp" : "ftp");
+                rows.push_back(b);                    // rows 1..n: a plain row (no <DIR>)
+            }
+        }
+        rows.push_back(MSG_REMOTE_ADD_ROW[Config::lang]);   // row n+1
+        int key;
+        int sel = OSD::fdChromeList(rows, MENU_ALL_TITLE[Config::lang],
+                                    MENU_REMOTE_TITLE[Config::lang],
+                                    OSD::FD_SIDE_HOSTS, false, &key, &hf, &hb);
+        if (sel <= 0) {                               // "..", Backspace, or Esc → leave list
+            if (sel < 0 && key == OSD::FDK_ESC) OSD::net_close_all = true; // Esc → close OSD
+            return;                                   // ".."/Backspace → climb to locations
+        }
+        if (sel == n + 1) { addRemoteForm(); continue; }    // [Add Remote] row
+        int hi = sel - 1;                             // host index (row 0 is "..")
+        if (hi < 0 || hi >= n) continue;
+        if (key == OSD::FDK_F8) {                      // F8 → forget this connection
+            if (OSD::msgDialog(g_remotes[hi].host, MSG_REMOTE_FORGET_Q[Config::lang]) == DLG_YES) {
+                for (int j = hi; j < n - 1; j++) g_remotes[j] = g_remotes[j + 1];
+                Config::saveRemotes(g_remotes, n - 1);
+            }
+            continue;
+        }
+        netConnectRemote(g_remotes[hi], g_remotes[hi].path); // connect → cd into saved Path
+        if (OSD::net_launch_close || OSD::net_close_all) return;  // launched or Esc → unwind
+    }
+}
 
-    // Modest alt stack: mbedTLS curve25519/P256/RSA-verify peaks at only a few KB,
-    // and the heap must keep enough for the handshake's mbedTLS allocations + SSH
-    // objects + the dir listing (free heap here is ~30-38 KB). Too big a stack
-    // starved the heap → "Out of memory" panic mid-handshake.
-    size_t stksz = 12 * 1024;
-    uint8_t* stk = (uint8_t*)malloc(stksz);
-    if (!stk) { stksz = 8 * 1024; stk = (uint8_t*)malloc(stksz); }
-    if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
+static void netDownloadArchive();   // Web Archives entry (defined below)
 
-    void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7); // 8-byte aligned top
-    net_call_on_stack(top, netSessionRun, &ctx);
-    free(stk);
+// Set by the F5 handler on a fresh F5 press → f5Locations restores Config::last_loc
+// once (so F5 reopens where you left off). Cleared after use; the SD-back-out re-entry
+// (goto) does NOT set it, so backing out always lands on the chooser.
+static bool g_f5_restore = false;
+
+// F5 last-location restore for the catalog (set by f5Locations before the alt-stack
+// archSessionRun entry): open this site at this path directly, skipping the list once.
+static string g_web_rsite, g_web_rpath;
+static bool   g_web_restore = false;
+
+// Split a tab-separated string into fields.
+static void splitTabs(const string& s, std::vector<string>& out) {
+    out.clear();
+    size_t start = 0;
+    for (size_t i = 0; i <= s.size(); ++i)
+        if (i == s.size() || s[i] == '\t') { out.push_back(s.substr(start, i - start)); start = i + 1; }
+}
+
+// F5 location level — rendered IN the file-browser window (Open File + sidebar) as
+// 4 rows: Local (SD) / Remote (FTP/SFTP) / Web Archives / Add Remote. Returns true
+// only when the user chose Local (caller then opens the SD browser); false for Esc
+// or any network action (caller closes the OSD).
+static bool f5Locations() {
+    // One-time restore of the last browse location (across all sources), so F5 reopens
+    // where you left off — Local stays at ALL_Path, Web/Remote reopen their last folder.
+    if (g_f5_restore) {
+        g_f5_restore = false;
+        const string& L = Config::last_loc;
+        if (!L.empty() && (L[0] == 'W' || L[0] == 'R')) {
+            std::vector<string> f; splitTabs(L, f);
+            if (L[0] == 'W' && f.size() >= 3) {              // W \t site \t path
+                g_web_rsite = f[1]; g_web_rpath = f[2]; g_web_restore = true;
+                netDownloadArchive();
+                if (OSD::net_launch_close || OSD::net_close_all) return false;
+            } else if (L[0] == 'R' && f.size() >= 6) {       // R \t host \t port \t proto \t user \t path
+                int n = Config::loadRemotes(g_remotes, Config::MAX_REMOTES);
+                uint16_t port = (uint16_t)atoi(f[2].c_str());
+                uint8_t  proto = (uint8_t)atoi(f[3].c_str());
+                for (int i = 0; i < n; i++)
+                    if (g_remotes[i].host == f[1] && g_remotes[i].port == port &&
+                        g_remotes[i].proto == proto && g_remotes[i].user == f[4]) {
+                        netConnectRemote(g_remotes[i], f[5]); break;
+                    }
+                if (OSD::net_launch_close || OSD::net_close_all) return false;
+            }
+            // after the restored browse → fall through to the chooser below
+        } else {
+            return true;   // "L" or empty → Local (SD) at ALL_Path
+        }
+    }
+    int lf = 2, lb = 2;                               // keep the cursor on the chosen location
+    while (1) {
+        if (OSD::net_launch_close) return false;      // a quick-start launched → close OSD
+        std::vector<string> rows = {
+            string(1, (char)DIR_MARKER) + MSG_F5_LOCAL[Config::lang],
+            string(1, (char)DIR_MARKER) + MSG_F5_REMOTE[Config::lang],
+            string(1, (char)DIR_MARKER) + MSG_F5_WEB[Config::lang],
+            MSG_F5_ADD_REMOTE[Config::lang],
+        };
+        OSD::menu_level = 0;
+        int key;
+        int loc = OSD::fdChromeList(rows, MENU_ALL_TITLE[Config::lang],
+                                    MENU_F5_LOCATION[Config::lang],
+                                    OSD::FD_SIDE_LOCATIONS, false, &key, &lf, &lb);
+        if (loc < 0) return false;                    // Esc → close OSD
+        if (loc == 0) return true;                    // Local (SD) → caller opens SD browser
+        else if (loc == 1) remoteHostsBrowse();
+        else if (loc == 2) netDownloadArchive();      // Web Archives (built-in catalog)
+        else if (loc == 3) addRemoteForm();
+        if (OSD::net_launch_close || OSD::net_close_all) return false;
+    }
 }
 
 // ── FTP server: share the SD card to the LAN ─────────────────────────────────
@@ -681,8 +864,24 @@ static void ftpServerRun() {
 // remoteFileDialog used for FTP/SFTP. Runs on the large heap stack like the
 // FTP/SFTP session — no crypto here, but the SD-indexed browser is the heavy
 // part, so we keep off the 4 KB core stack for safety + consistency.
+// Open one catalog site at `path`, browse, and record it as the global last location.
+static void archOpenSite(const char* siteId, const string& path) {
+    HttpCatalogFs* fs = new HttpCatalogFs(siteId);
+    if (!path.empty() && path != fs->cwdPath()) fs->cwd(path);
+    OSD::remoteFileDialog(fs);                  // catalog in the same chrome
+    fs->disconnect();
+    delete fs;
+    lastLocSet(string("W\t") + siteId + "\t" + OSD::net_last_path);
+}
+
 static void archSessionRun(void* p) {
     (void)p;
+    // Restore: open the last catalog site+path directly (then fall to the site list).
+    if (g_web_restore) {
+        g_web_restore = false;
+        archOpenSite(g_web_rsite.c_str(), g_web_rpath);
+        if (OSD::net_launch_close || OSD::net_close_all) return; // launched or Esc → unwind
+    }
     OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], "", 0, 0); // no URL (built-in catalog)
     static string site_ids[12];
     static string site_names[12];
@@ -690,17 +889,26 @@ static void archSessionRun(void* p) {
     OSD::progressDialog("", "", 0, 2);
     if (n <= 0) { OSD::osdCenteredMsg(MSG_ARCH_SITES_ERR[Config::lang], LEVEL_WARN, 2200); return; }
 
-    string m = string(MENU_ARCH_SITE_TITLE[Config::lang]) + "\n";
-    for (int i = 0; i < n; i++) m += site_names[i] + "\n";
-    OSD::menu_level = 2; OSD::menu_saverect = true; OSD::menu_curopt = 1;
-    uint8_t sel = OSD::menuRun(m);
-    if (sel == 0) return;
-    VIDEO::SaveRect.restore_last();
-
-    HttpCatalogFs* fs = new HttpCatalogFs(site_ids[sel - 1].c_str());
-    OSD::remoteFileDialog(fs); // SD-indexed browser (bounded RAM); F5 saves to SD
-    fs->disconnect();
-    delete fs;
+    // Site list rendered IN the browser window (not a popup) — ".." row returns to the
+    // locations level; selecting a source opens its catalog in the same chrome.
+    int sf = 2, sb = 2;                                  // keep the cursor on the chosen site
+    while (1) {
+        std::vector<string> rows;
+        rows.push_back(string(2, (char)DIR_MARKER) + "..");                 // → locations
+        for (int i = 0; i < n; i++) rows.push_back(string(1, (char)DIR_MARKER) + site_names[i]);
+        int key;
+        int sel = OSD::fdChromeList(rows, MENU_ALL_TITLE[Config::lang],
+                                    MENU_ARCH_SITE_TITLE[Config::lang],
+                                    OSD::FD_SIDE_LOCATIONS, false, &key, &sf, &sb);
+        if (sel <= 0) {                             // "..", Backspace, or Esc → leave list
+            if (sel < 0 && key == OSD::FDK_ESC) OSD::net_close_all = true; // Esc → close OSD
+            return;                                 // ".."/Backspace → climb to locations
+        }
+        int si = sel - 1;                           // site index (row 0 is "..")
+        if (si < 0 || si >= n) continue;
+        archOpenSite(site_ids[si].c_str(), "");     // open at root
+        if (OSD::net_launch_close || OSD::net_close_all) return;  // launched or Esc → unwind
+    }
 }
 
 // Top-level entry: require an active WiFi link, then browse the built-in online
@@ -1842,6 +2050,28 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             // Quick Save — save to current persist slot without dialog (same as F4 + F4)
             persistSave(Config::persist_slot, Config::persist_slot, true);
         } else if (FileUtils::fsMount && hkIdx == Config::HK_LOAD_ANY) {
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+            // When networking is available, F5 first offers a location picker IN the
+            // browser window (Local / Remote / Web Archives / Add Remote). The gate is
+            // cheap (no blocking ESP round-trip); the network actions check the WiFi link
+            // themselves. With networking off, fall straight through to the SD browser.
+            // The label is the "root": backing out of the SD browser returns here (below)
+            // rather than closing the OSD, so the locations chooser is always reachable.
+            // On a fresh F5 press, restore the last browse location across all sources
+            // (g_f5_restore); the goto re-entry skips it so back-out lands on the chooser.
+            if (ZiFiAT::connected || !Config::wifi_ssid.empty()) g_f5_restore = true;
+            f5_locations:
+            if (ZiFiAT::connected || !Config::wifi_ssid.empty()) {
+                if (!f5Locations()) {                // chose a non-Local action or cancelled
+                    if (OSD::net_launch_close) OSD::net_launch_close = false;
+                    OSD::net_close_all = false;      // Esc-close consumed → reset
+                    if (VIDEO::OSD) OSD::drawStats();
+                    return;
+                }
+                lastLocSet("L");                     // Local (SD) chosen → record as last location
+                // fall through to the SD browser below.
+            }
+#endif
             menu_level = 0;
             menu_saverect = false;
             string mFile;
@@ -1852,7 +2082,17 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             // Loop to allow re-opening fileDialog after ZIP cancel
             bool forcePopup = false;
             f5_retry:
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+            // From locations: show a ".." even at the SD root → returns "" → locations.
+            OSD::fd_root_parent = (ZiFiAT::connected || !Config::wifi_ssid.empty());
+#endif
             mFile = fileDialog(FileUtils::ALL_Path, MENU_ALL_TITLE[Config::lang], DISK_ALLFILE, 52, 22);
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+            OSD::fd_root_parent = false;             // don't leak into other fileDialog uses
+            // ".." at the SD root → locations chooser. Esc ("") just closes the browser
+            // (as before) — it does NOT climb a level.
+            if (mFile == "\x02UP") goto f5_locations;
+#endif
             if (mFile != "") {
                 // X prefix = extract ZIP to current folder
                 if (mFile[0] == 'X') {
@@ -6460,13 +6700,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     string nm = string(Config::lang ? "Red\n" : "Network\n")
                               + string(MENU_ESP01_TITLE[Config::lang]) + "\t>\n"  // 1 ESP01
                               + st + "\n";                                        // 2 WiFi
+                    // File transfer (Remote) and Online archives now live under F5
+                    // (location picker) — only the server/diagnostic rows remain here.
 #if ZIFI_NET_CLIENT
-                    nm += (Config::lang ? "Transferir archivos\t>\n" : "File transfer\t>\n"); // 3
-                    nm += (Config::lang ? "Servidor FTP\t>\n" : "FTP Server\t>\n");           // 4
-                    nm += (Config::lang ? "Archivos online\t>\n"   : "Online archives\t>\n"); // 4
-                    nm += string(MENU_HTTP_TEST_ITEM[Config::lang]);              // 5
+                    nm += (Config::lang ? "Servidor FTP\t>\n" : "FTP Server\t>\n");           // 3
+                    nm += string(MENU_HTTP_TEST_ITEM[Config::lang]);              // 4
 #endif
-                    nm += "ZiFi NIC\t>\n";                                        // 3 or 6
+                    nm += "ZiFi NIC\t>\n";                                        // 3 or 5
 
                     uint8_t net_opt = menuRun(nm);
                     if (net_opt == 0) break;
@@ -6474,11 +6714,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     if      (net_opt == 1) esp01Menu();
                     else if (net_opt == 2) doWifi();
 #if ZIFI_NET_CLIENT
-                    else if (net_opt == 3) { netFileTransfer(); }
-                    else if (net_opt == 4) { ftpServerRun(); }
-                    else if (net_opt == 5) { netDownloadArchive(); }
-                    else if (net_opt == 6) { netHttpTest(); }
-                    else if (net_opt == 7) doNic();
+                    else if (net_opt == 3) { ftpServerRun(); }
+                    else if (net_opt == 4) { netHttpTest(); }
+                    else if (net_opt == 5) doNic();
 #else
                     else if (net_opt == 3) doNic();
 #endif

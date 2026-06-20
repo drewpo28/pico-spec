@@ -40,6 +40,14 @@ public:
     static int fetchSites(std::string* ids, std::string* names, int maxn);
 
     bool listStream(const std::string& path, RemoteListCb cb, void* ctx) override;
+    std::string cacheId() const override { return "cat_" + site; }
+    // Conditional GET of the directory's .tsv (static tree only) → 304 = fresh,
+    // 200 = changed (+ new ETag). Dynamic /v1 has no validator → CACHE_UNKNOWN.
+    int revalidate(const std::string& path, const std::string& storedVal,
+                   std::string& newVal) override;
+    // ETag captured during the last listStream fetch (static tree); "" if none.
+    // The cache layer persists this so a later revalidate() can send If-None-Match.
+    std::string lastValidator() const override { return last_etag; }
     // Static tree is pre-sorted by the exporter → skip the OSD's on-disk sort (a
     // 10-15 s stall on big listings). Dynamic /v1 keeps sorting (order not assured).
     bool preSorted() const override;
@@ -56,6 +64,10 @@ public:
 private:
     std::string site;
     std::string cur_path;  // "" = root; segments joined by '/', no leading slash
+    std::string last_etag; // ETag seen during the last static-tree listStream fetch
+    // Local cache file of the current dir's raw .tsv (written while browsing) so a
+    // later get()/downloadBasename resolves the locator from SD, not a fresh HTTPS read.
+    std::string tsvCachePath() const;
 };
 
 #endif // !PICO_RP2040 && ZIFI_NET_CLIENT

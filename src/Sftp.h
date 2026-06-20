@@ -18,6 +18,7 @@ public:
     bool connect(const char* host, uint16_t port, const char* user, const char* pass);
 
     bool listStream(const std::string& path, RemoteListCb cb, void* ctx) override;
+    std::string cacheId() const override { return "sftp_" + host_; }
     bool cwd(const std::string& path) override;
     std::string cwdPath() const override { return cur_dir; }
     bool get(const std::string& remote, const std::string& localSdPath, XferProgressCb cb) override;
@@ -30,6 +31,7 @@ private:
     int         chan;
     uint32_t    next_id;
     std::string cur_dir;
+    std::string host_;     // remote host, for the listing-cache namespace (cacheId)
     bool        up;
 
     // Build an absolute remote path from a possibly-relative `name`.

@@ -39,6 +39,28 @@ public:
     // UTF-8 name is still used for navigation/download. Default false (8-bit names).
     virtual bool utf8Names() const { return false; }
 
+    // Stable identifier for this source/connection — used to namespace the on-disk
+    // listing cache (per-folder index files in /tmp). E.g. "ftp_<host>",
+    // "sftp_<host>", "cat_<site>". Must be unique enough that two sources don't
+    // collide, and stable across a session so cached folders are reused.
+    virtual std::string cacheId() const = 0;
+
+    // Cheap freshness check for a cached listing, when the protocol supports one
+    // (HTTP conditional GET → 304). `storedVal` is the validator persisted from the
+    // last fetch (ETag / Last-Modified); on CACHE_STALE, `newVal` receives the new
+    // validator to persist. Default CACHE_UNKNOWN → the cache layer falls back to
+    // session-fresh (re-fetch once per session). FTP/SFTP have no cheap signal.
+    enum CacheState { CACHE_UNKNOWN = 0, CACHE_FRESH = 1, CACHE_STALE = 2 };
+    virtual int revalidate(const std::string& path, const std::string& storedVal,
+                           std::string& newVal) {
+        (void)path; (void)storedVal; (void)newVal; return CACHE_UNKNOWN;
+    }
+
+    // The cache validator (ETag/Last-Modified) captured during the most recent
+    // listStream() fetch, to persist for a later revalidate(). "" if none (the
+    // protocol has no validator, e.g. FTP/SFTP).
+    virtual std::string lastValidator() const { return std::string(); }
+
     // Change current directory. Returns false on error.
     virtual bool cwd(const std::string& path) = 0;
 

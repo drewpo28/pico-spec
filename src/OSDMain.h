@@ -131,6 +131,33 @@ public:
     static string fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t mfcols, uint8_t mfrows);
     // Remote (FTP/SFTP) file browser — bounded RAM via an SD index (see OSDFile.cpp).
     static void remoteFileDialog(class RemoteFs* fs);
+
+    // Shared "file-browser chrome" list (Open File window + sidebar), reused for the
+    // F5 location level, the saved-remotes list, and the remote/web file browser so
+    // they all look like the SD browser. See OSDFile.cpp.
+    enum { FD_SIDE_LOCATIONS = 0, FD_SIDE_HOSTS, FD_SIDE_REMOTE, FD_SIDE_WEB };
+    enum { FDK_ENTER = 0, FDK_ALT, FDK_F2, FDK_F8, FDK_F5, FDK_F7, FDK_BACK, FDK_ESC };
+    // Render the already-populated `filenames` index; returns the selected row (0-based)
+    // or -1, with *outKey = FDK_*. Caller fills `filenames` (streamed) first. ioFocus/
+    // ioBegin (if given) carry the cursor position in and out, so the caller can remember
+    // it across re-lists and folder navigation (like the SD browser).
+    static int fdChromeNav(const string& title, const string& subtitle, int side,
+                           bool utf8, int* outKey, int* ioFocus = nullptr, int* ioBegin = nullptr);
+    // Convenience: render a small fixed `rows` list (DIR_MARKER prefix = navigable).
+    static int fdChromeList(const vector<string>& rows, const string& title,
+                            const string& subtitle, int side, bool utf8, int* outKey,
+                            int* ioFocus = nullptr, int* ioBegin = nullptr);
+    // When set, the SD fileDialog shows a ".." row even at the root "/" and selecting it
+    // returns "" (the F5 handler then re-opens the locations chooser). Set by the F5
+    // handler only when it entered SD via the locations level.
+    static bool fd_root_parent;
+    // The cwd remoteFileDialog last displayed — read by the caller to record the global
+    // "last F5 location" (Config::last_loc) so F5 reopens where you left off.
+    static string net_last_path;
+    // Set when Esc is pressed in any network browser → unwind all the menu loops and
+    // close the OSD (Esc closes the browser, like the old SD dialog). ".."/Backspace
+    // climb one level instead. Reset by the F5 handler.
+    static bool net_close_all;
     static int menuTape(const string& title);
     static void menuScroll(bool up);
     static void fd_Redraw(const string& title, const string& fdir, uint8_t ftype, const vector<string>& filexts);

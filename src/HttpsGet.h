@@ -29,6 +29,8 @@ public:
         int      status;    // HTTP status code, or -1 on transport/parse error
         uint32_t length;    // Content-Length (0 if unknown)
         uint32_t received;  // body bytes delivered to the sink
+        char     etag[64];     // response ETag (quoted), "" if none — for conditional GET
+        char     lastmod[40];  // response Last-Modified, "" if none
     };
 
     // GET an absolute URL, streaming the body to `sink`. For https, `caPath` is an
@@ -39,10 +41,15 @@ public:
     // or open-ended when rangeLen<=0) so a large body can be pulled in small, more
     // reliable pieces. Status is then 206 (partial), 200 (server ignored Range →
     // full body) or 416 (past EOF). `received` is the bytes delivered this call.
+    // `extraHeaders`, if set, is inserted verbatim into the request (must be
+    // CRLF-terminated lines, e.g. "If-None-Match: \"abc\"\r\n") — used for
+    // conditional GETs. The response ETag/Last-Modified are returned in Result;
+    // status 304 (Not Modified) is reported as-is (ok=false, status=304).
     static Result get(const char* url, SinkCb sink, void* sinkCtx,
                       const char* caPath = nullptr,
                       ProgressCb progress = nullptr, void* progCtx = nullptr,
-                      long rangeStart = -1, long rangeLen = -1);
+                      long rangeStart = -1, long rangeLen = -1,
+                      const char* extraHeaders = nullptr);
 
     // Convenience: download to an SD file (streamed, overwrites).
     static Result getToFile(const char* url, const char* sdPath,

@@ -31,6 +31,7 @@ string   Config::pref_romSetP1M = "Last";
 string   Config::pref_romSetProfi = "Last";
 string   Config::ram_file = NO_RAM_FILE;
 string   Config::last_ram_file = NO_RAM_FILE;
+uint8_t  Config::ram_file_origin = Config::ORIGIN_LOCAL;
 
 bool     Config::loaded = false;
 bool     Config::slog_on = false;
@@ -142,6 +143,7 @@ string   Config::net_dl_dir = "/spec";
 string   Config::net_ul_dir = "/spec";
 string   Config::catalog_host;
 uint16_t Config::catalog_port = 0;
+string   Config::last_loc;   // last F5 browse location (all sources); see Config.h
 #endif
 
 uint8_t Config::scanlines = 0;
@@ -465,6 +467,7 @@ void Config::loadWifiConfig() {
                 else if (key == "net_ul")    { if (!val.empty()) net_ul_dir = val; }
                 else if (key == "catalog_host") catalog_host = val;
                 else if (key == "catalog_port") catalog_port = (uint16_t)atoi(val.c_str());
+                else if (key == "last_loc")  last_loc = val;   // tab-separated; no '=' inside
                 else if (key == "baud")      { zifi_baud = (uint32_t)strtoul(val.c_str(), nullptr, 10); if (!zifi_baud) zifi_baud = 115200; }
             }
             line.clear();
@@ -479,19 +482,74 @@ void Config::saveWifiConfig() {
     FileUtils::mkdirParents(CONFIG_DIR);
     FIL* f = fopen2(WIFI_CFG_PATH, FA_WRITE | FA_CREATE_ALWAYS);
     if (!f) return;
-    char buf[768];
+    // Static (not on the stack): this runs deep under do_OSD (F5 → Add Remote) where the
+    // 4 KB core stack is tight — a 1 KB local here overflowed it (stackOvf). Not reentrant.
+    static char buf[1024];
     int n = snprintf(buf, sizeof(buf),
                      "ssid=%s\npass=%s\ntz=%d\nautoconnect=%d\n"
                      "net_host=%s\nnet_user=%s\nnet_port=%u\nnet_proto=%u\nbaud=%u\n"
-                     "net_dl=%s\nnet_ul=%s\ncatalog_host=%s\ncatalog_port=%u\n",
+                     "net_dl=%s\nnet_ul=%s\ncatalog_host=%s\ncatalog_port=%u\nlast_loc=%s\n",
                      wifi_ssid.c_str(), wifi_pass.c_str(),
                      (int)wifi_tz, wifi_autoconnect ? 1 : 0,
                      net_host.c_str(), net_user.c_str(),
                      (unsigned)net_port, (unsigned)net_proto, (unsigned)zifi_baud,
                      net_dl_dir.c_str(), net_ul_dir.c_str(),
-                     catalog_host.c_str(), (unsigned)catalog_port);
+                     catalog_host.c_str(), (unsigned)catalog_port, last_loc.c_str());
     UINT bw;
     if (n > 0) f_write(f, buf, n, &bw);
+    fclose2(f);
+}
+
+#define REMOTES_PATH CONFIG_DIR "/remotes.tsv"
+
+int Config::loadRemotes(Remote* out, int cap) {
+    FIL* f = fopen2(REMOTES_PATH, FA_READ);
+    if (!f) return 0;
+    int n = 0;
+    UINT br; char c; string line;
+    auto flush = [&]() {
+        if (line.empty()) return;
+        // Up to 8 tab fields: proto host port user savepass pass alias path. Older 6/7-field
+        // lines (no alias/path) parse fine — the missing trailing fields stay empty.
+        string fld[8]; int fi = 0;
+        for (char ch : line) { if (ch == '\t') { if (fi < 7) ++fi; } else fld[fi] += ch; }
+        if (fi >= 4 && n < cap) {            // need proto..savepass present
+            Remote& r = out[n];
+            r.proto    = (fld[0] == "sftp") ? 1 : 0;
+            r.host     = fld[1];
+            r.port     = (uint16_t)atoi(fld[2].c_str());
+            r.user     = fld[3];
+            r.savepass = (fld[4] == "1");
+            r.pass     = r.savepass ? fld[5] : "";
+            r.alias    = fld[6];             // optional display name ("" for old lines)
+            r.path     = fld[7];             // optional start directory
+            ++n;
+        }
+        line.clear();
+    };
+    while (!f_eof(f)) {
+        if (f_read(f, &c, 1, &br) != FR_OK || br == 0) break;
+        if (c == '\n') flush();
+        else if (c != '\r') line += c;
+    }
+    flush();                                  // last line may lack a trailing newline
+    fclose2(f);
+    return n;
+}
+
+void Config::saveRemotes(const Remote* list, int count) {
+    FileUtils::mkdirParents(CONFIG_DIR);
+    FIL* f = fopen2(REMOTES_PATH, FA_WRITE | FA_CREATE_ALWAYS);
+    if (!f) return;
+    for (int i = 0; i < count; ++i) {
+        const Remote& r = list[i];
+        static char buf[512];   // off the stack — saveRemotes also runs deep under do_OSD
+        int n = snprintf(buf, sizeof(buf), "%s\t%s\t%u\t%s\t%d\t%s\t%s\t%s\n",
+                         r.proto ? "sftp" : "ftp", r.host.c_str(), (unsigned)r.port,
+                         r.user.c_str(), r.savepass ? 1 : 0,
+                         r.savepass ? r.pass.c_str() : "", r.alias.c_str(), r.path.c_str());
+        UINT bw; if (n > 0) f_write(f, buf, (UINT)n, &bw);
+    }
     fclose2(f);
 }
 #endif
@@ -574,6 +632,7 @@ void Config::load() {
         if (pref_arch == "Profi") { pref_arch = "Last"; }
 #endif
         nvs_get_str("ram", ram_file, sts);
+        nvs_get_u8("ram_origin", ram_file_origin, sts); // provenance (default LOCAL)
         nvs_get_b("AY48", AY48, sts);
 #if !PICO_RP2040
         nvs_get_b("SAA1099", SAA1099, sts);
@@ -955,6 +1014,11 @@ void Config::save() {
     nvs_set_str(buf,"pref_romSetP1M",pref_romSetP1M.c_str());
     nvs_set_str(buf,"pref_romSetProfi",pref_romSetProfi.c_str());
     nvs_set_str(buf,"ram",ram_file.c_str());
+    // Derive provenance from the file's actual location so the stored tag is never
+    // stale: a /tmp path is a transient quick-start download, anything else is a
+    // real SD file. (Transient mounts are also dropped from the drive list below.)
+    ram_file_origin = (ram_file.compare(0, 5, "/tmp/") == 0) ? ORIGIN_TMP : ORIGIN_LOCAL;
+    nvs_set_u8(buf,"ram_origin", ram_file_origin);
     nvs_set_str(buf,"slog",slog_on ? "true" : "false");
 ///        nvs_set_str(buf,"sdstorage", FileUtils::MountPoint);
 ///        nvs_set_str(buf,"asp169",aspect_16_9 ? "true" : "false");
@@ -1056,11 +1120,18 @@ void Config::save() {
         nvs_set_u8(buf, (s + ".fdMode").c_str(), ft.fdMode);
         nvs_set_str(buf, (s + ".fileSearch").c_str(), ft.fileSearch.c_str());
         if (i < 4) {
+            // A quick-started download lives in /tmp and is gone after reboot — never
+            // persist it as a mount (it would just fail to reopen). Transient origin
+            // is encoded by the /tmp path itself; real SD mounts persist as before.
+            auto persistFile = [&](const string& key, const string& fn) {
+                bool transient = fn.compare(0, 5, "/tmp/") == 0;
+                nvs_set_str(buf, key.c_str(), transient ? "" : fn.c_str());
+            };
             s = "drive" + to_string(i);
-            nvs_set_str(buf, (s + ".file").c_str(), ESPectrum::fdd.disk[i] ? ESPectrum::fdd.disk[i]->fname.c_str() : "");
+            persistFile(s + ".file", ESPectrum::fdd.disk[i] ? ESPectrum::fdd.disk[i]->fname : "");
 #if !PICO_RP2040
             s = "mb02d" + to_string(i);
-            nvs_set_str(buf, (s + ".file").c_str(), ESPectrum::mb02_fdd.disk[i] ? ESPectrum::mb02_fdd.disk[i]->fname.c_str() : "");
+            persistFile(s + ".file", ESPectrum::mb02_fdd.disk[i] ? ESPectrum::mb02_fdd.disk[i]->fname : "");
 #endif
         }
     }

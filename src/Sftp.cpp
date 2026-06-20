@@ -93,6 +93,7 @@ bool Sftp::recvPacket(uint8_t& out_type, std::string& out_body, uint32_t timeout
 }
 
 bool Sftp::connect(const char* host, uint16_t port, const char* user, const char* pass) {
+    host_ = host ? host : "";   // for the listing-cache namespace (cacheId)
     if (!ssh.connect(host, port, user, pass)) return false;
     chan = ssh.openSubsystem("sftp");
     if (chan < 0) { Debug::log("SFTP: openSubsystem failed"); return false; }

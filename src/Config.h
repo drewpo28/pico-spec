@@ -81,6 +81,11 @@ public:
     static string   pref_romSetProfi;
     static string   ram_file;
     static string   last_ram_file;
+    // Provenance of a loaded/mounted file. Transient sources (TMP/REMOTE/WEB) are
+    // never pinned as a reload reference (the file is gone after reboot); LOCAL is a
+    // real SD path that persists. Old configs lack the tag → default LOCAL.
+    enum FileOrigin { ORIGIN_LOCAL = 0, ORIGIN_TMP = 1, ORIGIN_REMOTE = 2, ORIGIN_WEB = 3 };
+    static uint8_t  ram_file_origin;
     static uint8_t  esp32rev;
     static bool     slog_on;
     static bool     ledIndicators;
@@ -251,8 +256,34 @@ public:
     // GitHub-Pages tree fetched over TLS. See HttpCatalogFs. Empty = unset.
     static string   catalog_host;
     static uint16_t catalog_port; // dynamic mode only (0 = 80)
+    // Last F5 browse location across ALL sources (so F5 reopens where you left off,
+    // like the SD ALL_Path does). One global value, tab-separated:
+    //   "L"                                   → Local (SD); path is ALL_Path
+    //   "W\t<siteId>\t<path>"                  → Web catalog source + cur_path
+    //   "R\t<host>\t<port>\t<proto>\t<user>\t<path>" → remote (match a saved remote)
+    // Empty → none (F5 opens Local SD). Stored in wifi.cfg.
+    static string   last_loc;
     static void loadWifiConfig();
     static void saveWifiConfig();
+
+    // Saved FTP/SFTP connections (Network → F5 → Remote). Stored in
+    // CONFIG_DIR/remotes.tsv, one tab-separated line per connection:
+    //   proto \t host \t port \t user \t savepass \t pass \t alias \t path
+    // The password is only written when savepass=1 (else re-prompted at connect). `alias`
+    // is an optional display name (shown instead of user@host:port). `path` is an optional
+    // start directory — on connect the browser cd's straight into it. (path is the last
+    // field so older 7-field lines stay readable.)
+    struct Remote {
+        string   host, user, pass, alias, path;
+        uint16_t port;
+        uint8_t  proto;     // 0 = FTP, 1 = SFTP
+        bool     savepass;
+    };
+    static const int MAX_REMOTES = 16;
+    // Load saved remotes into `out` (array of `cap` entries). Returns count loaded.
+    static int  loadRemotes(Remote* out, int cap);
+    // Persist `count` remotes from `list` to remotes.tsv (overwrites).
+    static void saveRemotes(const Remote* list, int count);
 #endif
     
     static signed char aud_volume;

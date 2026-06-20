@@ -50,6 +50,7 @@ int Ftp::command(const char* verb, const char* arg, std::string& reply, uint32_t
 }
 
 bool Ftp::connect(const char* host, uint16_t port, const char* user, const char* pass) {
+    host_ = host ? host : "";   // for the listing-cache namespace (cacheId)
     if (!ZiFiSock::begin(true)) return false; // CIPMUX=1 for control+data
     if (ZiFiSock::sock_open(host, port, false, 12000) != CTRL) return false;
 
