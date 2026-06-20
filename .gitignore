@@ -10,5 +10,3 @@ debug
 debug.log
 dump.log
 logs/
-external/wolfssh/
-external/wolfssl/
