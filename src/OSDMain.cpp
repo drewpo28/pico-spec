@@ -3149,6 +3149,15 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 // Mode toggle — stay in the MB-02+ menu so drive rows
                                 // show up / disappear in place when the user flips Mode.
                                 uint8_t newval = Config::mb02 ? 0 : 1;
+                                // MB-02+ and Profi both claim the upper MemESP RAM
+                                // pages (Profi forces ~96 KB of SRAM pages for its
+                                // 1024K/DS80 working set); enabling MB-02+ on Profi
+                                // corrupts that and the machine fails to boot. Refuse.
+                                if (newval && Config::arch == "Profi") {
+                                    OSD::osdCenteredMsg("MB-02+ not available on Profi", LEVEL_WARN, 2000);
+                                    menu_curopt = 1;
+                                    continue;
+                                }
                                 Config::mb02 = newval;
                                 if (Config::mb02 && Config::esxdos) {
                                     Config::esxdos = 0;
@@ -3167,6 +3176,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     OSD::osdCenteredMsg("MB-02+: not enough memory", LEVEL_ERROR, 2000);
                                     Config::mb02 = 0;
                                 }
+                                // Restore the last-used disks remembered in the
+                                // mounts file. loadDiskMounts() skips MB-02 disks
+                                // while the interface is off, so after a reboot
+                                // taken with MB-02 disabled (e.g. switched to Profi
+                                // and back) mb02_fdd is empty — re-mount them now.
+                                if (MB02::enabled)
+                                    Config::loadMb02DiskMounts();
                                 Config::save();
                                 ESPectrum::reset();
                                 menu_curopt = 1;

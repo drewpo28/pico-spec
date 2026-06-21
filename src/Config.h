@@ -57,6 +57,7 @@ public:
 
     static void load();           // load main settings before emulator init
     static void loadDiskMounts(); // mount disks from storage.nvs after FDD/MB02 init
+    static void loadMb02DiskMounts(); // (re)mount only MB-02+ disks (on enable at runtime)
     static void save();
     static bool loaded;  // true after successful load() from file/RAM
 
@@ -229,6 +230,7 @@ public:
     static string esxdos_hdf_image[2];
     static uint8_t mb02;     // 0=OFF 1=ON (MB-02+ disk interface, mutually exclusive with TR-DOS/DivMMC)
     static bool mb02WP[4];   // MB-02+ per-slot write protect
+    static string mb02DiskFile[4]; // remembered MB-02+ disk paths; survive the interface being disabled
     static uint8_t mb02SoundLed;// MB-02+ disk sound & LED: 0=Off, 1=Led, 2=Sound, 3=Sound+Led
     static bool zcontroller; // Z-Controller SD on ports 0x77/0x57 (mutually exclusive with esxDOS/MB-02+)
     static uint8_t ide_scheme;   // IDE/HDD: 0=OFF 1=NEMO 2=PROFI (mutually exclusive with esxDOS DivMMC/DivIDE)

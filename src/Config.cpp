@@ -124,6 +124,7 @@ uint8_t  Config::esxdos = 0;
 string   Config::esxdos_hdf_image[2] = {"", ""};
 uint8_t  Config::mb02 = 0;
 bool     Config::mb02WP[4] = { true, true, true, true };
+string   Config::mb02DiskFile[4] = { "", "", "", "" };
 uint8_t  Config::mb02SoundLed = 0; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
 bool     Config::zcontroller = false;
 uint8_t  Config::ide_scheme = 0;
@@ -410,14 +411,20 @@ void Config::loadDiskMounts() {
                 plen = strlen(prefix);
                 if (s.length() >= plen && s.compare(0, plen, prefix) == 0) {
                     std::string fn = s.substr(plen);
-                    // Re-insert into the FDD struct even when MB-02+ is currently
-                    // disabled, so the remembered disks survive a power cycle /
-                    // hard reset taken while MB-02+ is off. The struct is never
-                    // ejected on disable (MB02::init keeps disk[] intact), so the
-                    // disks reappear when the interface is re-enabled. InsertDisk
-                    // only opens/parses the file; it doesn't need the track buffer
-                    // that MB02::init allocates on enable.
-                    if (!fn.empty()) {
+                    // Keep the remembered path in sync (authoritative for save()).
+                    mb02DiskFile[i] = fn;
+                    // Only re-insert MB-02 disks when the interface is enabled.
+                    // The path is persisted regardless of Config::mb02, so a disk
+                    // remembered while MB-02+ was on lingers in the mounts file
+                    // even after a guard auto-disables MB-02+ (e.g. on a switch to
+                    // Profi at OSDMain.cpp). loadDiskMounts() runs AFTER VIDEO::Init
+                    // at the tight-heap point, and InsertDisk heap-allocs the disk
+                    // struct (~2 KB) + a FIL — on Profi, which forces ~96 KB of SRAM
+                    // pages, that wasted alloc for a disabled interface can OOM the
+                    // boot (Profi never starts). Skipping the insert when !mb02 is
+                    // safe: the path stays remembered and the disk reappears once
+                    // MB-02+ is re-enabled (loadMb02DiskMounts) or on next boot.
+                    if (!fn.empty() && Config::mb02) {
                         rvmWD1793InsertDisk(&ESPectrum::mb02_fdd, i, fn);
                         if (ESPectrum::mb02_fdd.disk[i])
                             ESPectrum::mb02_fdd.disk[i]->writeprotect = mb02WP[i];
@@ -432,6 +439,28 @@ void Config::loadDiskMounts() {
     }
     fclose2(handle);
 }
+
+#if !PICO_RP2040
+// (Re)mount the MB-02+ disks remembered in mb02DiskFile[]. loadDiskMounts()
+// skips MB-02 disks while the interface is disabled (to keep the heap free on
+// Profi etc.), so the remembered paths persist but aren't loaded. Call this the
+// moment MB-02+ is enabled at runtime (OSD toggle) to restore the last-used
+// disks — otherwise they'd only reappear after a full reboot.
+void Config::loadMb02DiskMounts() {
+    for (int i = 0; i < 4; ++i) {
+        const string& fn = mb02DiskFile[i];
+        // Skip slots already holding the same disk so we don't eject / re-open a
+        // disk that's already mounted (re-insert resets state).
+        if (!fn.empty() &&
+            !(ESPectrum::mb02_fdd.disk[i] &&
+              ESPectrum::mb02_fdd.disk[i]->fname == fn)) {
+            rvmWD1793InsertDisk(&ESPectrum::mb02_fdd, i, fn);
+            if (ESPectrum::mb02_fdd.disk[i])
+                ESPectrum::mb02_fdd.disk[i]->writeprotect = mb02WP[i];
+        }
+    }
+}
+#endif
 
 #if !PICO_RP2040
 // Stored in CONFIG_DIR; legacy "/wifi.cfg" at the SD root is still read as a
@@ -787,8 +816,12 @@ void Config::load() {
         }
         nvs_get_u8("mb02", mb02, sts);
         for (int i = 0; i < 4; i++) {
-            char k[12]; snprintf(k, sizeof(k), "mb02d%d.wp", i);
+            char k[16]; snprintf(k, sizeof(k), "mb02d%d.wp", i);
             nvs_get_b(k, mb02WP[i], sts);
+            // Remembered MB-02+ disk path — authoritative source for save()/restore,
+            // independent of whether the interface is currently loaded.
+            snprintf(k, sizeof(k), "mb02d%d.file", i);
+            nvs_get_str(k, mb02DiskFile[i], sts);
         }
         if (!nvs_get_u8("mb02SoundLedMode", mb02SoundLed, sts)) {
             // Migrate legacy bool key: true -> Sound+Led (3), false -> Off (0)
@@ -1143,7 +1176,15 @@ void Config::save() {
             persistFile(s + ".file", ESPectrum::fdd.disk[i] ? ESPectrum::fdd.disk[i]->fname : "");
 #if !PICO_RP2040
             s = "mb02d" + to_string(i);
-            persistFile(s + ".file", ESPectrum::mb02_fdd.disk[i] ? ESPectrum::mb02_fdd.disk[i]->fname : "");
+            // MB-02+ disk paths must survive the interface being disabled. Persist
+            // the remembered path, NOT the live FDD state: when MB-02+ is off
+            // mb02_fdd is empty (and, on Profi, never loaded), so writing the live
+            // "" would erase the remembered disk. While the interface is enabled,
+            // keep the remembered path synced to the live mount (insert/eject both
+            // call save() with MB-02+ on), so it always reflects the latest action.
+            if (Config::mb02)
+                mb02DiskFile[i] = ESPectrum::mb02_fdd.disk[i] ? ESPectrum::mb02_fdd.disk[i]->fname : "";
+            persistFile(s + ".file", mb02DiskFile[i]);
 #endif
         }
     }
