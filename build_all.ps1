@@ -256,13 +256,28 @@ $Succeeded = @($Results | Where-Object { $_.Ok })
 $Failed    = @($Results | Where-Object { -not $_.Ok })
 
 if ($Succeeded.Count -gt 0) {
+    # Start from a clean firmware dir so it only holds this run's current-version
+    # uf2s (no stale files from earlier PORT_VERSION/clock builds).
+    Get-ChildItem -Path $OutputDir -Filter "*.uf2" -ErrorAction SilentlyContinue | Remove-Item -Force
     Write-Host "Succeeded ($($Succeeded.Count)):"
     foreach ($R in $Succeeded) {
         $BuildDir = Get-BuildDir $R.Target $R.Display
         Write-Host ("  {0}:{1} ({2}s)" -f $R.Target, $R.Display, $R.Seconds)
-        Get-ChildItem -Path $BuildDir -Filter "*.uf2" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-            Copy-Item $_.FullName -Destination $OutputDir -Force
-            Write-Host "    -> $($_.Name)"
+        # Copy only the uf2 from THIS run's CMake config (BUILD_NAME embeds the
+        # current PORT_VERSION), not every stale *.uf2 left in the bin dir from
+        # earlier builds with different versions/clocks.
+        $BuildName = (Select-String -Path $R.Log -Pattern '-- BUILD_NAME: *(.+)' |
+            Select-Object -First 1).Matches.Groups[1].Value
+        if (-not $BuildName) {
+            Write-Host "    !! could not determine BUILD_NAME from $($R.Log) — skipping"
+            continue
+        }
+        $Fw = Join-Path $BuildDir "bin\$BuildType\$BuildName.uf2"
+        if (Test-Path $Fw) {
+            Copy-Item $Fw -Destination $OutputDir -Force
+            Write-Host "    -> $(Split-Path $Fw -Leaf)"
+        } else {
+            Write-Host "    !! expected $Fw not found"
         }
     }
     Write-Host ""

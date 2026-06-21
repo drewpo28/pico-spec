@@ -163,6 +163,9 @@ for %%F in ("%STATE_DIR%\*.fail") do (
 )
 
 if defined SUCCEEDED (
+    :: Start from a clean firmware dir so it only holds this run's current-version
+    :: uf2s (no stale files from earlier PORT_VERSION/clock builds).
+    del /q "%OUTPUT_DIR%\*.uf2" 2>nul
     echo Succeeded:!SUCCEEDED!
     for %%E in (!SUCCEEDED!) do (
         set "ENTRY=%%E"
@@ -177,9 +180,21 @@ if defined SUCCEEDED (
         ) else (
             set "BD=%SCRIPT_DIR%\build-!T!-!D!"
         )
-        for /r "!BD!" %%F in (*.uf2) do (
-            copy /y "%%F" "%OUTPUT_DIR%\" >nul
-            echo   %%~nxF
+        :: Copy only the uf2 from THIS run's CMake config (BUILD_NAME embeds the
+        :: current PORT_VERSION), not every stale *.uf2 left in the bin dir from
+        :: earlier builds with different versions/clocks.
+        set "BUILD_NAME="
+        for /f "tokens=3" %%N in ('findstr /c:"-- BUILD_NAME:" "%LOG_DIR%\!T!-!D!.log" 2^>nul') do set "BUILD_NAME=%%N"
+        if not defined BUILD_NAME (
+            echo   !! could not determine BUILD_NAME from %LOG_DIR%\!T!-!D!.log -- skipping
+        ) else (
+            set "FW=!BD!\bin\%BUILD_TYPE%\!BUILD_NAME!.uf2"
+            if exist "!FW!" (
+                copy /y "!FW!" "%OUTPUT_DIR%\" >nul
+                echo   !BUILD_NAME!.uf2
+            ) else (
+                echo   !! expected !FW! not found
+            )
         )
     )
     echo.

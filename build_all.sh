@@ -276,16 +276,31 @@ while IFS= read -r line; do
 done <"$RESULTS_FILE"
 
 if [ ${#SUCCEEDED[@]} -gt 0 ]; then
+    # Start from a clean firmware dir so it only holds this run's current-version
+    # uf2s (no stale files from earlier PORT_VERSION/clock builds).
+    rm -f "$OUTPUT_DIR"/*.uf2
     echo "Succeeded (${#SUCCEEDED[@]}):"
     for ENTRY in "${SUCCEEDED[@]}"; do
         PAIR="${ENTRY%% (*}"
         IFS=':' read -r TARGET DISPLAY ALF <<<"$PAIR"
         BUILD_DIR="$(build_dir_for "$TARGET" "$DISPLAY" "$ALF")"
+        LOG="$LOG_DIR/${TARGET}-${DISPLAY}${ALF:+-ALF}.log"
         echo "  $ENTRY"
-        while IFS= read -r FW; do
+        # Copy only the uf2 from THIS run's CMake config (BUILD_NAME embeds the
+        # current PORT_VERSION), not every stale *.uf2 left in the bin dir from
+        # earlier builds with different versions/clocks.
+        BUILD_NAME="$(grep -m1 -- '-- BUILD_NAME:' "$LOG" 2>/dev/null | sed 's/.*-- BUILD_NAME: *//')"
+        if [ -z "$BUILD_NAME" ]; then
+            echo "    !! could not determine BUILD_NAME from $LOG — skipping"
+            continue
+        fi
+        FW="$BUILD_DIR/bin/$BUILD_TYPE/$BUILD_NAME.uf2"
+        if [ -f "$FW" ]; then
             cp "$FW" "$OUTPUT_DIR/"
             echo "    -> $(basename "$FW")"
-        done < <(find "$BUILD_DIR" -name "*.uf2" 2>/dev/null)
+        else
+            echo "    !! expected $FW not found"
+        fi
     done
     echo ""
     echo "All firmware files copied to: $OUTPUT_DIR/"
