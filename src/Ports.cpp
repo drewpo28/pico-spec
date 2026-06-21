@@ -1792,13 +1792,19 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   bool eff7_decode = (Config::arch == "Profi") ? ((address & 0xF008) == 0xE000)
                                                : ((address & 0x1008) == 0);
   if ((Z80Ops::isPentagon || Z80Ops::isProfi) && eff7_decode) { // EFF7
-    LED::touchW(LED::RAM);
     if (!MemESP::pagingLock) {
-      uint8_t prev = MemESP::page0ram;
+      uint8_t prevPage0 = MemESP::page0ram;
+      uint8_t prevNotMore = MemESP::notMore128;
       MemESP::notMore128 = bitRead(data, 2);
       MemESP::page0ram = bitRead(data, 3);
-      if (MemESP::page0ram != prev)
+      if (MemESP::page0ram != prevPage0)
         MemESP::recoverPage0();
+      // Only flash the RAM paging LED on an actual paging change. #EFF7 is
+      // shared with the CMOS-enable bit (D7): Gluk's RTC clock loop toggles D7
+      // every update, which would otherwise blink the RAM LED with no real
+      // paging activity.
+      if (MemESP::page0ram != prevPage0 || MemESP::notMore128 != prevNotMore)
+        LED::touchW(LED::RAM);
     }
   }
   // 128K, Pentagon
