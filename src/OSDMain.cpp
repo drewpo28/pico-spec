@@ -2878,7 +2878,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     if (opt2) {
                                         Config::trdosFastMode = (opt2 == 1);
                                         if (Config::trdosFastMode != prev) {
-                                            ESPectrum::fdd.fastmode = Config::trdosFastMode;
+                                            rvmWD1793UpdateFastmode(&ESPectrum::fdd);
                                             Config::save();
                                         }
                                         menu_curopt = opt2;

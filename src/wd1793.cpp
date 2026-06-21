@@ -1674,6 +1674,26 @@ IRAM_ATTR uint8_t rvmWD1793Read(rvmWD1793 *wd,uint8_t a) {
 static void fdiFlushTrack(rvmWD1793 *wd);
 static void mbdFlushTrack(rvmWD1793 *wd);
 
+// Fast mode (sectdatapos fast addressing) is only valid for standard-format
+// disks (SCL/TRD). Raw-format images (UDI/FDI/MBD/TD0/PRO) need real MFM
+// emulation and must run with fastmode=false. There is a single per-controller
+// fastmode flag, but the decision is per-disk — so it must follow the
+// *currently selected* drive only. Otherwise a raw image mounted in another
+// slot drags a standard disk in the active drive down to slow mode (the
+// multi-disk bug: A:=TRD was forced slow whenever B:/C:/D: held a UDI/FDI/etc).
+static bool diskFastCapable(rvmwdDisk *d) {
+  if (!d) return true;
+#if !PICO_RP2040
+  if (d->IsUDIFile || d->IsFDIFile || d->IsMBDFile || d->IsTD0File || d->IsProFile)
+    return false;
+#endif
+  return true;
+}
+
+void rvmWD1793UpdateFastmode(rvmWD1793 *wd) {
+  wd->fastmode = Config::trdosFastMode && diskFastCapable(wd->disk[wd->diskS]);
+}
+
 void rvmWD1793Reset(rvmWD1793 *wd) {
 
   wd->state = kRVMWD177XNone;
@@ -1696,19 +1716,9 @@ void rvmWD1793Reset(rvmWD1793 *wd) {
   // wd->crc=0xffff;
   wd->crc = 0; // Disable CRC. Not needed for Betadisk emulation
   wd->side = wd->diskS = 0;
-  // wd2797_mode is set externally (by MB02::init), preserve across reset
-  // UDI/FDI/MBD raw-format disks require fastmode=false (sectdatapos incompatible with raw MFM)
-#if !PICO_RP2040
-  {
-    bool hasRawDisk = false;
-    for (int i = 0; i < 4; i++)
-      if (wd->disk[i] && (wd->disk[i]->IsUDIFile || wd->disk[i]->IsFDIFile || wd->disk[i]->IsMBDFile || wd->disk[i]->IsTD0File))
-        hasRawDisk = true;
-    wd->fastmode = hasRawDisk ? false : Config::trdosFastMode;
-  }
-#else
-  wd->fastmode = Config::trdosFastMode;
-#endif
+  // wd2797_mode is set externally (by MB02::init), preserve across reset.
+  // Fastmode follows the active drive only (reset selects drive 0 above).
+  rvmWD1793UpdateFastmode(wd);
   wd->sclConverted = false;
 #if !PICO_RP2040
   // Flush modified UDI/FDI track to SD before resetting (avoid data loss)
@@ -1873,7 +1883,7 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         wd->disk[UnitNum]->fname = Filename;
         // writeprotect is seeded by the caller from the per-slot Config array.
         wd->disk[UnitNum]->writeprotect = 0;
-        wd->fastmode = Config::trdosFastMode;
+        rvmWD1793UpdateFastmode(wd);
         diskType = 0x16;
 
 #if !PICO_RP2040
@@ -1927,7 +1937,7 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         wd->disk[UnitNum]->fname = Filename;
         wd->diskLoadedCyl = -1;
         wd->diskLoadedSide = -1;
-        wd->fastmode = false; // fastmode uses sectdatapos, incompatible with raw MFM
+        rvmWD1793UpdateFastmode(wd); // fastmode uses sectdatapos, incompatible with raw MFM
 
         printf("UDI: %d cylinders, %d sides\n", cyls, sides);
         return true;
@@ -1978,7 +1988,7 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         wd->disk[UnitNum]->fname = Filename;
         wd->diskLoadedCyl = -1;
         wd->diskLoadedSide = -1;
-        wd->fastmode = false;
+        rvmWD1793UpdateFastmode(wd);
 
         printf("FDI: %d cylinders, %d sides\n", cyls, sides);
         return true;
@@ -2183,7 +2193,7 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         d0->fname = Filename;
         wd->diskLoadedCyl = -1;
         wd->diskLoadedSide = -1;
-        wd->fastmode = false;
+        rvmWD1793UpdateFastmode(wd);
 
         printf("TD0%s: %d cylinders, %d sides, %u stream bytes (%s)\n",
                packed ? " (packed)" : "", cyls, sides, (unsigned)imgLen,
@@ -2237,7 +2247,7 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         wd->disk[UnitNum]->fname = Filename;
         wd->diskLoadedCyl = -1;
         wd->diskLoadedSide = -1;
-        wd->fastmode = false;
+        rvmWD1793UpdateFastmode(wd);
 
         printf("MBD: %d tracks, %d sides, %d sec/trk, %d bytes/sec\n",
                tracks, sides, spt, wd->disk[UnitNum]->mbdSectorSize);
@@ -2283,7 +2293,7 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         wd->disk[UnitNum]->fname = Filename;
         wd->diskLoadedCyl = -1;
         wd->diskLoadedSide = -1;
-        wd->fastmode = false;
+        rvmWD1793UpdateFastmode(wd);
 
         printf("PRO (Profi CP/M): %d tracks, %d sides, %d sec/trk, %d bytes/sec\n",
                tracks, sides, spt, secSize);
@@ -2301,7 +2311,7 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         // writeprotect is seeded by the caller from the per-slot Config array.
         wd->disk[UnitNum]->writeprotect = 0;
         wd->disk[UnitNum]->sclDataOffset = 0;
-        wd->fastmode = Config::trdosFastMode;
+        rvmWD1793UpdateFastmode(wd);
 
         // fseek(wd->disk[UnitNum]->Diskfile,2048 + 227,SEEK_SET);
         // fread(&diskType,1,1,wd->disk[UnitNum]->Diskfile);

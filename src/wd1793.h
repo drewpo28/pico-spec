@@ -367,6 +367,10 @@ void rvmWD1793Write(rvmWD1793 *wd, uint8_t a, uint8_t v);
 uint8_t rvmWD1793Read(rvmWD1793 *wd, uint8_t a);
 void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps);
 void rvmWD1793Reset(rvmWD1793 *wd);
+// Recompute the per-controller fastmode flag from Config::trdosFastMode and the
+// currently selected drive's format. Call after changing the active drive
+// (diskS) or toggling the config so fastmode tracks the active disk only.
+void rvmWD1793UpdateFastmode(rvmWD1793 *wd);
 // Allocate the MFM track buffer (idempotent). Returns false on OOM. RP2350 only.
 bool rvmWD1793AllocTrackBuf(rvmWD1793 *wd);
 // Release the MFM track buffer (safe if already null). RP2350 only.

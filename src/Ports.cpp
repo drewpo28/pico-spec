@@ -883,6 +883,9 @@ static inline void profiFdcSysWrite(uint8_t data) {
         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->sides == 1)
       ESPectrum::fdd.side = 0;
     ESPectrum::fdd.sclConverted = false;
+    // Fastmode is per-disk: re-evaluate it for the newly selected drive so a
+    // raw image in one slot doesn't force a standard disk in another to slow.
+    rvmWD1793UpdateFastmode(&ESPectrum::fdd);
   }
 
   if (!(data & 0x4)) {
