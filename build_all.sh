@@ -110,7 +110,7 @@ for TARGET in $TARGETS; do
         fi
     done
     # ALF-enabled (NO_ALF=0) variants: m1p2 (MURM_P2) and z0p2 (ZERO2)
-    if [ "$TARGET" = "MURM_P2" ] || [ "$TARGET" = "ZERO2" ]; then
+    if [ "$TARGET" = "MURM2_P2" ] || [ "$TARGET" = "MURM_P2" ] || [ "$TARGET" = "ZERO2" ]; then
         BUILD_PAIRS+=("${TARGET}:VGA_HDMI:ALF")
     fi
 done
