@@ -2166,19 +2166,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     // Tape — sync TAP_Path: /tmp/ for ZIP, ALL_Path for normal files
                     FileUtils::TAP_Path = fromZip ? "/tmp/" : FileUtils::ALL_Path;
                     Config::save();
-                    // Respect the Auto-start toggle (same rule as Storage→Tape): with
-                    // auto-start off, force the "L" (load-only) key so flashload never
-                    // runs the program — the machine lands at BASIC. WAV/MP3 are real
-                    // audio and always play inside LoadTape regardless of the key.
+                    // Respect the Auto-start toggle: with auto-start off, force the
+                    // "L" (load-only) key so flashload never runs the program — the
+                    // machine lands at BASIC. WAV/MP3 always play inside LoadTape.
+                    // Don't press Play here: leaving the tape STOPPED until the guest
+                    // polls keeps F8 stats out of tape mode while it's merely mounted.
                     if (!Config::tape_autostart && mFile.size() > 0)
                         mFile[0] = 'L';
                     Tape::LoadTape(mFile);
-                    // With flashload off the loader didn't run, so press Play when
-                    // auto-start is on so the tape is ready for the LOAD "" poll.
-                    if (Config::tape_autostart && !Config::flashload &&
-                        Tape::tapeStatus == TAPE_STOPPED &&
-                        Tape::tapeFileName != "none")
-                        Tape::Play();
                 }
                 else if (FileUtils::ifaceForExt(ext) == IFACE_BETA) {
                     // TR-DOS disk. Enter in the browser mounts into Drive A;
@@ -2502,6 +2497,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             FileUtils::TAP_Path = "/tmp/";
                                         }
                                         Config::save();
+                                        // Auto-start off: force the "L" (load-only) key so
+                                        // flashload never runs the program — land at BASIC,
+                                        // same as the F5 file manager.
+                                        if (!Config::tape_autostart && mFile.size() > 0)
+                                            mFile[0] = 'L';
                                         Tape::LoadTape(mFile);
                                         // Auto-start: press Play automatically after a manual
                                         // mount. Skipped when flashload is on — there the loader

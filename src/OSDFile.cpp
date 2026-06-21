@@ -1775,16 +1775,13 @@ static bool rfd_launch_tmp(string path) {
     if (ext == "tap" || ext == "tzx" || ext == "pzx" || ext == "wav" || ext == "mp3") {
         FileUtils::TAP_Path = dir;
         Config::save();
-        // Respect the Auto-start toggle (Storage→Tape uses the same rule):
+        // Respect the Auto-start toggle:
         //   "R" = run (flashload if enabled), "L" = load only / never flashload.
         // WAV/MP3 are real audio and always start playing inside LoadTape.
+        // Don't press Play here: leaving the tape STOPPED until the guest actually
+        // polls (the runtime turbo/ROM heuristic then starts it) keeps F8 stats out
+        // of tape mode while the tape is merely mounted, not loading.
         Tape::LoadTape((Config::tape_autostart ? "R" : "L") + base); // LoadTape prepends TAP_Path
-        // With flashload off the loader didn't run, so press Play when auto-start
-        // is on (the runtime turbo heuristic then feeds edges once LOAD "" polls).
-        if (Config::tape_autostart && !Config::flashload &&
-            Tape::tapeStatus == TAPE_STOPPED &&
-            Tape::tapeFileName != "none")
-            Tape::Play();
         return true;
     }
     if (ext == "sna" || ext == "z80" || ext == "p") {

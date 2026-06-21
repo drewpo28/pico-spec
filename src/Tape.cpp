@@ -397,7 +397,10 @@ void Tape::Init() {
 // reset / power-cycle the same way a mounted TRD disk does (ESPectrum::reset()
 // otherwise wipes Tape::tapeFileName). Only TAP/TZX/PZX are remembered. Loads
 // with a non-"R" key so flashload never fires here (that would re-run the loader
-// and trash the freshly-reset machine state). Auto-plays when tape_autostart is on.
+// and trash the freshly-reset machine state). Never auto-plays: auto-start applies
+// only to a fresh load through the file manager, not to a reset/boot re-mount —
+// the tape comes back STOPPED and the runtime heuristic starts it when the guest
+// polls (a tape rolling right after reset is wrong, and pins F8 stats to tape mode).
 void Tape::LoadRemembered() {
     if (!FileUtils::fsMount) return;
     string full = Config::tape_file;
@@ -415,9 +418,7 @@ void Tape::LoadRemembered() {
     fclose2(probe);
     FileUtils::TAP_Path = full.substr(0, slash + 1);
     string name = full.substr(slash + 1);
-    LoadTape("L" + name); // "L" = load only, never flashload
-    if (Config::tape_autostart && tapeStatus == TAPE_STOPPED)
-        Play();
+    LoadTape("L" + name); // "L" = load only, never flashload (and never auto-play)
 }
 
 typedef struct INFO {
