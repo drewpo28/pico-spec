@@ -122,7 +122,9 @@ uint8_t RTC::readData() {
         int hh = dsec / 3600, mm = (dsec % 3600) / 60, ss = dsec % 60;
         int y; unsigned mo, dd;
         civil_from_days(days, y, mo, dd);
-        unsigned dow = (unsigned)(((days % 7) + 4) % 7) + 1; // 1=Sun..7=Sat
+        // Mr Gluk uses the Russian/European week: 1=Mon..7=Sun. days=0 is
+        // 1970-01-01 (Thursday=4), so offset by +3 (not +4, which gives Sun=1).
+        unsigned dow = (unsigned)(((days % 7) + 3) % 7) + 1; // 1=Mon..7=Sun
         switch (sel) {
             case 0x00: return to_bcd(ss);
             case 0x02: return to_bcd(mm);
