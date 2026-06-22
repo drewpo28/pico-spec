@@ -329,8 +329,22 @@ void init_sound() {
         }
     }
 #endif
+    // On boards that allow ZiFi's UART on the core audio output pins (MURM1_P2 can
+    // put UART1 on GP26/27), yield them: skip I2S/PWM init so the UART owns the
+    // pins. Audio output is sacrificed for WiFi — only when the user picked that
+    // pair. The GP29 PWM path (audio_driver==3) is unaffected (different pin).
+#if !PICO_RP2040
+    bool zifi_owns_audio = BoardPins::zifiOwnsPin(PWM_PIN0) ||
+                           BoardPins::zifiOwnsPin(I2S_DATA_PIO);
+#else
+    const bool zifi_owns_audio = false;
+#endif
     if (Config::audio_driver == 3) {
         Init_PWM_175(TSPIN_MODE_GP29);
+    } else if (zifi_owns_audio) {
+        is_i2s_enabled = false; // GP26/27 belong to the ZiFi UART; no audio output
+        Debug::log("init_sound: audio output pins GP%d/%d yielded to ZiFi UART",
+                   PWM_PIN0, PWM_PIN1);
     } else {
         if (link_i2s_code == 0xFF) {
             if (I2S_BCK_PIO != I2S_LCK_PIO && I2S_LCK_PIO != I2S_DATA_PIO && I2S_BCK_PIO != I2S_DATA_PIO) {

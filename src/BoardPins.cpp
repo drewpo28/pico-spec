@@ -54,6 +54,12 @@ static const UartPair ZIFI_PAIRS[] = {
 static const UartPair ZIFI_PAIRS[] = {
     {16, 17, "off: NESPAD"},    // UART0
     {14, 15, "off: NESPAD"},    // UART0
+    {26, 27, "off: audio"},     // UART1 — the ONLY non-UART0 pair on this board, so
+                                // the only one that can coexist with the GP0/1 debug
+                                // UART (MURM1_DBG_UART). Every other UART1 pin pair is
+                                // taken by SD/display/PSRAM and GP23 isn't broken out.
+                                // Displaces the I2S/PWM audio output on GP26/27 — see
+                                // init_sound() which yields these pins to ZiFi.
 };
 #endif
 
