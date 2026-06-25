@@ -4,13 +4,17 @@
 
 #include "ZiFi.h"
 #include "Debug.h"
+#include "Buffer.h"
 #include <pico/time.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 // ── Static storage ───────────────────────────────────────────────────────────
-uint8_t (*ZiFiSock::rx_buf)[ZiFiSock::RX_SZ] = nullptr;  // heap, alloc in begin()
+// The 4 KB demux ring is tiered (heap when free, else butter PSRAM under pressure)
+// and freed on session end. rx_buf caches the Buffer's addressable base.
+static Buffer s_rxbuf;
+uint8_t (*ZiFiSock::rx_buf)[ZiFiSock::RX_SZ] = nullptr;  // backed by s_rxbuf
 int     ZiFiSock::rx_head[ZiFiSock::N_LINKS] = {0};
 int     ZiFiSock::rx_tail[ZiFiSock::N_LINKS] = {0};
 bool    ZiFiSock::closed[ZiFiSock::N_LINKS]  = {false};
@@ -20,6 +24,20 @@ uint32_t ZiFiSock::rxBufDropped() { return g_rx_buf_drops; }
 bool    ZiFiSock::mux_mode = false;
 bool    ZiFiSock::is_ready = false;
 int     ZiFiSock::accepted_link = -1;
+
+// Lazy-alloc / free the demux ring through the tiered allocator. Idempotent.
+bool ZiFiSock::ensureRxBuf() {
+    if (rx_buf) return true;
+    // Session-scoped (freed in end()/server_stop()) → may use the lent prevFB arena.
+    if (!s_rxbuf.alloc((size_t)N_LINKS * RX_SZ, Buffer::NEED_POINTER | Buffer::USE_NET_ARENA)) return false;
+    rx_buf = (uint8_t(*)[RX_SZ])s_rxbuf.data();
+    Debug::log("ZiFiSock: rx_buf %uB tier=%s", (unsigned)s_rxbuf.size(), s_rxbuf.tierName());
+    return rx_buf != nullptr;
+}
+void ZiFiSock::freeRxBuf() {
+    s_rxbuf.free();
+    rx_buf = nullptr;
+}
 
 // ── +IPD demux state machine (file-scope) ───────────────────────────────────
 // The ESP delivers inbound TCP as "\r\n+IPD,<len>:<bytes>" (single mode) or
@@ -203,22 +221,49 @@ bool ZiFiSock::atCmd(const char* cmd, const char* expect, uint32_t timeout_ms) {
     return false;
 }
 
+// Drain the ESP UART until it's been silent for `quiet_ms` (or `max_ms` elapses).
+// A transfer aborted mid-stream (e.g. a TLS MAC failure on a half-read body) leaves
+// the server still pushing TCP data; the ESP keeps flooding +IPD frames over the
+// UART for a while after CIPCLOSE. A single drain-until-empty loop stops the moment
+// the FIFO momentarily empties, so the *next* command's "OK" lands in the middle of
+// that residual flood and atCmd misses it — which is why a retry's begin() failed
+// (the download then "only worked on the 4th try"). Waiting for real silence first
+// gives the next command a clean response window.
+static void drainQuiet(uint32_t quiet_ms, uint32_t max_ms) {
+    absolute_time_t hard  = make_timeout_time_ms(max_ms);
+    absolute_time_t quiet = make_timeout_time_ms(quiet_ms);
+    uint8_t junk[64];
+    while (!time_reached(hard)) {
+        if (ZiFi::recvRaw(junk, sizeof(junk)) > 0) {
+            quiet = make_timeout_time_ms(quiet_ms);   // saw bytes → restart the silence timer
+            ZiFi::rxSpill();                          // keep the IRQ ring from backing up
+        } else if (time_reached(quiet)) {
+            break;                                    // silent long enough → clean
+        }
+    }
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 bool ZiFiSock::begin(bool mux) {
     ZiFi::init(); // idempotent — ensure the UART backend is up
-    if (!rx_buf) rx_buf = (uint8_t(*)[RX_SZ])malloc((size_t)N_LINKS * RX_SZ);
-    if (!rx_buf) return false;   // OOM (shouldn't happen — begin runs with heap free)
+    if (!ensureRxBuf()) return false;   // OOM (shouldn't happen — begin runs with heap free)
     reset_parser();
     for (int i = 0; i < N_LINKS; i++) {
         rx_head[i] = rx_tail[i] = 0;
         closed[i] = opened[i] = false;
     }
     mux_mode = mux;
-    // Drain any stale bytes the ESP may have queued from a prior WiFi handshake.
-    uint8_t junk[64];
-    while (ZiFi::recvRaw(junk, sizeof(junk)) > 0) {}
+    // Wait out any residual flood from a prior (possibly aborted) session before
+    // issuing the mode command, so its "OK" isn't buried in stale +IPD bytes.
+    drainQuiet(80, 2000);
 
-    is_ready = atCmd(mux ? "AT+CIPMUX=1" : "AT+CIPMUX=0", "OK", 2000);
+    const char* cmd = mux ? "AT+CIPMUX=1" : "AT+CIPMUX=0";
+    is_ready = atCmd(cmd, "OK", 2000);
+    if (!is_ready) {
+        // One clean retry: the ESP may still have been settling. Drain again, harder.
+        drainQuiet(150, 2500);
+        is_ready = atCmd(cmd, "OK", 2000);
+    }
     return is_ready;
 }
 
@@ -367,12 +412,11 @@ bool ZiFiSock::sock_closed(int id) {
 // ── Server side ──────────────────────────────────────────────────────────────
 bool ZiFiSock::server_listen(uint16_t port) {
     ZiFi::init(); // idempotent — bring the UART backend up
-    // The 4 KB demux ring is lazy-heaped (Profi OOM fix) and freed by end(). begin()
-    // allocates it for the client path; the FTP-server path comes through here, so it
-    // must allocate it too — otherwise pump() early-returns on a null rx_buf, atCmd()
-    // never sees the AT+CIPMUX=1 "OK", and the server "fails to start".
-    if (!rx_buf) rx_buf = (uint8_t(*)[RX_SZ])malloc((size_t)N_LINKS * RX_SZ);
-    if (!rx_buf) return false; // OOM
+    // The 4 KB demux ring is lazy-alloc'd (Profi OOM fix) and freed by server_stop().
+    // begin() allocates it for the client path; the FTP-server path comes through
+    // here, so it must allocate it too — otherwise pump() early-returns on a null
+    // rx_buf, atCmd() never sees the AT+CIPMUX=1 "OK", and the server "fails to start".
+    if (!ensureRxBuf()) return false; // OOM
     reset_parser();
     for (int i = 0; i < N_LINKS; i++) {
         rx_head[i] = rx_tail[i] = 0;
@@ -417,9 +461,9 @@ void ZiFiSock::server_stop() {
     accepted_link = -1;
     is_ready = false;
     // Symmetric with server_listen()'s alloc (and end() on the client paths): return
-    // the 4 KB demux ring to the heap so it isn't leaked after the FTP server closes.
+    // the 4 KB demux ring to its tier so it isn't leaked after the FTP server closes.
     // The emulated ZiFi NIC uses its own buffers, so this is safe; ZiFi UART stays up.
-    free(rx_buf); rx_buf = nullptr;
+    freeRxBuf();
 }
 
 void ZiFiSock::end() {
@@ -428,7 +472,7 @@ void ZiFiSock::end() {
     if (mux_mode) atCmd("AT+CIPMUX=0", "OK", 1000);
     reset_parser();
     is_ready = false;
-    free(rx_buf); rx_buf = nullptr;   // return the 4 KB to the heap
+    freeRxBuf();                      // return the 4 KB to its tier
 }
 
 #endif // !PICO_RP2040 && ZIFI_NET_CLIENT

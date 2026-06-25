@@ -46,6 +46,16 @@ visit https://zxespectrum.speccy.org/contacto
 #define SPEC_W 256
 #define SPEC_H 192
 
+#if !PICO_RP2040
+// Free SRAM that must remain after the Gigascreen prev-FB is allocated, so the
+// running system keeps working room. Shared by VIDEO::ensurePrevFB (the live
+// allocation guard) and the SRAM budget gate (Subsystems::featureMargin for
+// FEAT_GIGASCREEN) — they MUST use the same value, or the gate says ALLOW while
+// ensurePrevFB silently declines (Gigascreen stays off, no popup). Empirically
+// the system runs fine down to ~20 KB free, so 24 KB leaves a small buffer.
+static constexpr size_t GIGASCREEN_PREVFB_HEADROOM = 24 * 1024;
+#endif
+
 #define TSTATES_PER_LINE 224
 #define TSTATES_PER_LINE_128 228
 #define TSTATES_PER_LINE_PENTAGON 224
@@ -177,6 +187,18 @@ public:
   // static void DrawBorderFast();
 #if !PICO_RP2040
   static void InitPrevBuffer();
+
+  // Lend the (dormant) Gigascreen prev framebuffer as scratch SRAM for the
+  // duration of a paused network session — only on butter-less boards where the
+  // TLS/socket working set would otherwise OOM the heap. Detaches prevFrameBuffer
+  // so the renderer can't read it while lent; reclaim re-attaches + clears it.
+  // Returns true (and fills base/size) only when there's a region to lend.
+  static bool gigascreenLendRegion(void*& base, size_t& size);
+  static void gigascreenReclaimRegion();
+
+  // Byte size the Gigascreen prev-FB needs in the *current* video mode (4-bit
+  // packed). Used by the SRAM budget manager to cost the Gigascreen feature.
+  static size_t gigascreenPrevFBBytes();
 #endif
 
   static void Border_Blank();

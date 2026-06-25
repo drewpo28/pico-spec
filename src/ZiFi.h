@@ -42,6 +42,19 @@ public:
     // RX-ring overflow byte count (diagnostic; 0 = no bytes lost).
     static uint32_t rxDropped();
 
+    // Re-assert the UART pin funcsel. A machine reset re-runs init_sound(), which
+    // can re-grab the shared audio pins (GP26/27 on MURM1_P2); call this afterwards
+    // so a live ESP link keeps its pins. No-op when the link is down.
+    static void reclaimPins();
+
+    // Current UART rate the Pico+ESP are (supposedly) on.
+    static uint32_t currentBaud();
+    // Diagnostic: temporarily switch the UART to `baud`, send "AT", and report
+    // whether the ESP answers "OK". Restores the prior baud + RX IRQ. Used to
+    // detect a baud desync (ESP power-sagged back to its 115200 default while we
+    // stayed at the raised rate → every AT fails until a manual reboot).
+    static bool probeBaud(uint32_t baud);
+
 private:
     // RX ring: IRQ landing zone. 8 KB so it absorbs SD-write/decrypt latency spikes
     // between drains even at high baud (460800/921600) — at 4 KB a blocking TLS

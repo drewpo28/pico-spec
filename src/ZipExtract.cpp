@@ -13,6 +13,7 @@ using namespace std;
 
 #include "ZipExtract.h"
 #include "FileUtils.h"
+#include "Buffer.h"
 #include "MemESP.h"
 #include "Video.h"
 #include "OSDMain.h"
@@ -259,6 +260,17 @@ bool ZipExtract::extractStored(FIL* zipFile, uint32_t size) {
     return true;
 }
 
+// Route miniz's inflate-state allocation (the ~11 KB tinfl_decompressor) through
+// the tiered Buffer with USE_NET_ARENA: a download/extract runs inside the paused
+// OSD net session, so the lent Gigascreen prevFB arena backs it instead of the
+// tight libc heap (heap-only boards / local zips just fall back to heap). This is
+// what was OOM-ing on a big extract (e.g. SATISFAC.SCL, 204 KB) when Gigascreen's
+// prevFB had already eaten the heap.
+static void* zip_zalloc(void* /*opaque*/, size_t items, size_t size) {
+    return Buffer::palloc(items * size, Buffer::USE_NET_ARENA);
+}
+static void zip_zfree(void* /*opaque*/, void* p) { Buffer::pfree(p); }
+
 bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize) {
     FIL& outFile = s_outFile;
     if (f_open(&outFile, TEMP_FILE, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
@@ -269,6 +281,8 @@ bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize) {
     z_stream stream;
 
     memset(&stream, 0, sizeof(stream));
+    stream.zalloc = zip_zalloc;   // inflate state → Buffer (arena/heap), off the tight heap
+    stream.zfree  = zip_zfree;
     stream.next_in = s_inbuf;
     stream.avail_in = 0;
     stream.next_out = s_outbuf;

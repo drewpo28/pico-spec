@@ -11,12 +11,36 @@
 #define Subsystem_h
 
 #include <stdbool.h>
+#include <cstddef>  // size_t
 
 namespace Subsystems {
     // Called from ESPectrum::loop() right after audbufcnt = 0 — the only
     // safe boundary where audio producers and the mixer are quiescent.
     // Also called once during ESPectrum::setup() before the main loop starts.
     void applyPending();
+
+#if !PICO_RP2040
+    // ── SRAM budget manager (RP2350) ───────────────────────────────────────────
+    // The big optional features can't all fit in SRAM on a butter-less SPI-PSRAM
+    // board (m1p2). Before enabling one, the OSD asks budgetCheck(): if it won't
+    // fit, OSD::featureBudgetGate() pops up the currently-enabled heavy features to
+    // turn off (user picks → Config + reboot). Costs are a static table (board-aware);
+    // getFreeHeap() is only the live baseline. Keep >=SRAM_MARGIN free.
+    enum FeatureId { FEAT_GIGASCREEN, FEAT_GENERAL_SOUND, FEAT_DIVMMC, FEAT_PROFI, FEAT_ZIFI, FEAT_COUNT };
+
+    static constexpr size_t SRAM_MARGIN = 10 * 1024;  // keep this much SRAM free
+
+    size_t      featureCost(FeatureId f);     // static estimate, board-aware (butter vs SPI)
+    bool        featureEnabled(FeatureId f);  // reads Config (arch=="Profi" for FEAT_PROFI)
+    const char* featureName(FeatureId f);     // localised, for the popup
+    void        featureSetEnabled(FeatureId f, bool on);  // writes Config only (caller reboots)
+
+    enum BudgetResult { BUDGET_ALLOW, BUDGET_DENY, BUDGET_NEEDS_FREE };
+    // Decide whether `enabling` fits. On BUDGET_NEEDS_FREE, fills candidates[] (enabled
+    // features that can be turned off, excl. ones `enabling` already auto-disables) and
+    // *deficit (bytes still needed). candidates[] must hold FEAT_COUNT entries.
+    BudgetResult budgetCheck(FeatureId enabling, FeatureId* candidates, int* nCand, size_t* deficit);
+#endif
 }
 
 // Helper macro: each subsystem declares the same five static members.

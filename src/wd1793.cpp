@@ -105,7 +105,6 @@ IRAM_ATTR static void _end(rvmWD1793 *wd) {
   wd->stepState = kRVMWD177XStepIdle;
   wd->control &= ~(kRVMWD177XWriting|kRVMWD177XDRQ);
   wd->retry = 15;
-  wd->led = 0;
   wd->control |= kRVMWD177XINTRQ; //TODO: ADD A INTERRUPT HANDLER
 }
 
@@ -122,7 +121,6 @@ IRAM_ATTR void _do(rvmWD1793 *wd) {
       }
 
       // RVM plays motor audio sample here
-      wd->led = 1;
 
       wd->control|=kRVMWD177XHLD;
       // wd->c=kRVMWD177XSettingHeaderTime * ((wd->control&kRVMWD177XTest)?1:0);
@@ -182,7 +180,6 @@ IRAM_ATTR void _do(rvmWD1793 *wd) {
           } else { // Restore
             wd->track=0xff;
             wd->data=0;
-            wd->led=0;
           }
 
           // printf("Seeking disk %d to track %d (disk in track: %d)\n",wd->diskS,wd->data,wd->disk[wd->diskS]->t);
@@ -237,7 +234,6 @@ IRAM_ATTR void _do(rvmWD1793 *wd) {
 
         rvmwdDiskStep(wd, wd->control & kRVMWD177XDire ? 0x100 : 0x300);
 
-        wd->led = 1; // RVM plays seek audio sample here
         wd->fdd_clicks++;
 
         wd->c=(srate[(wd->control & kRVMWD177XRateSelect) ^ 0x4][wd->command & 0x3]) >> 3; // Value for 1 bit per diskstep / 8
@@ -342,7 +338,6 @@ IRAM_ATTR void _do(rvmWD1793 *wd) {
         return;
       }
 
-      wd->led = 1;
 
       if(wd->headerI==0xff) {
         if(wd->a!=0xfe) {
@@ -670,7 +665,6 @@ case kRVMWD177XWriteData: {
         return;
       }
 
-      wd->led = 2;
 
       wd->a=wd->data;
       // wd->crc=crc(wd->crc,wd->a);
@@ -820,7 +814,6 @@ case kRVMWD177XWriteData: {
 
     case kRVMWD177XReadData: {
 
-      wd->led = 1;
 
       wd->data = wd->a;
 
@@ -941,7 +934,6 @@ case kRVMWD177XWriteTrack: {
         return;
       }
 
-      wd->led = 2;
 
         switch(wd->data) {
 
@@ -1043,7 +1035,6 @@ case kRVMWD177XWriteTrack: {
         return;
       }
 
-      wd->led = 1;
 
       if(wd->control & kRVMWD177XDRQ) wd->status|=kRVMWD177XStatusLostData;
 
@@ -1123,7 +1114,6 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
 
       case kRVMWD177XStepIdle:{
 
-        wd->led = 0;
 
         if(wd->retry && (pd & kRVMwdDiskOutIndex) && (s & kRVMwdDiskOutIndex)) {
           wd->retry--;
@@ -1138,7 +1128,6 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
       case kRVMWD177XStepWaiting: {
 
         if ((wd->track == 0 && wd->sector == 0) || wd->track == 0xff ) {
-          wd->led = 0;
           wd->fdd_clicks = 0;
         }
 
@@ -1369,7 +1358,6 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
           wd->stepState = kRVMWD177XStepIdle;
           wd->control &= ~(kRVMWD177XWriting|kRVMWD177XDRQ);
           wd->retry = 15;
-          wd->led = 0;
 
         } else {
 
@@ -1708,7 +1696,6 @@ void rvmWD1793Reset(rvmWD1793 *wd) {
   // Note: sector and data registers are NOT cleared by WD1793 hardware reset (MR pin)
   wd->status = kRVMWD177XStatusSetIndex | kRVMWD177XStatusSetTrack0 | kRVMWD177XStatusSetWP;
   wd->track = 0xff;
-  wd->led = 0;
   wd->fdd_clicks = 0;
   wd->wtrackmark = 0;
   wd->headerI = 0;

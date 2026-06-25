@@ -3,6 +3,7 @@
 #if !PICO_RP2040 && ZIFI_NET_CLIENT
 
 #include "ZiFiSock.h"
+#include "Buffer.h"
 #include "Debug.h"
 #include "ff.h"
 #include <pico/rand.h>
@@ -13,6 +14,32 @@
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/pk.h"
+#include "mbedtls/platform.h"
+
+// ── mbedTLS heap → tiered Buffer ─────────────────────────────────────────────
+// Route every mbedTLS allocation (the 16 KB IN + 4 KB OUT handshake working set is
+// the big one) through Buffer::palloc/pfree: heap first while there's headroom,
+// else butter PSRAM. Under a tight heap (Profi) this keeps the TLS handshake from
+// starving the framebuffer/Z80 RAM. Installed once, lazily, on the first connect().
+// calloc() must zero — palloc does not, so we memset here.
+static void* tls_calloc(size_t n, size_t size) {
+    size_t bytes = n * size;
+    if (!bytes) return nullptr;
+    // USE_NET_ARENA: the whole mbedTLS working set is session-scoped (freed before
+    // the network session ends), so it may draw from the lent Gigascreen prevFB
+    // arena when one is active — keeping the ~13 KB handshake off the tight heap.
+    void* p = Buffer::palloc(bytes, Buffer::USE_NET_ARENA);
+    if (p) memset(p, 0, bytes);
+    return p;
+}
+static void tls_free(void* p) { Buffer::pfree(p); }
+
+static void ensureMbedtlsAllocHook() {
+    static bool installed = false;
+    if (installed) return;
+    mbedtls_platform_set_calloc_free(tls_calloc, tls_free);
+    installed = true;
+}
 #ifdef MBEDTLS_DEBUG_C
 #include "mbedtls/debug.h"
 // Handshake tracing (enabled only when MBEDTLS_DEBUG_C is defined in the config).
@@ -68,6 +95,7 @@ int TlsSock::bioRecv(void* ctx, unsigned char* buf, size_t len) {
 TlsSock::TlsSock()
     : sock_id(-1), is_up(false), ca_loaded(false), verify_flags(0),
       last_err(0), inited(false) {
+    ensureMbedtlsAllocHook();   // route mbedTLS heap → tiered Buffer (covers CA parse too)
     mbedtls_x509_crt_init(&cacert);
 }
 

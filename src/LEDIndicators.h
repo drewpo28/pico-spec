@@ -38,12 +38,19 @@ namespace LED {
 
     bool isVisible(Id i);
 
-    static inline void touchR(Id i) {
-        if (Config::ledIndicators) rdec[i] = DECAY_FRAMES;
-    }
-    static inline void touchW(Id i) {
-        if (Config::ledIndicators) wdec[i] = DECAY_FRAMES;
-    }
+    // Always record activity (not gated on Config::ledIndicators): the rdec/wdec
+    // state also feeds the corner FDD lamp and the FDD motor-hum sound, which are
+    // independent settings (Config::trdosSoundLed). Cost is a single byte store on
+    // the port path. Whether the border glyph ROW is drawn is gated in draw().
+    static inline void touchR(Id i) { rdec[i] = DECAY_FRAMES; }
+    static inline void touchW(Id i) { wdec[i] = DECAY_FRAMES; }
+
+    // Recent-activity queries (true within DECAY_FRAMES of the last touch). Used by
+    // the corner FDD indicator so it tracks actual port access (and auto-clears)
+    // instead of the raw rvmWD1793::led flag, which can stay set if a command never
+    // reaches _end() (stuck BUSY) — leaving the LED lit with no disk access.
+    static inline bool readActive(Id i)  { return rdec[i] != 0; }
+    static inline bool writeActive(Id i) { return wdec[i] != 0; }
 
     void decay();
     void draw();

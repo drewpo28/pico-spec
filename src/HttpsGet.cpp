@@ -5,6 +5,7 @@
 #include "TlsSock.h"
 #include "ZiFiSock.h"
 #include "ZiFi.h"        // ZiFi::rxDropped() (RX-ring overflow diagnostic)
+#include "Buffer.h"
 #include "Debug.h"
 #include "ff.h"
 #include <pico/time.h>
@@ -92,7 +93,9 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
                                long rangeStart, long rangeLen, const char* extraHeaders) {
     Result res = {}; res.status = -1;
 
-    auto g_http_buf = std::make_unique<uint8_t[]>(HTTP_BUF_SZ);  // RAII: freed on every exit
+    Buffer httpbuf;  // tiered (heap/butter); RAII frees on every exit path
+    if (!httpbuf.alloc(HTTP_BUF_SZ, Buffer::NEED_POINTER)) { Debug::log("HttpsGet: buf alloc failed"); return res; }
+    uint8_t* hb = httpbuf.data();
 
     bool https; char host[128]; char path[512]; uint16_t port;
     if (!parseUrl(url, https, host, sizeof(host), port, path, sizeof(path))) {
@@ -174,7 +177,7 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
     while (total == 0 || res.received < total) {
         size_t want = HTTP_BUF_SZ;
         if (total && total - res.received < want) want = total - res.received;
-        int n = c.rd(g_http_buf.get(), want);
+        int n = c.rd(hb, want);
         if (n < 0) {  // read error (TLS alert, deadline, or dropped link)
             Debug::log("HttpsGet: read err @%lu/%lu tlsErr=-0x%04x rxDrop=%lu",
                        (unsigned long)res.received, (unsigned long)total,
@@ -187,8 +190,15 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
                 Debug::log("HttpsGet: EOF short @%lu/%lu", (unsigned long)res.received, (unsigned long)total);
             break;
         }
-        if (sink && !sink(sinkCtx, g_http_buf.get(), n)) { res.status = -1; goto done; } // abort
+        if (sink && !sink(sinkCtx, hb, n)) { res.status = -1; goto done; } // abort
         res.received += n;
+        // Keep the ESP RX ring drained while we write this chunk to SD. With HTTPS,
+        // mbedTLS hands back a whole decrypted record (up to 16 KB) and we drain it
+        // to SD 1 KB at a time WITHOUT going back through sock_recv — so nothing
+        // else spills zifi_in during that window and the ESP overruns it (rxDrop →
+        // MBEDTLS_ERR_SSL_INVALID_MAC). Spilling here (to fast SPI PSRAM, not SD)
+        // empties the ring between writes. Cheap no-op until the ring backs up.
+        ZiFi::rxSpill();
         if (progress && !progress(progCtx, res.received, total)) { res.status = -1; goto done; }
     }
 
@@ -226,9 +236,41 @@ HttpsGet::Result HttpsGet::getToFile(const char* url, const char* sdPath,
     FIL* f = fopen2(sdPath, FA_WRITE | FA_CREATE_ALWAYS);
     if (!f) { Debug::log("HttpsGet: cannot create %s", sdPath); return res; }
     FileSink fs = { f, true };
-    res = get(url, fileSink, &fs, caPath, progress, progCtx);
+
+    // Resume on a recoverable mid-stream failure (e.g. a TLS MAC error from a
+    // corrupted record — common at 921600 baud where UART bit timing is tight,
+    // rxDrop=0). The body is written sequentially, so the file already holds
+    // `received` good bytes; reconnect and re-GET the remainder via a Range
+    // request from that offset. mbedTLS rejects a bad record whole, so `received`
+    // always sits on a clean record boundary. Needs server Range support (206) —
+    // GitHub Pages / Fastly do; a 200 (Range ignored) is detected and aborts.
+    const int  MAX_TRIES = 5;
+    uint32_t   received  = 0;   // total good bytes written across attempts
+    uint32_t   total     = 0;   // full file size (from the first 200 response)
+    for (int attempt = 0; attempt < MAX_TRIES && fs.ok; attempt++) {
+        Result r = get(url, fileSink, &fs, caPath, progress, progCtx,
+                       attempt == 0 ? -1 : (long)received, -1);
+        if (attempt == 0) {
+            total = r.length;                       // Content-Length of the whole file
+            res.status = r.status;
+            memcpy(res.etag, r.etag, sizeof(res.etag));
+            memcpy(res.lastmod, r.lastmod, sizeof(res.lastmod));
+        } else if (r.status == 200) {
+            // Server ignored Range and resent the whole body from 0 → our appended
+            // file is now corrupt. Can't safely resume; bail (caller re-fetches).
+            Debug::log("HttpsGet: resume got 200 (no Range support) — abort");
+            fs.ok = false; break;
+        }
+        received += r.received;
+        if (r.ok && (total == 0 || received >= total)) break;   // complete
+        if (!total || received >= total) break;                 // nothing more to get / unknown size
+        Debug::log("HttpsGet: resume @%lu/%lu (attempt %d/%d)",
+                   (unsigned long)received, (unsigned long)total, attempt + 1, MAX_TRIES);
+    }
     fclose2(f);
-    if (!fs.ok) res.ok = false;
+    res.length   = total;
+    res.received = received;
+    res.ok       = fs.ok && total != 0 && received >= total;
     return res;
 }
 

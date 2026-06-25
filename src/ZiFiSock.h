@@ -83,9 +83,12 @@ public:
 
 private:
     static const int RX_SZ = 2048;
-    // Heap-backed (alloc in begin(), freed in end()) so the 4 KB isn't permanently
-    // reserved when the NIC is off — frees SRAM for memory-tight machines (Profi).
-    static uint8_t (*rx_buf)[RX_SZ];   // [N_LINKS][RX_SZ]
+    // Tiered (heap when free, else butter PSRAM); alloc in begin()/server_listen(),
+    // freed in end()/server_stop() so the 4 KB isn't permanently reserved when the
+    // NIC is off — frees SRAM for memory-tight machines (Profi).
+    static uint8_t (*rx_buf)[RX_SZ];   // [N_LINKS][RX_SZ], backed by the tiered allocator
+    static bool ensureRxBuf();         // lazy-alloc the ring; false on OOM
+    static void freeRxBuf();           // release the ring
     static int      rx_head[N_LINKS];  // next byte to hand to sock_recv
     static int      rx_tail[N_LINKS];  // next free slot for the demux
     static bool     closed[N_LINKS];   // per-link EOF flags (CLOSED seen)

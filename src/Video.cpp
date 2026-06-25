@@ -1330,6 +1330,19 @@ static bool ensurePrevFB(int lines, int stride) {
     size_t want = fbPrevBytes(lines, stride);
     if (sharedFB_prev && sharedFB_prev_size == want) return true;
     if (sharedFB_prev) { free(sharedFB_prev); sharedFB_prev = nullptr; sharedFB_prev_size = 0; }
+    // Heap-headroom guard. prevFB (~52 KB) is the biggest *optional* buffer. On a
+    // butter-less board it collides with other big SRAM users that landed on the
+    // heap before us (General Sound's ~36 KB work/cache/rings; the framebuffer),
+    // and a bare malloc-succeeds check isn't enough — the 52 KB fits *now* but
+    // starves the rest of boot (WD1793/Z80/DivMMC/ZiFi) → OOM panic loop. Only take
+    // it if enough heap remains afterwards; otherwise decline and the caller
+    // (GsSubsys::apply) cleanly disables Gigascreen for the session.
+    extern size_t getFreeHeap(void);
+    if (getFreeHeap() < want + GIGASCREEN_PREVFB_HEADROOM) {
+        Debug::log("VIDEO: prevFB declined (freeHeap=%u < %u+%u) — Gigascreen off this session",
+                   (unsigned)getFreeHeap(), (unsigned)want, (unsigned)GIGASCREEN_PREVFB_HEADROOM);
+        return false;
+    }
     uint8_t *p = (uint8_t*)malloc(want);
     if (!p) return false;
     memset(p, 0, want);
@@ -1408,6 +1421,43 @@ bool GsSubsys::apply() {
         sharedFB_prev_size = 0;
     }
     return true;
+}
+
+// ── Lend the dormant Gigascreen prev-FB to the network buffer pool ────────────
+// During a network session the emulator is paused, so the renderer never reads
+// prevFrameBuffer — its ~52 KB of SRAM can back the TLS/socket working set that
+// would otherwise OOM the heap on a butter-less board. We borrow the region
+// in place (no free/realloc → no fragmentation, unlike past attempts) and detach
+// vga.prevFrameBuffer so even a stray render falls back to the no-blend path.
+static bool s_prev_lent = false;
+
+bool VIDEO::gigascreenLendRegion(void*& base, size_t& size) {
+    // Only worth it where prevFB exists AND there's no butter PSRAM to absorb the
+    // TLS working set instead. On butter boards palloc already routes it to XIP.
+    if (s_prev_lent) return false;
+    if (!Config::gigascreen_enabled || !sharedFB_prev || sharedFB_prev_size == 0) return false;
+    if (butter_psram_size() != 0) return false;
+    base = sharedFB_prev;
+    size = sharedFB_prev_size;
+    VIDEO::vga.prevFrameBuffer = nullptr;   // renderer → no-blend branch while lent
+    s_prev_lent = true;
+    return true;
+}
+
+void VIDEO::gigascreenReclaimRegion() {
+    if (!s_prev_lent) return;
+    s_prev_lent = false;
+    // Clear stale network data so the next Gigascreen frame doesn't blend garbage,
+    // then re-attach the prev pointer array.
+    if (sharedFB_prev && sharedFB_prev_size) memset(sharedFB_prev, 0, sharedFB_prev_size);
+    if (sharedFB_arr2) VIDEO::vga.prevFrameBuffer = (unsigned char**)sharedFB_arr2;
+}
+
+size_t VIDEO::gigascreenPrevFBBytes() {
+    // Cost of the prev-FB in the *current* video mode. sharedFB_lines/stride are
+    // set at Init() regardless of whether Gigascreen is on, so this is the size it
+    // would claim if enabled. ~38 KB @640x480, ~52 KB @720x576.
+    return fbPrevBytes(sharedFB_lines, sharedFB_stride);
 }
 
 void VIDEO::disableGigascreenForProfi() {
@@ -3051,9 +3101,11 @@ IRAM_ATTR void VIDEO::EndFrame() {
     }
 #endif
 
+    // Decay activity counters every frame regardless of the border-glyph setting —
+    // the corner FDD lamp + motor-hum sound (Config::trdosSoundLed) consume them too.
+    LED::decay();
     if (Config::ledIndicators) {
         if (gigascreen_enabled) LED::touchR(LED::GIGASCREEN);
-        LED::decay();
         LED::draw();
     }
 

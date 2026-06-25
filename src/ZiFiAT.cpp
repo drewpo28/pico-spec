@@ -385,6 +385,19 @@ int ZiFiAT::scan(string* out, int maxn, uint32_t timeout_ms) {
             if (strstr(line, "OK") || strstr(line, "ERROR")) break;
         }
     }
+    // Diagnostic: a zero-result scan is either genuinely no APs, or the ESP went
+    // unresponsive. Probe "AT" at the current rate and at the 115200 default to
+    // tell them apart — AT@cur=0 + AT@115200=1 means the ESP reset to its default
+    // while we stayed at the raised baud (a power sag), i.e. a baud desync that
+    // currently needs a manual F12 to recover.
+    if (count == 0) {
+        uint32_t cur = ZiFi::currentBaud();
+        bool at_cur = ZiFi::probeBaud(cur);
+        bool at_def = (cur != 115200) ? ZiFi::probeBaud(115200) : at_cur;
+        Debug::log("ZiFiAT scan: 0 nets — baud=%u AT@cur=%d AT@115200=%d%s",
+                   (unsigned)cur, (int)at_cur, (int)at_def,
+                   (!at_cur && at_def) ? "  <-- BAUD DESYNC (ESP at default)" : "");
+    }
     return count;
 }
 

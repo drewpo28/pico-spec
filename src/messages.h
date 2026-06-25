@@ -2297,6 +2297,19 @@ static const char *MENU_ZIFI_GPIO_TITLE[2]   = { "ZiFi UART GPIO",    "ZiFi UART
 static const char *MENU_ESP01_TITLE[2]       = { "ESP-01(S)",         "ESP-01(S)"          };
 static const char *MENU_BAUD_TITLE[2]        = { "UART baud rate",    "Velocidad UART"     };
 
+// ─── SRAM budget manager strings ────────────────────────────────────────────
+// Heavy features (Gigascreen / General Sound / DivMMC / Profi / ZiFi) don't all
+// fit in SRAM on butter-less boards. When enabling one would overflow, the OSD
+// offers to free room or refuses.
+static const char *MSG_BUDGET_TITLE[2]       = { "Not enough SRAM",   "Falta SRAM"         };
+static const char *MSG_BUDGET_DENY[2]        = { "not enough free SRAM",
+                                                 "falta SRAM libre" };
+static const char *MSG_BUDGET_FREE_HINT[2]   = { "Turn off to free room, then Apply:",
+                                                 "Desactive para liberar, luego Aplicar:" };
+static const char *MSG_BUDGET_APPLY[2]       = { "Apply & reboot",    "Aplicar y reiniciar" };
+static const char *MSG_BUDGET_INSUFFICIENT[2]= { "Not enough freed - pick more",
+                                                 "Insuficiente - elija mas" };
+
 // ─── File transfer (FTP/SFTP) client strings ────────────────────────────────
 static const char *MENU_NET_PROTO[2]         = { "Protocol\nFTP\nSFTP\n", "Protocolo\nFTP\nSFTP\n" };
 static const char *MSG_NET_FT_NOWIFI[2]      = { "Connect Wi-Fi first", "Conecte Wi-Fi primero" };

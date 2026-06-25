@@ -43,7 +43,13 @@ void Debug::led_off()
 #ifdef PICO_DEFAULT_UART
 static inline bool dbg_uart_put(char c)
 {
-    if (!uart_is_writable(uart_default)) return false;
+    // Bounded wait for FIFO space. At boot the 115200 UART keeps up if we wait a
+    // few microseconds, so whole lines (incl. their CRLF) get out intact instead
+    // of being truncated mid-line — which previously merged adjacent log lines.
+    // The spin cap means a pathological flood (e.g. ZIFI_TRACE per-packet logging)
+    // still drops bytes after the bound rather than ever freezing the main loop.
+    for (uint32_t spin = 0; !uart_is_writable(uart_default); ++spin)
+        if (spin >= 200000u) return false;   // ~1 ms ceiling per byte → drop, never hang
     uart_get_hw(uart_default)->dr = (uint8_t)c;
     return true;
 }

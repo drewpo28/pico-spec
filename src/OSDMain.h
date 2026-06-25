@@ -205,6 +205,14 @@ public:
 
     static void esp_hard_reset();
 
+#if !PICO_RP2040
+    // SRAM budget gate for the 5 heavy features. Call BEFORE the enable path.
+    // Returns true → caller may proceed to enable the feature (it fits, or the
+    // user freed room — in which case this reboots and never returns). Returns
+    // false → caller must NOT enable (denied, or user cancelled the popup).
+    static bool featureBudgetGate(int featureId);
+#endif
+
     static bool updateFirmware(FIL *firmware);
     static bool updateROM(const string& file, uint8_t arch);
 

@@ -262,6 +262,14 @@ void Tape::LoadTape(const string& mFile_) {
         return;
     }
     string mFile = mFile_;
+    // The flashload path below runs FileZ80::loader48()/loader128(), which call
+    // ESPectrum::reset() → Tape::LoadRemembered(). LoadRemembered() overwrites
+    // FileUtils::TAP_Path with the directory of the *previously* remembered tape
+    // (Config::tape_file). Without restoring it, the *_Open() calls that follow
+    // would prepend that stale directory to the new file name and fail to open
+    // (e.g. "/old/dir/" + "newfile.tap"). Snapshot it here and restore before each
+    // open so the new tape always loads from the folder the caller selected.
+    const string savedTapPath = FileUtils::TAP_Path;
     StopRealPlayer();
     if (FileUtils::hasMP3extension(mFile)) {
         string keySel = mFile.substr(0,1);
@@ -311,6 +319,7 @@ void Tape::LoadTape(const string& mFile_) {
                     ESPectrum::TapeNameScroller = 0;
                 }    
         }
+        FileUtils::TAP_Path = savedTapPath; // undo any LoadRemembered() clobber from flashload reset
         Tape::Stop();
         // Read and analyze tap file
         Tape::TAP_Open(mFile);
@@ -345,6 +354,7 @@ void Tape::LoadTape(const string& mFile_) {
                     ESPectrum::TapeNameScroller = 0;
                 }
         }
+        FileUtils::TAP_Path = savedTapPath; // undo any LoadRemembered() clobber from flashload reset
         Tape::Stop();
         // Read and analyze tzx file
         Tape::TZX_Open(mFile);
@@ -379,6 +389,7 @@ void Tape::LoadTape(const string& mFile_) {
                     ESPectrum::TapeNameScroller = 0;
                 }
         }
+        FileUtils::TAP_Path = savedTapPath; // undo any LoadRemembered() clobber from flashload reset
         Tape::Stop();
         Tape::PZX_Open(mFile);
         ESPectrum::TapeNameScroller = 0;
@@ -1121,7 +1132,12 @@ void Tape::TAP_GetBlock() {
 }
 
 void Tape::Stop() {
-    OSD::osdCenteredMsg("Tape loading is stopped", LEVEL_INFO, 100);
+    // Only notify when an actual load was in progress. Stop() is also called as a
+    // teardown step by LoadTape() (incl. the silent F11/boot re-mount via
+    // LoadRemembered) — popping the OSD there put a spurious "Tape loading is
+    // stopped" message on screen on every reset.
+    if (tapeStatus == TAPE_LOADING)
+        OSD::osdCenteredMsg("Tape loading is stopped", LEVEL_INFO, 100);
     tapeEarBit = 0;
     tapeStatus = TAPE_STOPPED;
     tapePhase = TAPE_PHASE_STOPPED;

@@ -12,10 +12,14 @@
 #define MBEDTLS_CONFIG_PICOSPEC_H
 
 // ── Platform ──────────────────────────────────────────────────────────────
-// Use the standard C library allocator (default when PLATFORM_MEMORY is unset).
 // We do NOT pull in mbedTLS entropy/CTR_DRBG: SSH supplies its own f_rng backed
 // by the RP2350 hardware RNG (pico_rand). See Ssh.cpp ssh_rng().
 #define MBEDTLS_PLATFORM_C
+// Route mbedTLS heap (the 16 KB IN + 4 KB OUT handshake working set, X.509 parse,
+// etc.) through a settable calloc/free so TlsSock can push it to butter PSRAM when
+// the SRAM heap is tight. The hook is installed in TlsSock::connect() via
+// mbedtls_platform_set_calloc_free(); without it, the default malloc/free is used.
+#define MBEDTLS_PLATFORM_MEMORY
 
 // ── Symmetric crypto (SSH transport cipher) ─────────────────────────────────
 #define MBEDTLS_AES_C

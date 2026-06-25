@@ -51,6 +51,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Debug.h"
 #include "Snapshot.h"
 #include "MemESP.h"
+#include "Buffer.h"
 #include "Tape.h"
 #include "LEDIndicators.h"
 #include "sdcard.h"
@@ -320,6 +321,77 @@ static bool confirmReboot(const char* const dlg[2]) {
 }
 
 #if !PICO_RP2040
+// SRAM budget gate. See OSDMain.h. Asks Subsystems::budgetCheck whether `f` fits;
+// if not, either refuses (DENY) or pops up the freeable features so the user can
+// turn some off → Config + reboot. Returns true only when the caller may proceed
+// to enable `f` itself (it fits live); on a freeing reboot this never returns.
+bool OSD::featureBudgetGate(int featureId) {
+    using namespace Subsystems;
+    FeatureId f = (FeatureId)featureId;
+
+    FeatureId cand[FEAT_COUNT];
+    int nCand = 0;
+    size_t deficit = 0;
+    BudgetResult r = budgetCheck(f, cand, &nCand, &deficit);
+
+    if (r == BUDGET_ALLOW) return true;
+
+    if (r == BUDGET_DENY || nCand == 0) {
+        osdCenteredMsg((string)featureName(f) + ":\n" + MSG_BUDGET_DENY[Config::lang],
+                       LEVEL_WARN, 4000);
+        return false;
+    }
+
+    // BUDGET_NEEDS_FREE: multi-select popup of the freeable features.
+    bool sel[FEAT_COUNT] = { false };
+    menu_saverect = true;
+    bool result = false;
+    while (1) {
+        size_t freed = 0;
+        for (int i = 0; i < nCand; i++) if (sel[i]) freed += featureCost(cand[i]);
+
+        string menu = (string)MSG_BUDGET_FREE_HINT[Config::lang] + "\n";
+        for (int i = 0; i < nCand; i++) {
+            char row[48];
+            snprintf(row, sizeof(row), "%s (%uK)\t[%c]\n",
+                     featureName(cand[i]), (unsigned)((featureCost(cand[i]) + 1023) / 1024),
+                     sel[i] ? '*' : ' ');
+            menu += row;
+        }
+        menu += (string)MSG_BUDGET_APPLY[Config::lang] + "\t\n";
+
+        char foot[40];
+        snprintf(foot, sizeof(foot), "free %uK / need %uK",
+                 (unsigned)(freed / 1024), (unsigned)((deficit + 1023) / 1024));
+        menu_footer = foot;
+
+        uint8_t opt = menuRun(menu);
+        if (opt == 0) { result = false; break; }            // Esc → not enabled
+        if (opt <= nCand) {                                  // toggle a candidate
+            sel[opt - 1] = !sel[opt - 1];
+            menu_curopt = opt;
+            menu_saverect = false;
+            continue;
+        }
+        // Apply & reboot row.
+        if (freed < deficit) {
+            osdCenteredMsg(MSG_BUDGET_INSUFFICIENT[Config::lang], LEVEL_WARN, 2500);
+            menu_curopt = opt;
+            menu_saverect = false;
+            continue;
+        }
+        for (int i = 0; i < nCand; i++) if (sel[i]) featureSetEnabled(cand[i], false);
+        featureSetEnabled(f, true);
+        Config::save();
+        esp_hard_reset();   // never returns
+        result = true; break;
+    }
+    menu_saverect = false;
+    return result;
+}
+#endif
+
+#if !PICO_RP2040
 // Centred dialog to type a WiFi password (title = SSID). Saves/restores its own
 // screen rect. Returns the typed text, or "\x1B" if the user pressed Esc.
 static string wifiAskPassword(const string& ssid) {
@@ -495,6 +567,33 @@ void net_call_on_stack(void* new_top, void (*fn)(void*), void* arg) {
     );
 }
 
+// RAII: for the duration of a (paused) network session, lend the dormant
+// Gigascreen prev framebuffer to the Buffer pool so the alt-stack + TLS/socket
+// working set draws from those ~52 KB instead of the scarce heap. No-op unless
+// there's something to lend (Gigascreen on AND a butter-less board); on butter
+// boards palloc routes the TLS set to XIP PSRAM instead, so no lease is needed.
+struct NetArenaLease {
+    bool held = false;
+    NetArenaLease() {
+        void* base; size_t size;
+        if (VIDEO::gigascreenLendRegion(base, size)) {
+            if (Buffer::lendArena(base, size)) held = true;
+            else VIDEO::gigascreenReclaimRegion();   // lend rejected → undo the detach
+        }
+    }
+    ~NetArenaLease() {
+        if (held) { Buffer::reclaimArena(); VIDEO::gigascreenReclaimRegion(); }
+    }
+};
+
+// Alloc/free the network alt-stack via the Buffer pool so it can come from the
+// lent arena (USE_NET_ARENA) when one is active, else heap. Returns nullptr on OOM.
+static inline uint8_t* netAltStackAlloc(size_t& stksz) {
+    uint8_t* p = (uint8_t*)Buffer::palloc(stksz, Buffer::NEED_POINTER | Buffer::USE_NET_ARENA);
+    if (!p) { stksz = 8 * 1024; p = (uint8_t*)Buffer::palloc(stksz, Buffer::NEED_POINTER | Buffer::USE_NET_ARENA); }
+    return p;
+}
+
 // Connect to a saved remote (prompting the password if it wasn't stored) and run
 // the connect + browse session on a large heap stack (see net_call_on_stack). The
 // crypto/listing path can't live on the 4 KB core stack.
@@ -514,13 +613,13 @@ static void netConnectRemote(const Config::Remote& r, const string& restorePath 
 
     // Modest alt stack: mbedTLS curve25519/P256/RSA-verify peaks at only a few KB,
     // and the heap must keep enough for the handshake + SSH objects + the listing.
+    NetArenaLease lease;   // borrow the dormant Gigascreen prevFB if available
     size_t stksz = 12 * 1024;
-    uint8_t* stk = (uint8_t*)malloc(stksz);
-    if (!stk) { stksz = 8 * 1024; stk = (uint8_t*)malloc(stksz); }
+    uint8_t* stk = netAltStackAlloc(stksz);
     if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
     void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7); // 8-byte aligned top
     net_call_on_stack(top, netSessionRun, &ctx);
-    free(stk);
+    Buffer::pfree(stk);
 }
 
 // Shared scratch for the remotes list (avoids a big array on the 4 KB core stack;
@@ -867,7 +966,7 @@ static void ftpdSessionRun(void* arg) {
     }
 
     Ftpd::stop();
-    OSD::osdCenteredMsg(Config::lang ? "Servidor FTP detenido" : "FTP server stopped", LEVEL_INFO, 1200);
+    OSD::osdCenteredMsg(Config::lang ? "Servidor FTP detenido" : "FTP server stopped", LEVEL_WARN, 1200);
     VIDEO::SaveRect.restore_last();
 }
 
@@ -879,12 +978,13 @@ static void ftpServerRun() {
         return;
     }
     FtpdCtx ctx; ctx.ip = ip.c_str(); // ip outlives the (synchronous) call below
+    NetArenaLease lease;   // borrow the dormant Gigascreen prevFB if available
     size_t stksz = 8 * 1024;
-    uint8_t* stk = (uint8_t*)malloc(stksz);
+    uint8_t* stk = netAltStackAlloc(stksz);
     if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
     void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7); // 8-byte aligned top
     net_call_on_stack(top, ftpdSessionRun, &ctx);
-    free(stk);
+    Buffer::pfree(stk);
 }
 
 // ── Download archive (catalog server over plain HTTP) ───────────────────────
@@ -948,13 +1048,13 @@ static void netDownloadArchive() {
         return;
     }
 
+    NetArenaLease lease;   // borrow the dormant Gigascreen prevFB if available
     size_t stksz = 12 * 1024;
-    uint8_t* stk = (uint8_t*)malloc(stksz);
-    if (!stk) { stksz = 8 * 1024; stk = (uint8_t*)malloc(stksz); }
+    uint8_t* stk = netAltStackAlloc(stksz);
     if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
     void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7);
     net_call_on_stack(top, archSessionRun, nullptr);
-    free(stk);
+    Buffer::pfree(stk);
 }
 
 // ── HTTP test ("curl") ──────────────────────────────────────────────────────
@@ -1009,6 +1109,7 @@ void httpTestRun(void* p) {
 } // namespace
 
 static void netHttpTest() {
+    Buffer::selfTest();   // exercise the tiered allocator (logs to serial) before the GET
     string ssid, ip;
     if (!ZiFiAT::getStatus(ssid, ip)) {
         OSD::osdCenteredMsg(MSG_NET_FT_NOWIFI[Config::lang], LEVEL_WARN, 2200);
@@ -1046,13 +1147,13 @@ static void netHttpTest() {
 
     // Run the GET (and its TLS handshake) on a large heap stack, like the FTP/
     // archive sessions — the 4 KB core stack can't hold the mbedTLS handshake.
+    NetArenaLease lease;   // borrow the dormant Gigascreen prevFB if available
     size_t stksz = 12 * 1024;
-    uint8_t* stk = (uint8_t*)malloc(stksz);
-    if (!stk) { stksz = 8 * 1024; stk = (uint8_t*)malloc(stksz); }
+    uint8_t* stk = netAltStackAlloc(stksz);
     if (!stk) { OSD::osdCenteredMsg(MSG_NET_CONN_ERR[Config::lang], LEVEL_WARN, 2500); return; }
     void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7);
     net_call_on_stack(top, httpTestRun, &ctx);
-    free(stk);
+    Buffer::pfree(stk);
 }
 #endif // ZIFI_NET_CLIENT
 #endif
@@ -1953,6 +2054,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if !PICO_RP2040
             Config::gigascreen_onoff = (Config::gigascreen_onoff + 1) % 3; // Off -> On -> Auto -> Off
             bool want_on = (Config::gigascreen_onoff != 0);
+            if (want_on && !Config::gigascreen_enabled &&
+                !OSD::featureBudgetGate(Subsystems::FEAT_GIGASCREEN)) {
+                // Denied / cancelled (a freeing reboot never returns) — stay Off.
+                Config::gigascreen_onoff = 0;
+                want_on = false;
+            }
             if (want_on) {
                 if (!Config::gigascreen_enabled) {
                     initGigascreenBlendLUT();
@@ -3038,6 +3145,18 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     if (sub) {
                                         uint8_t newval = sub - 1;
                                         if (newval != Config::esxdos) {
+#if !PICO_RP2040
+                                            // Enabling DivMMC/DivIDE/DivSD from Off — check SRAM budget.
+                                            // Set esxdos to the chosen variant first so a freeing reboot
+                                            // preserves it; restore on ALLOW so the side-effects below run.
+                                            if (newval && Config::esxdos == 0) {
+                                                uint8_t oldEsx = Config::esxdos;
+                                                Config::esxdos = newval;
+                                                bool ok = OSD::featureBudgetGate(Subsystems::FEAT_DIVMMC);
+                                                Config::esxdos = oldEsx;
+                                                if (!ok) { menu_curopt = sub; menu_saverect = false; continue; }
+                                            }
+#endif
                                             if (newval && Config::mb02) {
                                                 Config::mb02 = 0;
                                                 MB02::init();
@@ -4022,7 +4141,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     uint8_t prev = Config::gs_enabled;
                                     Config::gs_enabled = prev ? 0 : 1;
                                     if (Config::gs_enabled != prev) {
-                                        if (Config::gs_enabled && Config::esxdos == 2) {
+                                        if (Config::gs_enabled && !OSD::featureBudgetGate(Subsystems::FEAT_GENERAL_SOUND)) {
+                                            // Denied / cancelled (a freeing reboot never returns).
+                                            Config::gs_enabled = prev;
+                                        } else if (Config::gs_enabled && Config::esxdos == 2) {
                                             if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
                                                 Config::esxdos = 0;
                                                 Config::save();
@@ -4456,6 +4578,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::gigascreen_onoff = opt2 - 1; // 0=Off, 1=On, 2=Auto
                                     if (Config::gigascreen_onoff != prev_onoff) {
                                         bool want_on = (Config::gigascreen_onoff != 0);
+                                        if (want_on && !OSD::featureBudgetGate(Subsystems::FEAT_GIGASCREEN)) {
+                                            // Denied / cancelled (a freeing reboot never returns here).
+                                            Config::gigascreen_onoff = prev_onoff;
+                                            menu_curopt = prev_onoff + 1;
+                                            menu_saverect = false;
+                                            continue;
+                                        }
                                         if (want_on) {
                                             initGigascreenBlendLUT();
                                             Config::gigascreen_enabled = true;
@@ -5125,6 +5254,18 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 
                         if (opt2) {
                             if (arch != Config::arch || romset != Config::romSet) {
+#if !PICO_RP2040
+                                // Entering Profi needs ~96 KB SRAM on butter-less boards.
+                                // Gate it: the popup frees room (Gigascreen/ZiFi/DivMMC
+                                // auto-handled by the code below; offers GS) or refuses. A freeing
+                                // reboot never returns; denied/cancelled stays on current arch.
+                                if (arch == "Profi" && Config::arch != "Profi" &&
+                                    !OSD::featureBudgetGate(Subsystems::FEAT_PROFI)) {
+                                    menu_curopt = arch_num;
+                                    menu_saverect = false;
+                                    continue;
+                                }
+#endif
                                 Config::ram_file = "none";
                                 if (romset != Config::romSet) {
                                     if (arch == "48K") {
@@ -5185,7 +5326,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 // TR-DOS is mandatory on Pentagon / Profi
                                 if ((arch == "Pentagon" || arch == "P512" || arch == "P1024" || arch == "Profi") && !Config::betadisk) {
                                     Config::betadisk = true;
-                                    OSD::osdCenteredMsg("Betadisk enabled", LEVEL_INFO, 1500);
+                                    OSD::osdCenteredMsg("Betadisk enabled", LEVEL_WARN, 1500);
                                 }
 #if !PICO_RP2040
                                 // Switching into Profi: Gigascreen is incompatible —
@@ -5194,7 +5335,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 // is already committed above (pref_arch=="Last" path).
                                 if (Config::arch == "Profi" && Config::gigascreen_enabled) {
                                     VIDEO::disableGigascreenForProfi();
-                                    OSD::osdCenteredMsg("Gigascreen disabled", LEVEL_INFO, 1500);
+                                    OSD::osdCenteredMsg("Gigascreen disabled", LEVEL_WARN, 1500);
                                 }
                                 // Switching into Profi: turn the ZiFi NIC off and free its
                                 // ~12 KB of heap rings — Profi forces ~80 KB of SRAM pages
@@ -5204,7 +5345,15 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::zifi_enabled = 0;
                                     ZiFi::enabled = 0;
                                     if (!ZiFiAT::connected) { ZiFiSock::end(); ZiFi::deinit(); }
-                                    OSD::osdCenteredMsg("ZiFi NIC disabled", LEVEL_INFO, 1500);
+                                    OSD::osdCenteredMsg("ZiFi NIC disabled", LEVEL_WARN, 1500);
+                                }
+                                // Switching into Profi: turn DivMMC off and free its
+                                // sector/IDE buffers — same mutual exclusion as MB-02+
+                                // (Profi forces ~80 KB of SRAM pages and OOMs otherwise).
+                                if (Config::arch == "Profi" && Config::esxdos) {
+                                    Config::esxdos = 0;
+                                    DivMMC::init();   // teardown path frees buffers
+                                    OSD::osdCenteredMsg("DivMMC disabled", LEVEL_WARN, 1500);
                                 }
 #endif
                                 Config::save();
@@ -6756,7 +6905,19 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     menu_level = 2; menu_saverect = true; menu_curopt = Config::zifi_enabled + 1;
                     uint8_t zn = menuRun(MENU_ZIFI_NIC[Config::lang]);
                     if (zn > 0) {
+                        uint8_t prevZ = Config::zifi_enabled;
                         Config::zifi_enabled = zn - 1;
+#if !PICO_RP2040
+                        // Turning the NIC on claims ~12 KB heap rings — check the SRAM budget.
+                        // Freeing reboot never returns; denied/cancelled reverts.
+                        if (Config::zifi_enabled && !prevZ &&
+                            !OSD::featureBudgetGate(Subsystems::FEAT_ZIFI)) {
+                            Config::zifi_enabled = prevZ;
+                            ZiFi::enabled = Config::zifi_enabled;
+                            VIDEO::SaveRect.restore_last();
+                            return;
+                        }
+#endif
                         ZiFi::enabled = Config::zifi_enabled; // runtime mirror gates tick()+ports
                         // The NIC toggle ONLY gates the 0xEF port emulation — it is
                         // independent of WiFi. Bring the shared UART link up when the NIC
@@ -8215,8 +8376,8 @@ static void saveDumpToFile(uint16_t addr_from, uint16_t addr_to) {
         wd.command, wd.status, wd.track, wd.sector, wd.data);
     f_write(f, line, strlen(line), &bw);
 
-    snprintf(line, sizeof(line), "  drive=%d side=%d dsr=%d led=%d retry=%d\n",
-        wd.diskS, wd.side, wd.dsr, wd.led, wd.retry);
+    snprintf(line, sizeof(line), "  drive=%d side=%d dsr=%d retry=%d\n",
+        wd.diskS, wd.side, wd.dsr, wd.retry);
     f_write(f, line, strlen(line), &bw);
 
     snprintf(line, sizeof(line), "  state=%u stepState=%u control=%04X\n",

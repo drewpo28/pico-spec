@@ -21,6 +21,8 @@ extern size_t getFreeHeap(void);
 #include "MidiSynth.h"
 #include "MB02.h"
 #include "DivMMC.h"
+#include "MemESP.h"   // butter_psram_size()
+#include "Video.h"    // VIDEO::gigascreenPrevFBBytes()
 #ifdef VGA_HDMI
 #include "hdmi.h"
 #endif
@@ -380,6 +382,139 @@ bool HdmiAudioSubsys::apply() {
 }
 
 #endif // VGA_HDMI
+
+// ----------------------------------------------------------------------------
+// SRAM budget manager (RP2350). See Subsystem.h. UI-free: the OSD popup lives in
+// OSDMain.cpp (OSD::featureBudgetGate) and calls these to decide what can fit and
+// what can be freed.
+// ----------------------------------------------------------------------------
+namespace Subsystems {
+
+size_t featureCost(FeatureId f) {
+    const bool spi = (butter_psram_size() == 0); // no XIP PSRAM → everything in SRAM
+    switch (f) {
+        case FEAT_GIGASCREEN:    return VIDEO::gigascreenPrevFBBytes();      // exact, current mode
+        case FEAT_GENERAL_SOUND: return 38 * 1024;   // work16 + 2x8K rings + 4K PC cache + fifos
+        case FEAT_DIVMMC:        return spi ? 33 * 1024 : 9 * 1024; // SPI: 3x8K cache+8K ROM+misc
+        // Profi's *marginal* SRAM cost relative to a non-Profi baseline, NOT the
+        // absolute forced-page reservation (~80-96 KB). Switching arch re-lays out
+        // memory: the forced SRAM pages replace SPI-backed pages, so the net hit to
+        // free heap is much smaller. Measured on m1p2: Pentagon+GS leaves ~59 KB free,
+        // Profi+GS+ZiFi boots & completes at ~20 KB free → marginal ~40 KB. We use a
+        // slightly higher 64 KB so switching to Profi with GS on shows the disable
+        // popup (and freeing GS yields comfortable headroom) rather than a false DENY.
+        case FEAT_PROFI:         return spi ? 64 * 1024 : 0;
+        case FEAT_ZIFI:          return 12 * 1024;   // in/out rings + rx_buf
+        default:                 return 0;
+    }
+}
+
+bool featureEnabled(FeatureId f) {
+    switch (f) {
+        case FEAT_GIGASCREEN:    return Config::gigascreen_enabled;
+        case FEAT_GENERAL_SOUND: return Config::gs_enabled != 0;
+        case FEAT_DIVMMC:        return Config::esxdos != 0;
+        case FEAT_PROFI:         return Config::arch == "Profi";
+        case FEAT_ZIFI:          return Config::zifi_enabled != 0;
+        default:                 return false;
+    }
+}
+
+const char* featureName(FeatureId f) {
+    // Proper names — same in EN and RU, no localisation needed.
+    switch (f) {
+        case FEAT_GIGASCREEN:    return "Gigascreen";
+        case FEAT_GENERAL_SOUND: return "General Sound";
+        case FEAT_DIVMMC:        return "DivMMC";
+        case FEAT_PROFI:         return "Profi";
+        case FEAT_ZIFI:          return "ZiFi";
+        default:                 return "?";
+    }
+}
+
+void featureSetEnabled(FeatureId f, bool on) {
+    switch (f) {
+        case FEAT_GIGASCREEN:
+            Config::gigascreen_enabled = on;
+            Config::gigascreen_onoff = on ? 1 : 0;  // also disarms Auto countdown when off
+            break;
+        case FEAT_GENERAL_SOUND:
+            Config::gs_enabled = on ? 1 : 0;
+            break;
+        case FEAT_DIVMMC:
+            if (!on) Config::esxdos = 0;
+            else if (Config::esxdos == 0) Config::esxdos = 1; // default DivMMC
+            break;
+        case FEAT_PROFI:
+            if (on) Config::requestMachine("Profi", ""); // disable handled by switching arch elsewhere
+            break;
+        case FEAT_ZIFI:
+            Config::zifi_enabled = on ? 1 : 0;
+            break;
+        default: break;
+    }
+}
+
+// Features that enabling F already turns off on its own — they're freed "for free"
+// (added back into freeNow) and must NOT appear in the popup's candidate list.
+static uint32_t autoDisabledMask(FeatureId f) {
+    if (f == FEAT_PROFI) return (1u << FEAT_GIGASCREEN) | (1u << FEAT_ZIFI) | (1u << FEAT_DIVMMC);
+    return 0;
+}
+
+// SRAM that must stay free *after* the feature is loaded. SRAM_MARGIN (10 KB) is
+// the general floor. The ONLY exception is Gigascreen: its allocation path
+// (VIDEO::ensurePrevFB) hard-declines unless GIGASCREEN_PREVFB_HEADROOM remains
+// after the prev-FB, so the gate must use the SAME shared constant or it says
+// ALLOW while the real alloc silently declines (→ no popup, feature stays off).
+// Every other feature just mallocs and works (or OOM-panics), so the 10 KB floor
+// is right — e.g. GS at 38 KB with 69 KB free leaves ~30 KB, plenty.
+static size_t featureMargin(FeatureId f) {
+    if (f == FEAT_GIGASCREEN) return GIGASCREEN_PREVFB_HEADROOM;
+    return SRAM_MARGIN;
+}
+
+BudgetResult budgetCheck(FeatureId enabling, FeatureId* candidates, int* nCand, size_t* deficit) {
+    *nCand = 0;
+    *deficit = 0;
+
+    const uint32_t autoMask = autoDisabledMask(enabling);
+    size_t freeNow = getFreeHeap();
+    // Memory that enabling F will reclaim by auto-disabling other features.
+    for (int i = 0; i < FEAT_COUNT; i++)
+        if ((autoMask & (1u << i)) && featureEnabled((FeatureId)i))
+            freeNow += featureCost((FeatureId)i);
+
+    // Switching to Profi also force-disables MB-02+ (mutually exclusive — see the
+    // arch-switch code in OSDMain). MB-02 isn't a tracked FeatureId, but its 8 KB
+    // EPROM composite is freed on disable, so credit it like the auto-disables.
+    if (enabling == FEAT_PROFI && Config::mb02)
+        freeNow += 8 * 1024;  // page0_composite (0x2000); 512 KB RAM is SPI-backed
+
+    const size_t need = featureCost(enabling) + featureMargin(enabling);
+    Debug::log("budgetCheck(%s): freeNow=%u need=%u(cost=%u+margin=%u)",
+               featureName(enabling), (unsigned)freeNow, (unsigned)need,
+               (unsigned)featureCost(enabling), (unsigned)featureMargin(enabling));
+    if (freeNow >= need) return BUDGET_ALLOW;
+
+    *deficit = need - freeNow;
+
+    // Build the list of features the user could turn off to make room.
+    size_t maxFree = 0;
+    for (int i = 0; i < FEAT_COUNT; i++) {
+        FeatureId c = (FeatureId)i;
+        if (c == enabling) continue;
+        if (c == FEAT_PROFI) continue;           // Profi only ever an *enabling* feature, never a candidate
+        if (autoMask & (1u << i)) continue;      // already auto-freed above
+        if (!featureEnabled(c)) continue;
+        candidates[(*nCand)++] = c;
+        maxFree += featureCost(c);
+    }
+
+    return (maxFree >= *deficit) ? BUDGET_NEEDS_FREE : BUDGET_DENY;
+}
+
+} // namespace Subsystems
 
 #endif // !PICO_RP2040
 

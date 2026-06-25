@@ -44,6 +44,8 @@ visit https://zxespectrum.speccy.org/contacto
 #include "FileUtils.h"
 #include "sdcard.h"
 #include "MemESP.h"
+#include "Buffer.h"
+#include "LEDIndicators.h"
 #include "OSDMain.h"
 #include "Ports.h"
 #include "Snapshot.h"
@@ -939,6 +941,11 @@ void ESPectrum::setup() {
   }
 #endif
 
+  // Tiered buffer pools: carve PSRAM/SD-swap arenas from whatever the existing
+  // consumers above (MemESP/Profi pages, DivMMC, GS) have NOT claimed. Must run
+  // after all of them so the boundaries are final. See Buffer.cpp.
+  Buffer::initPools();
+
   //=======================================================================================
   // VIDEO
   //=======================================================================================
@@ -1334,6 +1341,13 @@ void ESPectrum::reset(uint8_t romInUse) {
 
   init_sound();
   pcm_setup(Audio_freq);
+#if !PICO_RP2040
+  // A reset re-runs init_sound()/pcm_setup(), which can re-claim the shared audio
+  // output pins (GP26/27 on MURM1_P2). If a live ESP/WiFi link is using them for
+  // its UART, re-assert ownership so WiFi survives a machine reset (F11) instead of
+  // dying until a full reboot.
+  if (ZiFi::linkUp()) ZiFi::reclaimPins();
+#endif
 
   if (Config::tape_player) {
     AY_emu = false; // Disable AY emulation if tape player mode is set
@@ -2033,7 +2047,9 @@ void ESPectrum::FDDGenSound() {
         for (int c = 0; c < clicks; c++) {
             fddSound.click_pos[c] = spacing * (c + 1);
         }
-    } else if (ctrl->led) {
+    } else if (LED::readActive(LED::FDD) || LED::writeActive(LED::FDD)) {
+        // Motor hum while the drive is being accessed (recent FDC port activity).
+        // Replaces the removed rvmWD1793::led flag, which could stick on.
         fddSound.click_count = 0;
         fddSound.motor_noise = true;
     } else {
@@ -2514,24 +2530,33 @@ void ESPectrum::loop() {
     uint8_t led_off_col = zxColor(VIDEO::borderColor, 0);
 #if !PICO_RP2040
     if (profi_ds80_active) led_off_col = (uint8_t)(~VIDEO::borderColor) & 0x07;
+#endif
+    // Corner FDD lamp. ON/OFF follows LEDIndicators' decaying FDC-access state (it
+    // auto-clears, unlike the old rvmWD1793::led which could stick on with no disk
+    // access). COLOUR by the actual WD1793 command — write-sector/track → red, else
+    // (read/seek) → blue — because touchR/touchW track port I/O *direction* (a read
+    // command is issued by an OUT, so it would otherwise show red during loading).
+    rvmWD1793 *fctrl = &fdd;
+#if !PICO_RP2040
+    if (MB02::enabled) fctrl = &mb02_fdd;
+#endif
+    bool fdd_active = LED::readActive(LED::FDD) || LED::writeActive(LED::FDD);
+    bool fdd_write  = ((fctrl->command & 0xE0) == 0xA0) ||   // Write Sector (0xA_/0xB_)
+                      ((fctrl->command & 0xF0) == 0xF0);     // Write Track  (0xF_)
+    // Foreground = lamp colour when active, else the border colour so the diskette
+    // glyph vanishes into the border when idle. Reuse LEDIndicators' 8x8 diskette
+    // sprite (instead of a plain square) so the corner lamp matches the border row.
+    // drawGlyph paints the full 8x8 each frame (fg/bg), so it self-erases.
+    uint8_t fdd_fg = !fdd_active ? led_off_col
+                   : fdd_write   ? zxColor(2, 1)             // red  — write
+                                 : zxColor(1, 1);            // blue — read / seek
+#if !PICO_RP2040
     if (MB02::enabled && (Config::mb02SoundLed & 1)) {
-        // MB-02+ I/O skips the WD1793 command-dispatch paths that drive
-        // rvmWD1793::led, so mirror the panel LED off the port-0x13 motor state.
-        uint8_t mb02_led = ESPectrum::mb02_fdd.led;
-        if (!mb02_led && MB02::motor_state) mb02_led = 1;
-        if (mb02_led) {
-            VIDEO::vga.fillRect(312, 3, 4, 4, zxColor(mb02_led == 2 ? 2 : 1, 1));
-        } else {
-            VIDEO::vga.fillRect(312, 3, 4, 4, led_off_col);
-        }
+        LED::drawGlyph(LED::FDD, 311, 2, fdd_fg, led_off_col);
     } else
 #endif
     if (hasFdd && (Config::trdosSoundLed & 1)) {
-        if (ESPectrum::fdd.led) {
-            VIDEO::vga.fillRect(312, 3, 4, 4, zxColor(fdd.led == 2 ? 2 : 1, 1));
-        } else {
-            VIDEO::vga.fillRect(312, 3, 4, 4, led_off_col);
-        }
+        LED::drawGlyph(LED::FDD, 311, 2, fdd_fg, led_off_col);
     }
 
     elapsed = time_us_64() - ts_start;

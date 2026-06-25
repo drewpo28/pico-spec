@@ -3,6 +3,7 @@
 #if !PICO_RP2040
 
 #include "Config.h"
+#include "ZiFi.h"   // ZiFi::linkUp() — UART link owns its pins even with the NIC off
 
 namespace BoardPins {
 
@@ -78,7 +79,12 @@ bool resolveZifiPins(uint8_t cfg_tx, uint8_t cfg_rx, uint8_t& out_tx, uint8_t& o
 }
 
 bool zifiOwnsPin(uint8_t pin) {
-    if (!Config::zifi_enabled) return false;
+    // The pins belong to ZiFi whenever it's actively using them — i.e. the NIC is
+    // enabled, OR the ESP UART link is currently up (WiFi downloads/RTC use the
+    // link with the NIC off). Gating only on zifi_enabled meant a soft reset's
+    // init_sound() re-claimed the shared audio pins (GP26/27 on MURM1_P2) and
+    // silently killed a live WiFi link until a full reboot.
+    if (!Config::zifi_enabled && !ZiFi::linkUp()) return false;
     uint8_t tx, rx;
     if (!resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, tx, rx)) return false;
     return pin == tx || pin == rx;
