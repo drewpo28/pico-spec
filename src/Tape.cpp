@@ -146,7 +146,7 @@ void Tape::FreeSymDefTable() {
 
 int Tape::inflateCSW(int blocknumber, long startPos, long data_length) {
 
-    char destFileName[16]; // Nombre del archivo descomprimido
+    char destFileName[32]; // Nombre del archivo descomprimido
     uint8_t s_inbuf[BUF_SIZE];
     uint8_t s_outbuf[BUF_SIZE];
     FIL pOutfile;
@@ -154,7 +154,7 @@ int Tape::inflateCSW(int blocknumber, long startPos, long data_length) {
 
     // printf(CONFIG_DIR "/.csw%04d.tmp\n",blocknumber);
 
-    sprintf(destFileName, "/tmp/.csw%04d.tmp", blocknumber);
+    snprintf(destFileName, sizeof(destFileName), "/tmp/.csw%04d.tmp", blocknumber);
 
     // Move to input file compressed data position
     f_lseek(&tape, startPos);
@@ -262,6 +262,14 @@ void Tape::LoadTape(const string& mFile_) {
         return;
     }
     string mFile = mFile_;
+    // The flashload path below runs FileZ80::loader48()/loader128(), which call
+    // ESPectrum::reset() → Tape::LoadRemembered(). LoadRemembered() overwrites
+    // FileUtils::TAP_Path with the directory of the *previously* remembered tape
+    // (Config::tape_file). Without restoring it, the *_Open() calls that follow
+    // would prepend that stale directory to the new file name and fail to open
+    // (e.g. "/old/dir/" + "newfile.tap"). Snapshot it here and restore before each
+    // open so the new tape always loads from the folder the caller selected.
+    const string savedTapPath = FileUtils::TAP_Path;
     StopRealPlayer();
     if (FileUtils::hasMP3extension(mFile)) {
         string keySel = mFile.substr(0,1);
@@ -311,6 +319,7 @@ void Tape::LoadTape(const string& mFile_) {
                     ESPectrum::TapeNameScroller = 0;
                 }    
         }
+        FileUtils::TAP_Path = savedTapPath; // undo any LoadRemembered() clobber from flashload reset
         Tape::Stop();
         // Read and analyze tap file
         Tape::TAP_Open(mFile);
@@ -345,6 +354,7 @@ void Tape::LoadTape(const string& mFile_) {
                     ESPectrum::TapeNameScroller = 0;
                 }
         }
+        FileUtils::TAP_Path = savedTapPath; // undo any LoadRemembered() clobber from flashload reset
         Tape::Stop();
         // Read and analyze tzx file
         Tape::TZX_Open(mFile);
@@ -379,6 +389,7 @@ void Tape::LoadTape(const string& mFile_) {
                     ESPectrum::TapeNameScroller = 0;
                 }
         }
+        FileUtils::TAP_Path = savedTapPath; // undo any LoadRemembered() clobber from flashload reset
         Tape::Stop();
         Tape::PZX_Open(mFile);
         ESPectrum::TapeNameScroller = 0;
@@ -391,6 +402,34 @@ void Tape::LoadTape(const string& mFile_) {
 void Tape::Init() {
     f_close(&tape);
     tapeFileType = TAPE_FTYPE_EMPTY;
+}
+
+// Re-mount the tape remembered in Config::tape_file, so a tape survives an F11
+// reset / power-cycle the same way a mounted TRD disk does (ESPectrum::reset()
+// otherwise wipes Tape::tapeFileName). Only TAP/TZX/PZX are remembered. Loads
+// with a non-"R" key so flashload never fires here (that would re-run the loader
+// and trash the freshly-reset machine state). Never auto-plays: auto-start applies
+// only to a fresh load through the file manager, not to a reset/boot re-mount —
+// the tape comes back STOPPED and the runtime heuristic starts it when the guest
+// polls (a tape rolling right after reset is wrong, and pins F8 stats to tape mode).
+void Tape::LoadRemembered() {
+    if (!FileUtils::fsMount) return;
+    string full = Config::tape_file;
+    if (full.empty() || full == "none") return;
+    if (!FileUtils::hasTAPextension(full) &&
+        !FileUtils::hasTZXextension(full) &&
+        !FileUtils::hasPZXextension(full)) return;
+    size_t slash = full.rfind('/');
+    if (slash == string::npos) return;
+    // Verify the file still exists before handing it to LoadTape, which would
+    // otherwise pop an OSD error during a silent boot/reset re-mount. Use the
+    // heap-backed fopen2 (not a stack FIL — the core stack is only 2 KB).
+    FIL* probe = fopen2(full.c_str(), FA_READ);
+    if (!probe) return;
+    fclose2(probe);
+    FileUtils::TAP_Path = full.substr(0, slash + 1);
+    string name = full.substr(slash + 1);
+    LoadTape("L" + name); // "L" = load only, never flashload (and never auto-play)
 }
 
 typedef struct INFO {
@@ -772,8 +811,9 @@ void Tape::TAP_Open(const string& name) {
     }
     tapeFileSize = f_size(&tape);
     if (tapeFileSize == 0) return;
-    
+
     tapeFileName = name;
+    Config::tape_file = FileUtils::TAP_Path + name; // remember slot, re-mounted after F11/reboot
 
     Tape::TapeListing.clear(); // Clear TapeListing vector
     std::vector<TapeBlock>().swap(TapeListing); // free memory
@@ -1092,7 +1132,12 @@ void Tape::TAP_GetBlock() {
 }
 
 void Tape::Stop() {
-    OSD::osdCenteredMsg("Tape loading is stopped", LEVEL_INFO, 100);
+    // Only notify when an actual load was in progress. Stop() is also called as a
+    // teardown step by LoadTape() (incl. the silent F11/boot re-mount via
+    // LoadRemembered) — popping the OSD there put a spurious "Tape loading is
+    // stopped" message on screen on every reset.
+    if (tapeStatus == TAPE_LOADING)
+        OSD::osdCenteredMsg("Tape loading is stopped", LEVEL_INFO, 100);
     tapeEarBit = 0;
     tapeStatus = TAPE_STOPPED;
     tapePhase = TAPE_PHASE_STOPPED;

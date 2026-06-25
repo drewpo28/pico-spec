@@ -26,6 +26,31 @@ option(PICO_PC "RP2040-PICO-PC" OFF)
 option(PICO_DV "RP2350-PICO-DV" OFF)
 option(ZERO "RP2040-PiZero" OFF)
 option(ZERO2 "RP2350-PiZero" OFF)
+option(ZIFI_NET_CLIENT "Enable FTP/SFTP/SSH client over ZiFi (RP2350 only, uses mbedTLS)" ON)
+
+# Per-subsystem port-access tracing toggles (debugging). OFF by default — when
+# ON, gated `#if XXX_TRACE` Debug::log() calls in the sources become active.
+# Add new toggles here following the same option(...) + compile-definition pattern.
+option(IDE_PORT_TRACE "Enable PROFI IDE/HDD port access tracing" OFF)
+option(FDD_PORT_TRACE "Enable WD1793 (ВГ93) FDD command/port tracing" OFF)
+option(RTC_PORT_TRACE "Enable MC146818 Mr Gluk RTC port access tracing" OFF)
+option(PROFI_PORT_TRACE "Enable 0x7FFD/0xDFFD paging-port write tracing" OFF)
+option(SND_PORT_TRACE "Enable per-port I/O histogram (sound-DAC port hunting)" OFF)
+option(PERF_TRACE "Enable per-60-frame CPU/HDMI/FPS performance logging" OFF)
+option(GS_PERF_TRACE "Enable General Sound per-second perf counters (GS.cpp)" OFF)
+option(GS_DEBUG_TRACE "Enable General Sound port-IO trace ring + auto-dumps (~50 KB SRAM)" OFF)
+option(ZIFI_TRACE "Enable ZiFi (ESP-01S WiFi NIC) port/UART tracing" OFF)
+option(ZIFI_NET_VERBOSE "Per-packet trace of the ZiFi net client (+IPD/chanSend); floods logs" OFF)
+
+# Per-board Debug-Probe UART toggles (logging over UART). Declared here together;
+# the board-specific `if(<board>_DBG_UART)` blocks below consume them (they call
+# pico_enable_stdio_uart() + remap pins, which needs the target to exist first).
+# Each enables stdio over the board's Debug-Probe header — see the block for pins.
+set(MURM1_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1) — moves KBD to GP16/GP17, disables NESPAD")
+set(PICO_PC_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on DBG1 header GP0/GP1 (PICO_PC)")
+set(PICO_DV_DBG_UART ON CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
+set(ZERO_DBG_UART    OFF CACHE BOOL "Enable Debug Probe UART0 on GP16/GP13 (ZERO)")
+set(ZERO2_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO2)")
 
 #set(FLASH_SIZE_GREEN ON)
 #set(m1p2launcher ON)
@@ -34,16 +59,19 @@ option(ZERO2 "RP2350-PiZero" OFF)
 # set(TFT_INV ON)
 # set(ILI9341 ON)
 # set(ST7789 ON)
-# set(SOFTTV ON) 
+# set(SOFTTV ON)
+# set(PSRAM OFF)  #For Testing Only
 
 # Display output (default: VGA_HDMI; override with -D flags, e.g. cmake -DSOFTTV=ON)
 if(NOT VGA_HDMI AND NOT SOFTTV AND NOT TFT AND NOT ILI9341 AND NOT TV)
     set(VGA_HDMI ON)
 endif()
-set(NO_ALF 1)
+if(NOT DEFINED NO_ALF)
+    set(NO_ALF 1)
+endif()
 
 set(CPU_MHZ 378)
-set (PORT_VERSION "1.2.17")
+set (PORT_VERSION "1.2.24")
 string(LENGTH "${PORT_VERSION}" PORT_VERSION_LEN)
 
 # Target board (default: PICO_PC; override with -D flags, e.g. cmake -DMURM2=ON)
@@ -75,7 +103,12 @@ elseif(MURM2 AND NOT MURM2_P2)
     set(PICO_BOARD pico CACHE STRING "Board type" FORCE)
     set(PICO_PLATFORM rp2040)
 else()
-    set(PICO_BOARD pico2 CACHE STRING "Board type" FORCE)
+    # All remaining RP2350 boards (MURM2_P2, PICO_PC, PICO_DV, MURM1_P2/default)
+    # build for the RP2350B (48-GPIO) package so GPIO 30..47 are valid for any
+    # peripheral. pico2 forces PICO_RP2350A=1, so we use a local B-variant header
+    # (a CMake `set(PICO_RP2350A 0)` is ignored by the SDK — it must be the header).
+    set(PICO_BOARD_HEADER_DIRS ${CMAKE_SOURCE_DIR}/src/boards)
+    set(PICO_BOARD picospec_rp2350b CACHE STRING "Board type" FORCE)
     set(PICO_PLATFORM rp2350-arm-s)
 endif()
 
@@ -120,12 +153,39 @@ ELSE()
     set (BUTTER_PSRAM_GPIO 19)
 ENDIF()
 
+# PSRAM kill-switch: only when set(PSRAM OFF) is explicitly uncommented above
+# (an undefined/unset PSRAM leaves PSRAM enabled). Forces the butter PSRAM CS to
+# GPIO 255 (no valid pin) so the driver treats PSRAM as absent on every board.
+if(PSRAM STREQUAL "OFF")
+    set(BUTTER_PSRAM_GPIO 255)
+endif()
+
 set(OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE}")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
 
 project(${PROJECT_NAME} C CXX ASM)
+
+# Core0 stack lives at the top of SCRATCH_Y (.scratch_y is empty), and SCRATCH_X
+# (core1/video stack) sits directly below it. The default 2 KB core0 stack is too
+# tight for the OSD menu call chain (file browser → text-edit → file-info/create →
+# std::string + format parsers): it overflowed into SCRATCH_X, corrupting core1's
+# video stack — manifesting as SIGBUS (MSTKERR) crashes (F1 file info, F9 create
+# TRD) and a garbled screen. Grow core0 to 4 KB (fills the otherwise-empty 4 KB
+# SCRATCH_Y exactly); pin core1 at 2 KB so SCRATCH_X is unchanged.
+add_compile_definitions(PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x800)
+
+# ZiFi network client (FTP/SFTP/SSH) uses the SDK-vendored mbedTLS as a crypto
+# primitive library. Point the SDK's mbedTLS at our trimmed config via an
+# ABSOLUTE path BEFORE pico_sdk_init() — the pico_mbedtls CMakeLists reads
+# PICO_MBEDTLS_CONFIG_FILE at SDK-init time and propagates it (as
+# MBEDTLS_CONFIG_FILE) to both our TUs and the mbedTLS library's own sources.
+# Absolute path means it resolves regardless of per-target include dirs. Harmless
+# on builds that don't link pico_mbedtls (RP2040 / ZIFI_NET_CLIENT=OFF).
+if (ZIFI_NET_CLIENT AND NOT PICO_PLATFORM STREQUAL "rp2040")
+    set(PICO_MBEDTLS_CONFIG_FILE "${CMAKE_CURRENT_LIST_DIR}/src/mbedtls_config_picospec.h")
+endif ()
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
@@ -173,6 +233,11 @@ set_source_files_properties(src/SAASound.cpp PROPERTIES
     COMPILE_FLAGS "-O3 -ffast-math -funroll-loops")
 set_source_files_properties(src/MidiSynth.cpp PROPERTIES
     COMPILE_FLAGS "-O3 -ffast-math -funroll-loops")
+set_source_files_properties(src/SoftSynth.cpp PROPERTIES
+    COMPILE_FLAGS "-O3 -ffast-math -funroll-loops")
+# Wavetable MIDI engine wrapper (external/embeded-midi-synth) — hot audio path.
+set_source_files_properties(src/midi_wt.c PROPERTIES
+    COMPILE_FLAGS "-O3 -ffast-math -funroll-loops")
 set_source_files_properties(src/Video.cpp PROPERTIES
     COMPILE_FLAGS "-O3 -funroll-loops")
 # Z80 эмулятор — самый горячий код, критично для производительности
@@ -218,6 +283,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     hardware_pwm
     hardware_uart
     hardware_flash
+    hardware_xip_cache
     hardware_exception
     stdc++
 
@@ -227,6 +293,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 target_include_directories(${PROJECT_NAME} PRIVATE
         src
         src/roms
+        external/embeded-midi-synth
 )
 
 if (PICO_CYW43_SUPPORTED)
@@ -253,6 +320,56 @@ endif ()
 target_link_options(${PROJECT_NAME} PRIVATE -Xlinker --print-memory-usage --data-sections)
 target_compile_definitions(${PROJECT_NAME} PRIVATE FLASH_SIZE=${FLASH_SIZE})
 target_compile_definitions(${PROJECT_NAME} PRIVATE CONFIG_BOARD_TAG="${CONFIG_BOARD_TAG}")
+
+# IDE/HDD port tracing toggle (see Ports.cpp / IDE.cpp `#if IDE_PORT_TRACE`).
+if (IDE_PORT_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE IDE_PORT_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE IDE_PORT_TRACE=0)
+endif ()
+
+# WD1793 FDD command tracing toggle (see wd1793.cpp `#if FDD_PORT_TRACE`).
+if (FDD_PORT_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE FDD_PORT_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE FDD_PORT_TRACE=0)
+endif ()
+
+# RTC (MC146818 Mr Gluk TimeKeeper) port tracing — logs every IN/OUT with low
+# byte 0xF7 (and the EFF7 enable), to discover Gluk's real RTC port/register use.
+if (RTC_PORT_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RTC_PORT_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RTC_PORT_TRACE=0)
+endif ()
+
+# General Sound perf counters toggle (see GS.cpp `GS_PERF()` / `#if GS_PERF_TRACE`).
+if (GS_PERF_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE GS_PERF_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE GS_PERF_TRACE=0)
+endif ()
+
+# General Sound port-IO trace ring + auto-dump triggers (see GS.cpp
+# `#ifdef GS_DEBUG_TRACE`). Costs ~50 KB SRAM — diagnostic builds only;
+# the code tests presence with #ifdef, so define it only when ON.
+if (GS_DEBUG_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE GS_DEBUG_TRACE=1)
+endif ()
+
+# 0x7FFD/0xDFFD paging-port write tracing (see Ports.cpp `#if PROFI_PORT_TRACE`).
+if (PROFI_PORT_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PROFI_PORT_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PROFI_PORT_TRACE=0)
+endif ()
+
+# ZiFi port/UART tracing (see ZiFi.cpp / ZiFiAT.cpp `#if ZIFI_TRACE`).
+if (ZIFI_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_TRACE=0)
+endif ()
 
 if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
 target_compile_options(${PROJECT_NAME} PUBLIC
@@ -305,6 +422,32 @@ if (BUTTER_PSRAM_GPIO AND NOT PICO_PLATFORM STREQUAL "rp2040")
     target_compile_definitions(${PROJECT_NAME} PRIVATE USE_GS=1)
 endif()
 
+# ZiFi (ESP-01S WiFi NIC emulation) — RP2350 only.
+# TX/RX pins are chosen at RUNTIME (Network → GPIO picker, stored in NVS) from a
+# per-board candidate list defined in src/BoardPins.cpp. No compile-time pin
+# define is needed anymore; the old -DZIFI_TX_PIN/-DZIFI_RX_PIN are obsolete.
+
+# ZiFi network client (FTP/SFTP/SSH over the ESP-01S TCP sockets). RP2350 only —
+# SSH crypto runs on the Pico via mbedTLS primitives (NOT wolfSSH, NOT mbedTLS's
+# TLS stack; see src/mbedtls_config_picospec.h). New sources (ZiFiSock/Ftp/Ssh/
+# Sftp.cpp) auto-compile via the GLOB; each file body is wrapped in
+# `#if !PICO_RP2040 && ZIFI_NET_CLIENT` so RP2040 builds get zero footprint.
+if (ZIFI_NET_CLIENT AND NOT PICO_PLATFORM STREQUAL "rp2040")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_NET_CLIENT=1)
+    if (ZIFI_NET_VERBOSE)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_NET_VERBOSE=1)
+    endif ()
+    # MBEDTLS_CONFIG_FILE is supplied by the SDK from PICO_MBEDTLS_CONFIG_FILE
+    # (set before pico_sdk_init above) — do not redefine it here, that collides
+    # with pico_mbedtls_headers' INTERFACE define.
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        pico_mbedtls          # crypto primitives from pico-sdk's vendored mbedTLS
+        pico_rand)            # hardware RNG for SSH ephemeral keys / padding
+    message(STATUS "ZiFi network client (FTP/SFTP/SSH) enabled with mbedTLS crypto")
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ZIFI_NET_CLIENT=0)
+endif ()
+
 # redcode/Z80 build configuration for GS (LGPLv3 library vendored in src/GS/)
 set_source_files_properties(src/GS/Z80_redcode.c PROPERTIES
     COMPILE_FLAGS "-O3 -funroll-loops -DZ80_STATIC -DGS_Z80_INSN_IN_SRAM -DZ80_EXTERNAL_HEADER=\\\"Z80_compat.h\\\"")
@@ -345,13 +488,13 @@ IF(MURM2)
 
         #PSRAM
         # PSRAM_MUTEX=1
-        PSRAM_SPINLOCK=1
-        PSRAM_ASYNC=1
+        PSRAM_SPINLOCK=255
+        PSRAM_ASYNC=255
 
-        PSRAM_PIN_CS=18
-        PSRAM_PIN_SCK=19
-        PSRAM_PIN_MOSI=20
-        PSRAM_PIN_MISO=21
+        PSRAM_PIN_CS=255
+        PSRAM_PIN_SCK=255
+        PSRAM_PIN_MOSI=255
+        PSRAM_PIN_MISO=255
 
         # NES Gamepad
         USE_NESPAD
@@ -379,11 +522,10 @@ IF(MURM2)
         PICO_DEFAULT_LED_PIN=25
     )
 ELSEIF(PICO_PC)
-    # Optional UART for Debug Probe. Set PICO_PC_DBG_UART=ON to enable UART0 on the
+    # Debug-Probe UART toggle PICO_PC_DBG_UART declared at top. Enables UART0 on the
     # on-board DBG1 header (GP0=TX, GP1=RX) of Olimex RP2040-PICO-PC.
     # DBG1 shares pins with KBD_CLOCK/KBD_DATA → keyboard is auto-remapped to FREE
     # pins GP10/GP11 when DBG_UART is enabled.
-    set(PICO_PC_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on DBG1 header GP0/GP1 (PICO_PC)")
     if(PICO_PC_DBG_UART)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
         set(PICO_PC_KBD_CLOCK 10) # GP0 taken by UART TX → move KBD to FREE pin
@@ -393,8 +535,6 @@ ELSEIF(PICO_PC)
         set(PICO_PC_KBD_DATA 1)
     endif()
     target_compile_definitions(${PROJECT_NAME} PRIVATE
-        DEBUG=0
-
         $<$<BOOL:${PICO_PC_DBG_UART}>:PICO_DEFAULT_UART=0>
         $<$<BOOL:${PICO_PC_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=0>
         $<$<BOOL:${PICO_PC_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=1>
@@ -439,14 +579,14 @@ ELSEIF(PICO_PC)
         SDCARD_PIN_SPI0_MOSI=7
         SDCARD_PIN_SPI0_CS=22
 
-        #PSRAM           # not implemented
-        PSRAM_SPINLOCK=1 # not implemented
-        PSRAM_ASYNC=1    # not implemented
+        #PSRAM             # not implemented
+        PSRAM_SPINLOCK=255 # not implemented
+        PSRAM_ASYNC=255    # not implemented
 
-        PSRAM_PIN_CS=3   # not implemented
-        PSRAM_PIN_SCK=3  # not implemented
-        PSRAM_PIN_MOSI=3 # not implemented
-        PSRAM_PIN_MISO=3 # not implemented
+        PSRAM_PIN_CS=255   # not implemented
+        PSRAM_PIN_SCK=255  # not implemented
+        PSRAM_PIN_MOSI=255 # not implemented
+        PSRAM_PIN_MISO=255 # not implemented
 
         # NES Gamepad
         USE_NESPAD
@@ -465,20 +605,17 @@ ELSEIF(PICO_PC)
         PICO_DEFAULT_LED_PIN=25
     )
 ELSEIF(PICO_DV)
-    # Optional UART for Debug Probe. Set DBG_UART_PINS=ON to enable UART1 on GP20/GP21.
+    # Debug-Probe UART toggle PICO_DV_DBG_UART declared at top. Enables UART1 on GP20/GP21.
     # Note: GP20 is also LOAD_WAV_PIO default — auto-remapped to GP3 when UART enabled.
-    set(PICO_DV_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
     if(PICO_DV_DBG_UART)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
-        set(PICO_DV_LOAD_WAV_PIO 3)  # GP20 taken by UART → use FREE pin
-        set(MIDI_TX_PIN 3) # GP21 taken by UART → use FREE pin
+        set(PICO_DV_LOAD_WAV_PIO 255)  # GP20 taken by UART → use FREE pin
+        set(MIDI_TX_PIN 255) # GP21 taken by UART → use FREE pin
     else()
         set(PICO_DV_LOAD_WAV_PIO 20)
         set(MIDI_TX_PIN 21)
     endif()
     target_compile_definitions(${PROJECT_NAME} PRIVATE
-        DEBUG=0
-
         $<$<BOOL:${PICO_DV_DBG_UART}>:PICO_DEFAULT_UART=1>
         $<$<BOOL:${PICO_DV_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=20>
         $<$<BOOL:${PICO_DV_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=21>
@@ -488,9 +625,9 @@ ELSEIF(PICO_DV)
 
         PICO_DV=1
 
-        # DBG1 1/2
-        KBD_CLOCK_PIN=0
-        KBD_DATA_PIN=1
+        # PS/2 keyboard (moved from GP0/1 → GP14/15; GP0/1 freed for ZiFi UART0)
+        KBD_CLOCK_PIN=14
+        KBD_DATA_PIN=15
 
         LOAD_WAV_PIO=${PICO_DV_LOAD_WAV_PIO}
 
@@ -519,14 +656,14 @@ ELSEIF(PICO_DV)
         SDCARD_PIO=pio1
         SDCARD_PIO_SM=0
 
-        #PSRAM           # not implemented
-        PSRAM_SPINLOCK=1 # not implemented
-        PSRAM_ASYNC=1    # not implemented
+        #PSRAM             # not implemented
+        PSRAM_SPINLOCK=255 # not implemented
+        PSRAM_ASYNC=255    # not implemented
 
-        PSRAM_PIN_CS=3   # not implemented
-        PSRAM_PIN_SCK=3  # not implemented
-        PSRAM_PIN_MOSI=3 # not implemented
-        PSRAM_PIN_MISO=3 # not implemented
+        PSRAM_PIN_CS=255   # not implemented
+        PSRAM_PIN_SCK=255  # not implemented
+        PSRAM_PIN_MOSI=255 # not implemented
+        PSRAM_PIN_MISO=255 # not implemented
 
         # NES Gamepad
         NES_GPIO_CLK=8    # UXT1-6
@@ -544,14 +681,12 @@ ELSEIF(PICO_DV)
         PICO_DEFAULT_LED_PIN=25
 )
 ELSEIF(ZERO)
-    # Optional UART for Debug Probe. Set ZERO_DBG_UART=ON to enable UART0 on GP16(TX)/GP13(RX).
+    # Debug-Probe UART toggle ZERO_DBG_UART declared at top. Enables UART0 on GP16(TX)/GP13(RX).
     # Both pins are FREE on ZERO; UART0 used because UART1 has no free pins on this board.
-    set(ZERO_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on GP16/GP13 (ZERO)")
     if(ZERO_DBG_UART)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
     endif()
     target_compile_definitions(${PROJECT_NAME} PRIVATE
-        DEBUG=0
         $<$<BOOL:${ZERO_DBG_UART}>:PICO_DEFAULT_UART=0>
         $<$<BOOL:${ZERO_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=16>
         $<$<BOOL:${ZERO_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=13>
@@ -585,15 +720,14 @@ ELSEIF(ZERO)
         SDCARD_PIN_SPI0_MISO=20
         SDCARD_PIN_SPI0_CS=21
 
-     #   PSRAM
-        # PSRAM_MUTEX=1
-        PSRAM_SPINLOCK=1
-        PSRAM_ASYNC=1
+        #PSRAM             # not implemented
+        PSRAM_SPINLOCK=255 # not implemented
+        PSRAM_ASYNC=255    # not implemented
 
-        PSRAM_PIN_CS=2
-        PSRAM_PIN_SCK=3
-        PSRAM_PIN_MOSI=4
-        PSRAM_PIN_MISO=5
+        PSRAM_PIN_CS=255   # not implemented
+        PSRAM_PIN_SCK=255  # not implemented
+        PSRAM_PIN_MOSI=255 # not implemented
+        PSRAM_PIN_MISO=255 # not implemented
 
         # NES Gamepad
         USE_NESPAD
@@ -613,12 +747,11 @@ ELSEIF(ZERO)
         PICO_DEFAULT_LED_PIN=25
     )
 ELSEIF(ZERO2)
-    set(ZERO2_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO2)")
+    # Debug-Probe UART toggle ZERO2_DBG_UART declared at top (UART1 on GP20/GP21).
     if(ZERO2_DBG_UART)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
     endif()
     target_compile_definitions(${PROJECT_NAME} PRIVATE
-        DEBUG=0
         $<$<BOOL:${ZERO2_DBG_UART}>:PICO_DEFAULT_UART=1>
         $<$<BOOL:${ZERO2_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=20>
         $<$<BOOL:${ZERO2_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=21>
@@ -665,15 +798,14 @@ ELSEIF(ZERO2)
         SDCARD_PIN_SPI0_MISO=40
         SDCARD_PIN_SPI0_CS=43
 
-        # PSRAM
-        # PSRAM_MUTEX=1
-        PSRAM_SPINLOCK=0
-        PSRAM_ASYNC=1
+        #PSRAM             # not implemented
+        PSRAM_SPINLOCK=255 # not implemented
+        PSRAM_ASYNC=255    # not implemented
 
-        PSRAM_PIN_CS=0
-        PSRAM_PIN_SCK=0
-        PSRAM_PIN_MOSI=0
-        PSRAM_PIN_MISO=0
+        PSRAM_PIN_CS=255   # not implemented
+        PSRAM_PIN_SCK=255  # not implemented
+        PSRAM_PIN_MOSI=255 # not implemented
+        PSRAM_PIN_MISO=255 # not implemented
 
         # NES Gamepad
         USE_NESPAD
@@ -688,11 +820,12 @@ ELSEIF(ZERO2)
         # HDMI 8 pins starts from pin:
         HDMI_BASE_PIN=32
 
-        PICO_DEFAULT_LED_PIN=25
+        PICO_DEFAULT_LED_PIN=255
         DEFAULT_THROTTLING=0
     )
 ELSE()
-    set(MURM1_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1) — moves KBD to GP16/GP17, disables NESPAD")
+    # Debug-Probe UART toggle MURM1_DBG_UART declared at top (UART0 on GP0/GP1;
+    # moves KBD to GP16/GP17, disables NESPAD).
     if(MURM1_DBG_UART)
         pico_enable_stdio_uart(${PROJECT_NAME} 1)
         set(MURM1_KBD_CLOCK_PIN 16)
@@ -702,7 +835,6 @@ ELSE()
         set(MURM1_KBD_DATA_PIN  1)
     endif()
     target_compile_definitions(${PROJECT_NAME} PRIVATE
-        DEBUG=0
         $<$<BOOL:${MURM1_DBG_UART}>:PICO_DEFAULT_UART=0>
         $<$<BOOL:${MURM1_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=0>
         $<$<BOOL:${MURM1_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=1>
@@ -740,6 +872,13 @@ ELSE()
         # PSRAM_MUTEX=1
         PSRAM_SPINLOCK=1
         PSRAM_ASYNC=1
+
+        # SPI clock ceiling. At 126 MHz (default) sys_clk=378 gives clkdiv=1.5 —
+        # a fractional divider that makes SCK jitter and corrupts this board's
+        # APS6404 8 MB chip (~930 KB/1 MB bad at boot, size probe flaps 8M↔1M).
+        # 63 MHz forces clkdiv=3.0 (integer, clean waveform) — zero corruption.
+        # psram_update_clkdiv() keeps it at 63 MHz after CPU overclock too.
+        PSRAM_MAX_SCK_MHZ=63
 
         PSRAM_PIN_CS=18
         PSRAM_PIN_SCK=19
@@ -800,7 +939,11 @@ ELSE()
     SET(BUILD_NAME "${BUILD_NAME}-VGA-HDMI")
 ENDIF()
 
-SET(BUILD_NAME "${BUILD_NAME}-${CPU_MHZ}MHz-${PORT_VERSION}")
+SET(BUILD_NAME "${BUILD_NAME}-${PORT_VERSION}")
+
+IF (NOT NO_ALF)
+    SET(BUILD_NAME "${BUILD_NAME}-ALF")
+ENDIF()
 
 IF(m1p2launcher)
     IF(MURM2)

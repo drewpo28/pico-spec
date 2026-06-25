@@ -446,6 +446,7 @@ void Tape::TZX_Open(const string& name) {
     }
 
     tapeFileName = name;
+    Config::tape_file = FileUtils::TAP_Path + name; // remember slot, re-mounted after F11/reboot
 
     FIL* tape = &Tape::tape;
     fseek(tape, 2, SEEK_CUR); // Jump TZX version bytes
@@ -531,7 +532,7 @@ uint32_t Tape::CalcTZXBlockPos(int block) {
 void Tape::TZX_GetBlock() {
     int tapeData;
     short jumpDistance;
-    char cswFileName[16]; // Nombre del archivo descomprimido    
+    char cswFileName[32]; // Nombre del archivo descomprimido
     FIL* tape = &Tape::tape;
     for (;;) {
         if (tapeCurBlock >= tapeNumBlocks) {
@@ -740,7 +741,7 @@ void Tape::TZX_GetBlock() {
                     // printf(CONFIG_DIR "/.csw%04d.tmp\n",tapeCurBlock);
 
                     // Open csw file
-                    sprintf(cswFileName, "/tmp/.csw%04d.tmp",tapeCurBlock);
+                    snprintf(cswFileName, sizeof(cswFileName), "/tmp/.csw%04d.tmp", tapeCurBlock);
                     if (f_open(&cswBlock, cswFileName, FA_READ) != FR_OK) {
                         printf("Failed opening csw block!\n");
                         tapeCurBlock = 0;

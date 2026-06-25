@@ -54,8 +54,9 @@ visit https://zxespectrum.speccy.org/contacto
 int AySound::selected_chip = 0;
 
 AySound chip0(0);
-AySound chip1(1);
-AySound* chips[2] = { &chip0, &chip1 };
+// chip1 lives in heap; managed by TurboSubsys (see Subsystem.cpp).
+AySound* chip1 = nullptr;
+AySound* chips[2] = { &chip0, nullptr };
 
 /* sound chip volume envelops (will calculated by gen_env()) */
 // static int bEnvGenInit = 0;
@@ -501,7 +502,7 @@ void AySound::updIOPortA() {
     // Bit-bang UART decoder: zx-midiplayer uses reg 14 bit 2 as serial TX line
     // 0xFE = HIGH (bit2=1), 0xFA = LOW (bit2=0)
     // Frame: idle(H) → START(L) → D0..D7 (LSB first) → STOP(H)
-    if (Midi::enabled == 1 || Midi::enabled == 3) {
+    if (Midi::enabled == 1 || Midi::enabled == 3 || Midi::enabled == 4) {
         bool line = (regs[14] & 0x04) != 0; // bit 2
 
         if (midi_bitbang_pos == -1) {

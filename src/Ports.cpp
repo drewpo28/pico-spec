@@ -40,6 +40,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "CPU.h"
 #include "Config.h"
 #include "ESPectrum.h"
+#include "LEDIndicators.h"
 #include "MemESP.h"
 #include "Tape.h"
 #include "Video.h"
@@ -51,6 +52,11 @@ visit https://zxespectrum.speccy.org/contacto
 
 #include "OSDMain.h"
 
+#if !PICO_RP2040
+#include "../drivers/graphics/graphics.h"
+extern "C" const uint32_t profi_default_palette16[16];
+#endif
+
 #include "Midi.h"
 #include "Z80DMA.h"
 #ifdef USE_GS
@@ -58,10 +64,39 @@ visit https://zxespectrum.speccy.org/contacto
 #endif
 #if !PICO_RP2040
 #include "DivMMC.h"
+#include "IDE.h"
+#include "ZiFi.h"
+#include "RTC.h"
 #include "MB02.h"
 #include "hardware/gpio.h"
 #include "sdcard.h"
 #endif
+
+// Set to 1 to trace every 0x7FFD / 0xDFFD paging-port write (Profi debugging).
+// Off by default — these fire thousands of times during DS80/CP/M init.
+#ifndef PROFI_PORT_TRACE
+#define PROFI_PORT_TRACE 0
+#endif
+
+#if PROFI_PORT_TRACE
+// Pointers to the CURRENT display pages (updated whenever profi_clrmem/grmem change).
+// writebyte() compares ramCurrent[slot] against these to detect writes to display pages.
+uint8_t* ds80_dbg_clrmem = nullptr;  // display color-attribute page (56 or 58)
+uint8_t* ds80_dbg_grmem  = nullptr;  // display pixel page (4 or 6)
+int      ds80_dbg_wr_cnt = 0;        // reset each frame so we always capture first write
+
+// Helper so MemESP.h writebyte() can read the Z80 PC without pulling
+// in Z80_JLS/z80.h (which would create circular include chains via MemESP.h).
+uint16_t _ds80_dbg_get_pc(void) { return Z80::getRegPC(); }
+#endif
+
+// Per-frame port-call counters — read and reset in VIDEO::EndFrame diagnostic.
+uint32_t Ports::port7ffd_cnt  = 0;
+uint32_t Ports::portdffd_cnt  = 0;
+volatile uint32_t Ports::fdd_ports_us = 0;
+
+// IDE_PORT_TRACE (PROFI IDE/HDD port tracing) is defined by CMake (default 0).
+// Undefined → 0 in #if, so no fallback #define is needed here.
 
 // Place hot port functions in SRAM instead of XIP flash
 #undef IRAM_ATTR
@@ -82,33 +117,81 @@ visit https://zxespectrum.speccy.org/contacto
 // and adjusted for BEEPER_MAX_VOLUME = 97
 uint8_t Ports::speaker_values[8] = {0, 19, 34, 53, 97, 101, 130, 134};
 uint8_t Ports::port[128];
+uint8_t Ports::extPort[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 uint8_t Ports::port254 = 0;
+uint8_t Ports::sndriveLatch[6] = {0, 0, 0, 0, 0, 0};
 uint8_t Ports::portAFF7 = 0;
+uint8_t Ports::portDFFD = 0;
+uint8_t Ports::portEFF7 = 0;
 #if !PICO_RP2040
 Ports::PIT8253Channel Ports::pitChannels[3] = {};
 #endif
 
 uint8_t (*Ports::getFloatBusData)() = &Ports::getFloatBusData48;
 
+#if SND_PORT_TRACE
+uint32_t Ports::sndTraceWr[256];
+uint32_t Ports::sndTraceRd[256];
+uint8_t  Ports::sndTraceLastVal[256];
+// Not IRAM: called once per ~5 s from the main loop. Prints every port (by low
+// address byte) touched since the previous dump, then clears the histograms.
+void Ports::sndTraceDump() {
+    char buf[512];
+    int pos = snprintf(buf, sizeof(buf), "SNDTRC bank=%d rom=%d DFFD=%02X W:",
+                       (int)MemESP::bankLatch, (int)MemESP::romLatch, portDFFD);
+    for (int p = 0; p < 256; p++) {
+        if (!sndTraceWr[p]) continue;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, " %02X=%lu(%02X)",
+                        p, (unsigned long)sndTraceWr[p], sndTraceLastVal[p]);
+        sndTraceWr[p] = 0;
+        if (pos > (int)sizeof(buf) - 16) break;
+    }
+    Debug::log("%s\n", buf);
+    pos = snprintf(buf, sizeof(buf), "SNDTRC R:");
+    for (int p = 0; p < 256; p++) {
+        if (!sndTraceRd[p]) continue;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, " %02X=%lu",
+                        p, (unsigned long)sndTraceRd[p]);
+        sndTraceRd[p] = 0;
+        if (pos > (int)sizeof(buf) - 16) break;
+    }
+    Debug::log("%s\n", buf);
+}
+#endif
+
 IRAM_ATTR uint8_t Ports::getFloatBusData48() {
 
   unsigned int currentTstates = CPU::tstates;
 
   unsigned int line = (currentTstates / 224) - 64;
-  if (line >= 192)
+  if (line >= 192) {
+#if HALT2INT_TRACE
+    Debug::log("[FLOAT] ts=%u line=%d(off) -> 0xFF (lt=%u IntEnd=%d)",
+               currentTstates, (int)line, (unsigned)CPU::latetiming, (int)CPU::IntEnd);
+#endif
     return 0xFF;
+  }
 
   unsigned char halfpix = (currentTstates % 224) - 3;
-  if ((halfpix >= 125) || (halfpix & 0x04))
+  if ((halfpix >= 125) || (halfpix & 0x04)) {
+#if HALT2INT_TRACE
+    Debug::log("[FLOAT] ts=%u line=%u halfpix=%u -> 0xFF (lt=%u)",
+               currentTstates, line, (unsigned)halfpix, (unsigned)CPU::latetiming);
+#endif
     return 0xFF;
+  }
 
   int hpoffset = (halfpix >> 2) + ((halfpix >> 1) & 0x01);
-  ;
 
-  if (halfpix & 0x01)
-    return (VIDEO::grmem[VIDEO::offAtt[line] + hpoffset]);
-
-  return (VIDEO::grmem[VIDEO::offBmp[line] + hpoffset]);
+  uint8_t fbdata = (halfpix & 0x01)
+                       ? VIDEO::grmem[VIDEO::offAtt[line] + hpoffset]
+                       : VIDEO::grmem[VIDEO::offBmp[line] + hpoffset];
+#if HALT2INT_TRACE
+  Debug::log("[FLOAT] ts=%u line=%u halfpix=%u hpoff=%d %s byte=%02X (lt=%u)",
+             currentTstates, line, (unsigned)halfpix, hpoffset,
+             (halfpix & 0x01) ? "ATT" : "BMP", fbdata, (unsigned)CPU::latetiming);
+#endif
+  return fbdata;
 }
 
 IRAM_ATTR uint8_t Ports::getFloatBusData128() {
@@ -139,8 +222,11 @@ IRAM_ATTR void Ports::FDDStep(bool force) {
   CPU::tstates_diff += p_states - CPU::prev_tstates;
 
   if (force ||
-      ((ESPectrum::fdd.control & (kRVMWD177XHLD | kRVMWD177XHLT)) != 0))
+      ((ESPectrum::fdd.control & (kRVMWD177XHLD | kRVMWD177XHLT)) != 0)) {
+    uint64_t _t0 = time_us_64();
     rvmWD1793Step(&ESPectrum::fdd, CPU::tstates_diff / WD177XSTEPSTATES); // FDD
+    fdd_ports_us += (uint32_t)(time_us_64() - _t0);
+  }
 
   CPU::tstates_diff = CPU::tstates_diff % WD177XSTEPSTATES;
 
@@ -160,6 +246,19 @@ IRAM_ATTR static void FDDStep_MB02(bool force) {
 
 uint8_t nes_pad2_for_alf(void);
 static uint8_t newAlfBit = 0;
+static uint8_t profi_fdc_busy = 0;
+// Profi CP/M: detect DSKKE9A "CALL 0x40EA → JR 0x40D9" re-issue loop.
+// When drive has no disk, successive OUT(0x1F) commands are issued at CPU
+// speed via the re-issue loop. After a few re-issues we force-exit: walk
+// the Z80 stack to find the original return address (non-0x40DE frame) and
+// redirect execution there via EI+RET, avoiding stack overflow and crash.
+static int profi_nodisk_reissue_cnt = 0;
+// Tracks whether the last Profi CP/M FDC command was issued via the shifted
+// 0x83 port path (Dos5 5.30 driver) vs the standard 0x1F/0x3F path.
+// Used to decide what IN A,(0x3F) returns: INTRQ/DRQ status (shifted scheme)
+// vs track register (standard scheme). Set on CMD write via 0x83; cleared on
+// CMD write via normal path (address & 0xE3 == 0x03).
+static bool profi_shifted_fdc = false;
 
 extern int ram_pages, butter_pages, psram_pages, swap_pages;
 
@@ -173,13 +272,16 @@ inline static size_t extendedZxRamPages() {
     return 64;
   if (Z80Ops::is512)
     return 32;
-  if (Z80Ops::is128 || Z80Ops::isPentagon)
+  if (Z80Ops::is128 || (Z80Ops::isPentagon || Z80Ops::isProfi))
     return 8;
   return 4;
 }
 
 IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   uint8_t data;
+#if SND_PORT_TRACE
+  sndTraceRd[address & 0xFF]++;
+#endif
   if (Config::numPortReadBP > 0 && Config::hasBreakPoint(address, Config::BP_PORT_READ))
     CPU::portBasedBP = true;
   uint8_t rambank = address >> 14;
@@ -193,7 +295,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   } else {
     // // ULA ports (A0=0): ULA always applies contention during display area
     // // Non-ULA ports (A0=1): contention only if port address maps to contended memory
-    // bool earlyContend = ((address & 0x0001) == 0) ? !Z80Ops::isPentagon : MemESP::ramContended[rambank];
+    // bool earlyContend = ((address & 0x0001) == 0) ? !(Z80Ops::isPentagon || Z80Ops::isProfi) : MemESP::ramContended[rambank];
     // VIDEO::Draw(1, earlyContend); // I/O Contention (Early)
     // Early contention depends on ADDRESS (contended memory?), not port type
     // Wiki: ULA port non-contended addr = N:1,C:3; contended addr = C:1,C:3
@@ -202,11 +304,20 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   }
 
   if (MEM_PG_CNT > 64 && address == 0xAFF7) {
+    LED::touchR(LED::RAM);
     return portAFF7;
+  }
+  if (Config::arch == "Profi" && address == 0xDFFD) {
+    LED::touchR(LED::RAM);
+    return portDFFD;
   }
   bool ia = Z80Ops::isALF;
   uint8_t p8 = address & 0xFF;
-  if (Z80Ops::isPentagon) { // Hidden RAM (Pentagon 512/1024 only)
+  // Hidden RAM — Pentagon 512/1024 (and Profi) only. Plain Pentagon 128 must NOT
+  // react: stock software probes #xxFB (printer port) — e.g. BALLQ's loader does
+  // IN A,(#FB) at init — and remapping bank 0 to ram[MEM_PG_CNT+romLatch] sends
+  // every bank-0 access through SD-swap on no-PSRAM boards (FPS halves).
+  if ((Z80Ops::is512 || Z80Ops::is1024 || Z80Ops::isProfi)) {
     if (p8 == 0xFB) { // Hidden RAM on
       MemESP::newSRAM = true;
       MemESP::recoverPage0();
@@ -218,9 +329,30 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       return 0xFF;
     }
   }
+#if !PICO_RP2040
+  // IDE/HDD — NEMO scheme. Enabled on ANY machine when the user selects NEMO
+  // (the NEMO interface is a bus card, not machine-specific). Decoded BEFORE the
+  // ULA even-port branch because NEMO register ports (e.g. 0xC8/0xD0/0xF0) have
+  // A0=0 and would otherwise be swallowed by the ULA port handler. 16-bit data
+  // via A0 latch. Authentic NEMO is mapped outside TR-DOS; on Profi the SYSEN
+  // line keeps ESPectrum::trdos permanently asserted (not real TR-DOS paging),
+  // so the !trdos rule is bypassed there.
+  if (IDE::scheme == IDE::NEMO && !(address & 6) && (Z80Ops::isProfi || !ESPectrum::trdos)) {
+    if (address & 1) { LED::touchR(LED::IDE); return IDE::read_latch(); } // A0=1: high-byte latch
+    if ((address & 0x18) == 0x08 && (address & 0xE0) == 0xC0) {          // control / alt-status
+      LED::touchR(LED::IDE); return IDE::read8(8);
+    }
+    if ((address & 0x18) == 0x10) {                                      // register window
+      LED::touchR(LED::IDE);
+      uint8_t reg = (address >> 5) & 7;
+      return (reg == 0) ? IDE::read_data_low() : IDE::read8(reg);
+    }
+    // else: not an IDE sub-address — fall through (don't shadow AY/ULA etc.)
+  }
+#endif
   // ULA PORT
   if ((address & 0x0001) == 0) {
-    VIDEO::Draw(3, !Z80Ops::isPentagon); // I/O Contention (Late)
+    VIDEO::Draw(3, !(Z80Ops::isPentagon || Z80Ops::isProfi)); // I/O Contention (Late)
     if (ia && p8 == 0xFE) {
       data = nes_pad2_for_alf(); // default port value is 0xFF.
     } else {
@@ -230,7 +362,19 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         if ((portHigh & mask) != 0)
           data &= port[row];
       }
+#if !PICO_RP2040
+      // Profi extended keyboard: bit 5 of each standard row.
+      // portHigh bit i set → row i is selected → AND extPort[i] with bit 5 only.
+      // (other bits of extPort are kept 1 so they don't affect bits 0-4 of data)
+      if (Z80Ops::isProfi && Config::profi_ext_keys) {
+        for (int row = 0, mask = 0x01; row < 8; row++, mask <<= 1) {
+          if ((portHigh & mask) != 0)
+            data &= (extPort[row] | 0xDF); // mask: only bit 5 can be cleared
+        }
+      }
+#endif
     }
+    if (Tape::tapeStatus == TAPE_LOADING) LED::touchR(LED::TAPE);
     if (Tape::TapePortRead()) return data;
     // Turbo loaders at 0xFE00+ write to port254 to set border colors, which
     // on Issue2 hardware feeds bit3 back into EAR input (bit6), inverting
@@ -252,6 +396,34 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     }
   } else {
     ioContentionLate(MemESP::ramContended[rambank]);
+#if !PICO_RP2040
+    // ZiFi NIC port: A0..A7 == 0xEF, A8..A15 selects register (0x00..0xC7)
+    // 0xEFF7 (hi=0xEF > 0xC7) falls through to Pentagon mode16col handler below
+    if (Config::zifi_enabled && p8 == 0xEF) {
+      uint8_t zifi_hi = address >> 8;
+      if (zifi_hi <= 0xC7)
+        return ZiFi::read(zifi_hi);
+      if (zifi_hi >= 0xF8) // 16550 UART window (#F8EF..#FFEF) — raw-UART drivers
+        return ZiFi::uart16550Read(zifi_hi);
+    }
+    // MC146818 RTC data read (#BFF7) — Pentagon/Profi "Mr Gluk" TimeKeeper.
+    // Register index was latched via OUT (#DFF7). Port is RTC-specific on these
+    // machines, so no extra gating needed.
+    if (Config::rtc_enabled && (Z80Ops::isPentagon || Z80Ops::isProfi) && address == 0xBFF7) {
+      uint8_t rv = RTC::readData();
+#if RTC_PORT_TRACE
+      Debug::log("[RTC RD ] BFF7 sel=%02X -> %02X pc=%04X eff7=%02X",
+                 RTC::dbgSel(), rv, Z80::getRegPC(), Ports::portEFF7);
+#endif
+      return rv;
+    }
+#if RTC_PORT_TRACE
+    // Catch-all: any other IN with low byte 0xF7 (reveals a non-#BFF7 data port).
+    if ((Z80Ops::isPentagon || Z80Ops::isProfi) && (address & 0xFF) == 0xF7)
+      Debug::log("[RTC IN?] %04X pc=%04X eff7=%02X sel=%02X",
+                 address, Z80::getRegPC(), Ports::portEFF7, RTC::dbgSel());
+#endif
+#endif
 #ifndef NO_ALF
     if (ia && bitRead(p8, 7) == 0) {
       if (bitRead(p8, 1) == 0) { // 1D
@@ -266,6 +438,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
 #if !PICO_RP2040
     // ULA+ data port read
     if (Config::ulaplus && address == 0xFF3B) {
+      LED::touchR(LED::ULAPLUS);
       uint8_t reg = VIDEO::ulaplus_reg;
       if ((reg & 0xC0) == 0x00)
         return VIDEO::ulaplus_palette[reg & 0x3F];
@@ -293,6 +466,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     if (GS::enabled && !DivMMC::divide_mode) {
       uint8_t a8 = address & 0xFF;
       if (a8 == 0xB3 || a8 == 0xBB) {
+        LED::touchR(LED::GS);
         ioContentionLate(MemESP::ramContended[rambank]);
         return (a8 == 0xB3) ? GS::hostReadB3() : GS::hostReadBB();
       }
@@ -300,11 +474,13 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
 #endif
     // Timex SCLD port read (port 0x00FF) — skip when TR-DOS is active (port conflict)
     if (Config::timex_video && !ESPectrum::trdos && address == 0x00FF) {
+      LED::touchR(LED::TIMEX);
       ioContentionLate(MemESP::ramContended[rambank]);
       return VIDEO::timex_port_ff;
     }
     // Z80 DMA / zxnDMA port read: listen on both 0x0B and 0x6B
     if (Config::dma_mode && ((address & 0xFF) == 0x0B || (address & 0xFF) == 0x6B)) {
+      LED::touchR(LED::DMA);
       ioContentionLate(MemESP::ramContended[rambank]);
       return Z80DMA::readPort();
     }
@@ -320,10 +496,13 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         FDDStep_MB02(true); // force step — WD2797 needs step advancement for Seek/Restore
         ioContentionLate(MemESP::ramContended[rambank]);
         uint8_t r = (lo >> 5) & 3;
+        // Only count a real data-register read as access (reg 3); status polling
+        // (reg 0) happens continuously at idle and would keep the LED lit.
+        if (r == 3) LED::touchR(LED::FDD);
         uint8_t val = rvmWD1793Read(&ESPectrum::mb02_fdd, r);
         return val;
       }
-      if (lo == 0x13) { // Floppy status
+      if (lo == 0x13) { // Floppy status (poll — not counted as access)
         FDDStep_MB02(true);
         ioContentionLate(MemESP::ramContended[rambank]);
         return MB02::readPort13();
@@ -333,18 +512,22 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     if (DivMMC::enabled) {
       uint8_t lo = address & 0xFF;
       if (lo == 0xE3) {
+        LED::touchR(LED::SD);
         return (DivMMC::conmem ? 0x80 : 0) | (DivMMC::mapram ? 0x40 : 0) | DivMMC::bank;
       }
       if (DivMMC::divide_mode) {
         if ((lo & 0xE3) == 0xA3) {
+          LED::touchR(LED::SD);
           uint8_t reg = (lo >> 2) & 0x07;
           return DivMMC::ide_read(reg);
         }
       } else {
         if (lo == 0xEB) {
+          LED::touchR(LED::SD);
           return DivMMC::mmc_read();
         }
         if (lo == 0xE7) {
+          LED::touchR(LED::SD);
           return 0xFF;
         }
       }
@@ -352,69 +535,256 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
 
     if (DivMMC::zc_enabled) {
       uint8_t lo = address & 0xFF;
-      if (lo == 0x77) return DivMMC::zc_read_status();
-      if (lo == 0x57) return DivMMC::zc_read_data();
+      if (lo == 0x77) { LED::touchR(LED::ZCTRL); return DivMMC::zc_read_status(); }
+      if (lo == 0x57) { LED::touchR(LED::ZCTRL); return DivMMC::zc_read_data(); }
+    }
+
+    // IDE/HDD — PROFI scheme. Per Karabas-Pro/Profi manual "Порты IDE HDD (CF)":
+    //   read regs at #xxCB, write regs at #xxEB, system reg at #xxAB.
+    //   register selector = high byte A(10:8) = (address>>8)&7; #00CB = data low.
+    //   CS active when (CPM=1 & ROM14=1) OR (DOS=1 & ROM14=0).
+    //   CPM=(portDFFD&0x20), ROM14=MemESP::romLatch, DOS=ESPectrum::trdos.
+    // Profi IDE — per UnrealSpeccy io.cpp MM_PROFI modified-ports section:
+    //   Gate: (p7FFD & 0x10) && (pDFFD & 0x20) = ROM14=1 AND CPM=1 only.
+    //   Port decode: (p1 & 0x9F)==0x8B, then A6 selects CS1 vs CS3.
+    //   16-bit latch: #xxCB(A6=1,A5=0) → read_data()+latch_hi, return lo;
+    //                 #xxEB(A6=1,A5=1) → return latch_hi (HIGH byte).
+    if (IDE::scheme == IDE::PROFI && Config::arch == "Profi") {
+      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch;
+      if (cpm && rom14) {                               // same gate as UnrealSpeccy
+        uint8_t p1 = address & 0xFF;
+        uint8_t reg = (address >> 8) & 7;
+        if ((p1 & 0x9F) == 0x8B) {
+          if (p1 & 0x40) {                             // CS1 (A6=1): data/registers
+            LED::touchR(LED::IDE);
+            uint8_t rv;
+            if (p1 & 0x20)                             // A5=1 = #xxEB: HIGH byte latch
+              rv = IDE::read_latch();
+            else if (reg == 0)                         // A5=0 = #xxCB: low byte (16-bit data)
+              rv = IDE::read_data_low();
+            else
+              rv = IDE::read8(reg);
+#if IDE_PORT_TRACE
+            Debug::log("[IDE RD] pc=%04X port=%02X reg=%d val=%02X CS1",
+                       Z80::getRegPC(), (unsigned)p1, reg, rv);
+#endif
+            return rv;
+          }
+          // CS3 (A6=0) = #xxAB: ATA control block. reg6 → alternate status
+          // (mirror of the status register). MBOOTHDD reads/writes #06AB with A5=0,
+          // so do NOT gate on A5 here.
+          if (reg == 6) {
+            LED::touchR(LED::IDE);
+            uint8_t rv = IDE::read8(7);                  // altstatus == status
+#if IDE_PORT_TRACE
+            Debug::log("[IDE RD] pc=%04X port=%02X reg=%d val=%02X CS3-altstatus",
+                       Z80::getRegPC(), (unsigned)p1, reg, rv);
+#endif
+            return rv;
+          }
+#if IDE_PORT_TRACE
+          Debug::log("[IDE RD] pc=%04X port=%02X reg=%d CS3 (unhandled)",
+                     Z80::getRegPC(), (unsigned)p1, reg);
+#endif
+        }
+      }
     }
 #endif
 
     // Beta-128 ports: accessible when TR-DOS ROM is paged in,
-    // or when a raw-format disk (UDI/FDI) is inserted (copy-protected loaders
-    // access WD1793 ports from RAM with TR-DOS ROM paged out)
-    if (ESPectrum::trdos
+    // or when a raw-format disk (UDI/FDI/MBD/PRO) is inserted (copy-protected
+    // loaders + Profi CP/M access WD1793 ports from RAM with TR-DOS ROM paged out)
+    // Profi SYS ROM (romInUse=0) probes FDC during boot — use the stub below
+    // (no real disk attached) so the BIOS boot menu can proceed. But if ANY
+    // disk is mounted (TRD/SCL/FDI/UDI/MBD/Pro), route to real FDC so TR-DOS
+    // and CP/M boot disk detection works.
 #if !PICO_RP2040
-        || (ESPectrum::fdd.disk[ESPectrum::fdd.diskS] &&
-            (ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsUDIFile || ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsFDIFile))
+    bool has_raw_disk = ESPectrum::fdd.disk[ESPectrum::fdd.diskS] &&
+        (ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsUDIFile ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsFDIFile ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsMBDFile ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsTD0File ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsProFile);
+    // Any mounted disk — includes TRD/SCL which are not "raw" but still need
+    // real FDC routing so Profi SYS ROM disk probe succeeds.
+    bool has_any_disk = ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != nullptr;
+#else
+    bool has_raw_disk = false;
+    bool has_any_disk = false;
 #endif
-    ) {
+    // skip_real_fdc: bypass real WD1793 during Profi SYS ROM boot ONLY when
+    // no disk is mounted at all.  With any disk (TRD/SCL/FDI/...), let the
+    // real FDC handle it so the SYS ROM disk probe can succeed.
+    bool skip_real_fdc = (Config::arch == "Profi" && MemESP::romInUse == 0 && !has_any_disk);
+
+    // Profi CP/M mode: when the selected drive has no disk, FDC status reads
+    // must return NOT_READY | SEEK_ERROR (0x90) with BUSY=0.
+    //
+    // Without this, IN A,(0x1F) returns 0xFF (bus float — FDC input not handled),
+    // and the DSKKE9A busy-wait at 0x4043-0x4060 (IN A,(0x1F); RRCA; JR C loop)
+    // spins forever: the timeout at 0x4050 has been disabled by self-modifying code
+    // from a previous successful operation, so there is no exit.
+    //
+    // Returning 0x90 (BUSY=0, NOT_READY=1, SEEK_ERROR=1):
+    //   • bit 0 = 0  → RRCA carry = 0 → JR C not taken → busy-wait exits normally
+    //   • bit 4 = 1  → AND 0x10 ≠ 0  → error path at 0x40BD (SCF/RET carry=1)
+#if !PICO_RP2040
+    if (Config::arch == "Profi" && (portDFFD & 0x20) && !has_raw_disk &&
+        (address & 0xE3) == 0x03) {
+      return kRVMWD177XStatusNotReady | kRVMWD177XStatusSeek;
+    }
+#endif
+
+    if (!skip_real_fdc && (ESPectrum::trdos || has_raw_disk)) {
 
       uint8_t dat;
 
+      // Profi CP/M mode: FDC data registers shift to 0x83/0xA3/0xC3/0xE3
+      // UnrealSpeccy decode: (addr & 0x9F) == 0x83 → reg index = (addr >> 5) & 3
+      //   0x83 → reg0 (CMD/STATUS), 0xA3 → reg1 (TRACK),
+      //   0xC3 → reg2 (SECTOR),     0xE3 → reg3 (DATA)
+      // 0xBF & 0x9F == 0x9F ≠ 0x83, so SYS port 0xBF falls through to switch below.
+      // Profi CP/M shifted FDC: 0x83/0xA3/0xC3/0xE3 → WD1793 regs 0..3.
+      // The Karabas-Pro manual p.22 says this is gated by ROM14=0, but the
+      // Dos5 5.30 CP/M floppy driver (e.g. at 0x8625: OUT (0x3F)/OUT (0x83) cmd;
+      // IN (0x83) BUSY poll) accesses these ports with ROM14=1 too. Gating on
+      // ROM14=0 left IN (0x83) returning 0xFF (bus float) → BUSY bit stuck high
+      // → the Type-I busy-wait at 0x862B (IN A,(0x83); RRCA; JR C) spun forever.
+      // CPM=1 alone is the correct enable; 0xBF (SYS) is unaffected since
+      // 0xBF & 0x9F == 0x9F ≠ 0x83.
+      if (Config::arch == "Profi" && (portDFFD & 0x20) &&
+          ((address & 0x9F) == 0x83)) {
+        // Force FDC advancement (true = force, regardless of HLD/HLT motor state).
+        // The case 0xe3 SYS-register path uses FDDStep(true) for the same reason:
+        // IN A,(0x83) is polled in tight busy-wait loops at 0x8625/0x862B with no
+        // other code advancing the FDC, so we must force each step here.
+        FDDStep(true);
+        // Only the data register (reg 3) is real access; reg 0 is status polling.
+        if (((address >> 5) & 0x3) == 3) LED::touchR(LED::FDD);
+        return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
+      }
+
+      // Profi CP/M port 0x3F: per manual "Порты FDD", in the ROM14=1 & CPM=1
+      // (MBOOTHDD) scheme #3F is the WD93 SYS register (RQ93) — read returns the
+      // status (INTRQ bit7, DRQ bit6), used in the sector-read loop at 0x86A4
+      // (IN A,(0x3F); AND 0xC0; JP M → INI from 0xE3). In ROM14=0 (standard /
+      // BOOTFDD) #3F is the WD track register — handled by case 0x23 below.
+      // Gate matches the OUT(#3F) SYS write path: CPM=1 & ROM14=1.
+      if (Config::arch == "Profi" && (portDFFD & 0x20) && MemESP::romLatch &&
+          ((address & 0xFF) == 0x3F)) {
+        // SYS status poll — not counted as disk access.
+        FDDStep(true);
+        uint8_t v = 0;
+        if (ESPectrum::fdd.control & kRVMWD177XDRQ)                        v |= 0x40;
+        if (ESPectrum::fdd.control & (kRVMWD177XINTRQ | kRVMWD177XFINTRQ)) v |= 0x80;
+        return v;
+      }
+
       switch (address & 0xe3) {
       case 0x03:
+        // Port #1F is shared: WD1793 status register AND the standard Kempston
+        // joystick (decodes A5=0). With a raw disk mounted (e.g. TD0/Pro CP/M
+        // images stay mounted while a game runs), this FDC branch shadowed the
+        // Kempston read below and broke the joystick. Per Karabas-Pro manual
+        // p.24 the FDC owns #1F only when CPM=1 (DOS=0) — i.e. an active loader
+        // context: TR-DOS ROM paged in or Profi CP/M mode. Otherwise (a running
+        // game polling the joystick) let it fall through to the Kempston block.
+        if (Config::joystick == JOY_KEMPSTON && !ESPectrum::trdos &&
+            !(Config::arch == "Profi" && (portDFFD & 0x20)))
+          break;
+        // fallthrough — FDC owns #1F in loader/CP-M context
       case 0x23:
       case 0x43:
       case 0x63:
         FDDStep(false);
-
+        // Only count data-register reads (reg 3); reg 0 status polling runs
+        // continuously while TR-DOS is paged in and would pin the LED on.
+        if (((address >> 5) & 0x3) == 3) LED::touchR(LED::FDD);
         return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
 
-      case 0xe3: {
+      case 0xa3:
+        // Port #BF (address & 0xe3 == 0xa3) is the RQ93 SYS register only in
+        // ROM14=0 & CPM=1 (BOOTFDD). When ROM14=1 the SYS register moves to #3F
+        // (MBOOTHDD scheme, handled before this switch) and #BF is reassigned
+        // to extended periphery.
+        if (Config::arch != "Profi" || MemESP::romLatch)
+          break;
+        goto fdc_sys_status;
+      case 0xe3:
+        // Port #FF is the Beta128 SYS register ONLY when the TR-DOS ROM is
+        // paged in (real Beta128 decodes its FDC ports only while its ROM is
+        // active). With a raw disk merely mounted but TR-DOS not paged (e.g. a
+        // 48K program running with an FDI/UDI image still mounted), #FF must
+        // float — otherwise IN A,(0xFF) returns FDC status (~0x00) instead of
+        // the floating bus, breaking floating-bus reads (games + halt2int's
+        // Float test → "Unknown"). On Profi trdos is permanently asserted
+        // (SYSEN), so its SYS-register path is unaffected.
+        if (!ESPectrum::trdos)
+          break;
+        // Port #FF (and #FF-family) is the SYS register only in the standard
+        // scheme (CPM=0). In CP/M the SYS register is at #BF/#3F and the
+        // #FF-family belongs to extended periphery (IDE etc.) — see the write
+        // path. So do NOT return FDC status for these ports in CP/M mode.
+        if (Config::arch == "Profi" && (portDFFD & 0x20))
+          break;
+      fdc_sys_status: {
+        // SYS-register status read: bit 7 = INTRQ, bit 6 = DRQ (Beta-128
+        // ordering, verified on Profi 5.06 SYS-ROM at 0x07A4: `JP M`).
+        // Pure status poll — not counted as disk access (would pin the LED).
         FDDStep(true);
-
         uint8_t v = 0;
-        if (ESPectrum::fdd.control & kRVMWD177XDRQ)
-          v |= 0x40;
-        if (ESPectrum::fdd.control & (kRVMWD177XINTRQ | kRVMWD177XFINTRQ))
-          v |= 0x80;
+        if (ESPectrum::fdd.control & kRVMWD177XDRQ)                        v |= 0x40;
+        if (ESPectrum::fdd.control & (kRVMWD177XINTRQ | kRVMWD177XFINTRQ)) v |= 0x80;
         return v;
       }
       }
     }
 
     /// if (ESPectrum::ps2mouse && Config::mouse == 1)
-    {
+    // Karabas-Pro manual p.25-27: Kempston Mouse gate is "CPM=0" — in CP/M
+    // mode #xxDF ports are reassigned to extended periphery (e.g. RTC #DF).
+    if (!(Config::arch == "Profi" && (portDFFD & 0x20))) {
       if ((address & 0x05ff) == 0x01df) {
+        LED::touchR(LED::KEMPMOUSE);
         return (uint8_t)ESPectrum::mouseX;
       }
       if ((address & 0x05ff) == 0x05df) {
+        LED::touchR(LED::KEMPMOUSE);
         return (uint8_t)ESPectrum::mouseY;
       }
       if ((address & 0x05ff) == 0x00df) {
+        LED::touchR(LED::KEMPMOUSE);
         return 0xff & (ESPectrum::mouseButtonL ? 0xfd : 0xff) &
                (ESPectrum::mouseButtonR ? 0xfe : 0xff);
       }
     }
 
+    // Profi FDC stub: return WD1793 "no disk" sequence so boot ROM's FDC
+    // detection fails cleanly instead of hanging in its wait-for-BUSY loop.
+    // Stateful: returns 0x81 (BUSY|NOT_READY) once after an OUT command, then
+    // 0x90 (SEEK_ERROR|NOT_READY) — ROM sees error at 0x073D → gives up on FDC.
+    // Applies when SYS ROM is active (Profi BIOS probes FDC even with SYSEN).
+    if (Config::arch == "Profi" && MemESP::romInUse == 0 && (address & 0xE3) == 0x03) {
+      if (profi_fdc_busy) {
+        profi_fdc_busy = 0;
+        return 0x81; // BUSY|NOT_READY — exits ROM wait-for-busy at 0x0710
+      }
+      return 0x90; // SEEK_ERROR|NOT_READY — fails FDC presence check at 0x073D
+    }
+
     // Kempston Joystick
-    // Standard Kempston decodes A5=0 (so port 0x1F catches 0x00..0x1F).
-    // Non-standard kempstonPort values (0x37, 0x5F) use exact low-byte match.
-    if (Config::joystick == JOY_KEMPSTON) {
-      bool kempston_hit = (Config::kempstonPort == 0x1F)
-                              ? ((p8 & 0x20) == 0)
-                              : (p8 == Config::kempstonPort);
-      if (kempston_hit)
+    // Standard Kempston decodes A5=0 — always honored so games like Dizzy
+    // that read port 0x1F keep working even when an alternate kempstonPort
+    // (0x37, 0x5F) is selected for boards that also map joystick reads there.
+    // Karabas-Pro manual p.24: gate is "CPM=0 & DOS=0" — in CP/M mode the
+    // port #1F belongs to the FDC and Kempston must stay off the bus.
+    if (Config::joystick == JOY_KEMPSTON &&
+        !(Config::arch == "Profi" && (portDFFD & 0x20))) {
+      if (((p8 & 0x20) == 0) || (p8 == Config::kempstonPort)) {
+        LED::touchR(LED::KEMPJOY);
         return ia ? (port[Config::kempstonPort] ^ 0xA0)
                   : port[Config::kempstonPort];
+      }
     }
 
     // Fuller Joystick
@@ -424,15 +794,21 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // Sound (AY-3-8912)
     if (ESPectrum::AY_emu) {
       if ((address & 0xC002) == 0xC000) {
+        LED::touchR(LED::AY);
         if (ia) {
           return chips[AySound::selected_chip]->getRegisterData() | newAlfBit;
         }
         return chips[AySound::selected_chip]->getRegisterData();
       }
     }
-    if (!Z80Ops::isPentagon) {
+    if (!(Z80Ops::isPentagon || Z80Ops::isProfi)) {
+#if HALT2INT_TRACE
+      if (address == 0xFFFF)
+        Debug::log("[FLOAT-IN] addr=%04X ts=%u ia=%d", address, CPU::tstates, (int)ia);
+#endif
       data = getFloatBusData();
       if ((!Z80Ops::is48) && !Z80Ops::isALF && ((address & 0x8002) == 0)) {
+        LED::touchR(LED::RAM);
         // //  Solo en el modelo 128K, pero no en los +2/+2A/+3, si se lee el
         // puerto
         // //  0x7ffd, el valor leído es reescrito en el puerto 0x7ffd.
@@ -456,8 +832,15 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
           }
           if (MemESP::videoLatch != bitRead(data, 3)) {
             MemESP::videoLatch = bitRead(data, 3);
-            VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[7].direct()
-                                              : MemESP::ram[5].direct();
+            if (Config::arch == "Profi" && (portDFFD & 0x80)) {
+              VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[6].direct() : MemESP::ram[4].direct();
+              uint32_t clrPage = MemESP::videoLatch ? 58 : 56;
+              uint32_t totPages = ram_pages + butter_pages + psram_pages + swap_pages;
+              VIDEO::profi_clrmem = (clrPage < totPages) ? MemESP::ram[clrPage].direct() : nullptr;
+            } else {
+              VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
+              if (Config::arch == "Profi") VIDEO::profi_clrmem = nullptr;
+            }
             if (Config::gigascreen_onoff == 2) VIDEO::gigascreen_auto_countdown = 3;
 #if !PICO_RP2040
             if (VIDEO::mode16col_enabled) VIDEO::mode16colUpdatePlanes();
@@ -465,7 +848,11 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
           }
           MemESP::romLatch = bitRead(data, 4);
           if (!ESPectrum::trdos) {
-            MemESP::romInUse = MemESP::romLatch;
+            // Profi: 7FFD bit4 selects bank 2 (128K compat) vs bank 3 (SOS)
+            // — banks 0 (SYS) and 1 (TR-DOS) are reserved for SYSEN/DOSEN.
+            MemESP::romInUse = (Config::arch == "Profi")
+                ? (MemESP::romLatch ? 3 : 2)
+                : MemESP::romLatch;
             MemESP::recoverPage0();
           }
         }
@@ -475,11 +862,95 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   return data;
 }
 
+// Profi CP/M system (RQ93) register write: drive select, soft-reset, HLT/test,
+// side select (bit4: 1→side0, 0→side1) and density (bit5: ~DDEN). Shared by the
+// standard scheme (SYS at 0xBF/0xFF) and the Dos5 5.30 shifted scheme, where the
+// MBOOTHDD loader addresses the SYS register at 0x3F (not 0xBF). Without routing
+// 0x3F here it landed in the WD TRACK register (0x3F&0xe3==0x23), so the
+// side-select OUT(0x3F),0x1C was silently lost and fdd.side stuck → side-compare
+// rejected the catalog on track0/side0 → "FDD Read Error".
+static inline void profiFdcSysWrite(uint8_t data) {
+#if FDD_PORT_TRACE
+  Debug::log("[FDC SYS] data=%02X drv=%d reset=%d side(bit4)=%d dden=%d pc=%04X",
+             data, data & 3, (int)((data & 0x04) == 0),
+             (int)((data & 0x10) != 0), (int)((data & 0x20) == 0),
+             Z80::getRegPC());
+#endif
+  // Change active disk unit. Profi 5.06 has 2 physical drives, so drive bits
+  // wrap modulo 2 (ZXMAK2 WD1793.cs:227).
+  uint8_t new_drive = data & 0x3;
+  if (Config::arch == "Profi") new_drive &= 0x1;
+  if (ESPectrum::fdd.diskS != new_drive) {
+    ESPectrum::fdd.diskS = new_drive;
+    if (ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != NULL &&
+        ESPectrum::fdd.side &&
+        ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->sides == 1)
+      ESPectrum::fdd.side = 0;
+    ESPectrum::fdd.sclConverted = false;
+    // Fastmode is per-disk: re-evaluate it for the newly selected drive so a
+    // raw image in one slot doesn't force a standard disk in another to slow.
+    rvmWD1793UpdateFastmode(&ESPectrum::fdd);
+  }
+
+  if (!(data & 0x4)) {
+    rvmWD1793Reset(&ESPectrum::fdd);
+    profi_nodisk_reissue_cnt = 0;
+    profi_shifted_fdc = false;
+  }
+
+  if (data & 0x8)
+    ESPectrum::fdd.control |= kRVMWD177XTest;
+  else
+    ESPectrum::fdd.control &= ~kRVMWD177XTest;
+
+  if (data & 0x10)
+    ESPectrum::fdd.side = 0;
+  else {
+    if (ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != NULL)
+      ESPectrum::fdd.side =
+          ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->sides == 1 ? 0 : 1;
+    else
+      ESPectrum::fdd.side = 1;
+  }
+
+  // RQ93 bit 5: ~DDEN (0=MFM double density, 1=FM single density)
+  if (data & 0x20)
+    ESPectrum::fdd.control &= ~kRVMWD177XDDEN;
+  else
+    ESPectrum::fdd.control |= kRVMWD177XDDEN;
+}
+
 IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   int Audiobit;
+#if SND_PORT_TRACE
+  sndTraceWr[address & 0xFF]++;
+  sndTraceLastVal[address & 0xFF] = data;
+#endif
   if (Config::numPortWriteBP > 0 && Config::hasBreakPoint(address, Config::BP_PORT_WRITE))
     CPU::portBasedBP = true;
   uint8_t rambank = address >> 14;
+#if !PICO_RP2040
+  // Profi dynamic palette: per ZXMAK2 UlaProfi5XX.WritePortFE,
+  // any OUT with (address & 0x0081) == 0 (port low byte even AND bit 7 = 0)
+  // and DS80 active (CMR1/DFFD bit 7) triggers palette write:
+  //   index = (port254 XOR 0x0F) & 0x0F
+  //   color = ~(address >> 8), decoded as Gg0Rr0Bb (2-2-2 with gaps).
+  if (Config::arch == "Profi" && (address & 0x0081) == 0 && (portDFFD & 0x80)) {
+    uint8_t index = (port254 ^ 0x0F) & 0x0F;
+    uint8_t color = ~(uint8_t)(address >> 8);
+    static int s_pal_log_cnt = 0;
+    if (s_pal_log_cnt < 48) {
+      s_pal_log_cnt++;
+      // Decode same way as profi_color_to_rgb888 (2:2:2 GG_RR_BB layout).
+      uint8_t R = ((color >> 3) & 3) * 85;
+      uint8_t G = ((color >> 6) & 3) * 85;
+      uint8_t B = (color & 3) * 85;
+      // Debug::log("[PAL] idx=%2d byte=0x%02X RGB=#%02X%02X%02X (addr=0x%04X port254=0x%02X pc=0x%04X)",
+      //            index, color, R, G, B, address, port254, Z80::getRegPC());
+    }
+    VIDEO::profiPaletteWrite(index, color);
+  }
+#endif
 
   if (Z80Ops::isByte && address >= 0xC000) {
     // вместо VIDEO::Draw(1, MemESP::ramContended[rambank]);
@@ -496,7 +967,36 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   uint8_t a8 = (address & 0xFF);
   p_states = CPU::tstates;
 
+#if !PICO_RP2040
+  // ZiFi NIC port: A0..A7 == 0xEF, A8..A15 selects register (0x00..0xC7)
+  // 0xEFF7 (hi=0xEF > 0xC7) falls through to Pentagon mode16col handler below
+  if (Config::zifi_enabled && a8 == 0xEF) {
+    uint8_t zifi_hi = address >> 8;
+    if (zifi_hi <= 0xC7) {
+      ZiFi::write(zifi_hi, data);
+      return;
+    }
+    if (zifi_hi >= 0xF8) { // 16550 UART window (#F8EF..#FFEF) — raw-UART drivers
+      ZiFi::uart16550Write(zifi_hi, data);
+      return;
+    }
+  }
+  // MC146818 RTC (Pentagon/Profi "Mr Gluk" TimeKeeper):
+  //   OUT (#DFF7), reg  → latch register index
+  //   OUT (#BFF7), data → write selected register
+  if (Config::rtc_enabled && (Z80Ops::isPentagon || Z80Ops::isProfi)) {
+#if RTC_PORT_TRACE
+    if (a8 == 0xF7)
+      Debug::log("[RTC OUT] %04X <- %02X pc=%04X eff7=%02X",
+                 address, data, Z80::getRegPC(), Ports::portEFF7);
+#endif
+    if (address == 0xDFF7) { RTC::selectReg(data); return; }
+    if (address == 0xBFF7) { RTC::writeData(data); return; }
+  }
+#endif
+
   if (address == 0xAFF7) {
+    LED::touchW(LED::RAM);
     uint8_t prev = portAFF7;
     uint8_t d6 = data & 0b00111111; // limit it for 64 planes
     if (prev != d6) {
@@ -509,20 +1009,165 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
           MemESP::bankLatch = page;
           MemESP::ramCurrent[3] = MemESP::ram[page].sync(3);
           MemESP::ramContended[3] =
-              Z80Ops::isPentagon ? false : (page & 0x01 ? true : false);
+              (Z80Ops::isPentagon || Z80Ops::isProfi) ? false : (page & 0x01 ? true : false);
         }
       }
     }
   }
 
+  // Profi extended paging port 0xDFFD
+  // bits [2:0]: upper RAM page group (combined with 0x7FFD bits[2:0] → 8 groups × 8 pages)
+  // bit [4]: map bank0 to RAM page 0 (else ROM)
+  // bit [5]: DOS ports / TR-DOS enable (handled by existing TR-DOS mechanism)
+  // bit [6]: map bank2 to page 6
+  // bit [7]: hires video mode — screen at RAM page 4/6 instead of 5/7
+  if (Config::arch == "Profi" && address == 0xDFFD) {
+    ++Ports::portdffd_cnt;
+    LED::touchW(LED::RAM);
+    // Per ZXMAK2 MemoryProfi1024: DFFD writes are NOT gated by paging lock.
+    // norom (bit 4) clears lock unconditionally.
+    {
+      uint8_t prev_page0ram = MemESP::page0ram;
+#if PROFI_PORT_TRACE
+      static uint8_t prev_dffd = 0xFE;
+      if (prev_dffd != data) {
+        Debug::log("[DFFD] new=0x%02X DS80=%d CPM=%d NOROM=%d SCO=%d SCR=%d page2..0=%d pc=0x%04X rom14=%d trdos=%d",
+                   data, (data >> 7) & 1, (data >> 5) & 1, (data >> 4) & 1,
+                   (data >> 3) & 1, (data >> 6) & 1, data & 7, Z80::getRegPC(),
+                   (int)MemESP::romLatch, (int)ESPectrum::trdos);
+        prev_dffd = data;
+      }
+#endif
+      portDFFD = data;
+      MemESP::page0ram = bitRead(data, 4);
+      if (MemESP::page0ram) MemESP::pagingLock = false; // norom → unlock
+      if (MemESP::page0ram != prev_page0ram)
+        MemESP::recoverPage0();
+      // SCR (bit6): bank2 → page6 (else page2)
+      uint8_t bank2_page = bitRead(data, 6) ? 6 : 2;
+      MemESP::ramCurrent[2] = MemESP::ram[bank2_page].sync(2);
+      // Re-apply bankLatch with new extended group offset
+      uint32_t page = (MemESP::bankLatch & 0x7) + ((data & 0x7) << 3);
+      uint32_t pages = ram_pages + butter_pages + psram_pages + swap_pages;
+      if (page < pages) {
+        MemESP::bankLatch = page;
+        MemESP::ramContended[3] = false;
+      }
+      // SCO (bit3): per ZXMAK2 UpdateMapping —
+      //   sco=0: MapRead4000 = RAM[5];       MapReadC000 = RAM[ramPage]  ← std 128K
+      //   sco=1: MapRead4000 = RAM[ramPage];  MapReadC000 = RAM[7]       ← Profi extended
+      if (bitRead(data, 3)) {
+        MemESP::ramCurrent[1] = MemESP::ram[MemESP::bankLatch].sync(1);
+        MemESP::ramCurrent[3] = MemESP::ram[7].sync(3);
+      } else {
+        MemESP::ramCurrent[1] = MemESP::ram[5].direct();
+        MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(3);
+      }
+#if PROFI_PORT_TRACE
+      // Log when a DS80 video page (4/6/56/58) is mapped into the Z80 address space.
+      {
+        uint32_t bl = MemESP::bankLatch;
+        if (bl == 4 || bl == 6 || bl == 56 || bl == 58) {
+          bool vl = MemESP::videoLatch;
+          bool sco = bitRead(data, 3);
+          // slot: SCO=1 → bankLatch at 0x4000 (slot1); SCO=0 → bankLatch at 0xC000 (slot3)
+          char slot = sco ? '1' : '3';
+          // Is this the DISPLAY page (currently being rendered from)?
+          bool disp = (!vl && (bl == 4 || bl == 56)) || (vl && (bl == 6 || bl == 58));
+          Debug::log("[DFFD] bl=%u slot%c vl=%u %s PC=%04X",
+              bl, slot, vl, disp ? "DISPLAY-PAGE!" : "write-buf", Z80::getRegPC());
+        }
+      }
+#endif
+      // bit7: hires mode switches screen pages 5/7 → 4/6; color attrs from pages 58/56
+      if (data & 0x80) {
+        VIDEO::grmem     = MemESP::videoLatch ? MemESP::ram[6].direct()  : MemESP::ram[4].direct();
+        uint32_t clrPage = MemESP::videoLatch ? 58 : 56;
+        uint32_t totPages = ram_pages + butter_pages + psram_pages + swap_pages;
+        VIDEO::profi_clrmem = (clrPage < totPages) ? MemESP::ram[clrPage].direct() : nullptr;
+        // Debug::log("[DFFD] DS80 on: clrPage=%u tot=%u clrmem=%p grmem=%p", clrPage, totPages, VIDEO::profi_clrmem, VIDEO::grmem);
 #if !PICO_RP2040
-  // Port #EFF7 D0 enables Pentagon 16col video mode (Alone Coder).
-  // Other bits historically reserved (D1=hardware multicolor stub, etc.) — ignored.
-  if (Z80Ops::isPentagon && Config::mode16col_onoff && address == 0xEFF7) {
-    bool want = (data & 0x01) != 0;
-    if (want != VIDEO::mode16col_enabled) {
-      VIDEO::mode16col_enabled = want;
-      if (want) VIDEO::mode16colUpdatePlanes();
+        // DEFERRED: hdmi_set_profi_ds80_mode() writes conv_color[] which the HDMI
+        // DMA reads in real time.  Calling it here (Z80 loop, core0, active scan)
+        // races the DMA on core1 → TMDS corruption → picture disappears.
+        // Set a flag; EndFrame() (always at vblank) will apply it safely.
+        // Guard: only set pending if neither mode is already active/pending.
+        extern volatile bool profi_ds80_active;
+        if (!profi_ds80_active && !VIDEO::profi_ds80_activate_pending) {
+            VIDEO::profi_ds80_deactivate_pending = false; // cancel any pending off
+            VIDEO::profi_ds80_activate_pending   = true;
+        } else if (profi_ds80_active) {
+            // DS80 already active — cancel any spurious deactivation queued by a
+            // preceding bit7=0 write in the same Z80 frame (e.g. sea-viewer does
+            // OUT (#FD),0x00  ; "reset" portDFFD before reprogramming banks
+            // OUT (#FD),0x80  ; re-enable DS80
+            // Without this cancel, EndFrame would see deactivate_pending=true and
+            // tear down DS80 for one frame → black flash / flicker.
+            if (VIDEO::profi_ds80_deactivate_pending) {
+                VIDEO::profi_ds80_deactivate_pending = false;
+            }
+        }
+        VIDEO::updateBorderBrd();
+#endif
+      } else {
+        VIDEO::grmem        = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
+        VIDEO::profi_clrmem = nullptr;
+#if !PICO_RP2040
+        // DEFERRED: same race condition — defer deactivation to EndFrame vblank.
+        extern volatile bool profi_ds80_active;
+        bool exiting_ds80 = profi_ds80_active || VIDEO::profi_ds80_activate_pending;
+        if (exiting_ds80) {
+            VIDEO::profi_ds80_activate_pending   = false; // cancel any pending on
+            VIDEO::profi_ds80_deactivate_pending = true;
+            // Reset border to white (standard ZX boot default) when leaving DS80
+            VIDEO::borderColor = 7;
+        }
+        VIDEO::updateBorderBrd();
+        // Fill framebuffer with BLACK (0) when leaving DS80.
+        //
+        // Why not WHITE (7)?  The deferred deactivation flag (profi_ds80_deactivate_pending)
+        // means HDMI ISR is STILL in DS80 mode when this fill runs — EndFrame hasn't
+        // processed the flag yet.  In DS80 mode, byte 7 = slot profi_pair_lookup[0][7]
+        // = pair(black, white) → alternating pixels → fine vertical gray stripes on the
+        // border areas (bytes 0..pad_l-1 and pad_l+256..xres-1 are NOT overwritten by the
+        // DS80 scan-time renderer, so they stay at 7 until EndFrame clears them).
+        //
+        // Byte 0 is safe in both modes:
+        //   DS80:     slot 0 = pair(0,0) = black/black → solid black ✓
+        //   Standard: palette index 0 = BLACK ✓
+        // The border scanner fires after EndFrame deactivates DS80 and writes the correct
+        // border color (white/default), so the first full standard frame looks correct.
+        if (exiting_ds80 && VIDEO::vga.frameBuffer) {
+          for (int y = 0; y < (int)VIDEO::vga.yres; y++)
+            if (VIDEO::vga.frameBuffer[y]) memset(VIDEO::vga.frameBuffer[y], 0, VIDEO::vga.xres);
+        }
+#endif
+      }
+    }
+  }
+
+#if !PICO_RP2040
+  // Port #EFF7 — extended-feature register (per UnrealSpeccy emul.h):
+  //   D0 (0x01) = EFF7_4BPP      — 4-bit-per-pixel mode
+  //   D1 (0x02) = EFF7_512       — 512-pixel hires mode (Profi CP/M)
+  //   D2 (0x04) = EFF7_LOCKMEM
+  //   D3 (0x08) = EFF7_ROCACHE
+  //   D4 (0x10) = EFF7_GIGASCREEN
+  //   D5 (0x20) = EFF7_HWMC      — hardware multicolor
+  //   D6 (0x40) = EFF7_384       — 384-line video
+  //   D7 (0x80) = EFF7_CMOS      — CMOS RTC enable
+  if ((Z80Ops::isPentagon || Z80Ops::isProfi) && address == 0xEFF7) {
+    // Debug::log("[EFF7] pc=0x%04X data=0x%02X (4BPP=%d 512=%d LOCK=%d GIGA=%d HWMC=%d CMOS=%d)",
+    //            Z80::getRegPC(), data, !!(data & 0x01), !!(data & 0x02), !!(data & 0x04),
+    //            !!(data & 0x10), !!(data & 0x20), !!(data & 0x80));
+    portEFF7 = data;
+    // Pentagon 16col — keep existing bit 0 behaviour (legacy mode_16col_onoff)
+    if (Config::mode16col_onoff) {
+      bool want = (data & 0x01) != 0;
+      if (want != VIDEO::mode16col_enabled) {
+        VIDEO::mode16col_enabled = want;
+        if (want) VIDEO::mode16colUpdatePlanes();
+      }
     }
   }
 #endif
@@ -555,13 +1200,33 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     }
   }
 #endif
+#if !PICO_RP2040
+  // IDE/HDD — NEMO scheme. Enabled on ANY machine when the user selects NEMO
+  // (bus card, not machine-specific). Decoded BEFORE the ULA even-port branch
+  // (NEMO register ports have A0=0). 16-bit data via A0 latch. On Profi the
+  // SYSEN line keeps ESPectrum::trdos permanently asserted, so the !trdos rule
+  // (authentic NEMO is outside TR-DOS) is bypassed there.
+  if (IDE::scheme == IDE::NEMO && !(address & 6) && (Z80Ops::isProfi || !ESPectrum::trdos)) {
+    if (address & 1) { LED::touchW(LED::IDE); IDE::write_latch(data); return; } // A0=1: high latch
+    if ((address & 0x18) == 0x08 && (address & 0xE0) == 0xC0) {                // control
+      LED::touchW(LED::IDE); IDE::write8(8, data); return;
+    }
+    if ((address & 0x18) == 0x10) {                                           // register window
+      LED::touchW(LED::IDE);
+      uint8_t reg = (address >> 5) & 7;
+      if (reg == 0) IDE::write_data_low(data); else IDE::write8(reg, data);
+      return;
+    }
+    // else: not an IDE sub-address — fall through (don't shadow AY/ULA etc.)
+  }
+#endif
   // ULA =======================================================================
   if ((address & 0x0001) == 0) {
     port254 = data;
     // Border color
     if (VIDEO::borderColor != data) {
       VIDEO::brdChange = true;
-      if (!Z80Ops::isPentagon)
+      if (!(Z80Ops::isPentagon || Z80Ops::isProfi))
         // VIDEO::Draw(0, false); // Flush video rendering without adding contention
         VIDEO::Draw(0, true); // Apply contention to align border change with ULA character cell
       VIDEO::DrawBorder();
@@ -571,7 +1236,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         VIDEO::ulaPlusUpdateBorder();
       else
 #endif
-        VIDEO::brd = VIDEO::border32[VIDEO::borderColor];
+        VIDEO::updateBorderBrd();
     }
     if (Config::tape_player)
       Audiobit = Tape::tapeEarBit ? 255 : 0; // For tape player mode
@@ -582,17 +1247,19 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     if (Audiobit != ESPectrum::lastaudioBit) {
       ESPectrum::BeeperGetSample();
       ESPectrum::lastaudioBit = Audiobit;
+      LED::touchW(LED::BEEPER);
     }
     // AY
     // ========================================================================
     if ((ESPectrum::AY_emu) && ((address & 0x8002) == 0x8000)) {
+      LED::touchW(LED::AY);
       if ((address & 0x4000) != 0) {
         chips[AySound::selected_chip]->selectRegister(data);
       } else {
         if (Tape::tapeStatus != TAPE_LOADING) ESPectrum::AYGetSample();
         chips[AySound::selected_chip]->setRegisterData(data);
       }
-      VIDEO::Draw(3, !Z80Ops::isPentagon); // I/O Contention (Late)
+      VIDEO::Draw(3, !(Z80Ops::isPentagon || Z80Ops::isProfi)); // I/O Contention (Late)
       return;
     }
 #if !PICO_RP2040
@@ -626,17 +1293,19 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       }
     }
 #endif
-    VIDEO::Draw(3, !Z80Ops::isPentagon); // I/O Contention (Late)
+    VIDEO::Draw(3, !(Z80Ops::isPentagon || Z80Ops::isProfi)); // I/O Contention (Late)
   } else {
 #if !PICO_RP2040
     // ULA+ ports (odd addresses: 0xBF3B register select, 0xFF3B data)
     if (Config::ulaplus) {
       if (address == 0xBF3B) {
+        LED::touchW(LED::ULAPLUS);
         VIDEO::ulaplus_reg = data;
         ioContentionLate(MemESP::ramContended[rambank]);
         return;
       }
       if (address == 0xFF3B) {
+        LED::touchW(LED::ULAPLUS);
         uint8_t reg = VIDEO::ulaplus_reg;
         if ((reg & 0xC0) == 0x00) {
           // Palette group write
@@ -652,7 +1321,9 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
           if (new_on && !VIDEO::ulaplus_enabled) {
             VIDEO::ulaplus_enabled = true;
             VIDEO::flashing = 0;
-            VIDEO::regenerateUlaPlusAluBytes();
+            // Defer heavy AluByte/palette rebuild to EndFrame so it runs during
+            // HDMI blanking and not from inside Z80 port-write context
+            VIDEO::ulaplus_alubytes_dirty = true;
             VIDEO::ulaPlusUpdateBorder();
           } else if (!new_on && VIDEO::ulaplus_enabled) {
             VIDEO::ulaPlusDisable();
@@ -663,10 +1334,51 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       }
     }
 #endif
+    // Covox #FB: on real Profi this is an external DAC decoding only A7:0=#FB,
+    // NOT gated by CPM — Profi CP/M games (Single Warrior) stream samples to #FB
+    // with DFFD bit5 set. (Karabas-Pro gates its internal Covox by DOS=0&CPM=0,
+    // but that manual doesn't apply to Profi.)
     int covox = Config::covox;
     if ((covox == 1 && a8 == 0xFB) || (covox == 2 && a8 == 0xDD)) {
+      LED::touchW(LED::COVOX);
       ESPectrum::lastCovoxVal = data;
+      ESPectrum::lastCovoxValR = data;
       ESPectrum::CovoxGetSample();
+    }
+    // SounDrive: five 8-bit DAC latches — #0F/#1F/#3F mix left, #4F/#5F right,
+    // #FB both (Karabas-Pro manual p.36). Config::soundrive: 1=On, 2=Auto
+    // (Profi only). The ports are shared with the WD1793: real hardware gates
+    // SounDrive CS by DOS=0, and Profi CP/M periphery mode (DFFD bit5) decodes
+    // the FDC there too — so the ports act as DACs only outside both modes.
+    // Single Warrior loads its disk with CPM=1, then streams 7.6 kHz menu PCM
+    // to #3F/#5F with CPM=0 and trdos=0. Stereo: left/right latch groups go to
+    // the L/R covox buffers; return so the writes never reach the FDC block
+    // (out_has_raw_disk would route them to WD1793 regs).
+    else if ((Config::soundrive == 1 ||
+              (Config::soundrive == 2 && Z80Ops::isProfi)) &&
+             !ESPectrum::trdos && !(Z80Ops::isProfi && (portDFFD & 0x20))) {
+      int8_t slot = -1;
+      switch (a8) {
+        case 0x0F: slot = 0; break;
+        case 0x1F: slot = 1; break;
+        case 0x3F: slot = 2; break;
+        case 0x4F: slot = 3; break;
+        case 0x5F: slot = 4; break;
+        case 0xFB: slot = 5; break;
+      }
+      if (slot >= 0) {
+        sndriveLatch[slot] = data;
+        int l = sndriveLatch[0] + sndriveLatch[1] + sndriveLatch[2] + sndriveLatch[5];
+        int r = sndriveLatch[3] + sndriveLatch[4] + sndriveLatch[5];
+        if (l > 255) l = 255;
+        if (r > 255) r = 255;
+        LED::touchW(LED::COVOX);
+        ESPectrum::lastCovoxVal = l;
+        ESPectrum::lastCovoxValR = r;
+        ESPectrum::CovoxGetSample();
+        ioContentionLate(MemESP::ramContended[rambank]);
+        return;
+      }
     }
 #if !PICO_RP2040
     // ShamaZX MIDI Interface (SAM2695)
@@ -680,6 +1392,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // General Sound — host-side data/command ports
     if (GS::enabled && !DivMMC::divide_mode) {
       if (a8 == 0xB3 || a8 == 0xBB) {
+        LED::touchW(LED::GS);
         if (a8 == 0xB3) GS::hostWriteB3(data);
         else            GS::hostWriteBB(data);
         ioContentionLate(MemESP::ramContended[rambank]);
@@ -689,6 +1402,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
 #endif
     // Z80 DMA / zxnDMA port write: listen on both 0x0B and 0x6B
     if (Config::dma_mode && (a8 == 0x0B || a8 == 0x6B)) {
+      LED::touchW(LED::DMA);
       Z80DMA::writePort(data);
       ioContentionLate(MemESP::ramContended[rambank]);
       return;
@@ -696,6 +1410,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // Timex SCLD video mode register (port 0x00FF, bit 8 clear)
     // Skip when TR-DOS is active — port 0xFF is the Beta-128 system register
     if (Config::timex_video && !ESPectrum::trdos && a8 == 0xFF && !(address & 0x0100)) {
+      LED::touchW(LED::TIMEX);
       VIDEO::timex_port_ff = data & 0x3F;
       VIDEO::timex_mode = data & 0x07;
       VIDEO::timex_hires_ink = (data >> 3) & 0x07;
@@ -705,18 +1420,22 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // SAA1099 Sound Chip
     // Ports: 0x00FF/0x01FF (original), 0x04FF/0x05FF (Light/Middle revisions)
     //        0x00FE/0x01FE (FPGA48all.tap and some other programs use a8=0xFE)
-    // Accessible only when TR-DOS ROM is NOT mapped (DOS/ = 1)
-    if (ESPectrum::SAA_emu && !ESPectrum::trdos && (a8 == 0xFF)) {
+    // Accessible only when TR-DOS ROM is NOT mapped (DOS/ = 1).
+    // Karabas-Pro manual: gate is "DOS=0" — for Profi this is the extended
+    // periphery mode (CPM=1 AND ROM14=1). Other archs keep the TR-DOS gate.
+    if (ESPectrum::SAA_emu && saaChip && !ESPectrum::trdos && (a8 == 0xFF) &&
+        !(Config::arch == "Profi" && (portDFFD & 0x20) && MemESP::romLatch)) {
+      LED::touchW(LED::SAA);
       if (address & 0x0100) {
         // Register select (bit 8 set): 0x01FF, 0x05FF, etc.
         // Generate samples before selectRegister — it advances external envelope clock
         if (Tape::tapeStatus != TAPE_LOADING) ESPectrum::SAAGetSample();
-        saaChip.selectRegister(data);
+        saaChip->selectRegister(data);
         return;
       } else {
         // Data write (bit 8 clear): 0x00FF, 0x04FF, etc.
         if (Tape::tapeStatus != TAPE_LOADING) ESPectrum::SAAGetSample();
-        saaChip.setRegisterData(data);
+        saaChip->setRegisterData(data);
         return;
       }
     }
@@ -733,6 +1452,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       }
     }
     if ((ESPectrum::AY_emu) && ((address & 0x8002) == 0x8000)) {
+      LED::touchW(LED::AY);
       if (a8 == 0xFF) { // Old TS way
         AySound::selected_chip = 0;
       } else if (a8 == 0xFE && Config::turbosound > 1) {
@@ -753,6 +1473,10 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       if ((lo & 0x9F) == 0x0F) { // WD2797 registers
         FDDStep_MB02(false);
         uint8_t reg = (lo >> 5) & 3;
+        // Red = real data written to disk: only the data register (reg 3).
+        // Command (reg 0 = seek/read/write/force-int) and track/sector setup
+        // (reg 1/2) are not transfers — counting them turned every read yellow.
+        if (reg == 3) LED::touchW(LED::FDD);
         rvmWD1793Write(&ESPectrum::mb02_fdd, reg, data);
         // If command register written and DMA transfer is pending, execute it now.
         // On real hardware DMA waits for DRQ from FDC; here we run the whole
@@ -763,11 +1487,11 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         ioContentionLate(MemESP::ramContended[rambank]);
         return;
       }
-      if (lo == 0x13) { // Floppy control
+      if (lo == 0x13) { // Floppy control (motor/drive select — housekeeping)
         MB02::writePort13(data);
         return;
       }
-      if (lo == 0x17) { // Memory paging
+      if (lo == 0x17) { // Memory paging (not disk access)
         MB02::writePort17(data);
         return;
       }
@@ -776,6 +1500,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     if (DivMMC::enabled) {
       uint8_t lo = address & 0xFF;
       if (lo == 0xE3) {
+        LED::touchW(LED::SD);
         DivMMC::bank = data & (DIVMMC_NUM_BANKS - 1);
         if (data & 0x40) DivMMC::mapram = true;
         DivMMC::conmem = (data & 0x80) != 0;
@@ -784,16 +1509,19 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       }
       if (DivMMC::divide_mode) {
         if ((lo & 0xE3) == 0xA3) {
+          LED::touchW(LED::SD);
           uint8_t reg = (lo >> 2) & 0x07;
           DivMMC::ide_write(reg, data);
           return;
         }
       } else {
         if (lo == 0xEB) {
+          LED::touchW(LED::SD);
           DivMMC::mmc_write(data);
           return;
         }
         if (lo == 0xE7) {
+          LED::touchW(LED::SD);
           DivMMC::mmc_cs(data);
           return;
         }
@@ -802,74 +1530,291 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
 
     if (DivMMC::zc_enabled) {
       uint8_t lo = address & 0xFF;
-      if (lo == 0x77) { DivMMC::zc_write_config(data); return; }
-      if (lo == 0x57) { DivMMC::zc_write_data(data); return; }
+      if (lo == 0x77) { LED::touchW(LED::ZCTRL); DivMMC::zc_write_config(data); return; }
+      if (lo == 0x57) { LED::touchW(LED::ZCTRL); DivMMC::zc_write_data(data); return; }
+    }
+
+    // IDE/HDD — PROFI scheme, per UnrealSpeccy MM_PROFI modified-ports section:
+    //   Gate: ROM14=1 AND CPM=1 (same as UnrealSpeccy: p7FFD&0x10 && pDFFD&0x20).
+    //   Port decode: (p1 & 0x9F)==0x8B; CS1=A6=1 for data/registers.
+    //   16-bit latch: #xxCB(A5=0) → store HIGH byte in write_latch;
+    //                 #xxEB(A5=1, reg=0) → write 16-bit: data|(latch<<8).
+    //   CS3: #xxAB(A6=0,A5=1, reg=6) → ATA control register (SRST/nIEN).
+    if (IDE::scheme == IDE::PROFI && Config::arch == "Profi") {
+      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch;
+      if (cpm && rom14) {
+        uint8_t p1 = address & 0xFF;
+        uint8_t reg = (address >> 8) & 7;
+        if ((p1 & 0x9F) == 0x8B) {
+#if IDE_PORT_TRACE
+          Debug::log("[IDE WR] pc=%04X port=%02X reg=%d data=%02X",
+                     Z80::getRegPC(), (unsigned)p1, reg, data);
+#endif
+          if (p1 & 0x40) {                           // CS1 (A6=1): data/registers
+            LED::touchW(LED::IDE);
+            if (!(p1 & 0x20)) {                      // A5=0 = #xxCB: HIGH byte latch
+              IDE::write_latch(data);
+              return;
+            }
+            // A5=1 = #xxEB: write register or 16-bit data
+            if (reg == 0)                            // data register: combine with latch
+              IDE::write_data_low(data);             // latch_write is HIGH byte
+            else
+              IDE::write8(reg, data);
+            return;
+          }
+          // CS3 (A6=0) = #xxAB reg6: ATA device control (0x3F6, SRST/nIEN).
+          // MBOOTHDD issues the ATA soft-reset via OUT (#06AB),A — port 0xAB has
+          // A5=0, so do NOT gate on A5 (the old `p1&0x20` check dropped the reset).
+          if (reg == 6) {
+            LED::touchW(LED::IDE);
+            IDE::write8(8, data);
+            return;
+          }
+        }
+      }
     }
 #endif
 
-    // Check if TRDOS Rom is mapped.
-    if (ESPectrum::trdos) {
+    // Profi FDC stub: command write to WD1793 reg0 → arm the one-shot busy flag.
+    // Only active when no disk at all is mounted; if any disk is present (TRD/SCL
+    // included), route to the real FDC so the SYS ROM disk probe can succeed.
+#if !PICO_RP2040
+    bool out_has_raw_disk = ESPectrum::fdd.disk[ESPectrum::fdd.diskS] &&
+        (ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsUDIFile ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsFDIFile ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsMBDFile ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsTD0File ||
+         ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->IsProFile);
+    bool out_has_any_disk = ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != nullptr;
+#else
+    bool out_has_raw_disk = false;
+    bool out_has_any_disk = false;
+#endif
+    if (Config::arch == "Profi" && MemESP::romInUse == 0 && !out_has_any_disk
+        && (address & 0xE3) == 0x03) {
+      profi_fdc_busy = 1;
+      ioContentionLate(MemESP::ramContended[rambank]);
+      return;
+    }
 
-      switch (address & 0xe3) {
+    // Profi CP/M mode: no-disk CMD write detection (must be BEFORE the
+    // out_has_raw_disk gate below, which is skipped when no disk is present).
+    //
+    // When no disk is in the selected drive, out_has_raw_disk=false and the
+    // FDC output block is never entered.  But DSKKE9A still issues CMD writes
+    // and spins in the re-issue loop (CALL 0x40EA → JR 0x40D9 → OUT 0x1F)
+    // at CPU speed, overflowing the stack into code and crashing.
+    //
+    // Fix: count consecutive no-disk CMD writes here.  After 4 we walk the
+    // Z80 stack to find the original non-0x40DE return address, restore SP
+    // and redirect PC to 0x40E1 (EI; RET) for a clean error return.
+#if !PICO_RP2040
+    if (Config::arch == "Profi" && (portDFFD & 0x20) &&
+        !out_has_raw_disk &&
+        (address & 0xE3) == 0x03 && ((address >> 5) & 0x3) == 0) {
+      ++profi_nodisk_reissue_cnt;
+      if (profi_nodisk_reissue_cnt >= 4) {
+        profi_nodisk_reissue_cnt = 0;
+        uint16_t sp = Z80::getRegSP();
+        uint16_t found_addr = 0;
+        for (int i = 0; i < 256 && sp < 0xFF00; i++, sp += 2) {
+          uint16_t lo = MemESP::ramCurrent[sp >> 14][(sp) & 0x3FFF];
+          uint16_t hi = MemESP::ramCurrent[(sp+1) >> 14][(sp+1) & 0x3FFF];
+          uint16_t frame = lo | (hi << 8);
+          if (frame != 0x40DE) {
+            found_addr = frame;
+            break;
+          }
+        }
+        if (found_addr) {
+          ESPectrum::fdd.status = kRVMWD177XStatusNotReady | kRVMWD177XStatusSeek;
+          ESPectrum::fdd.control |= kRVMWD177XINTRQ | kRVMWD177XFINTRQ;
+          ESPectrum::fdd.stepState = kRVMWD177XStepIdle;
+          Z80::setRegSP(sp);
+          Z80::setRegPC(0x40E1);
+          Debug::log("[FDC] Profi no-disk loop break (gate): drv=%d found_ret=0x%04X new_sp=0x%04X",
+                     ESPectrum::fdd.diskS, found_addr, sp);
+        } else {
+          Debug::log("[FDC] Profi no-disk (gate): no non-0x40DE frame, sp=0x%04X",
+                     Z80::getRegSP());
+        }
+      }
+      ioContentionLate(MemESP::ramContended[rambank]);
+      return;
+    }
+#endif
+
+    // Check if TRDOS Rom is mapped, or a raw disk is loaded.
+    if (ESPectrum::trdos || out_has_raw_disk) {
+
+      // Profi CP/M mode: FDC data registers shift to 0x83/0xA3/0xC3/0xE3
+      // UnrealSpeccy decode: (addr & 0x9F) == 0x83 → reg index = (addr >> 5) & 3
+      //   0x83 → reg0 (CMD/STATUS), 0xA3 → reg1 (TRACK),
+      //   0xC3 → reg2 (SECTOR),     0xE3 → reg3 (DATA)
+      // 0xBF & 0x9F == 0x9F ≠ 0x83, so SYS port 0xBF falls through to switch below.
+      // Profi CP/M shifted FDC (see matching read path): enable on CPM=1 alone,
+      // not gated by ROM14. The Dos5 5.30 CP/M driver writes Type-I commands to
+      // 0x83 (e.g. OUT (0x83),0x0C/0x1C at 0x864F/0x866C) with ROM14=1.
+      if (Config::arch == "Profi" && (portDFFD & 0x20) &&
+          ((address & 0x9F) == 0x83)) {
+        FDDStep(false);
+        uint8_t fr = (address >> 5) & 0x3;
+        // Count command (reg 0) and data (reg 3) writes; reg 1/2 are setup.
+        if (fr == 0 || fr == 3) LED::touchW(LED::FDD);
+        // CMD write via shifted 0x83 → activate shifted-scheme status for IN(0x3F)
+        if (fr == 0) profi_shifted_fdc = true;
+        rvmWD1793Write(&ESPectrum::fdd, fr, data);
+      } else if (Config::arch == "Profi" && (portDFFD & 0x20) && MemESP::romLatch &&
+                 (address & 0xFF) == 0x3F) {
+        // Per manual "Порты FDD": in the ROM14=1 & CPM=1 (MBOOTHDD) scheme the
+        // WD93 SYS register (RQ93) is at #3F — NOT the track register. The
+        // MBOOTHDD loader selects drive/side/reset via OUT(#3F) (e.g. 0x1C=side0,
+        // 0x0C=side1). #3F&0xe3==0x23 would otherwise land in the track-register
+        // case and silently drop the side select → fdd.side stuck → side-compare
+        // rejects the catalog on track0/side0 → "FDD Read Error".
+        // SYS register write (drive/side select) — housekeeping, not counted.
+        FDDStep(true);
+        profiFdcSysWrite(data);
+      } else switch (address & 0xe3) {
 
       case 0x03:
       case 0x23:
       case 0x43:
       case 0x63:
         FDDStep(false);
+        // Count command (reg 0) and data (reg 3) writes; reg 1/2 (track/sector)
+        // are setup writes that recur during idle seeks.
+        if (((address >> 5) & 0x3) == 0 || ((address >> 5) & 0x3) == 3) LED::touchW(LED::FDD);
+        // CMD write via normal path → deactivate shifted-scheme status
+        if (((address >> 5) & 0x3) == 0) profi_shifted_fdc = false;
+#if !PICO_RP2040
+        // Profi CP/M: detect the DSKKE9A re-issue loop (CALL 0x40EA → JR 0x40D9).
+        // The DSKKE9A disk driver uses an infinite re-issue loop: after issuing a
+        // Seek command it immediately calls CALL 0x40EA which JRs back to re-issue
+        // the OUT. On real Profi hardware the Z80 WAIT pin stretches each OUT until
+        // the WD1793 finishes (or the head is at target), so only a handful of
+        // iterations occur. Without WAIT emulation, the loop spins at CPU speed
+        // (~85 K iterations/second), quickly overflowing the stack into code.
+        //
+        // FIX: when a no-disk CMD write is issued consecutively (re-issue loop),
+        // count the re-issues. After MAX_REISSUES we:
+        //  1. Walk the Z80 stack to find the first return address that is NOT 0x40DE
+        //     (the CALL 0x40EA return address) — this is the frame that called the
+        //     Seek path originally (e.g. 0x40AB, which checks SEEK_ERROR status).
+        //  2. Restore SP to just below that frame so RET returns to it.
+        //  3. Set PC = 0x40E1 (EI; RET) so interrupts are re-enabled and the
+        //     original caller resumes.
+        //  4. Leave WD status = NOT_READY | SEEK_ERROR so the caller detects failure.
+        if (Config::arch == "Profi" && (portDFFD & 0x20)) {
+          uint8_t fdc_reg = (address >> 5) & 0x3;
+          if (fdc_reg == 0) {  // CMD register write
+            bool no_disk = !ESPectrum::fdd.disk[ESPectrum::fdd.diskS];
+            if (no_disk) {
+              ++profi_nodisk_reissue_cnt;
+              if (profi_nodisk_reissue_cnt >= 4) {
+                profi_nodisk_reissue_cnt = 0;
+                // Walk Z80 stack to find the first return address ≠ 0x40DE.
+                // 0x40DE is the CALL 0x40EA return (pushed by the re-issue loop).
+                // The first non-0x40DE frame is the original caller.
+                uint16_t sp = Z80::getRegSP();
+                uint16_t found_addr = 0;
+                for (int i = 0; i < 256 && sp < 0xFF00; i++, sp += 2) {
+                  uint16_t lo = MemESP::ramCurrent[sp >> 14][(sp) & 0x3FFF];
+                  uint16_t hi = MemESP::ramCurrent[(sp+1) >> 14][(sp+1) & 0x3FFF];
+                  uint16_t frame = lo | (hi << 8);
+                  if (frame != 0x40DE) {
+                    found_addr = frame;
+                    break;
+                  }
+                }
+                if (found_addr) {
+                  // Set WD to NOT_READY + SEEK_ERROR so status check at 0x40AE
+                  // returns carry=1 (CP/M error) to the application.
+                  // NOT_READY | SEEK_ERROR, BUSY=0
+                  ESPectrum::fdd.status =
+                      kRVMWD177XStatusNotReady | kRVMWD177XStatusSeek;
+                  ESPectrum::fdd.control |= kRVMWD177XINTRQ | kRVMWD177XFINTRQ;
+                  ESPectrum::fdd.stepState = kRVMWD177XStepIdle;
+                  // sp points to the found_addr frame (break was hit before
+                  // the for-loop's sp += 2 increment), so found_addr is at
+                  // the top-of-stack.  RET will pop it and return there.
+                  Z80::setRegSP(sp);
+                  // EI + RET: re-enable interrupts and return to found_addr
+                  Z80::setRegPC(0x40E1);
+                  Debug::log("[FDC] Profi no-disk loop break: drv=%d found_ret=0x%04X new_sp=0x%04X",
+                             ESPectrum::fdd.diskS, found_addr, sp);
+                } else {
+                  Debug::log("[FDC] Profi no-disk loop: no non-0x40DE frame found, sp=0x%04X",
+                             Z80::getRegSP());
+                }
+                break;  // skip rvmWD1793Write
+              }
+            } else {
+              profi_nodisk_reissue_cnt = 0;
+            }
+          }
+        }
+#endif
         rvmWD1793Write(&ESPectrum::fdd, ((address >> 5) & 0x3), data);
         break;
-      case 0xe3:
-
+      case 0xa3:
+        // Profi: port 0xBF (address & 0xe3 == 0xa3) is the RQ93 SYS register
+        // only in ROM14=0 & CPM=1 (the BOOTFDD scheme). When ROM14=1 the address
+        // #BF is reassigned to extended periphery, and the SYS register moves to
+        // #3F (the ROM14=1 & CPM=1 / MBOOTHDD scheme, handled before this switch).
+        if (Config::arch != "Profi" || MemESP::romLatch)
+          break;
+        // SYS register write — housekeeping, not counted as disk access.
         FDDStep(true);
-
-        // Change active disk unit
-        if (ESPectrum::fdd.diskS != (data & 0x3)) {
-          ESPectrum::fdd.diskS = data & 0x3;
-          if (ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != NULL &&
-              ESPectrum::fdd.side &&
-              ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->sides == 1)
-            ESPectrum::fdd.side = 0;
-          ESPectrum::fdd.sclConverted = false;
-        }
-
-        if (!(data & 0x4)) {
-          rvmWD1793Reset(&ESPectrum::fdd);
-        }
-
-        if (data & 0x8)
-          ESPectrum::fdd.control |= kRVMWD177XTest;
-        else
-          ESPectrum::fdd.control &= ~kRVMWD177XTest;
-
-        if (data & 0x10)
-          ESPectrum::fdd.side = 0;
-        else {
-          if (ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != NULL)
-            ESPectrum::fdd.side =
-                ESPectrum::fdd.disk[ESPectrum::fdd.diskS]->sides == 1 ? 0 : 1;
-          else
-            ESPectrum::fdd.side = 1;
-        }
-
-        if (data & 0x40)
-          ESPectrum::fdd.control |= kRVMWD177XDDEN;
-        else
-          ESPectrum::fdd.control &= ~kRVMWD177XDDEN;
-
+        profiFdcSysWrite(data);
+        break;
+      case 0xe3:
+        // Port #FF (and the #FF-family: #E7/#EB/#EF/#F3/#F7/#FB that also satisfy
+        // address&0xe3==0xe3) is the WD93 SYS register ONLY in the standard scheme
+        // (CPM=0). Per manual "Порты FDD", in CP/M the SYS register moves to #BF
+        // (ROM14=0) or #3F (ROM14=1), and the #FF-family belongs to extended
+        // periphery — notably the PROFI IDE/HDD ports (#xxEB) probed by the HDD22
+        // driver. Routing those to the FDC here issued a spurious soft-reset
+        // (SYS bit2=0 → rvmWD1793Reset → track=0xFF), which corrupted the floppy
+        // track register mid-boot and made MBOOTHDD mis-seek (530.pro hang).
+        // So gate out CP/M mode: only the standard TR-DOS scheme uses #FF as SYS.
+        if (Config::arch == "Profi" && (portDFFD & 0x20))
+          break;
+        // SYS register write (#FF: drive/side/motor select) — housekeeping,
+        // recurs continuously while TR-DOS is paged in; not counted as access.
+        FDDStep(true);
+        profiFdcSysWrite(data);
         break;
       }
     }
     ioContentionLate(MemESP::ramContended[rambank]);
   }
-  // Pentagon only
-  if (Z80Ops::isPentagon && ((address & 0x1008) == 0)) { // 1008 !-> EFF7
+  // Pentagon #EFF7 (page0ram/notMore128). The loose Pentagon decode
+  // (address & 0x1008)==0 (= A12=0 & A3=0) COLLIDES with the Profi CP/M FDC
+  // command port #83: e.g. RDSEC 0x82/0x86 → OUT(0x83),A makes address 0x8283/
+  // 0x8683 (A12=0, low-byte bit3=0), which spuriously enters this handler and
+  // clobbers page0ram = bit3(opcode) → pages ROM into bank0 mid-RDSEC. The
+  // MBOOTHDD stack lives at 0x00D8 (page0), so the next CALL/RET reads its
+  // return address from ROM → wild jump (NOP-slide crash). Profi gets page0ram
+  // from DFFD bit4 (above) and does not use the Pentagon-1024 #EFF7 port, so
+  // require the real #EFF7 address for Profi to avoid the FDC-port collision.
+  bool eff7_decode = (Config::arch == "Profi") ? ((address & 0xF008) == 0xE000)
+                                               : ((address & 0x1008) == 0);
+  if ((Z80Ops::isPentagon || Z80Ops::isProfi) && eff7_decode) { // EFF7
     if (!MemESP::pagingLock) {
-      uint8_t prev = MemESP::page0ram;
+      uint8_t prevPage0 = MemESP::page0ram;
+      uint8_t prevNotMore = MemESP::notMore128;
       MemESP::notMore128 = bitRead(data, 2);
       MemESP::page0ram = bitRead(data, 3);
-      if (MemESP::page0ram != prev)
+      if (MemESP::page0ram != prevPage0)
         MemESP::recoverPage0();
+      // Only flash the RAM paging LED on an actual paging change. #EFF7 is
+      // shared with the CMOS-enable bit (D7): Gluk's RTC clock loop toggles D7
+      // every update, which would otherwise blink the RAM LED with no real
+      // paging activity.
+      if (MemESP::page0ram != prevPage0 || MemESP::notMore128 != prevNotMore)
+        LED::touchW(LED::RAM);
     }
   }
   // 128K, Pentagon
@@ -878,7 +1823,32 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // for banking, not #7FFD. Letting #7FFD writes through here corrupts
   // videoLatch/pagingLock and produces a black screen on ALF.
   if ((!Z80Ops::is48) && !Z80Ops::isALF && ((address & 0x8002) == 0)) { // 8002 !-> 7FFD
-    if (!MemESP::pagingLock) {
+    ++Ports::port7ffd_cnt;
+    LED::touchW(LED::RAM);
+#if PROFI_PORT_TRACE
+    if (Config::arch == "Profi") {
+      static uint8_t prev_7ffd = 0xFE;
+      if (prev_7ffd != data) {
+        Debug::log("[7FFD] new=0x%02X bank=%d videoLatch=%d romLatch=%d lock=%d pc=%04X",
+                   data, data & 7, (data >> 3) & 1, (data >> 4) & 1, (data >> 5) & 1,
+                   Z80::getRegPC());
+        prev_7ffd = data;
+      }
+    }
+#endif
+    // 48K paging-lock gate (7FFD bit5). Mirror UnrealSpeccy io.cpp set_banks
+    // entry: the lock is RE-EVALUATED on every write, not a sticky flag.
+    // Pentagon-1024 (not notMore128) and Profi with NOROM(DFFD.4) bypass the
+    // lock entirely, so a CP/M bank-switch routine that writes 7FFD with bit5
+    // set is never silently dropped (caused level-load freezes / wrong banks).
+    bool blocked = MemESP::pagingLock;
+    if (blocked) {
+      if (Z80Ops::is1024 && !MemESP::notMore128)
+        blocked = false; // Pentagon-1024 unlocked
+      else if (Z80Ops::isProfi && (portDFFD & 0x10))
+        blocked = false; // Profi NOROM → paging always live
+    }
+    if (!blocked) {
       uint8_t D5 = bitRead(data, 5);
       if (Z80Ops::is1024) {
         MemESP::pagingLock = MemESP::notMore128 ? D5 : 0;
@@ -905,21 +1875,63 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
           page = pPlus;
         }
       }
+      // For Profi: combine 0x7FFD bits[2:0] with 0xDFFD group (bits[2:0]<<3)
+      if (Config::arch == "Profi") {
+        uint32_t profi_page = (page & 0x7) + ((portDFFD & 0x7) << 3);
+        uint32_t profi_pages = ram_pages + butter_pages + psram_pages + swap_pages;
+        if (profi_page < profi_pages) page = profi_page;
+      }
       if (MemESP::bankLatch != page) {
         MemESP::bankLatch = page;
-        MemESP::ramCurrent[3] = MemESP::ram[page].sync(3);
         MemESP::ramContended[3] =
-            Z80Ops::isPentagon ? false : (page & 0x01 ? true : false);
+            (Z80Ops::isPentagon || Z80Ops::isProfi) ? false : (page & 0x01 ? true : false);
       }
-      MemESP::romLatch = bitRead(data, 4);
-      if (!ia && !ESPectrum::trdos) {
-        MemESP::romInUse = MemESP::romLatch;
+      // Profi SCO (DFFD bit3): bank1=ramPage (full 0..63), bank3=page7; else bank3=ramPage
+      if (Config::arch == "Profi" && (portDFFD & 0x08)) {
+        MemESP::ramCurrent[1] = MemESP::ram[MemESP::bankLatch].sync(1);
+        MemESP::ramCurrent[3] = MemESP::ram[7].sync(3);
+      } else {
+        MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(3);
+      }
+#if PROFI_PORT_TRACE
+      if (Config::arch == "Profi" && (portDFFD & 0x80)) {
+        uint32_t bl = MemESP::bankLatch;
+        if (bl == 4 || bl == 6 || bl == 56 || bl == 58) {
+          bool vl = MemESP::videoLatch; // current (not yet updated for bit3)
+          bool sco = portDFFD & 0x08;
+          char slot = sco ? '1' : '3';
+          bool disp = (!vl && (bl == 4 || bl == 56)) || (vl && (bl == 6 || bl == 58));
+          Debug::log("[7FFD] bl=%u slot%c vl=%u %s PC=%04X",
+              bl, slot, vl, disp ? "DISPLAY-PAGE!" : "write-buf", Z80::getRegPC());
+        }
+      }
+#endif
+      { uint8_t prevLatch = MemESP::romLatch;
+        MemESP::romLatch = bitRead(data, 4);
+        if (!ia && !ESPectrum::trdos) {
+          // Profi: bit4=0→bank2(128K), bit4=1→bank3(SOS/48K); trdos path handled in check_trdos
+          MemESP::romInUse = (Config::arch == "Profi") ? (MemESP::romLatch ? 3 : 2) : MemESP::romLatch;
+        }
       }
       if (!ESPectrum::trdos) MemESP::recoverPage0();
       if (MemESP::videoLatch != bitRead(data, 3)) {
         MemESP::videoLatch = bitRead(data, 3);
-        VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[7].direct()
-                                          : MemESP::ram[5].direct();
+        if (Config::arch == "Profi" && (portDFFD & 0x80)) {
+          VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[6].direct() : MemESP::ram[4].direct();
+          uint32_t clrPage = MemESP::videoLatch ? 58 : 56;
+          uint32_t totPages = ram_pages + butter_pages + psram_pages + swap_pages;
+          VIDEO::profi_clrmem = (clrPage < totPages) ? MemESP::ram[clrPage].direct() : nullptr;
+#if PROFI_PORT_TRACE
+          Debug::log("[DS80 FLIP] vl=%u dispPx=%u dispClr=%u PC=%04X",
+              MemESP::videoLatch, MemESP::videoLatch ? 6u : 4u, clrPage, Z80::getRegPC());
+          ds80_dbg_wr_cnt = 0;
+          ds80_dbg_grmem  = VIDEO::grmem;
+          ds80_dbg_clrmem = VIDEO::profi_clrmem;
+#endif
+        } else {
+          VIDEO::grmem = MemESP::videoLatch ? MemESP::ram[7].direct() : MemESP::ram[5].direct();
+          if (Config::arch == "Profi") VIDEO::profi_clrmem = nullptr;
+        }
         if (Config::gigascreen_onoff == 2) VIDEO::gigascreen_auto_countdown = 3;
 #if !PICO_RP2040
         if (VIDEO::mode16col_enabled) VIDEO::mode16colUpdatePlanes();
@@ -999,7 +2011,7 @@ IRAM_ATTR void Ports::dmaOutput(uint16_t address, uint8_t data) {
                 VIDEO::ulaPlusUpdateBorder();
             else
 #endif
-                VIDEO::brd = VIDEO::border32[VIDEO::borderColor];
+                VIDEO::updateBorderBrd();
         }
         int Audiobit;
         Audiobit = speaker_values[((data >> 2) & 0x04) | (Tape::tapeEarBit << 1) |

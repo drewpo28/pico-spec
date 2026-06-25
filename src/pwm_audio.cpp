@@ -6,7 +6,9 @@
 #include "audio.h"
 #include "pwm_audio.h"
 #include "Config.h"
+#include "BoardPins.h"
 #include "Debug.h"
+#include "Subsystem.h"
 #ifdef USE_GS
 #include "GS/GS.h"
 #endif
@@ -82,7 +84,7 @@ extern "C" int testPins(uint32_t pin0, uint32_t pin1) {
 #ifdef BUTTER_PSRAM_GPIO
     if (pin0 == BUTTER_PSRAM_GPIO || pin1 == BUTTER_PSRAM_GPIO) return res;
 #endif
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     if (pin0 == PICO_DEFAULT_LED_PIN || pin1 == PICO_DEFAULT_LED_PIN) return res; // LED
     #endif
     if (pin0 == 23 || pin1 == 23) return res; // SMPS Power
@@ -231,10 +233,12 @@ esp_err_t __not_in_flash_func(pwm_audio_write)(
     size_t* bytes_written,
     uint32_t wait_ms
 ) {
-    uint32_t vol8 = (uint32_t)vol << 3;
+    uint32_t vol8 = (uint32_t)(vol + Config::audio_boost) << 3;
     for (size_t i = 0; i < len; ++i) {
-        buff_L[i] = (int16_t)((uint32_t)bufL[i] * vol8);
-        buff_R[i] = (int16_t)((uint32_t)bufR[i] * vol8);
+        int32_t vL = (int32_t)bufL[i] * (int32_t)vol8;
+        int32_t vR = (int32_t)bufR[i] * (int32_t)vol8;
+        buff_L[i] = vL > 32767 ? 32767 : (int16_t)vL;
+        buff_R[i] = vR > 32767 ? 32767 : (int16_t)vR;
     }
     m_off = 0;
     m_size = len;
@@ -286,14 +290,20 @@ static bool hw_get_bit_LOAD() {
 
 void init_sound() {
 #if !PICO_RP2040 && defined(VGA_HDMI)
+    // Buffers (~36.9 KB) are allocated/freed by HdmiAudioSubsys::apply() at
+    // the next Subsystems::applyPending() — both init_sound() call sites are
+    // followed by one. With the VGA output active, Data Islands can't be
+    // emitted at all — don't waste the SRAM on a stale audio_driver=4 config.
+    extern bool SELECT_VGA;
+    HdmiAudioSubsys::request(Config::audio_driver == 4 && !SELECT_VGA);
     if (Config::audio_driver == 4) {
         Debug::log("init_sound: HDMI audio mode");
-        hdmi_audio_init();
         return;
     }
 #endif
 #ifdef PCM5122_I2S_DATA
-    if (Config::audio_driver == 5) {
+    // Yield I2S DATA pin to ZiFi if it owns it (skip PCM5122 → standard audio).
+    if (Config::audio_driver == 5 && !BoardPins::zifiOwnsPin(PCM5122_I2S_DATA)) {
         Debug::log("init_sound: PCM5122 mode (explicit)");
         pcm5122_detected = pcm5122_init(PCM5122_I2C_SDA, PCM5122_I2C_SCL);
         Debug::log("init_sound: PCM5122 detected=%d", (int)pcm5122_detected);
@@ -304,7 +314,7 @@ void init_sound() {
         i2s_volume(&i2s_config, 0);
         return;
     }
-    if (Config::audio_driver == 0) {
+    if (Config::audio_driver == 0 && !BoardPins::zifiOwnsPin(PCM5122_I2S_DATA)) {
         // Auto mode: probe PCM5122 via I2C before standard testPins
         if (pcm5122_detect(PCM5122_I2C_SDA, PCM5122_I2C_SCL)) {
             Debug::log("init_sound: PCM5122 detected in auto mode");
@@ -319,8 +329,22 @@ void init_sound() {
         }
     }
 #endif
+    // On boards that allow ZiFi's UART on the core audio output pins (MURM1_P2 can
+    // put UART1 on GP26/27), yield them: skip I2S/PWM init so the UART owns the
+    // pins. Audio output is sacrificed for WiFi — only when the user picked that
+    // pair. The GP29 PWM path (audio_driver==3) is unaffected (different pin).
+#if !PICO_RP2040
+    bool zifi_owns_audio = BoardPins::zifiOwnsPin(PWM_PIN0) ||
+                           BoardPins::zifiOwnsPin(I2S_DATA_PIO);
+#else
+    const bool zifi_owns_audio = false;
+#endif
     if (Config::audio_driver == 3) {
         Init_PWM_175(TSPIN_MODE_GP29);
+    } else if (zifi_owns_audio) {
+        is_i2s_enabled = false; // GP26/27 belong to the ZiFi UART; no audio output
+        Debug::log("init_sound: audio output pins GP%d/%d yielded to ZiFi UART",
+                   PWM_PIN0, PWM_PIN1);
     } else {
         if (link_i2s_code == 0xFF) {
             if (I2S_BCK_PIO != I2S_LCK_PIO && I2S_LCK_PIO != I2S_DATA_PIO && I2S_BCK_PIO != I2S_DATA_PIO) {
@@ -348,7 +372,10 @@ void init_sound() {
     if (Config::midi != 1 && Config::midi != 2)
 #endif
     {
-        inInit(LOAD_WAV_PIO);
+#if !PICO_RP2040
+        if (!BoardPins::zifiOwnsPin(LOAD_WAV_PIO)) // yield WAV input pin to ZiFi
+#endif
+            inInit(LOAD_WAV_PIO);
     }
 #endif
 }
@@ -399,9 +426,14 @@ static void __not_in_flash_func(pcm_call_inner)() {
     int32_t gs_offL = 0, gs_offR = 0;
 #ifdef USE_GS
     if (GS::enabled) {
+#ifdef SOFTTV
+        // Under SOFTTV, core1 is fully occupied by composite video rendering
+        // (video_timer_callbackTV at 30 kHz), so GS::pump() runs here on core0.
+        GS::pump();
+#endif
         uint8_t gL, gR;
         GS::getLiveLR(gL, gR);
-        uint32_t vol8 = (uint32_t)vol << 3;
+        uint32_t vol8 = (uint32_t)(vol + Config::audio_boost) << 3;
         gs_offL = ((int32_t)gL - 128) * (int32_t)vol8;
         gs_offR = ((int32_t)gR - 128) * (int32_t)vol8;
     }
@@ -506,6 +538,7 @@ void pcm_setup(int hz) {
 #if !PICO_RP2040
     if (Config::audio_driver == 4) {
         // HDMI audio — timer only, no I2S/PWM hardware
+        if (m_timer.delay_us) cancel_repeating_timer(&m_timer);
         add_repeating_timer_us(-1000000 / hz, timer_callback, NULL, &m_timer);
         return;
     }

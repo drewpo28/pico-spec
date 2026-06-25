@@ -3,8 +3,14 @@
 bin
 build
 build-*
+build_*
 firmware
 drew.todo
 debug
 debug.log
 dump.log
+logs/
+
+# GM wavetable bank (user-supplied; NOT redistributable if from Microsoft gm.dls)
+gm_bank.bin
+*.dls

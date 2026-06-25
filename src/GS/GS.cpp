@@ -2,7 +2,9 @@
 
 #include "GS.h"
 #include "GS_ROM.h"
+#include "../Config.h"
 #include "Debug.h"
+#include "../LEDIndicators.h"
 
 extern "C" {
 #include "Z80_redcode.h"
@@ -190,6 +192,17 @@ static inline void __not_in_flash_func(gs_trace_gs)(uint8_t kind, uint8_t data, 
 }
 #endif  // GS_DEBUG_TRACE
 
+// Perf counters are compile-gated: volatile increments in the core1 hot
+// path (pump/gs_pc_read/host IO) survive optimization even when the
+// once-per-second log below is disabled, so keep them out of release
+// builds entirely. Enable with -DGS_PERF_TRACE=ON in CMake.
+#if GS_PERF_TRACE
+#define GS_PERF(stmt) stmt
+#else
+#define GS_PERF(stmt) ((void)0)
+#endif
+
+#if GS_PERF_TRACE
 // Cache stats: hit/miss counts per second to gauge how often gs_pc_read
 // has to fetch a fresh 64-byte line from PSRAM (vs hitting in SRAM cache).
 // High miss count during slow seconds = GS-Z80 thrashing PSRAM and
@@ -219,6 +232,7 @@ static volatile uint32_t s_perf_h_b3r   = 0;
 static volatile uint32_t s_perf_h_bbw   = 0;
 static volatile uint32_t s_perf_h_bbr   = 0;
 static volatile uint32_t s_perf_h_spin_us = 0;     // total spinwait µs/sec in hostWriteB3
+#endif  // GS_PERF_TRACE
 
 
 
@@ -267,7 +281,7 @@ static volatile uint32_t s_cmd_fifo_r = 0;
 // GS-time — absorbs typical 10-25 ms core1 slowdowns (heavy core0 PSRAM use,
 // sustained OSD activity) without draining. Single-writer (core1 main) /
 // single-reader (core1 IRQ preempts main) — volatile wpos/rpos atomic on ARM.
-#define GS_RING_SIZE 1024
+#define GS_RING_SIZE 4096
 #define GS_RING_MASK (GS_RING_SIZE - 1)
 static int16_t* s_ring_L = nullptr;
 static int16_t* s_ring_R = nullptr;
@@ -280,9 +294,10 @@ static uint32_t s_drain_frac = 0;
 // RAM caps at ~18 T/µs effective, so 24 MHz target under-delivers (measured
 // ~77% → 29 kHz IRQ, pitch shifted ~25% low). 12 MHz + 320 T is well within
 // capacity and matches native GS firmware timing exactly.
-static constexpr uint32_t GS_CLOCK_HZ    = 13125000;
-static constexpr uint32_t GS_INT_HZ      = 37500;
-static constexpr uint32_t GS_INT_PERIOD  = GS_CLOCK_HZ / GS_INT_HZ;  // 320
+static constexpr uint32_t GS_CLOCK_TABLE[5] = {12000000, 13125000, 14000000, 20000000, 24000000};
+static constexpr uint32_t GS_INT_HZ         = 37500;
+static uint32_t           GS_CLOCK_HZ       = 13125000;  // set in init() from Config::gs_clock
+static uint32_t           GS_INT_PERIOD     = 350;        // set in init()
 
 static inline uint32_t __not_in_flash_func(gs_map_addr)(uint16_t address) {
     return (uint32_t)(GS::reg_page - 1) * 0x8000u + (address - 0x8000u);
@@ -326,18 +341,18 @@ static inline void __not_in_flash_func(gs_pc_invalidate_line)(uint32_t psram_off
 static inline zuint8 __not_in_flash_func(gs_pc_read)(uint32_t psram_off) {
     uint32_t line = psram_off >> GS_PC_LINE_BITS;
     uint32_t col  = psram_off & GS_PC_LINE_MASK;
-    if (line == s_pc_last_line) { s_perf_pc_hit++; return s_pc_last_buf[col]; }
+    if (line == s_pc_last_line) { GS_PERF(s_perf_pc_hit++); return s_pc_last_buf[col]; }
     uint32_t set  = line & GS_PC_SETS_MASK;
     for (int w = 0; w < GS_PC_WAYS; w++) {
         if (s_pc_tag[set][w] == line) {
             s_pc_last_line = line;
             s_pc_last_buf  = s_pc_data[set][w];
-            s_perf_pc_hit++;
+            GS_PERF(s_perf_pc_hit++);
             return s_pc_data[set][w][col];
         }
     }
     // Miss — FIFO eviction, bulk-copy 64 bytes from PSRAM (XIP burst friendly).
-    s_perf_pc_miss++;
+    GS_PERF(s_perf_pc_miss++);
     uint8_t v = s_pc_next[set];
     s_pc_next[set] = (v + 1) & (GS_PC_WAYS - 1);
     if (s_gs_use_spi) {
@@ -483,9 +498,9 @@ static zuint8 __not_in_flash_func(gs_cb_in)(void* ctx, zuint16 port) {
         case 0x04: {
             v = GS::reg_status;
             uint16_t pc = Z80_PC(s_cpu);
-            s_perf_p04_total++;
-            if (pc == s_perf_p04_pc) s_perf_p04_spin++;
-            s_perf_p04_pc = pc;
+            GS_PERF(s_perf_p04_total++);
+            GS_PERF(if (pc == s_perf_p04_pc) s_perf_p04_spin++);
+            GS_PERF(s_perf_p04_pc = pc);
             // Two IN A,(04) in main idle loop. PC already advanced by 2:
             // 0x026E → PC=0x0270 (early-exit path when work_ram[0x4084]=0)
             // 0x027F → PC=0x0281 (steady-state path, always reached after C000)
@@ -652,6 +667,11 @@ void   __not_in_flash_func(gs_direct_out         )(zuint16 port, zuint8 value) {
 
 bool GS::init(uint32_t ram_size_bytes) {
     if (enabled) return true;
+    {
+        uint8_t ci = Config::gs_clock < 5 ? Config::gs_clock : 1;
+        GS_CLOCK_HZ  = GS_CLOCK_TABLE[ci];
+        GS_INT_PERIOD = GS_CLOCK_HZ / GS_INT_HZ;
+    }
 
     uint32_t rounded = 0x20000;
     while (rounded < ram_size_bytes && rounded < (2u << 20)) rounded <<= 1;
@@ -873,6 +893,7 @@ void GS::pollPerf() {
         }
     }
 #endif  // GS_DEBUG_TRACE
+#if GS_PERF_TRACE
     static uint32_t s_last_us = 0;
     uint32_t now = time_us_32();
     if ((now - s_last_us) < 1000000) return;
@@ -963,11 +984,12 @@ void GS::pollPerf() {
     (void)pc_m; (void)pc_h; (void)pc_miss_pct;
     (void)b3w; (void)b3r; (void)bbw; (void)bbr; (void)hsw;
 #endif
+#endif  // GS_PERF_TRACE
 }
 
 void __not_in_flash_func(GS::pump)() {
     if (!enabled) return;
-    s_perf_pump_calls++;
+    GS_PERF(s_perf_pump_calls++);
     // Wall-clock-locked pacing. Independent of how fast the emulator can
     // crunch instructions — we always advance GS-Z80 time at exactly
     // GS_CLOCK_HZ T-states per real second. With INSN handlers placed in
@@ -984,19 +1006,21 @@ void __not_in_flash_func(GS::pump)() {
     uint32_t dt_us = now - s_pump_last_us;
     if (dt_us == 0) return;
     if (dt_us > 1000) dt_us = 1000;          // clamp: max 1 ms per pump
-    int budget_t = (int)(dt_us * 12);         // 12 T-states per µs at 12 MHz
+    // Budget matches GS_CLOCK_HZ exactly: 13125 T/ms → INT every 350T = 37500Hz
+    int budget_t = (int)((uint32_t)dt_us * (GS_CLOCK_HZ / 1000u) / 1000u);
     s_pump_last_us = now;
 
     // Ring-fill safety: if consumer fell badly behind (shouldn't happen
     // when wall-clock paced), don't push more or we'll overrun.
     uint32_t used = s_ring_wpos - s_ring_rpos;
     if (used >= (GS_RING_SIZE * 7 / 8)) {
-        s_perf_pump_skip++;
+        GS_PERF(s_perf_pump_skip++);
         return;
     }
 
     int ran = step(budget_t);
-    s_perf_tstates += (uint32_t)ran;
+    GS_PERF(s_perf_tstates += (uint32_t)ran);
+    (void)ran;
 }
 
 int __not_in_flash_func(GS::step)(int tstates) {
@@ -1053,7 +1077,7 @@ int __not_in_flash_func(GS::step)(int tstates) {
 }
 
 uint8_t GS::hostReadB3() {
-    s_perf_h_b3r++;
+    GS_PERF(s_perf_h_b3r++);
     uint8_t v = reg_data_gs;
     __dmb();  // consume data before clearing the flag
     uint32_t fifo_used = s_host_fifo_w - s_host_fifo_r;
@@ -1069,7 +1093,7 @@ uint8_t GS::hostReadB3() {
 }
 
 uint8_t GS::hostReadBB() {
-    s_perf_h_bbr++;
+    GS_PERF(s_perf_h_bbr++);
     uint8_t v = reg_status | 0x7E;
     gs_trace_host(TR_BBr, v, reg_status);
     return v;
@@ -1084,7 +1108,7 @@ uint8_t GS::hostReadBB() {
 // FIFO size is 512 bytes; at 37500 bytes/sec drain rate that's ~14 ms
 // buffer — enough to absorb a full SCL sector (256 B) plus a margin.
 void GS::hostWriteB3(uint8_t data) {
-    s_perf_h_b3w++;
+    GS_PERF(s_perf_h_b3w++);
     gs_trace_host(TR_B3w, data, reg_status);
     uint32_t w = s_host_fifo_w;
     uint32_t used = w - s_host_fifo_r;
@@ -1094,7 +1118,8 @@ void GS::hostWriteB3(uint8_t data) {
                && (time_us_32() - spin_t0) < 500) {
             __dmb();
         }
-        s_perf_h_spin_us += time_us_32() - spin_t0;
+        GS_PERF(s_perf_h_spin_us += time_us_32() - spin_t0);
+        (void)spin_t0;
         if ((s_host_fifo_w - s_host_fifo_r) >= GS_HOST_FIFO_SIZE) {
             s_host_fifo_r = s_host_fifo_w - GS_HOST_FIFO_SIZE + 1;
         }
@@ -1108,7 +1133,7 @@ void GS::hostWriteB3(uint8_t data) {
 }
 
 void GS::hostWriteBB(uint8_t data) {
-    s_perf_h_bbw++;
+    GS_PERF(s_perf_h_bbw++);
     gs_trace_host(TR_BBw, data, reg_status);
 #ifdef GS_DEBUG_TRACE
     // Auto-dump trigger: ZP4 GS-detection sequence starts with CMD 0xD2 →
@@ -1219,6 +1244,7 @@ void __not_in_flash_func(GS::getLiveLR)(uint8_t& L, uint8_t& R) {
     L = gs_to_u8(sumL / (int32_t)n);
     R = gs_to_u8(sumR / (int32_t)n);
     s_ring_rpos = r + n;
+    if (sumL || sumR) LED::touchR(LED::GS);
 }
 
 // =================================================================

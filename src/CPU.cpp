@@ -59,6 +59,10 @@ uint32_t CPU::tstates = 0;
 int32_t CPU::prev_tstates = 0;
 uint32_t CPU::tstates_diff = 0;
 
+// Frame timing accumulators (µs); read+reset in VIDEO::EndFrame diagnostic.
+volatile uint32_t cpu_frame_us  = 0;  // total CPU::loop() time (incl. FDC)
+volatile uint32_t fdd_step_us   = 0;  // time inside rvmWD1793Step only
+
 uint64_t CPU::global_tstates = 0;
 uint32_t CPU::statesInFrame = 0;
 uint32_t CPU::tstates_frame = 0;
@@ -77,27 +81,29 @@ bool Z80Ops::is128;
 bool Z80Ops::isPentagon;
 bool Z80Ops::is512 = false;
 bool Z80Ops::is1024 = false;
+bool Z80Ops::isProfi = false;
 
 void CPU::updateStatesInFrame() {
 #if !NO_ALF
     Z80Ops::isALF = (Config::arch == "ALF");
 #endif
-    // Our emulator's baseline ULA timings correspond to the Late variant (Issue 3
-    // and similar — contention start at 14336, INT window [1..32]). Early ULA is
-    // modelled by shifting the INT window backward by 1 T-state (AluTiming=0
-    // means Early => earlyShift=1, AluTiming=1 means Late => earlyShift=0).
-    int earlyShift = Z80Ops::isPentagon ? 0 : (CPU::latetiming ? 0 : 1);
+    // Early/Late ULA timing: Early=latetiming=0, Late=latetiming=1.
+    // IntEnd += latetiming shifts the INT window 1T later for Late.
+    // isActiveINT adds latetiming to tstates so that Late fires 1T later,
+    // including via end-of-frame straddle (tstates=statesInFrame-1 → tmp=0).
     if (Config::arch == "48K") {
         statesInFrame = TSTATES_PER_FRAME_48;
-        IntStart = INT_START48 - earlyShift;
-        IntEnd = INT_END48 - earlyShift;
+        IntStart = INT_START48;
+        IntEnd = INT_END48 + CPU::latetiming;
         if (Config::romSet48 == "48Kby") {
-            IntEnd = INT_END_BYTE48 - earlyShift;
+            statesInFrame = TSTATES_PER_FRAME_BYTE;
+            IntStart = INT_START48;
+            IntEnd = INT_END_BYTE48;
         }
     } else if (Config::arch == "128K" || Z80Ops::isALF) {
         statesInFrame = TSTATES_PER_FRAME_128;
-        IntStart = INT_START128 - earlyShift;
-        IntEnd = INT_END128 - earlyShift;
+        IntStart = INT_START128;
+        IntEnd = INT_END128 + CPU::latetiming;
     } else if (Config::arch == "P512") {
         statesInFrame = TSTATES_PER_FRAME_PENTAGON;
         IntStart = INT_START_PENTAGON;
@@ -106,6 +112,10 @@ void CPU::updateStatesInFrame() {
         statesInFrame = TSTATES_PER_FRAME_PENTAGON;
         IntStart = INT_START_PENTAGON;
         IntEnd = INT_END_PENTAGON;
+    } else if (Config::arch == "Profi") {
+        statesInFrame = TSTATES_PER_FRAME_PROFI;
+        IntStart = INT_START_PROFI;
+        IntEnd = INT_END_PROFI;
     } else { // if (Config::arch == "Pentagon") - by default
         statesInFrame = TSTATES_PER_FRAME_PENTAGON;
         IntStart = INT_START_PENTAGON;
@@ -137,8 +147,9 @@ void CPU::reset() {
         Z80Ops::isPentagon = false;
         Z80Ops::is512 = false;
         Z80Ops::is1024 = false;
+        Z80Ops::isProfi = false;
         // Set emulation loop sync target
-        ESPectrum::target = MICROS_PER_FRAME_48;
+        ESPectrum::target = !Z80Ops::isByte ? MICROS_PER_FRAME_48 : MICROS_PER_FRAME_BYTE;
     } else if (Config::arch == "128K" || Z80Ops::isALF) {
         Z80Ops::isByte = (Config::romSet128 == "128Kby" || Config::romSet128 == "128Kbg");
         Ports::getFloatBusData = &Ports::getFloatBusData128;
@@ -147,8 +158,9 @@ void CPU::reset() {
         Z80Ops::isPentagon = false;
         Z80Ops::is512 = false;
         Z80Ops::is1024 = false;
+        Z80Ops::isProfi = false;
         // Set emulation loop sync target
-        ESPectrum::target = MICROS_PER_FRAME_128;
+        ESPectrum::target = !Z80Ops::isByte ? MICROS_PER_FRAME_128 : MICROS_PER_FRAME_BYTE;
     } else if (Config::arch == "P512") {
         Z80Ops::isByte = false;
         Z80Ops::is48 = false;
@@ -156,6 +168,7 @@ void CPU::reset() {
         Z80Ops::isPentagon = true;
         Z80Ops::is512 = true;
         Z80Ops::is1024 = false;
+        Z80Ops::isProfi = false;
         // Set emulation loop sync target
         ESPectrum::target = MICROS_PER_FRAME_PENTAGON;
     } else if (Config::arch == "P1024") {
@@ -165,8 +178,19 @@ void CPU::reset() {
         Z80Ops::isPentagon = true;
         Z80Ops::is512 = false;
         Z80Ops::is1024 = true;
+        Z80Ops::isProfi = false;
         // Set emulation loop sync target
         ESPectrum::target = MICROS_PER_FRAME_PENTAGON;
+    } else if (Config::arch == "Profi") {
+        Z80Ops::isByte = false;
+        Z80Ops::is48 = false;
+        Z80Ops::is128 = false;
+        Z80Ops::isPentagon = false;
+        Z80Ops::is512 = false;
+        Z80Ops::is1024 = false;
+        Z80Ops::isProfi = true;
+        // Set emulation loop sync target
+        ESPectrum::target = MICROS_PER_FRAME_PROFI;
     } else { // if (Config::arch == "Pentagon") - by default
         Z80Ops::isByte = false;
         Z80Ops::is48 = false;
@@ -174,19 +198,28 @@ void CPU::reset() {
         Z80Ops::isPentagon = true;
         Z80Ops::is512 = false;
         Z80Ops::is1024 = false;
+        Z80Ops::isProfi = false;
         // Set emulation loop sync target
         ESPectrum::target = MICROS_PER_FRAME_PENTAGON;
     }
 
 #if !PICO_RP2040
     // 16col is Pentagon-only — auto-disable when switching to non-Pentagon arch.
-    if (!Z80Ops::isPentagon) {
+    if (!(Z80Ops::isPentagon || Z80Ops::isProfi)) {
         if (Config::mode16col_onoff) {
             Config::mode16col_onoff = false;
             Config::save();
         }
         VIDEO::mode16col_enabled = false;
     }
+#endif
+
+    // TR-DOS (betadisk) is mandatory on Pentagon — force on without saving.
+    if ((Z80Ops::isPentagon || Z80Ops::isProfi) && !Config::betadisk) Config::betadisk = true;
+
+    // Timex video is incompatible with Byte ROM sets — auto-disable.
+#if !PICO_RP2040
+    if (Z80Ops::isByte && Config::timex_video) Config::timex_video = false;
 #endif
 
     updateStatesInFrame();
@@ -206,9 +239,11 @@ IRAM_ATTR void CPU::step() {
 
 
 IRAM_ATTR void CPU::loop() {
+    uint64_t _loop_t0 = time_us_64();
     bool pbbp = CPU::portBasedBP;
     if (paused || pbbp) {
         VIDEO::EndFrame();
+        cpu_frame_us += (uint32_t)(time_us_64() - _loop_t0);
         return;
     }
     int nbp = Config::numPcBP;
@@ -252,9 +287,13 @@ IRAM_ATTR void CPU::loop() {
 
     if ((ESPectrum::fdd.control & (kRVMWD177XHLD | kRVMWD177XHLT)) != 0)
     {
+        uint64_t _fdd_t0 = time_us_64();
         rvmWD1793Step(&ESPectrum::fdd, CPU::tstates_diff / WD177XSTEPSTATES); // FDD
+        fdd_step_us += (uint32_t)(time_us_64() - _fdd_t0);
     }
     CPU::tstates_diff = CPU::tstates_diff % WD177XSTEPSTATES;
+
+    cpu_frame_us += (uint32_t)(time_us_64() - _loop_t0);
 
     global_tstates += statesInFrame; // increase global Tstates
     tstates_frame = tstates;
@@ -296,7 +335,22 @@ IRAM_ATTR void CPU::FlushOnHalt() {
 
             uint32_t incr = (stEnd - pre_tstates) >> 2;
             if (pre_tstates & 0x03) incr++;
-            tstates += (incr << 2);
+#if !PICO_RP2040
+            if (Z80Ops::isProfi) {
+                // Land the HALT-wake on the absolute 4T frame grid (phase 0)
+                // rather than inheriting pre_tstates' phase. A HALT only idles
+                // waiting for INT, so its exact wake T-state is a modelling
+                // choice, not discarded computation — same incr, hence same
+                // regR. The inherited phase depends on the (non-deterministic)
+                // flashload/CP/M handoff timing, which made INT-synced border
+                // effects (mcprofi2016) jitter 0..3T per launch; a phase-0
+                // landing is launch-independent. Other archs keep the
+                // inherited-phase model their border timings were calibrated
+                // against.
+                tstates = (pre_tstates & ~3u) + (incr << 2);
+            } else
+#endif
+                tstates += (incr << 2);
             Z80::incRegR(incr & 0x000000FF);
 
         }
@@ -584,15 +638,11 @@ IRAM_ATTR void Z80Ops::addressOnBus(uint16_t address, int32_t wstates) {
 
 /* Callback to know when the INT signal is active */
 IRAM_ATTR bool Z80Ops::isActiveINT(void) {
-    // IntStart/IntEnd are absolute tstate positions and may be negative in Early
-    // mode (window wraps to the end of the previous frame).
-    int32_t tmp = (int32_t)CPU::tstates;
+    // Adding latetiming shifts the check 1T later for Late mode.
+    // At end of frame (tstates=statesInFrame-1), tmp wraps to 0, firing
+    // the Late INT via straddle — this is the correct hardware behaviour.
+    int32_t tmp = (int32_t)CPU::tstates + CPU::latetiming;
     if (tmp >= (int32_t)CPU::statesInFrame) tmp -= CPU::statesInFrame;
-    if (CPU::IntStart < 0) {
-        // Window straddles frame boundary: active if tmp < IntEnd OR tmp >= IntStart+statesInFrame
-        if (tmp < CPU::IntEnd) return true;
-        return tmp >= CPU::IntStart + (int32_t)CPU::statesInFrame;
-    }
     return (tmp >= CPU::IntStart) && (tmp < CPU::IntEnd);
 }
 

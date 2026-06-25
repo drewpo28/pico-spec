@@ -139,6 +139,7 @@ void Tape::PZX_Open(const string& name) {
     fseek(tp, 8 + size, SEEK_SET);
 
     tapeFileName = name;
+    Config::tape_file = FileUtils::TAP_Path + name; // remember slot, re-mounted after F11/reboot
 
     Tape::TapeListing.clear();
     std::vector<TapeBlock>().swap(TapeListing);

@@ -43,11 +43,12 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Debug.h"
 #include "Config.h"
 #include "CPU.h"
+#include "ChipPackage.h"
 
 #define MEM_PG_SZ 0x4000
 #if PICO_RP2350
 // with gigascreen
-#define MEM_REMAIN (12*16*1024)
+#define MEM_REMAIN (14*16*1024)
 #else
 #define MEM_REMAIN (6*16*1024)
 #endif
@@ -55,7 +56,8 @@ visit https://zxespectrum.speccy.org/contacto
 extern uint32_t MEM_PG_CNT;
 extern uint8_t* PSRAM_DATA;
 extern uint8_t psram_pin;
-extern bool rp2350a;
+extern volatile uint32_t mem_spi_evict_count; // SPI PSRAM loads per frame
+extern volatile uint32_t mem_spi_evict_page;  // last evicted page index
 uint32_t butter_psram_size();
 extern uint8_t rx[4];
 
@@ -73,7 +75,8 @@ class mem_desc_t {
         uint32_t vram_off;
         mem_type_t mem_type;
         bool is_rom;
-        mem_desc_int_t() : p(0), vram_off(0), mem_type(POINTER), is_rom(false) {}
+        bool pinned;  // if true, _sync skips this entry (never evicted while pinned)
+        mem_desc_int_t() : p(0), vram_off(0), mem_type(POINTER), is_rom(false), pinned(false) {}
     };
     mem_desc_int_t* _int;
     uint8_t* to_vram(void);
@@ -95,6 +98,15 @@ public:
     inline uint8_t* direct(void) {
         return _int->p;
     }
+    // Force-load this SPI page from PSRAM into the pool without claiming a CPU
+    // bank slot.  Bank=255 is a sentinel: _sync checks plugged_in[0..3] only,
+    // so 255 is never matched → all 4 active bank pointers are checked (a page
+    // currently mapped into any CPU bank is safely skipped rather than evicted).
+    // Nop when already POINTER (page already in SRAM).  Called at DS80 activate
+    // to ensure the color-attr page is in SRAM for fast direct rendering.
+    inline void preload() { if (_int->mem_type != POINTER) _sync(255); }
+    inline mem_type_t memType(void) { return _int->mem_type; }
+    inline uint32_t   spiBase(void) { return _int->vram_off; }
     inline uint8_t* sync(uint8_t bank) {
         if (_int->mem_type != POINTER) {
             _sync(bank);
@@ -140,6 +152,11 @@ public:
             pages.push_back(*this);
         }
     }
+    // Mark this pool entry as pinned: _sync() skips it when looking for a
+    // victim to evict.  The page stays in the pool (pool size unchanged) so
+    // other banks can still find enough evictable slots.  Nop for non-pool pages.
+    inline void pin()   { _int->pinned = true;  }
+    inline void unpin() { _int->pinned = false; }
     inline void assign_rom(const uint8_t* p) { // TODO: prev?
         this->_int->p = (uint8_t*)p;
         this->_int->vram_off = 0;
@@ -189,6 +206,12 @@ public:
     static void writebyte(uint16_t addr, uint8_t data);
     static void writeword(uint16_t addr, uint16_t data);
 
+    // Cold out-of-line breakpoint checks: keep the 20-entry scan and the
+    // portBasedBP store out of every inlined readbyte/writebyte expansion
+    // in the Z80 core (icache footprint), entered only when mem BPs exist.
+    static void checkMemReadBP(uint16_t addr);
+    static void checkMemWriteBP(uint16_t addr);
+
     static int getByteContention(uint16_t addr);
 
     inline static void recoverPage0() {
@@ -215,8 +238,8 @@ inline int MemESP::getByteContention(uint16_t addr) {
 }
 
 inline uint8_t MemESP::readbyte(uint16_t addr) {
-    if (Config::numMemReadBP > 0 && Config::hasBreakPoint(addr, Config::BP_MEM_READ))
-        CPU::portBasedBP = true;
+    if (__builtin_expect(Config::numMemReadBP != 0, 0))
+        checkMemReadBP(addr);
     uint8_t page = addr >> 14;
 #if !PICO_RP2040
     if (page == 0 && divmmc_mapped) {
@@ -232,8 +255,8 @@ inline uint16_t MemESP::readword(uint16_t addr) {
 
 inline void MemESP::writebyte(uint16_t addr, uint8_t data)
 {
-    if (Config::numMemWriteBP > 0 && Config::hasBreakPoint(addr, Config::BP_MEM_WRITE))
-        CPU::portBasedBP = true;
+    if (__builtin_expect(Config::numMemWriteBP != 0, 0))
+        checkMemWriteBP(addr);
     uint8_t page = addr >> 14;
 #if !PICO_RP2040
     if (page == 0 && divmmc_mapped) {
@@ -259,6 +282,32 @@ inline void MemESP::writebyte(uint16_t addr, uint8_t data)
 #endif
     uint8_t* p = ramCurrent[page];
     if (p < (uint8_t*)0x11000000) return;
+    // NOTE: the Profi CP/M BOOTFDD has 0x801A = 0xC9, which the BIOS reads via
+    // `LD A,(0x801A); AND A; JR NZ` to select the floppy boot path (A≠0).
+    // An earlier experiment patched this byte to 0x00 to force the HDD boot path,
+    // but the HDD CP/M boot is not implemented and that patch hung the boot.
+    // We boot CP/M from floppy; the IDE HDD remains accessible as a data drive
+    // from within CP/M via the Profi IDE ports — so no 0x801A patch here.
+#if PROFI_PORT_TRACE
+    // Intercept writes to the currently-displayed DS80 page (colour or pixel).
+    // Fires when the Z80 writes to the page the VGA/HDMI renderer is reading from.
+    {
+        extern uint8_t* ds80_dbg_clrmem;
+        extern uint8_t* ds80_dbg_grmem;
+        extern int      ds80_dbg_wr_cnt;
+        if ((ds80_dbg_clrmem && p == ds80_dbg_clrmem) ||
+            (ds80_dbg_grmem  && p == ds80_dbg_grmem)) {
+            if (ds80_dbg_wr_cnt < 30) {
+                bool is_clr = (ds80_dbg_clrmem && p == ds80_dbg_clrmem);
+                // _ds80_dbg_get_pc() is defined in Ports.cpp (which includes z80.h).
+                extern uint16_t _ds80_dbg_get_pc(void);
+                Debug::log("[WR→DISPLAY_%s] a=%04X d=%02X PC=%04X #%d",
+                    is_clr ? "CLR" : "PIX", addr, data,
+                    _ds80_dbg_get_pc(), ++ds80_dbg_wr_cnt);
+            }
+        }
+    }
+#endif
     p[addr & 0x3fff] = data;
 }
 

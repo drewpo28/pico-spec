@@ -158,15 +158,15 @@ On RP2350, UART TX available via two funcsel:
 
 | GPIO | Function | Cat | Notes |
 |------|----------|-----|-------|
-| 0 | KBD_CLOCK | REASSIGN | |
-| 1 | KBD_DATA | REASSIGN | |
+| 0 | ZiFi UART0 TX | REASSIGN | freed from KBD; UART0 TX funcsel 2 |
+| 1 | ZiFi UART0 RX | REASSIGN | freed from KBD; UART0 RX funcsel 2 |
 | 2 | — | FREE | |
 | 3 | — | FREE | |
 | 4 | — | FREE | |
 | 5 | SD SCK | FIXED | SPI1 PCB |
 | 6-13 | VGA/HDMI (8 pins) | FIXED | Display base=6; NES_CLK=8, NES_LAT=9 conflict! |
-| 14 | — | FREE | |
-| 15 | — | FREE | |
+| 14 | KBD_CLOCK | REASSIGN | moved from GP0 for ZiFi |
+| 15 | KBD_DATA | REASSIGN | moved from GP1 for ZiFi |
 | 16 | — | FREE | |
 | 17 | — | FREE | |
 | 18 | SD MOSI | FIXED | SPI1 PCB |
@@ -278,6 +278,97 @@ On RP2350, UART TX available via two funcsel:
 3. **PICO_DV NESPAD vs Display** — NES_CLK=8, NES_LAT=9 inside display range (6-13). USE_NESPAD correctly not set
 4. **MURM2/MURM MIDI_TX=LOAD_WAV_PIO=22** — mutually exclusive features on same pin. Handled in code (warning in messages.h)
 
+## ZiFi NIC — two host interfaces (both bridge to one ESP UART)
+
+Port low byte `0xEF`; high address byte = register. Gated by `Config::zifi_enabled`.
+- **ZIFI-API FIFO** (`#00EF`..`#C7EF`): hi ≤ 0xC7. `ZiFi::read/write`. DR data + ZIFR/ZOFR/IMR/CR. High-level FIFO interface.
+- **16550 UART window** (`#F8EF`..`#FFEF`): hi ≥ 0xF8. `ZiFi::uart16550Read/Write`. reg = hi&7: 0=RBR/THR(or DLL if DLAB), 1=IER/DLM, 2=IIR/FCR, 3=LCR, 4=MCR, 5=LSR, 6=MSR, 7=SCR. THR/RBR bridge to the SAME `zifi_in_buf`/`zifi_out_buf` as the API. LSR=`0x60 | (rx?1:0)`; baud fixed 115200 8N1 (divisor latches stored, ignored).
+- Most real ZiFi software (e.g. `debug/NET/MRF.TRD` terminal, drivers ZW-64/ZW-64-SC/GZ-80) uses the **16550 window**, not the API. Verified by disasm: `LD B,#Fx; LD C,#EF; OUT (C),A` + `IN A,(#FDEF)` LSR poll. App sends its own AT commands over the bridge.
+- Wired in `Ports::input`/`Ports::output` after the API check.
+
+### UART TX/RX pins — runtime, per-board (`src/BoardPins.*`)
+- **No compile-time pin define** anymore (old `-DZIFI_TX_PIN` removed). `ZiFi::init()` reads `Config::zifi_tx_pin`/`zifi_rx_pin` and resolves via `BoardPins::resolveZifiPins()` + `uartInstanceForTx()` (authoritative RP2350 pinmux from `rp2350[ab]_interface_pins.json` — the old `(pin/4)%2` heuristic was WRONG for GPIO 8/10/24/26). UART instance/funcsel chosen at runtime; `g_uart`/`g_uart_irq` statics.
+- Config sentinels: `0xFE` = board default, `0xFF` = OFF (no UART, FIFO-only), else explicit TX (RX = odd partner). Stored in NVS (`zifi_tx_pin`/`zifi_rx_pin`).
+- **Per-board candidate pairs** + defaults live in `BoardPins.cpp` (`#if PICO_DV/MURM2/PICO_PC/ZERO2/#else MURM1_P2`). Defaults: PICO_DV 0/1, MURM2 20/21, PICO_PC 20/21, ZERO2 24/25, MURM1_P2 16/17.
+- **Picker**: Network → first row `GPIO x/y` (or `GPIO Off`, `(def)` suffix when unset) → submenu listing `Off` + each board pair with a note (what it displaces, e.g. "off: NESPAD"). On select: save + `ZiFi::deinit()/init()` if NIC on. `BoardPins` is the reusable home for board pin-maps (extend for MIDI etc.).
+- **Yield-at-boot**: when a chosen pair shares pins with a peripheral (non-empty note), ZiFi has priority — at boot each conflicting peripheral calls `BoardPins::zifiOwnsPin(pin)` and **skips its own init** if ZiFi owns it: NESPAD (`main.cpp`, moved after `Config::load`, gated by `nespad_active`), MIDI (`ESPectrum.cpp` `Midi::enabled=0`), WAV (`pwm_audio.cpp` skip `inInit`), PCM5122 (`pwm_audio.cpp` skip I2S), AY-clock (`PinSerialData_595.c` via `extern "C" board_zifi_owns_pin`). The displaced peripheral only releases pins at boot, so selecting a conflicting pair **or** enabling the NIC with a conflicting default prompts `OSD_DLG_APPLYREBOOT` (`BoardPins::zifiActiveNote()` non-empty). Defaults that conflict by design: MURM2/PICO_PC 20/21 = NESPAD, MURM1_P2 16/17 = NESPAD.
+
+## Internet archive downloader (WIP — TR-DOS/tape images over HTTPS to SD)
+
+Goal: browse/download disk & tape images (vtrd.in, then zxart.ee, worldofspectrum)
+over the ESP-01 and save to SD, with minimal SRAM. RP2350-only, behind
+`#if !PICO_RP2040 && ZIFI_NET_CLIENT`. Reuses `RemoteFs` + `OSD::remoteFileDialog`.
+
+### Architecture: host-TLS on RP2350 + serverless GitHub Pages catalog
+- **Catalog** built by a **GitHub Action (cron)** → static per-site index files
+  (`vtrd.tsv`, `zxart.tsv`, `wos.tsv` + `sites.tsv`) served over HTTPS from
+  GitHub Pages. No always-on server. Index line = `type \t name \t size \t locator`
+  (`D`=dir/category, `F`=file → absolute download URL). Per-site logic lives in the
+  Action; the device stays generic. Fallback for a Cloudflare-hard site (vtrd 403s
+  bots): the Action mirrors extracted `.trd` to Pages. **Local :80 proxy** remains
+  the documented fallback if host-TLS proves unworkable.
+- **Device does HTTPS itself** (the load-bearing decision): TLS runs on the RP2350,
+  the ESP-01 is a dumb plain-TCP pipe — **same host-crypto/dumb-ESP split as SSH**
+  (`Ssh.cpp`). ESP-AT's own SSL is NOT used (ESP-01S lacks heap for a ~40-50 KB
+  handshake and stock AT firmware has no GCM ciphers).
+
+### TLS layer (`src/TlsSock.{h,cpp}`)
+- mbedTLS TLS 1.2 client over `ZiFiSock::sock_open(host,443,/*tls=*/false,..)`,
+  wired via `mbedtls_ssl_set_bio` (`bioSend`/`bioRecv` → `ZiFiSock::sock_send/recv`).
+- `bioRecv` uses new `ZiFiSock::isClosed(id)` to tell clean EOF from a transient
+  no-data timeout (returns `MBEDTLS_ERR_SSL_WANT_READ`).
+- f_rng from RP2350 hardware RNG (`pico/rand.h` `get_rand_32`), like `Ssh.cpp`'s
+  `ssh_rng` — no entropy/CTR_DRBG modules.
+- CA verification: `loadCaFile()` parses PEM from `cacert.pem` on SD →
+  `VERIFY_REQUIRED`; no CA → `VERIFY_NONE` (bring-up spike only, logs a warning).
+  SNI always set via `mbedtls_ssl_set_hostname`.
+- **mbedTLS config** (`src/mbedtls_config_picospec.h`): TLS stack added on top of the
+  SSH crypto primitives — `MBEDTLS_SSL_TLS_C/SSL_CLI_C/SSL_PROTO_TLS1_2/SNI`,
+  ECDHE-RSA/ECDSA key exch, `GCM_C`, X.509 (`PK_C/PK_PARSE_C/X509_USE_C/X509_CRT_PARSE_C/PEM_PARSE_C`).
+  TLS 1.2 only (no 1.3 → no version pinning needed). Buffers trimmed:
+  `SSL_IN_CONTENT_LEN=16384` (cert chains), `SSL_OUT_CONTENT_LEN=4096` (tiny GETs).
+
+### HTTP layer (`src/HttpsGet.{h,cpp}`)
+- Minimal HTTP/1.1 GET: `https://`→`TlsSock`, `http://`→plain `ZiFiSock`. Streams
+  body to a `SinkCb` (or `getToFile()` straight to SD via `fopen2`/`f_write`),
+  static 1 KB buffer off the stack (like `Ftp.cpp` `g_ftp_buf`). Handles
+  Content-Length + connection-close bodies; **chunked T-E is rejected** (Pages sends
+  Content-Length). Browser `User-Agent` (for vtrd's 403 filter).
+- **`HttpsGet::selfTest(url[,caPath])`** — bring-up spike: GET + log status /
+  Content-Length / first body bytes. Use to validate TLS-over-ESP on hardware
+  before building `HttpCatalogFs`/menu (next: Commit 1).
+
+### On-device "curl" test (`netHttpTest` in `OSDMain.cpp`)
+- Network menu row **"HTTP test (curl)"** (RP2350, under `#if ZIFI_NET_CLIENT`).
+  Prompts scheme (https/http) + host[:port] + path as **separate fields** (because
+  `inlineTextEdit` caps text at the field width — a full URL won't fit one field;
+  `netAskField` gained an optional `field` width arg). GETs via `HttpsGet`, shows a
+  summary (status / Content-Length / received / ok / **free-heap before→after**) +
+  body preview in `OSD::showTextDialog`. This is the on-hardware trigger for the
+  TLS-over-ESP spike. Output is summary-only (no SD file).
+- **Memory**: curl's preview/summary buffers are alt-stack locals (no permanent
+  BSS). mbedTLS stays on the libc heap (heap-first; SSH already runs there). The
+  free-heap log lets us see if a TLS handshake (IN16K+OUT4K + alt-stack, all from
+  heap) is too tight — if so, route mbedTLS allocs to PSRAM (`PSRAM_DATA`) later.
+  SD-swap is NOT usable for TLS buffers (no MMU/demand-paging on RP2350).
+
+## RTC / Time (Pentagon Mr Gluk TimeKeeper)
+
+- `src/RTC.*` — MC146818 emulation (RP2350-only). Ports (Pentagon/Profi):
+  - `OUT (#DFF7), reg` — latch register index (confirmed via `OUT (C),H` at Gluk ROM 0x11BA)
+  - `OUT (#BFF7), data` / `IN A,(#BFF7)` — data register (runtime-unpacked, not in static ROM)
+  - Wired in `Ports::input`/`Ports::output`; responds on `isPentagon||isProfi` (NOT gated on EFF7 bit7 CMOS, for robustness — those ports are RTC-specific on these machines)
+- Reg B=0x02 (24h, BCD — what Gluk expects); Reg D bit7 VRT=1 (battery valid); Reg A UIP=0 always. Clock regs 0x00-0x09 computed live from `base_secs + elapsed_ms` (no per-register tick); guest writes to time regs ignored.
+- Time source: SNTP via ZiFi ESP — `ZiFiAT::syncTime(tz, out)` sends `AT+CIPSNTPCFG=1,tz,"pool.ntp.org"` then polls `AT+CIPSNTPTIME?` (parses `+CIPSNTPTIME:Www Mmm dd hh:mm:ss yyyy`, accepts year≥2020).
+- Trigger: **manual** — Network menu → "Sync time (SNTP)". Timezone via Network → "Time zone" (UTC−12..+14 list → `Config::wifi_tz`, saved to wifi.cfg key `tz`).
+- **Network menu** (RP2350, built dynamically): row 1 = `WiFi On <ssid> <ip>` / `WiFi Off` (live status, padded to fixed 32 width so geometry stays stable) then `Sync time (SNTP)` / `Time zone >` / `ZiFi NIC >`. Selecting the **WiFi** row is the all-in-one action — connected: SSID+IP + disconnect (msgDialog); not connected: `AT+CWLAP` scan → pick SSID (dynamic menuRun list) → password (`wifiAskPassword` box over `OSD::inlineTextEdit`) → connect → saves SSID/pass to wifi.cfg. Status is cached (`getStatus` is blocking) and refreshed on menu entry + after connect/disconnect/NIC-toggle. Connect/Disconnect/Reload items removed.
+- **wifi.cfg** lives in `CONFIG_DIR` (`/.config/pico-spec/wifi.cfg`); legacy `/wifi.cfg` still read as fallback. `Config::saveWifiConfig()` writes ssid/pass/tz/autoconnect; `ZiFiAT::scan()` parses `+CWLAP`.
+- **Auto-sync on boot**: when `ZiFi::enabled && Config::rtc_enabled && wifi_ssid` set, `ESPectrum::loop` kicks off `ZiFiAT::autoSyncBegin()` ~4 s in, then `autoSyncPoll()` each tick. Non-blocking background state machine (CWMODE→CWJAP→CIPSNTPCFG→poll CIPSNTPTIME?, ~15 retries) — **no OSD, never freezes** audio/video; writes straight into RTC, silent on failure. Manual menu sync still uses the blocking `syncTime()`.
+- **"NO CMOS" fix (hw-confirmed)**: Gluk treats CMOS valid only when NVRAM **reg 0x11 == 0xAA** (unpacked-RAM check at 0x6049 `CP 0xAA / JR NZ`); reg 0x12 == 0x47 (`'G'`) gates loading the 27-byte config (regs 0x13–0x2D → RAM 0x63A1). No checksum. Gluk's auto-path writes a bogus 0x55 and never self-validates (real signature written only on menu-save). `RTC::init()` seeds `regs[0x11] = 0xAA` after `loadNVRAM()` so the clock works out of the box; Gluk then reads time regs 0x00–0x09.
+- NVRAM (0x0E–0x3F + reg B) persisted to `CONFIG_DIR/cmos.nvr` (battery emulation): `loadNVRAM()` at init, dirty-flushed from main loop via `RTC::flushNVRAM()`.
+- `RTC_PORT_TRACE` CMake option (default OFF) logs every `..F7` IN/OUT for debugging.
+- **Toggle**: Options → Other → "RTC + NVRAM" (Yes/No → `Config::rtc_enabled`, default **off** — `Config::rtc_enabled = false`, NVS-persisted). RP2350-only: the menu row is appended at runtime under `#if !PICO_RP2040`; when off, the `#DFF7`/`#BFF7` port handlers are bypassed (Gluk shows "NO CMOS").
+
 ## Tools
 
 - `tools/z80disasm.py` — Z80 disassembler (pure Python3, no deps)
@@ -285,10 +376,12 @@ On RP2350, UART TX available via two funcsel:
   - Raw binaries: `python3 tools/z80disasm.py code.bin --org 0x8000`
   - API: `from tools.z80disasm import disasm_bytes, disasm_bytes_text`
   - Supports all Z80 prefixes: CB, DD, FD, ED, DD CB, FD CB (including undocumented)
+- [profi2png VGA detection fix](memory/profi2png_vga_detection.md) — max_byte>15 heuristic always fires for VGA std-mode (0xC0+ sync bits); fix: also require min_byte<0xC0.
 
 ## Test Files
 
-- `FPGA48all.tap` — SAA1099 test program for ZX Spectrum 128K
+- `FPGA48all.tap` — **ULA test program for ZX Spectrum 48K** (NOT SAA1099 — port
+  `0x01FE` is the ULA port, A0=0; the earlier "SAA1099" label was wrong, per user)
   - Disassembly: `FPGA48all_disasm.txt`
   - Loader at 0x5E00, screen at 0x4000, main code at 0x6200
-  - Main code starts with `CALL 0x817E` (IM 2 setup), uses SAA1099 port 0x01FE
+  - Main code starts with `CALL 0x817E` (IM 2 setup); exercises the ULA via port `0x01FE`

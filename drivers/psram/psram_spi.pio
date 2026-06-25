@@ -38,6 +38,42 @@ readloop_mid:
     jmp y--, readloop   side 0b00  ; Lower clock. Loop if we have more to read
 
 
+; 32-bit counter variants: allow full 16KB page in a single SPI transaction.
+; x/y are loaded as 32-bit big-endian values from the TX FIFO (4 bytes each).
+; The command format changes: first 8 bytes = [x_be32, y_be32], then SPI bytes.
+.program spi_psram_32
+.side_set 2
+begin:
+    out x, 32           side 0b01
+    out y, 32           side 0b01
+    jmp x--, writeloop  side 0b01
+writeloop:
+    out pins, 1         side 0b00
+    jmp x--, writeloop  side 0b10
+    jmp !y, begin       side 0b00
+    jmp readloop_mid    side 0b10
+readloop:
+    in pins, 1          side 0b10
+readloop_mid:
+    jmp y--, readloop   side 0b00
+
+.program spi_psram_32_fudge
+.side_set 2
+begin:
+    out x, 32           side 0b01
+    out y, 32           side 0b01
+    jmp x--, writeloop  side 0b01
+writeloop:
+    out pins, 1         side 0b00
+    jmp x--, writeloop  side 0b10
+    jmp !y, begin       side 0b00
+    nop                 side 0b10
+    jmp readloop_mid    side 0b00
+readloop:
+    in pins, 1          side 0b00
+readloop_mid:
+    jmp y--, readloop   side 0b10
+
 .program qspi_psram
 .side_set 2
 begin:

@@ -130,6 +130,13 @@ static void showInfoBox(const string& info, int lineCount) {
 
     drawContent(lineStarts, lineLens, totalLines, scrollPos, visRows, bx, by, w, menuCols);
 
+    // Drain the keyboard queue: the F1 press that opened this dialog (and any
+    // auto-repeat re-injections while F1 is still held) would otherwise be read
+    // below and dismiss the box immediately.
+    { fabgl::VirtualKeyItem drain;
+      while (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable())
+          ESPectrum::PS2Controller.keyboard()->getNextVirtualKey(&drain); }
+
     // Scroll loop
     fabgl::VirtualKeyItem Menukey;
     while (1) {
@@ -155,8 +162,13 @@ static void showInfoBox(const string& info, int lineCount) {
                     if (scrollPos != 0) { scrollPos = 0; redraw = true; }
                 } else if (Menukey.vk == fabgl::VK_END) {
                     if (scrollPos != maxScroll) { scrollPos = maxScroll; redraw = true; }
-                } else if (is_back(Menukey.vk) || is_enter(Menukey.vk)
+                } else if (Menukey.vk == fabgl::VK_ESCAPE || Menukey.vk == fabgl::VK_MENU_LEFT
+                        || is_enter(Menukey.vk)
                         || Menukey.vk == fabgl::VK_RETURN || Menukey.vk == fabgl::VK_SPACE) {
+                    // Dismiss on ESC/Enter/Space — but NOT F1. F1 opened this box
+                    // from the file browser; treating it as "back" here lets key
+                    // auto-repeat (after a 500ms hold) close + reopen the box in a
+                    // loop, re-parsing the file from SD each cycle (apparent hang).
                     goto done;
                 }
                 if (redraw)
@@ -689,6 +701,154 @@ static void viewHDF(FIL* f, FSIZE_t fileSize, string& info, int& lines) {
     info += line; info += "\n"; lines++;
 }
 
+// ---- MBD (MB-02+ BS-DOS raw sector dump; 16-byte header) ----
+static void viewMBD(FIL* f, FSIZE_t fileSize, string& info, int& lines) {
+    uint8_t hdr[16]; UINT br;
+    f_lseek(f, 0);
+    f_read(f, hdr, 16, &br);
+    if (br != 16) return;
+
+    // Geometry from header (matches wd1793 loadDisk): tracks@4, spt@6, sides@8.
+    uint8_t tracks = hdr[4], spt = hdr[6], sides = hdr[8];
+    if (tracks == 0 || spt == 0 || sides == 0) { tracks = 82; sides = 2; spt = 11; }
+
+    uint32_t secSize = (uint32_t)(fileSize / ((uint32_t)tracks * sides * spt));
+    if (secSize != 256 && secSize != 512 && secSize != 1024) secSize = 1024;
+
+    char line[48];
+    info += "MB-02+ BS-DOS disk\n"; lines++;
+    snprintf(line, sizeof(line), "%dT %dS  %d sec x %luB",
+             tracks, sides, spt, (unsigned long)secSize);
+    info += line; info += "\n"; lines++;
+}
+
+// ---- TD0 (Teledisk) ----
+static void viewTD0(FIL* f, FSIZE_t fileSize, string& info, int& lines) {
+    if (fileSize < 12) return;
+    uint8_t h[12]; UINT br;
+    f_lseek(f, 0);
+    f_read(f, h, 12, &br);
+    if (br != 12) return;
+
+    bool packed = (h[0] == 't');    // 'TD' = normal, 'td' = advanced (LZH) compression
+    uint8_t ver = h[4];             // Teledisk version (e.g. 21 = v2.1)
+    uint8_t sides = h[9];
+    bool hasComment = (h[7] & 0x80) != 0;
+
+    char line[48];
+    snprintf(line, sizeof(line), "Teledisk v%d.%d %s", ver / 10, ver % 10,
+             packed ? "(LZH)" : "(normal)");
+    info += line; info += "\n"; lines++;
+    snprintf(line, sizeof(line), "Sides: %d", sides);
+    info += line; info += "\n"; lines++;
+
+    if (!hasComment) return;
+    if (packed) { info += "Comment: (packed)\n"; lines++; return; }
+
+    // Comment block follows the 12-byte header (plaintext for normal TD0):
+    // CRC(2), len(2 LE), Y, M(0-based), D, h, m, s, then `len` bytes of text
+    // with NUL bytes separating lines.
+    uint8_t c[10];
+    f_lseek(f, 12);
+    f_read(f, c, 10, &br);
+    if (br != 10) return;
+    uint16_t clen = c[2] | (c[3] << 8);
+    snprintf(line, sizeof(line), "Date: %04d-%02d-%02d %02d:%02d",
+             1900 + c[4], c[5] + 1, c[6], c[7], c[8]);
+    info += line; info += "\n"; lines++;
+    if (clen) {
+        char txt[40];
+        UINT rd = clen > (uint16_t)(sizeof(txt) - 1) ? (UINT)(sizeof(txt) - 1) : clen;
+        f_read(f, txt, rd, &br);
+        txt[br] = 0;
+        for (UINT i = 0; i < br; i++)
+            if (txt[i] == 0 || txt[i] == '\r' || txt[i] == '\n') { txt[i] = 0; break; }
+        if (txt[0]) { info += txt; info += "\n"; lines++; }
+    }
+}
+
+// ---- PRO (Profi CP/M raw floppy image, no header) ----
+static void viewPRO(FIL* f, FSIZE_t fileSize, string& info, int& lines) {
+    // Layout per wd1793 loadDisk(): 819200 = 80T/2S/5×1024 (800K),
+    // 409600 = 80T/1S (400K); anything else falls back to the 800K geometry.
+    uint8_t tracks = 80, sides = 2, spt = 5;
+    uint16_t secSize = 1024;
+    if (fileSize == 409600) sides = 1;
+
+    char line[48];
+    info += "Profi CP/M floppy\n"; lines++;
+    snprintf(line, sizeof(line), "%dT %dS  %d sec x %dB", tracks, sides, spt, secSize);
+    info += line; info += "\n"; lines++;
+    // First track uses special sector IDs (copy-protection-friendly layout).
+    info += "Track 0/0 IDs: 1,2,3,4,9\n"; lines++;
+}
+
+// ---- HDD (raw hard-disk image, no header) ----
+static void viewHDD(FIL* f, FSIZE_t fileSize, string& info, int& lines) {
+    uint32_t total_lba = (uint32_t)(fileSize / 512);
+    // Geometry synthesized exactly like IDE::synth_chs() (H=16, S=63).
+    uint16_t heads = 16, spt = 63;
+    uint32_t cyl = total_lba / (16u * 63u);
+    if (cyl == 0) cyl = 1;
+    if (cyl > 65535) cyl = 65535;
+
+    char line[48];
+    info += "Raw HDD image\n"; lines++;
+    snprintf(line, sizeof(line), "LBA sectors: %lu", (unsigned long)total_lba);
+    info += line; info += "\n"; lines++;
+    snprintf(line, sizeof(line), "CHS: %lu/%d/%d (synth)", (unsigned long)cyl, heads, spt);
+    info += line; info += "\n"; lines++;
+
+    // Profi HiDD partition: signature "rPfoHiDD" (byte-swapped) at 256*512+16.
+    if (fileSize >= 131088 + 8) {
+        uint8_t psig[8]; UINT br;
+        f_lseek(f, 131088);
+        f_read(f, psig, 8, &br);
+        if (br == 8 && memcmp(psig, "rPfoHiDD", 8) == 0) {
+            info += "Profi HiDD partition (H16 S16)\n"; lines++;
+        }
+    }
+}
+
+// ---- VHD (Fixed Virtual Hard Disk; 512-byte footer at end of file) ----
+static void viewVHD(FIL* f, FSIZE_t fileSize, string& info, int& lines) {
+    if (fileSize < 512) { info += "Too small for VHD footer\n"; lines++; return; }
+
+    // Static: all view* helpers inline into viewInfo, so this 512 B buffer would
+    // otherwise dominate viewInfo's stack frame. viewInfo nests under do_OSD(1 KB)
+    // + fileDialog(0.7 KB) on the 4 KB core0 stack — every byte counts. Not reentrant.
+    static uint8_t ft[512];
+    UINT br;
+    f_lseek(f, fileSize - 512);
+    f_read(f, ft, 512, &br);
+    if (br != 512 || memcmp(ft, "conectix", 8) != 0) {
+        info += "No VHD footer (conectix)\n"; lines++;
+        return;
+    }
+    // Microsoft VHD footer (big-endian): Current Size @ 0x30, Disk Geometry
+    // @ 0x38 (cyl 2B, heads 1B, spt 1B), Disk Type @ 0x3C.
+    uint32_t disk_type = ((uint32_t)ft[0x3C] << 24) | ((uint32_t)ft[0x3D] << 16) |
+                         ((uint32_t)ft[0x3E] << 8) | ft[0x3F];
+    uint64_t cur_size = 0;
+    for (int i = 0; i < 8; ++i) cur_size = (cur_size << 8) | ft[0x30 + i];
+    uint16_t vc = (ft[0x38] << 8) | ft[0x39];
+    uint8_t  vh = ft[0x3A];
+    uint8_t  vs = ft[0x3B];
+
+    const char* typeStr = disk_type == 2 ? "Fixed" :
+                          disk_type == 3 ? "Dynamic" :
+                          disk_type == 4 ? "Differencing" : "?";
+    char line[48];
+    snprintf(line, sizeof(line), "VHD type %lu (%s)", (unsigned long)disk_type, typeStr);
+    info += line; info += "\n"; lines++;
+    snprintf(line, sizeof(line), "CHS: %d/%d/%d", vc, vh, vs);
+    info += line; info += "\n"; lines++;
+    snprintf(line, sizeof(line), "Virtual size: %luMB",
+             (unsigned long)(cur_size / (1024 * 1024)));
+    info += line; info += "\n"; lines++;
+    if (disk_type != 2) { info += "Only Fixed (2) supported\n"; lines++; }
+}
+
 // ---- Main dispatcher ----
 void FileInfo::viewInfo(const string& path) {
     FIL& f = s_infoFile;
@@ -715,6 +875,11 @@ void FileInfo::viewInfo(const string& path) {
     else if (ext == "fdi") viewFDI(&f, fileSize, info, lines);
     else if (ext == "udi") viewUDI(&f, fileSize, info, lines);
     else if (ext == "hdf") viewHDF(&f, fileSize, info, lines);
+    else if (ext == "pro") viewPRO(&f, fileSize, info, lines);
+    else if (ext == "mbd") viewMBD(&f, fileSize, info, lines);
+    else if (ext == "td0") viewTD0(&f, fileSize, info, lines);
+    else if (ext == "hdd") viewHDD(&f, fileSize, info, lines);
+    else if (ext == "vhd") viewVHD(&f, fileSize, info, lines);
     else if (ext == "mmc") { /* just show filename + size (title) */ }
 
     f_close(&f);

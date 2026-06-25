@@ -19,11 +19,16 @@ public:
     static uint8_t readPort();
     static void handleDMA();
 
-    // Per-scanline attribute shadow (8x1 attrs via DMA)
-    static uint8_t  dma_attr_shadow[192 * 32];
+    // Per-scanline attribute shadow (8x1 attrs via DMA). 6 KB — heap-allocated
+    // only while Config::dma_mode != 0 (DMA is off by default); freed when the
+    // user switches DMA off in the OSD.
+    static constexpr uint32_t DMA_ATTR_SHADOW_SZ = 192 * 32;
+    static uint8_t* dma_attr_shadow;
     static bool     dma_attr_valid[192];
     static bool     dma_charrow_active[24];
     static void     resetAttrShadow();
+    static bool     ensureAttrShadow();
+    static void     freeAttrShadow();
 
     // MB-02+ deferred DMA: trigger pending transfer externally
     static bool mb02_deferred;

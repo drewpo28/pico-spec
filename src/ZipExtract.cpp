@@ -13,12 +13,14 @@ using namespace std;
 
 #include "ZipExtract.h"
 #include "FileUtils.h"
+#include "Buffer.h"
 #include "MemESP.h"
 #include "Video.h"
 #include "OSDMain.h"
 #include "Config.h"
 #include "ESPectrum.h"
 #include "messages.h"
+#include "Debug.h"
 
 extern Font Font6x8;
 
@@ -113,6 +115,10 @@ string ZipExtract::extract(const string& zipPath, uint8_t fileType) {
 
         FSIZE_t dataStart = f_tell(&zipFile);
 
+        Debug::log("ZIP: scan '%s' method=%u flags=0x%x csz=%u usz=%u match=%d",
+                   s_zip_fnBuf, hdr.compression, hdr.flags, hdr.compressedSize,
+                   hdr.uncompressedSize, (int)hasMatchingExt(s_zip_fnBuf, fileType));
+
         // Check: not a directory, has matching extension
         if (s_zip_fnBuf[hdr.nameLen - 1] != '/' && hasMatchingExt(s_zip_fnBuf, fileType)) {
             ZipEntry& e = entries[entryCount];
@@ -135,6 +141,7 @@ string ZipExtract::extract(const string& zipPath, uint8_t fileType) {
     }
 
     if (entryCount == 0) {
+        Debug::log("ZIP: no matching entry for fileType=%u (scanned to first non-match/EOCD)", fileType);
         f_close(&zipFile);
         return "";
     }
@@ -166,11 +173,28 @@ string ZipExtract::extract(const string& zipPath, uint8_t fileType) {
     ZipEntry& e = entries[selected];
     f_lseek(&zipFile, e.dataOffset);
 
+    Debug::log("ZIP: extract '%s' method=%u csz=%u usz=%u (entries=%d)",
+               e.name, e.compression, e.compressedSize, e.uncompressedSize, entryCount);
+
+    // Only stored (0) and deflate (8) are supported. Newer packers may use
+    // Deflate64 (9), BZIP2 (12), LZMA (14), Zstandard (93), XZ (95), PPMd (98),
+    // or AES-encrypted (99) — these are NOT decodable here. Tell the user which
+    // one rather than the generic "no supported file" message.
+    if (e.compression != 0 && e.compression != 8) {
+        f_close(&zipFile);
+        char m[40];
+        snprintf(m, sizeof(m), " ZIP: unsupported method %u ", e.compression);
+        OSD::osdCenteredMsg(m, LEVEL_WARN, 3000);
+        return "";
+    }
+
     OSD::osdCenteredMsg(OSD_ZIP_EXTRACTING[Config::lang], LEVEL_INFO, 0);
 
     cleanup();
     bool ok = extractFile(&zipFile, e.compression, e.compressedSize, e.uncompressedSize);
     f_close(&zipFile);
+
+    Debug::log("ZIP: extractFile ok=%d", (int)ok);
 
     if (!ok) return "";
 
@@ -203,7 +227,8 @@ string ZipExtract::extractByIndex(const string& zipPath, int fileIndex) {
 
 bool ZipExtract::extractFile(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize) {
     if (compression == 0)
-        return extractStored(zipFile, compressedSize);
+        // Streaming-stored (csz=0 in local header): csz==usz for stored data.
+        return extractStored(zipFile, compressedSize ? compressedSize : uncompressedSize);
     if (compression == 8)
         return extractDeflate(zipFile, compressedSize);
     return false;
@@ -235,6 +260,17 @@ bool ZipExtract::extractStored(FIL* zipFile, uint32_t size) {
     return true;
 }
 
+// Route miniz's inflate-state allocation (the ~11 KB tinfl_decompressor) through
+// the tiered Buffer with USE_NET_ARENA: a download/extract runs inside the paused
+// OSD net session, so the lent Gigascreen prevFB arena backs it instead of the
+// tight libc heap (heap-only boards / local zips just fall back to heap). This is
+// what was OOM-ing on a big extract (e.g. SATISFAC.SCL, 204 KB) when Gigascreen's
+// prevFB had already eaten the heap.
+static void* zip_zalloc(void* /*opaque*/, size_t items, size_t size) {
+    return Buffer::palloc(items * size, Buffer::USE_NET_ARENA);
+}
+static void zip_zfree(void* /*opaque*/, void* p) { Buffer::pfree(p); }
+
 bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize) {
     FIL& outFile = s_outFile;
     if (f_open(&outFile, TEMP_FILE, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
@@ -245,12 +281,22 @@ bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize) {
     z_stream stream;
 
     memset(&stream, 0, sizeof(stream));
+    stream.zalloc = zip_zalloc;   // inflate state → Buffer (arena/heap), off the tight heap
+    stream.zfree  = zip_zfree;
     stream.next_in = s_inbuf;
     stream.avail_in = 0;
     stream.next_out = s_outbuf;
     stream.avail_out = ZIP_BUF_SIZE;
 
+    // compressedSize==0 with the data-descriptor flag (flags&0x08) means a
+    // streaming packer wrote the file without back-patching the local header —
+    // the real size is only in the central directory. For deflate we don't need
+    // it: feed input until the deflate stream self-terminates (Z_STREAM_END),
+    // bounded by EOF. inflate ignores any trailing data-descriptor/CD bytes left
+    // in the input buffer, so reading past the stream end is harmless.
+    bool unbounded = (compressedSize == 0);
     uint32_t infile_remaining = compressedSize;
+    bool in_eof = false;
 
     // Borrow video RAM pages 5+7 as inflate dictionary (32KB contiguous).
     // pages57 is a static 32KB array: ram[5]=pages57, ram[7]=pages57+16KB.
@@ -268,20 +314,34 @@ bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize) {
     UINT br, bw;
 
     for (;;) {
-        if (!stream.avail_in) {
-            uint32_t n = (infile_remaining < ZIP_BUF_SIZE) ? infile_remaining : ZIP_BUF_SIZE;
+        if (!stream.avail_in && !in_eof) {
+            uint32_t n = unbounded ? ZIP_BUF_SIZE
+                                   : ((infile_remaining < ZIP_BUF_SIZE) ? infile_remaining : ZIP_BUF_SIZE);
             if (n > 0) {
-                if (f_read(zipFile, s_inbuf, n, &br) != FR_OK || br != n) {
+                if (f_read(zipFile, s_inbuf, n, &br) != FR_OK) {
                     success = false;
                     break;
                 }
-                stream.next_in = s_inbuf;
-                stream.avail_in = n;
-                infile_remaining -= n;
+                if (br == 0) {
+                    in_eof = true;            // reached end of file
+                } else {
+                    if (!unbounded) {
+                        if (br != n) { success = false; break; }
+                        infile_remaining -= n;
+                    } else if (br < n) {
+                        in_eof = true;        // short read = last chunk
+                    }
+                    stream.next_in = s_inbuf;
+                    stream.avail_in = br;
+                }
+            } else {
+                in_eof = true;
             }
         }
 
-        int status = inflate(&stream, (infile_remaining == 0 && stream.avail_in == 0) ? Z_FINISH : Z_SYNC_FLUSH);
+        bool finishing = (stream.avail_in == 0) &&
+                         (in_eof || (!unbounded && infile_remaining == 0));
+        int status = inflate(&stream, finishing ? Z_FINISH : Z_SYNC_FLUSH);
 
         if ((status == Z_STREAM_END) || (!stream.avail_out)) {
             uint32_t n = ZIP_BUF_SIZE - stream.avail_out;
@@ -297,6 +357,12 @@ bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize) {
 
         if (status == Z_STREAM_END) break;
         if (status != Z_OK && status != Z_BUF_ERROR) {
+            success = false;
+            break;
+        }
+        // No input left and none coming: a non-terminated stream is truncated/
+        // corrupt. Bail instead of spinning forever on Z_BUF_ERROR.
+        if (finishing && stream.avail_in == 0 && status == Z_BUF_ERROR) {
             success = false;
             break;
         }
@@ -409,12 +475,19 @@ void ZipExtract::viewInfo(const string& zipPath) {
         pos = (nl != string::npos) ? nl + 1 : info.size();
     }
 
-    // Wait for any key
+    // Drain the F1 press (and any auto-repeat re-injections while F1 is still
+    // held) that opened this dialog — otherwise it dismisses the box at once.
+    { fabgl::VirtualKeyItem drain;
+      while (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable())
+          ESPectrum::PS2Controller.keyboard()->getNextVirtualKey(&drain); }
+
+    // Wait for any key — except F1, which opened this box from the file browser.
+    // Treating F1 as dismiss lets key auto-repeat close + reopen it in a loop.
     fabgl::VirtualKeyItem Menukey;
     while (1) {
         if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
             if (ESPectrum::readKbd(&Menukey)) {
-                if (Menukey.down) break;
+                if (Menukey.down && Menukey.vk != fabgl::VK_F1) break;
             }
         }
         sleep_ms(5);
@@ -482,7 +555,8 @@ void ZipExtract::cleanup() {
     f_unlink(TEMP_FILE);
     const char* exts[] = {
         ".sna", ".z80", ".p", ".tap", ".tzx", ".pzx", ".wav", ".mp3",
-        ".trd", ".scl", ".udi", ".fdi", ".mmc", ".hdf", ".rom", ".bin", NULL
+        ".trd", ".scl", ".udi", ".fdi", ".td0", ".mbd", ".pro",
+        ".mmc", ".hdf", ".hdd", ".vhd", ".iso", ".rom", ".bin", NULL
     };
     for (int i = 0; exts[i]; i++) {
         char path[32];

@@ -21,12 +21,17 @@
 #endif
 
 #include "ESPectrum.h"
+#if !PICO_RP2040
+#include "MidiSynth.h"
+#endif
 #include "Config.h"
+#include "BoardPins.h"
 #include "FileUtils.h"
 #ifdef USE_GS
 #include "GS/GS.h"
 #endif
 #include "MemESP.h"
+#include "ChipPackage.h"
 #include "pwm_audio.h"
 #include "messages.h"
 
@@ -48,7 +53,6 @@
 
 #define HOME_DIR (char*)"\\SPEC"
 
-bool rp2350a = true;
 bool cursor_blink_state = false;
 uint8_t CURSOR_X, CURSOR_Y = 0;
 uint8_t rx[4] = { 0 };
@@ -367,8 +371,10 @@ extern "C" bool handleScancode(const uint32_t ps2scancode) {
 // ghost release. The USB pad next callback would then see gamepad1_bits.X
 // reset and push a duplicate press → button stuck.
 static uint32_t nespad_prev_state = 0;
+static bool nespad_active = false; // false until nespad_begin(); stays false if yielded to ZiFi
 
 static void nespad_tick1(void) {
+    if (!nespad_active) return;
     nespad_read();
     uint32_t cur = nespad_state;
     uint32_t prev = nespad_prev_state;
@@ -461,6 +467,7 @@ static void nespad_tick1(void) {
 }
 
 static void nespad_tick2(void) {
+    if (!nespad_active) return;
     if (Config::secondJoy == 3) return;
     gamepad2_bits.a = (nespad_state2 & DPAD_A) != 0;
     gamepad2_bits.b = (nespad_state2 & DPAD_B) != 0;
@@ -868,8 +875,10 @@ void __scratch_x("render") render_core() {
         refresh_lcd();
 #endif
         pcm_call();
-#ifdef USE_GS
+#if defined(USE_GS) && !defined(SOFTTV)
         // Wall-clock-locked: runs GS-Z80 at exactly 12 MHz off core0.
+        // Under SOFTTV, GS::pump() runs in pcm_call_inner (core0) instead,
+        // because video_timer_callbackTV at 30 kHz would starve it here.
         GS::pump();
 #endif
         tight_loop_contents();
@@ -936,6 +945,9 @@ static void __not_in_flash_func(psram_retiming)() {
                           divisor << QMI_M1_TIMING_CLKDIV_LSB;
 }
 uint32_t __not_in_flash_func(butter_psram_size)() {
+#if BUTTER_PSRAM_GPIO == 255
+    return 0;   // PSRAM disabled via CMake kill-switch (set(PSRAM OFF))
+#else
     if (BUTTER_PSRAM_SIZE != -1) return BUTTER_PSRAM_SIZE;
     for(register int i = MB8; i < MB16; i += 4096)
         PSRAM_DATA[i] = 16;
@@ -947,16 +959,81 @@ uint32_t __not_in_flash_func(butter_psram_size)() {
         PSRAM_DATA[i] = 1;
     register uint32_t res = PSRAM_DATA[MB16 - 4096];
     for (register int i = MB16 - MB1; i < MB16; i += 4096) {
-        if (res != PSRAM_DATA[i])
+        if (res != PSRAM_DATA[i]) {
+            BUTTER_PSRAM_SIZE = 0;
             return 0;
+        }
     }
+    // A floating bus (no chip) can read back a consistent garbage value (e.g.
+    // 0xFF); only the markers actually planted by the probe are trustworthy.
+    if (res != 1 && res != 4 && res != 8 && res != 16)
+        res = 0;
     BUTTER_PSRAM_SIZE = res << 20;
     return BUTTER_PSRAM_SIZE;
+#endif
+}
+
+// Probe for a PSRAM chip on XIP CS1 via QMI direct mode: exit QPI (0xF5) in
+// case the chip is still in QPI after a warm reboot, then Read ID (0x9F).
+// APS6404-compatible chips answer MF ID 0x0D, KGD 0x5D; with no chip the SD
+// lines float and read 0x00/0xFF. Must run entirely from RAM: while direct
+// mode is enabled any flash (CS0) access would deadlock the QMI.
+static bool __no_inline_not_in_flash_func(psram_detect)() {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        // Exit QPI mode (quad-width single byte, output enabled)
+        qmi_hw->direct_csr |= QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+        qmi_hw->direct_tx = QMI_DIRECT_TX_OE_BITS |
+                            (QMI_DIRECT_TX_IWIDTH_VALUE_Q << QMI_DIRECT_TX_IWIDTH_LSB) |
+                            0xF5;
+        while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
+            ;
+        (void)qmi_hw->direct_rx;
+        qmi_hw->direct_csr &= ~QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+        for (volatile int d = 0; d < 64; ++d)   // respect min CS deselect time
+            ;
+
+        // Read ID: 0x9F + 3 address bytes, then MF ID and KGD
+        qmi_hw->direct_csr |= QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+        uint8_t mfid = 0, kgd = 0;
+        for (int i = 0; i < 6; ++i) {
+            qmi_hw->direct_tx = (i == 0) ? 0x9F : 0xFF;
+            while (!(qmi_hw->direct_csr & QMI_DIRECT_CSR_TXEMPTY_BITS))
+                ;
+            while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
+                ;
+            uint8_t b = (uint8_t)qmi_hw->direct_rx;
+            if (i == 4) mfid = b;
+            else if (i == 5) kgd = b;
+        }
+        qmi_hw->direct_csr &= ~QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+        for (volatile int d = 0; d < 64; ++d)
+            ;
+
+        if (kgd == 0x5D || mfid == 0x5D)
+            return true;
+        // The first transaction after a chip reset is known to come back
+        // garbage on some chips (see init_psram in psram_spi.c) — retry.
+    }
+    return false;
 }
 void __no_inline_not_in_flash_func(psram_init)(uint cs_pin) {
     gpio_set_function(cs_pin, GPIO_FUNC_XIP_CS1);
 
-    // Enable direct mode, PSRAM CS, clkdiv of 10.
+    // Enable direct mode (manual CS for the ID probe), clkdiv of 30.
+    qmi_hw->direct_csr = 30 << QMI_DIRECT_CSR_CLKDIV_LSB | QMI_DIRECT_CSR_EN_BITS;
+    while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
+        ;
+
+    // No chip on CS1 (board assembled without PSRAM): leave XIP CS1 unconfigured.
+    // Without this check the size probe below reads a floating bus, which can
+    // return a consistent garbage value and report a chip that is not there.
+    if (!psram_detect()) {
+        qmi_hw->direct_csr = 0;
+        BUTTER_PSRAM_SIZE = 0;
+        return;
+    }
+
+    // Re-enter direct mode with auto CS, clkdiv of 10.
     qmi_hw->direct_csr = 10 << QMI_DIRECT_CSR_CLKDIV_LSB | \
                                QMI_DIRECT_CSR_EN_BITS | \
                                QMI_DIRECT_CSR_AUTO_CS1N_BITS;
@@ -1012,10 +1089,69 @@ uint8_t* PSRAM_DATA = (uint8_t*)0;
 uint32_t __not_in_flash_func(butter_psram_size)() { return 0; }
 #endif
 
-void sigbus(void) {
-    printf("SIGBUS exception caught...\n");
-    // reset_usb_boot(0, 0);
+// Linker-defined per-core stack bounds: core0 = SCRATCH_Y (__Stack*),
+// core1 = SCRATCH_X (__StackOne*). The fault can fire on EITHER core, so pick the
+// right bounds by the SIO CPUID — otherwise a normal core1 SP looks like a core0
+// "overflow" (it sits in SCRATCH_X, below __StackBottom) and mislabels the fault.
+extern char __StackBottom;
+extern char __StackTop;
+extern char __StackOneBottom;
+extern char __StackOneTop;
+
+// C linkage so the naked-asm `b sigbus_handler` resolves without mangling.
+extern "C" void sigbus_handler(uint32_t *frame) {
+    static int count = 0;
+    if (++count > 3) return;
+    // Exception frame: [0]=r0 [1]=r1 [2]=r2 [3]=r3 [4]=r12 [5]=LR [6]=PC [7]=xPSR.
+    // LR = the return address of the function that faulted (addr2line that).
+    // `frame` ~= the SP at fault time; ovf = SP below this core's stack bottom.
+    uint32_t pc   = frame[6];
+    uint32_t lr   = frame[5];
+    uint32_t sp   = (uint32_t)frame;
+    uint32_t core = *(volatile uint32_t*)0xD0000000u;   // SIO CPUID (0 or 1)
+    uint32_t bot  = core ? (uint32_t)(uintptr_t)&__StackOneBottom : (uint32_t)(uintptr_t)&__StackBottom;
+    uint32_t top  = core ? (uint32_t)(uintptr_t)&__StackOneTop    : (uint32_t)(uintptr_t)&__StackTop;
+    int ovf = (sp < bot);
+#ifndef PICO_RP2040
+    // CFSR/BFAR only exist on Cortex-M3+ (not M0+)
+    uint32_t cfsr = *(volatile uint32_t*)0xE000ED28u;
+    uint32_t bfar = *(volatile uint32_t*)0xE000ED38u;
+    printf("SIGBUS[%d] core%u: PC=%08x LR=%08x SP=%08x CFSR=%08x BFAR=%08x stackOvf=%d (bot=%08x top=%08x)\n",
+           count, (unsigned)core, (unsigned)pc, (unsigned)lr, (unsigned)sp, (unsigned)cfsr, (unsigned)bfar,
+           ovf, (unsigned)bot, (unsigned)top);
+#else
+    printf("SIGBUS[%d] core%u: PC=%08x LR=%08x SP=%08x stackOvf=%d\n",
+           count, (unsigned)core, (unsigned)pc, (unsigned)lr, (unsigned)sp, ovf);
+#endif
 }
+// Naked trampoline: pass the stacked exception frame to sigbus_handler.
+// EXC_RETURN bit 2: 0 = MSP, 1 = PSP was active when the fault fired.
+#ifdef PICO_RP2040
+// Cortex-M0+: no IT blocks, TST only register form, high-reg immediates forbidden.
+void __attribute__((naked)) sigbus(void) {
+    __asm volatile (
+        "movs r0, #4\n"
+        "mov  r1, lr\n"
+        "tst  r0, r1\n"       // Z=1 if bit2(LR)=0 → MSP
+        "bne  1f\n"
+        "mrs  r0, msp\n"
+        "b    sigbus_handler\n"
+        "1:\n"
+        "mrs  r0, psp\n"
+        "b    sigbus_handler\n"
+    );
+}
+#else
+void __attribute__((naked)) sigbus(void) {
+    __asm volatile (
+        "tst    lr, #4\n"
+        "ite    eq\n"
+        "mrseq  r0, msp\n"
+        "mrsne  r0, psp\n"
+        "b      sigbus_handler\n"
+    );
+}
+#endif
 void __attribute__((naked, noreturn)) __printflike(1, 0) dummy_panic(__unused const char *fmt, ...) {
     printf("*** PANIC ***\n");
     if (fmt)
@@ -1138,7 +1274,7 @@ int main() {
     keyboard_init();
 #endif
 
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
     for (int i = 0; i < 6; i++) {
@@ -1150,20 +1286,23 @@ int main() {
     #endif
 
 #if PICO_RP2350
-    rp2350a = (*((io_ro_32*)(SYSINFO_BASE + SYSINFO_PACKAGE_SEL_OFFSET)) & 1);
     #ifdef BUTTER_PSRAM_GPIO
-        psram_pin = rp2350a ? BUTTER_PSRAM_GPIO : 47;
+    #if BUTTER_PSRAM_GPIO == 255
+        psram_pin = 255;   // PSRAM disabled via CMake kill-switch (set(PSRAM OFF))
+    #else
+        psram_pin = chip_is_rp2350a() ? BUTTER_PSRAM_GPIO : 47;
         psram_init(psram_pin);
         butter_psram_size();
+    #endif
     #endif
     exception_set_exclusive_handler(HARDFAULT_EXCEPTION, sigbus);
 #endif
 
 
-#if USE_NESPAD
-    nespad_begin(clock_get_hz(clk_sys) / 1000, NES_GPIO_CLK, NES_GPIO_DATA, NES_GPIO_LAT);
-#endif
+// NESPAD init moved below ESPectrum::setup() so Config (and thus the ZiFi pin
+// selection) is loaded first — see the guarded nespad_begin() after setup().
 
+#if !defined(BUTTER_PSRAM_GPIO) || BUTTER_PSRAM_GPIO != 255   // skip when PSRAM kill-switch on (set(PSRAM OFF))
 #if PICO_RP2350
     if (butter_psram_size() == 0 || psram_pin != PSRAM_PIN_SCK) {
 #endif
@@ -1172,6 +1311,7 @@ int main() {
     #endif
 #if PICO_RP2350
     }
+#endif
 #endif
     Debug::log("main: psram init done");
     // send kbd reset only after initial process passed
@@ -1188,7 +1328,34 @@ int main() {
     Debug::log("main: before ESPectrum::setup()");
     ESPectrum::setup();
     Debug::log("main: after ESPectrum::setup()");
-    #ifdef PICO_DEFAULT_LED_PIN
+    Debug::log2SD("main: after ESPectrum::setup()");
+
+#if !PICO_RP2040
+    // Install the GM.DLS wavetable bank from SD into flash here — single core,
+    // BEFORE core1/video starts (no HDMI ISR, no multicore_lockout, no freeze).
+    // No-op unless GM.DLS MIDI is selected and the SD bank differs from flash.
+    MidiSynth::provisionAtBoot();
+#endif
+
+#if USE_NESPAD
+    // Bring up the NES gamepad now that Config is loaded — unless ZiFi (RP2350)
+    // has claimed any of its pins, in which case yield so the UART owns them.
+    {
+        bool nes_yield = false;
+#if !PICO_RP2040
+        nes_yield = BoardPins::zifiOwnsPin(NES_GPIO_CLK) ||
+                    BoardPins::zifiOwnsPin(NES_GPIO_DATA) ||
+                    BoardPins::zifiOwnsPin(NES_GPIO_LAT);
+#endif
+        if (!nes_yield) {
+            nespad_begin(clock_get_hz(clk_sys) / 1000, NES_GPIO_CLK, NES_GPIO_DATA, NES_GPIO_LAT);
+            nespad_active = true;
+        } else {
+            Debug::log("NESPAD: yielded to ZiFi (pins claimed)");
+        }
+    }
+#endif
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     for (int i = 0; i < 6; i++) {
         sleep_ms(33);
         gpio_put(PICO_DEFAULT_LED_PIN, true);
@@ -1235,31 +1402,67 @@ int main() {
     {
 #if !PICO_RP2040
         // Apply saved vreg voltage (vreg_disable_voltage_limit already called at boot)
+        Debug::log2SD("main: vreg_set_voltage %d", (int)Config::vreq_voltage);
         vreg_set_voltage((enum vreg_voltage)Config::vreq_voltage);
         sleep_ms(10);
 #endif
         uint16_t running_mhz = clock_get_hz(clk_sys) / 1000000;
-        if (Config::cpu_mhz != running_mhz) {
-            if (try_set_sys_clock_khz(Config::cpu_mhz * KHZ)) {
-#ifdef VGA_HDMI
-                graphics_set_pio_clk_div((float)Config::cpu_mhz / 252.0f);
-#endif
-                // Reinit audio: I2S PIO divider was calculated for old sys_clk
-                pcm_setup(ESPectrum::Audio_freq);
-            } else {
-                // PLL did not lock — restore original PLL
-                set_sys_clock_khz(running_mhz * KHZ, true);
-                //Config::cpu_mhz = running_mhz;
-                //Config::save();
+        Debug::log2SD("main: cpu_mhz cfg=%d running=%d", (int)Config::cpu_mhz, (int)running_mhz);
+
+        // CRITICAL ordering note: ESPectrum::setup() already ran, so GS is live
+        // and the audio repeating-timer ISR fires on core0 at ~Audio_freq. That
+        // ISR (pcm_call_inner) touches GS state and, with HDMI audio, flash/PSRAM.
+        // try_set_sys_clock_khz() briefly drops clk_sys to the USB PLL and brings
+        // it back at the new rate, while flash/PSRAM QMI timing still reflects the
+        // boot clock until flash_timings()/psram_retiming() run. If that ISR (or
+        // any flash/PSRAM access) lands inside this window at the higher clock with
+        // stale QMI timing, the QMI hangs — observed as a freeze on the
+        // try_set_sys_clock_khz() line at 252/504 MHz with GS + HDMI audio enabled
+        // (378 MHz = boot clock, so the whole block is skipped). Run the switch and
+        // the timing fix-up as one interrupt-disabled critical section, then bring
+        // IRQs back only once flash/PSRAM timing matches the new clock. All four
+        // helpers below are __not_in_flash so they execute safely with IRQs off.
+        bool clk_changed = (Config::cpu_mhz != running_mhz);
+        bool clk_locked  = true;
+        {
+            const uint32_t ints = save_and_disable_interrupts();
+            if (clk_changed) {
+                clk_locked = try_set_sys_clock_khz(Config::cpu_mhz * KHZ);
+                if (!clk_locked) {
+                    // PLL did not lock — restore original PLL
+                    set_sys_clock_khz(running_mhz * KHZ, true);
+                }
             }
-        }
-        // Always re-apply flash/PSRAM timing with Config values
+            const uint16_t applied_mhz = clk_locked ? Config::cpu_mhz : running_mhz;
+            // Re-apply flash/PSRAM timing for the now-active clock BEFORE re-enabling
+            // interrupts, so the next flash/PSRAM access (incl. the audio ISR) is safe.
 #ifndef PICO_RP2040
-        flash_timings(Config::cpu_mhz);
+            flash_timings(applied_mhz);
 #endif
-#if PICO_RP2350 && defined(BUTTER_PSRAM_GPIO)
-        psram_retiming();
+#if PICO_RP2350 && defined(BUTTER_PSRAM_GPIO) && BUTTER_PSRAM_GPIO != 255
+            psram_retiming();
 #endif
+            // Recalculate PIO SPI PSRAM clkdiv for the now-active sys_clk.
+            // init_psram() ran at boot-time 378 MHz; if applied_mhz differs
+            // (e.g. 504 MHz) the frozen clkdiv=1.5 drives SCK at 168 MHz — above
+            // the 133 MHz spec.  Always re-apply to get a clean integer divider.
+#ifdef PSRAM
+            psram_update_clkdiv();
+#endif
+            restore_interrupts(ints);
+        }
+
+        if (clk_changed && clk_locked) {
+            Debug::log2SD("main: sys_clk -> %d MHz OK", (int)Config::cpu_mhz);
+#ifdef VGA_HDMI
+            graphics_set_pio_clk_div((float)Config::cpu_mhz / 252.0f);
+#endif
+            // Reinit audio: I2S PIO divider was calculated for old sys_clk
+            pcm_setup(ESPectrum::Audio_freq);
+        } else if (clk_changed) {
+            Debug::log2SD("main: PLL lock FAILED at %d MHz, restoring %d",
+                          (int)Config::cpu_mhz, (int)running_mhz);
+        }
     }
 
     sem_init(&vga_start_semaphore, 0, 1);

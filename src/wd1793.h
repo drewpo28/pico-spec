@@ -164,6 +164,25 @@ typedef struct
     bool IsMBDFile;
     uint8_t mbdSectorsPerTrack;       // sectors per track (typically 11)
     uint16_t mbdSectorSize;           // bytes per sector (typically 1024)
+    // PRO format flag: Profi CP/M raw disk. Uses MBD-style track builder but
+    // with special sector ID layout — first track (cyl 0 side 0) uses IDs
+    // {1,2,3,4,9} (5th sector has ID=9 for CP/M boot), other tracks {1,2,3,4,5}.
+    bool IsProFile;
+    // TD0 (Teledisk) flag. Streamed track-by-track from SD to avoid holding the
+    // whole (potentially ~1 MB) image in RAM. Packed images (lowercase "td"
+    // magic) are LZH-decompressed once into a temp file on the SD card at insert;
+    // unpacked images ("TD") stream directly from the original file. Per-track
+    // byte offsets within the (decompressed) stream are stored in
+    // fdiTrackHdrOffsets[]; td0Stream is the FIL to seek/read. Read-only. RP2350.
+    bool IsTD0File;
+    // TR-DOS auto-boot: set when an SCL lacks a "boot" file and we synthesised one
+    // into the in-RAM catalog (SCLtoTRD). The boot's single data sector is served
+    // from flash (kTrdosBootSector) for track 0 / sector 9. TRD images get the boot
+    // written directly into the file at insert, so they don't need this flag.
+    bool bootInjected;
+    FIL* td0Stream;          // file to stream track records from (Diskfile or temp)
+    bool td0OwnsStream;      // true if td0Stream is a temp file we must close+unlink
+    std::string td0TempPath; // temp file path to unlink on eject (if owned)
 #endif
 } rvmwdDisk;
 
@@ -270,6 +289,11 @@ typedef struct
 
 #define WD177XSTEPSTATES 112 // 112 states -> 14 states per bit
 
+// Size of the per-drive MFM track buffer (UDI/FDI/MBD). Formerly an inline
+// array; now heap-allocated (see rvmWD1793AllocTrackBuf) so the second
+// MB-02 drive can release its 12.5 KB when MB-02 is disabled.
+#define DISK_TRACK_BUF_SZ 12800
+
 typedef struct
 {
     uint32_t state, stepState, next;
@@ -300,19 +324,31 @@ typedef struct
 
     bool fastmode;
     bool wd2797_mode;
+    // Profi CP/M boot polls "wait for BUSY=1" right after each Type I command.
+    // If our state machine completes the Type I instantly (e.g., Seek to the
+    // already-current track), BUSY=0 immediately → BIOS loop hangs forever.
+    // This one-shot flag forces BUSY=1 in the first status read after a Type I
+    // command that completed synchronously, then auto-clears.
+    bool typeI_busy_oneshot;
+    // Profi CP/M WAIT-line simulation: hold BUSY=1 persistently in the STATUS
+    // REGISTER (not just the oneshot) until a status read occurs.  Used for
+    // no-disk commands so the DSKKE9A CALL 0x40EA re-issue loop sees BUSY=1
+    // and re-issues are rejected, preventing infinite recursion + stack growth.
+    // Cleared on the first status register read (port 0x1F reg 0).
+    bool profi_busy_hold;
 
     bool sclConverted;
 
     int wtrackmark, wtracksector;
 
-    uint8_t led;
     uint8_t fdd_clicks;  // Pending step clicks count
 
 #if !PICO_RP2040
-    uint8_t diskTrackBuf[12800];  // MFM track buffer for UDI/FDI/MBD
+    uint8_t* diskTrackBuf;        // MFM track buffer (DISK_TRACK_BUF_SZ); heap-allocated
     uint16_t diskTrackLen;        // length of current track
     int diskLoadedCyl;            // loaded cylinder (-1 = none)
     int diskLoadedSide;           // loaded side
+    int diskLoadedUnit;           // drive unit whose track is in diskTrackBuf (-1 = none)
     bool diskDirty;              // track buffer modified, needs flush to file
 
     // FDI find_marker support (ZXMAK2-style)
@@ -330,6 +366,14 @@ void rvmWD1793Write(rvmWD1793 *wd, uint8_t a, uint8_t v);
 uint8_t rvmWD1793Read(rvmWD1793 *wd, uint8_t a);
 void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps);
 void rvmWD1793Reset(rvmWD1793 *wd);
+// Recompute the per-controller fastmode flag from Config::trdosFastMode and the
+// currently selected drive's format. Call after changing the active drive
+// (diskS) or toggling the config so fastmode tracks the active disk only.
+void rvmWD1793UpdateFastmode(rvmWD1793 *wd);
+// Allocate the MFM track buffer (idempotent). Returns false on OOM. RP2350 only.
+bool rvmWD1793AllocTrackBuf(rvmWD1793 *wd);
+// Release the MFM track buffer (safe if already null). RP2350 only.
+void rvmWD1793FreeTrackBuf(rvmWD1793 *wd);
 bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string& Filename);
 uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control);
 void wdDiskEject(rvmWD1793 *wd, unsigned char UnitNum);

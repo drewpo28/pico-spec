@@ -234,20 +234,14 @@ static void process_gp_0810_0001(uint8_t instance, uint8_t const* report, uint16
 // therefore report_desc = NULL, desc_len = 0
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_report, uint16_t desc_len)
 {
-  printf("HID device address = %d, instance = %d is mounted\r\n", dev_addr, instance);
-
   // Interface protocol (hid_interface_protocol_enum_t)
   const char* protocol_str[] = { "None", "Keyboard", "Mouse" };
   uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
-
-  printf("HID Interface Protocol = %s\r\n", protocol_str[itf_protocol]);
 
   uint16_t vid = 0, pid = 0;
   tuh_vid_pid_get(dev_addr, &vid, &pid);
   hid_info[instance].vid = vid;
   hid_info[instance].pid = pid;
-  Debug::log("HID mount: addr=%u inst=%u VID=%04X PID=%04X proto=%u desc_len=%u",
-             dev_addr, instance, vid, pid, itf_protocol, desc_len);
 
   if (instance < CFG_TUH_HID) {
     hid_snap_t& s = hid_snap[instance];
@@ -276,8 +270,6 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
   if ( itf_protocol == HID_ITF_PROTOCOL_NONE )
   {
     hid_info[instance].report_count = tuh_hid_parse_report_descriptor(hid_info[instance].report_info, MAX_REPORT, desc_report, desc_len);
-    printf("HID has %u reports \r\n", hid_info[instance].report_count);
-    Debug::log("HID generic: %u reports", hid_info[instance].report_count);
 
     // Fallback: some pads (DS4/DS5, long composite descriptors) trip the
     // stock tinyusb parser and return 0 reports. Re-parse with the RIP
@@ -292,16 +284,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
           hid_info[instance].report_info[i].usage_page = rip_info[i].usage_page;
         }
         hid_info[instance].report_count = n;
-        Debug::log("HID RIP fallback: recovered %u reports", n);
       }
-    }
-
-    for (uint8_t i = 0; i < hid_info[instance].report_count; i++) {
-      Debug::log("  rpt[%u]: id=%u usage_page=%04X usage=%04X",
-                 i,
-                 hid_info[instance].report_info[i].report_id,
-                 hid_info[instance].report_info[i].usage_page,
-                 hid_info[instance].report_info[i].usage);
     }
   }
 
@@ -520,6 +503,8 @@ static void process_hid_gamepad(uint8_t const* report, uint16_t len)
     bool btn_y     = (b5 & 0x80) != 0;
     bool btn_l     = (b6 & 0x01) != 0;
     bool btn_r     = (b6 & 0x02) != 0;
+    bool btn_lt    = (b6 & 0x04) != 0;  // LT/RT: DragonRise-family layout,
+    bool btn_rt    = (b6 & 0x08) != 0;  // zero on pads without triggers
     bool btn_sel   = (b6 & 0x10) != 0;
     bool btn_start = (b6 & 0x20) != 0;
 
@@ -562,11 +547,13 @@ static void process_hid_gamepad(uint8_t const* report, uint16_t len)
     }
     // X / Y / L / R — fed to joydef via VK_JOY_X/Y/Z/C-style dropdowns. Use the
     // remaining DPAD slots so users can rebind in the joystick definition menu.
-    static bool prev_x = false, prev_y = false, prev_l = false, prev_r = false;
+    static bool prev_x = false, prev_y = false, prev_l = false, prev_r = false, prev_lt = false, prev_rt = false;
     if (btn_x != prev_x) { kbdPushData(fabgl::VirtualKey::VK_JOY_X, btn_x); prev_x = btn_x; }
     if (btn_y != prev_y) { kbdPushData(fabgl::VirtualKey::VK_JOY_Y, btn_y); prev_y = btn_y; }
     if (btn_l != prev_l) { kbdPushData(fabgl::VirtualKey::VK_JOY_Z, btn_l); prev_l = btn_l; }
     if (btn_r != prev_r) { kbdPushData(fabgl::VirtualKey::VK_JOY_C, btn_r); prev_r = btn_r; }
+    if (btn_lt != prev_lt) { kbdPushData(fabgl::VirtualKey::VK_JOY_L2, btn_lt); prev_lt = btn_lt; }
+    if (btn_rt != prev_rt) { kbdPushData(fabgl::VirtualKey::VK_JOY_R2, btn_rt); prev_rt = btn_rt; }
 
     gamepad1_bits.up = up;
     gamepad1_bits.down = down;
@@ -622,6 +609,8 @@ static void process_ds4_gamepad(uint8_t instance, uint8_t const* report, uint16_
     bool btn_triangle = (face & 0x80) != 0;
     bool btn_l1       = (b5 & 0x01) != 0;
     bool btn_r1       = (b5 & 0x02) != 0;
+    bool btn_l2       = (b5 & 0x04) != 0;
+    bool btn_r2       = (b5 & 0x08) != 0;
     bool btn_share    = (b5 & 0x10) != 0;
     bool btn_options  = (b5 & 0x20) != 0;
 
@@ -658,11 +647,13 @@ static void process_ds4_gamepad(uint8_t instance, uint8_t const* report, uint16_
         if (Config::secondJoy != 1) joyPushData(fabgl::VirtualKey::VK_DPAD_SELECT, btn_share);
     }
 
-    static bool prev_sq = false, prev_tr = false, prev_l1 = false, prev_r1 = false;
+    static bool prev_sq = false, prev_tr = false, prev_l1 = false, prev_r1 = false, prev_l2 = false, prev_r2 = false;
     if (btn_square   != prev_sq) { kbdPushData(fabgl::VirtualKey::VK_JOY_X, btn_square);   prev_sq = btn_square; }
     if (btn_triangle != prev_tr) { kbdPushData(fabgl::VirtualKey::VK_JOY_Y, btn_triangle); prev_tr = btn_triangle; }
     if (btn_l1       != prev_l1) { kbdPushData(fabgl::VirtualKey::VK_JOY_Z, btn_l1);       prev_l1 = btn_l1; }
     if (btn_r1       != prev_r1) { kbdPushData(fabgl::VirtualKey::VK_JOY_C, btn_r1);       prev_r1 = btn_r1; }
+    if (btn_l2       != prev_l2) { kbdPushData(fabgl::VirtualKey::VK_JOY_L2, btn_l2);      prev_l2 = btn_l2; }
+    if (btn_r2       != prev_r2) { kbdPushData(fabgl::VirtualKey::VK_JOY_R2, btn_r2);      prev_r2 = btn_r2; }
 
     gamepad1_bits.up = up;
     gamepad1_bits.down = down;
@@ -732,6 +723,8 @@ static void process_ds5_gamepad(uint8_t instance, uint8_t const* report, uint16_
     bool btn_triangle = (face & 0x80) != 0;
     bool btn_l1       = (b8 & 0x01) != 0;
     bool btn_r1       = (b8 & 0x02) != 0;
+    bool btn_l2       = (b8 & 0x04) != 0;
+    bool btn_r2       = (b8 & 0x08) != 0;
     bool btn_create   = (b8 & 0x10) != 0;
     bool btn_options  = (b8 & 0x20) != 0;
 
@@ -768,11 +761,13 @@ static void process_ds5_gamepad(uint8_t instance, uint8_t const* report, uint16_
         if (Config::secondJoy != 1) joyPushData(fabgl::VirtualKey::VK_DPAD_SELECT, btn_create);
     }
 
-    static bool prev_sq = false, prev_tr = false, prev_l1 = false, prev_r1 = false;
+    static bool prev_sq = false, prev_tr = false, prev_l1 = false, prev_r1 = false, prev_l2 = false, prev_r2 = false;
     if (btn_square   != prev_sq) { kbdPushData(fabgl::VirtualKey::VK_JOY_X, btn_square);   prev_sq = btn_square; }
     if (btn_triangle != prev_tr) { kbdPushData(fabgl::VirtualKey::VK_JOY_Y, btn_triangle); prev_tr = btn_triangle; }
     if (btn_l1       != prev_l1) { kbdPushData(fabgl::VirtualKey::VK_JOY_Z, btn_l1);       prev_l1 = btn_l1; }
     if (btn_r1       != prev_r1) { kbdPushData(fabgl::VirtualKey::VK_JOY_C, btn_r1);       prev_r1 = btn_r1; }
+    if (btn_l2       != prev_l2) { kbdPushData(fabgl::VirtualKey::VK_JOY_L2, btn_l2);      prev_l2 = btn_l2; }
+    if (btn_r2       != prev_r2) { kbdPushData(fabgl::VirtualKey::VK_JOY_R2, btn_r2);      prev_r2 = btn_r2; }
 
     gamepad1_bits.up = up;
     gamepad1_bits.down = down;
@@ -837,6 +832,8 @@ static void process_f710_dinput(uint8_t instance, uint8_t const* report, uint16_
     bool btn_y     = (face & 0x80) != 0;
     bool btn_lb    = (b5 & 0x01) != 0;
     bool btn_rb    = (b5 & 0x02) != 0;
+    bool btn_lt    = (b5 & 0x04) != 0;
+    bool btn_rt    = (b5 & 0x08) != 0;
     bool btn_back  = (b5 & 0x10) != 0;
     bool btn_start = (b5 & 0x20) != 0;
 
@@ -873,11 +870,13 @@ static void process_f710_dinput(uint8_t instance, uint8_t const* report, uint16_
         if (Config::secondJoy != 1) joyPushData(fabgl::VirtualKey::VK_DPAD_SELECT, btn_back);
     }
 
-    static bool prev_x = false, prev_y = false, prev_lb = false, prev_rb = false;
+    static bool prev_x = false, prev_y = false, prev_lb = false, prev_rb = false, prev_lt = false, prev_rt = false;
     if (btn_x  != prev_x)  { kbdPushData(fabgl::VirtualKey::VK_JOY_X, btn_x);  prev_x  = btn_x; }
     if (btn_y  != prev_y)  { kbdPushData(fabgl::VirtualKey::VK_JOY_Y, btn_y);  prev_y  = btn_y; }
     if (btn_lb != prev_lb) { kbdPushData(fabgl::VirtualKey::VK_JOY_Z, btn_lb); prev_lb = btn_lb; }
     if (btn_rb != prev_rb) { kbdPushData(fabgl::VirtualKey::VK_JOY_C, btn_rb); prev_rb = btn_rb; }
+    if (btn_lt != prev_lt) { kbdPushData(fabgl::VirtualKey::VK_JOY_L2, btn_lt); prev_lt = btn_lt; }
+    if (btn_rt != prev_rt) { kbdPushData(fabgl::VirtualKey::VK_JOY_R2, btn_rt); prev_rt = btn_rt; }
 
     gamepad1_bits.up     = up;
     gamepad1_bits.down   = down;
@@ -1067,10 +1066,12 @@ static void process_gp_feed_2320(uint8_t instance, uint8_t const* report, uint16
     }
 
     static bool prev_x = false, prev_y = false, prev_l = false, prev_r = false;
+    // FEED:2320 button remap (identity). Physical bit assignment deduced from hw:
+    // physical Y = btn_l, physical C = btn_y, physical Z = btn_r. X unchanged.
     if (btn_x != prev_x) { kbdPushData(fabgl::VirtualKey::VK_JOY_X, btn_x); prev_x = btn_x; }
-    if (btn_y != prev_y) { kbdPushData(fabgl::VirtualKey::VK_JOY_Y, btn_y); prev_y = btn_y; }
-    if (btn_l != prev_l) { kbdPushData(fabgl::VirtualKey::VK_JOY_Z, btn_l); prev_l = btn_l; }
-    if (btn_r != prev_r) { kbdPushData(fabgl::VirtualKey::VK_JOY_C, btn_r); prev_r = btn_r; }
+    if (btn_l != prev_l) { kbdPushData(fabgl::VirtualKey::VK_JOY_Y, btn_l); prev_l = btn_l; }
+    if (btn_y != prev_y) { kbdPushData(fabgl::VirtualKey::VK_JOY_C, btn_y); prev_y = btn_y; }
+    if (btn_r != prev_r) { kbdPushData(fabgl::VirtualKey::VK_JOY_Z, btn_r); prev_r = btn_r; }
 
     gamepad1_bits.up     = up;
     gamepad1_bits.down   = down;
@@ -1134,7 +1135,7 @@ static void process_gp_0810_0001(uint8_t instance, uint8_t const* report, uint16
     bool btn_select = (b5 & 0x10) != 0;
     bool btn_start  = (b5 & 0x20) != 0;
 
-    (void)btn_lt; (void)btn_rt; // available for future rebinding
+    // btn_lt and btn_rt are now mapped to L2/R2
 
     // D-pad + OSD navigation (edge-detected)
     if (up != gamepad1_bits.up) {
@@ -1171,12 +1172,14 @@ static void process_gp_0810_0001(uint8_t instance, uint8_t const* report, uint16
         if (Config::secondJoy != 1) joyPushData(fabgl::VirtualKey::VK_DPAD_SELECT, btn_select);
     }
 
-    // X / Y / L / R → rebindable extras
-    static bool prev_x = false, prev_y = false, prev_l = false, prev_r = false;
-    if (btn_x != prev_x) { kbdPushData(fabgl::VirtualKey::VK_JOY_X, btn_x); prev_x = btn_x; }
-    if (btn_y != prev_y) { kbdPushData(fabgl::VirtualKey::VK_JOY_Y, btn_y); prev_y = btn_y; }
-    if (btn_lb != prev_l) { kbdPushData(fabgl::VirtualKey::VK_JOY_Z, btn_lb); prev_l = btn_lb; }
-    if (btn_rb != prev_r) { kbdPushData(fabgl::VirtualKey::VK_JOY_C, btn_rb); prev_r = btn_rb; }
+    // X / Y / L / R / LT / RT → rebindable extras
+    static bool prev_x = false, prev_y = false, prev_l = false, prev_r = false, prev_lt = false, prev_rt = false;
+    if (btn_x  != prev_x)  { kbdPushData(fabgl::VirtualKey::VK_JOY_X,  btn_x);  prev_x  = btn_x; }
+    if (btn_y  != prev_y)  { kbdPushData(fabgl::VirtualKey::VK_JOY_Y,  btn_y);  prev_y  = btn_y; }
+    if (btn_lb != prev_l)  { kbdPushData(fabgl::VirtualKey::VK_JOY_Z,  btn_lb); prev_l  = btn_lb; }
+    if (btn_rb != prev_r)  { kbdPushData(fabgl::VirtualKey::VK_JOY_C,  btn_rb); prev_r  = btn_rb; }
+    if (btn_lt != prev_lt) { kbdPushData(fabgl::VirtualKey::VK_JOY_L2, btn_lt); prev_lt = btn_lt; }
+    if (btn_rt != prev_rt) { kbdPushData(fabgl::VirtualKey::VK_JOY_R2, btn_rt); prev_rt = btn_rt; }
 
     gamepad1_bits.up     = up;
     gamepad1_bits.down   = down;

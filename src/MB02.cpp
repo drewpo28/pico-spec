@@ -2,6 +2,8 @@
 
 #if !PICO_RP2040
 
+#include <stdlib.h>
+#include <string.h>
 #include "Config.h"
 #include "MemESP.h"
 #include "ESPectrum.h"
@@ -14,7 +16,7 @@ bool MB02::enabled = false;
 uint8_t MB02::paging_reg = 0;
 uint8_t MB02::floppy_reg = 0xFF;
 bool MB02::write_enabled = false;
-uint8_t MB02::page0_composite[0x2000] = {};
+uint8_t* MB02::page0_composite = nullptr;
 uint8_t MB02::motor_state = 0;
 int MB02::ram_base_idx = -1;
 bool MB02::disk_changed = false;
@@ -30,7 +32,21 @@ void MB02::init() {
 
     if (!Config::mb02) {
         Config::dma_mode = 0;
+        // Free the 8 KB EPROM composite when disabling.
+        free(page0_composite);
+        page0_composite = nullptr;
         return;
+    }
+
+    // Allocate the 8 KB EPROM composite buffer on first enable.
+    // Owned by Mb02Subsys; freed when Config::mb02 transitions to 0.
+    if (!page0_composite) {
+        page0_composite = (uint8_t*)calloc(0x2000, 1);
+        if (!page0_composite) {
+            Debug::log("MB02: OOM (page0_composite)");
+            Config::mb02 = 0;
+            return;
+        }
     }
 
     // Use MemESP::ram[] pages for MB-02 SRAM.
@@ -59,8 +75,14 @@ void MB02::init() {
     for (int i = 0; i < 4; i++)
         if (ESPectrum::mb02_fdd.disk[i]) has_disks = true;
     if (!has_disks) {
+        // Preserve the heap-allocated track buffer across the wipe so we don't
+        // leak it; the buffer is owned by Mb02Subsys (freed on MB-02 disable).
+        uint8_t* keepTrackBuf = ESPectrum::mb02_fdd.diskTrackBuf;
         memset(&ESPectrum::mb02_fdd, 0, sizeof(rvmWD1793));
+        ESPectrum::mb02_fdd.diskTrackBuf = keepTrackBuf;
     }
+    // The MB-02 drive needs its track buffer while MB-02 is active.
+    rvmWD1793AllocTrackBuf(&ESPectrum::mb02_fdd);
     ESPectrum::mb02_fdd.wd2797_mode = true;
     rvmWD1793Reset(&ESPectrum::mb02_fdd);
     ESPectrum::mb02_fdd.wd2797_mode = true;
@@ -109,6 +131,12 @@ void MB02::applyMapping() {
     }
 
     if (eprom_en) {
+        if (!page0_composite) {
+            // Should be allocated by Mb02Subsys::apply(); fail safe to defaults.
+            MemESP::divmmc_mapped = false;
+            MemESP::recoverPage0();
+            return;
+        }
         memcpy(page0_composite, gb_rom_mb02boot, MB02_EPROM_SIZE);
         page0_composite[0x0021] = 0x18; // skip RAM test
         uint8_t* rom_ptr = MemESP::rom[MemESP::romInUse].direct();

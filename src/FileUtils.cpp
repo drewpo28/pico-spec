@@ -54,6 +54,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "diskio.h"
 #if !PICO_RP2040
 #include "DivMMC.h"
+#include "IDE.h"
 #endif
 
 extern "C" void mem_swap_reopen(void);
@@ -81,10 +82,10 @@ DISK_FTYPE FileUtils::fileTypes[6] = {
 #else
     {".sna,.SNA,.z80,.Z80,.p,.P,.zip,.ZIP",2,2,0,""},
     {".tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.zip,.ZIP",2,2,0,""},
-    {".trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.mbd,.MBD,.zip,.ZIP",2,2,0,""},
+    {".trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.td0,.TD0,.mbd,.MBD,.pro,.PRO,.zip,.ZIP",2,2,0,""},
     {".rom,.ROM,.bin,.BIN",2,2,0,""},
-    {".mmc,.MMC,.hdf,.HDF,.zip,.ZIP",2,2,0,""},
-    {".sna,.SNA,.z80,.Z80,.p,.P,.tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.mbd,.MBD,.mmc,.MMC,.hdf,.HDF,.zip,.ZIP",2,2,0,""}
+    {".mmc,.MMC,.hdf,.HDF,.hdd,.HDD,.vhd,.VHD,.iso,.ISO,.zip,.ZIP",2,2,0,""},
+    {".sna,.SNA,.z80,.Z80,.p,.P,.tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.td0,.TD0,.mbd,.MBD,.pro,.PRO,.mmc,.MMC,.hdf,.HDF,.zip,.ZIP",2,2,0,""}
 #endif
 };
 
@@ -105,8 +106,32 @@ string FileUtils::getLCaseExt(const string& filename) {
     return toLower( extension );
 }
 
+string FileUtils::utf8ToCp1251(const string& s) {
+    string out; out.reserve(s.size());
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) { out += (char)c; i++; continue; }
+        if ((c & 0xE0) == 0xC0 && i + 1 < n && ((unsigned char)s[i+1] & 0xC0) == 0x80) {
+            unsigned cp = ((c & 0x1F) << 6) | ((unsigned char)s[i+1] & 0x3F);
+            char m = 0;
+            if (cp >= 0x0410 && cp <= 0x042F)      m = (char)(0xC0 + (cp - 0x0410)); // А-Я
+            else if (cp >= 0x0430 && cp <= 0x044F) m = (char)(0xE0 + (cp - 0x0430)); // а-я
+            else if (cp == 0x0401)                 m = (char)0xA8;                    // Ё
+            else if (cp == 0x0451)                 m = (char)0xB8;                    // ё
+            out += m ? m : '?';
+            i += 2; continue;
+        }
+        if ((c & 0xF0) == 0xE0 && i + 2 < n) { out += '?'; i += 3; continue; } // other 3-byte
+        if ((c & 0xF8) == 0xF0 && i + 3 < n) { out += '?'; i += 4; continue; } // 4-byte
+        out += (char)c; i++; // lone high byte — not UTF-8, leave as-is
+    }
+    return out;
+}
+
 DiskIface FileUtils::ifaceForExt(const string& lcExt) {
-    if (lcExt == "trd" || lcExt == "scl" || lcExt == "fdi" || lcExt == "udi") return IFACE_BETA;
+    if (lcExt == "trd" || lcExt == "scl" || lcExt == "fdi" || lcExt == "udi"
+     || lcExt == "td0" || lcExt == "pro") return IFACE_BETA;
     if (lcExt == "mbd") return IFACE_MB02;
     if (lcExt == "mmc" || lcExt == "hdf") return IFACE_ESX;
     return IFACE_NONE;
@@ -126,23 +151,26 @@ inline void fclose(FIL& f) {
 }
 
 // Create every directory along an absolute path (intermediate components
-// included). Existing directories are tolerated; this matches the behaviour
-// of `mkdir -p` against FatFs.
-void FileUtils::mkdirParents(const char* path) {
-    if (!path || !*path) return;
+// included). Returns true when the full path exists after the call.
+// FR_EXIST is treated as success; any other failure short-circuits and
+// returns false so callers can refuse to write into a non-existent dir.
+bool FileUtils::mkdirParents(const char* path) {
+    if (!path || !*path) return false;
     char buf[128];
     size_t len = strlen(path);
-    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    if (len >= sizeof(buf)) return false;
     memcpy(buf, path, len);
     buf[len] = 0;
     for (size_t i = 1; i < len; ++i) {
         if (buf[i] == '/') {
             buf[i] = 0;
-            f_mkdir(buf);
+            FRESULT r = f_mkdir(buf);
+            if (r != FR_OK && r != FR_EXIST) return false;
             buf[i] = '/';
         }
     }
-    f_mkdir(buf);
+    FRESULT r = f_mkdir(buf);
+    return r == FR_OK || r == FR_EXIST;
 }
 
 void FileUtils::initFileSystem() {
@@ -150,12 +178,10 @@ void FileUtils::initFileSystem() {
     if (SDReady) {
         f_mkdir("/tmp");
         mkdirParents(CONFIG_DIR);
-        f_mkdir(CONFIG_DIR DISK_ROM_DIR);
-        f_mkdir(CONFIG_DIR DISK_SNA_DIR);
-        f_mkdir(CONFIG_DIR DISK_TAP_DIR);
-        f_mkdir(CONFIG_DIR DISK_DSK_DIR);
-        f_mkdir(CONFIG_DIR DISK_SCR_DIR);
-        f_mkdir(CONFIG_DIR DISK_PSNA_DIR);
+        // User data (snapshots/screenshots) lives under visible /spec root.
+        f_mkdir(SPEC_DIR_ROOT);
+        f_mkdir(DISK_SCR_DIR);
+        f_mkdir(DISK_PSNA_DIR);
         mkdirParents(CONFIG_DIR_BOARD);
     }
 }
@@ -226,6 +252,7 @@ bool FileUtils::remountSD() {
 
 #if !PICO_RP2040
     DivMMC::reopenFiles();
+    if (IDE::scheme != IDE::OFF) IDE::init();  // reopen IDE images after remount
 #endif
 
     return true;

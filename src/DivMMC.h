@@ -99,7 +99,10 @@ private:
     static uint32_t mmc_read_address;
     static uint32_t mmc_write_address;
 
-    static uint8_t mmc_sector_buf[512];
+public:
+    // Heap-allocated by DivMmcSubsys; nullptr when Config::esxdos == 0.
+    static uint8_t* mmc_sector_buf;
+private:
     static uint32_t mmc_sector_buf_addr;
     static bool mmc_sector_dirty;
 
@@ -107,6 +110,7 @@ private:
     static bool mmc_file_open[2];
     static uint32_t mmc_file_size[2];
 
+    // CSD/CID/OCR are tiny (37 B total) — stay in .bss.
     static uint8_t mmc_csd[16];
     static uint8_t mmc_cid[16];
     static uint8_t mmc_ocr[5];
@@ -145,11 +149,17 @@ private:
     static uint8_t ide_head;
     static uint8_t ide_status;
     static uint8_t ide_error;
-    static uint8_t ide_buffer[512];   // sector transfer buffer
+public:
+    // Heap-allocated by DivMmcSubsys; nullptr when Config::esxdos == 0.
+    static uint8_t* ide_buffer;       // sector transfer buffer (512 B)
+private:
     static int ide_data_index;        // byte position in buffer (-1 = no transfer)
     static bool ide_data_write;       // true = PIO_OUT (write), false = PIO_IN (read)
     static uint32_t ide_hdf_data_offset[2]; // byte offset to data area in HDF [master/slave]
-    static uint8_t ide_identity[2][106];   // ATA IDENTIFY data from HDF header
+public:
+    // Heap-allocated by DivMmcSubsys; nullptr when Config::esxdos == 0.
+    static uint8_t (*ide_identity)[106];   // 2 x 106 B ATA IDENTIFY data
+private:
     static uint16_t ide_cylinders[2];
     static uint16_t ide_heads[2];
     static uint16_t ide_sectors[2];

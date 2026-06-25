@@ -57,6 +57,7 @@ public:
 
     static void load();           // load main settings before emulator init
     static void loadDiskMounts(); // mount disks from storage.nvs after FDD/MB02 init
+    static void loadMb02DiskMounts(); // (re)mount only MB-02+ disks (on enable at runtime)
     static void save();
     static bool loaded;  // true after successful load() from file/RAM
 
@@ -71,23 +72,33 @@ public:
     static string   romSetPent;
     static string   romSetP512;
     static string   romSetP1M;
+    static string   romSetProfi;
     static string   pref_arch;
     static string   pref_romSet_48;
     static string   pref_romSet_128;
     static string   pref_romSetPent;
     static string   pref_romSetP512;
     static string   pref_romSetP1M;
+    static string   pref_romSetProfi;
     static string   ram_file;
     static string   last_ram_file;
+    static string   tape_file;       // full path of remembered tape, re-mounted after F11/reboot like a disk
+    // Provenance of a loaded/mounted file. Transient sources (TMP/REMOTE/WEB) are
+    // never pinned as a reload reference (the file is gone after reboot); LOCAL is a
+    // real SD path that persists. Old configs lack the tag → default LOCAL.
+    enum FileOrigin { ORIGIN_LOCAL = 0, ORIGIN_TMP = 1, ORIGIN_REMOTE = 2, ORIGIN_WEB = 3 };
+    static uint8_t  ram_file_origin;
     static uint8_t  esp32rev;
     static bool     slog_on;
+    static bool     ledIndicators;
+    static bool     sdLedBlink;     // blink onboard LED (GPIO 25) on physical SD card access
     const static bool     aspect_16_9; /// TODO:
     static uint8_t  lang;
     static bool     AY48;
 #if !PICO_RP2040
     static bool     SAA1099;
-    static uint8_t  midi;  // 0=Off, 1=AY bitbang, 2=ShamaZX, 3=Soft Synth
-    static uint8_t  midi_synth_preset; // 0=GM,1=Piano,2=Chiptune,3=Strings,4=Rock,5=Organ,6=MusicBox,7=Synth
+    static uint8_t  midi;  // 0=Off, 1=AY bitbang, 2=ShamaZX, 3=Software synth, 4=GM.DLS wavetable
+    static uint8_t  midi_synth_preset; // Software synth preset: 0=GM,1=Piano,2=Chiptune,3=Strings,4=Rock,5=Organ,6=MusicBox,7=Synth
     static bool     timex_video;  // Timex SCLD video modes (port 0xFF)
     static uint8_t  dma_mode;     // 0=Off, 1=Port #0B (Z80 DMA), 2=Port #6B (zxnDMA)
     static bool     mode16col_onoff; // Pentagon 16col video mode (port #EFF7 D0)
@@ -100,10 +111,14 @@ public:
     static uint8_t  vreq_voltage;  // vreg_voltage_t enum value, default VREG_VOLTAGE_1_60
 #endif
     static bool     Issue2;
-    static bool     flashload;    
+    static bool     rtc_enabled;  // Pentagon/Profi Mr Gluk MC146818 RTC + CMOS NVRAM (RP2350)
+    static bool     flashload;
     static bool     tape_player;
     static volatile bool real_player;
+    static bool     profi_ext_keys;  // Profi extended keyboard mode (default false)
+    static bool     profi_ds80_std_palette_osd; // Use standard ZX palette for OSD over DS80 (default false = keep DS80 background)
     static bool     tape_timing_rg;
+    static bool     tape_autostart;  // auto-play tape on load + after F11/boot re-mount (default true)
     static bool     rightSpace;
     static bool     wasd;
     enum BPType : uint8_t { BP_PC=0, BP_PORT_READ=1, BP_PORT_WRITE=2, BP_MEM_WRITE=3, BP_MEM_READ=4, BP_NONE=0xFF };
@@ -179,13 +194,16 @@ public:
         }
     }
     static uint8_t  joystick;
-    static uint16_t joydef[12];
+    static uint16_t joydef[14];
     static uint8_t  AluTiming;
     static uint8_t  ayConfig;
     static uint8_t  turbosound;
     static uint8_t  covox;
+    static uint8_t  soundrive;          // 0=Off, 1=On, 2=Auto (Profi only)
+    static bool soundriveEnabled();     // resolves Auto against current arch
     static uint8_t  gs_enabled;
     static uint8_t  gs_ram_size;
+    static uint8_t  gs_clock;   // 0=12MHz 1=13MHz 2=14MHz 3=20MHz 4=24MHz
     static uint8_t  joy2cursor;
     static uint8_t  secondJoy;
     static uint8_t  kempstonPort;
@@ -199,9 +217,11 @@ public:
 
     static bool StartMsg;    
 
+    static bool betadisk;       // TR-DOS interface enabled
     static bool trdosFastMode;
-    static bool trdosSoundLed;
-    static uint8_t trdosBios; // 0=5.03, 1=5.04TM, 2=5.05D
+    static bool trdosAutoBoot;  // inject a "boot" file into TRD/SCL images that lack one
+    static uint8_t trdosSoundLed; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
+    static uint8_t trdosBios; // 0=5.03, 1=5.04TM, 2=5.05D, 3=Custom (flashable)
     static bool driveWP[4];   // TR-DOS per-slot write protect (Drive A..D)
 #if !PICO_RP2040
     static uint8_t esxdos;   // 0=OFF 1=DivMMC 2=DivIDE 3=DivSD
@@ -210,19 +230,75 @@ public:
     static string esxdos_hdf_image[2];
     static uint8_t mb02;     // 0=OFF 1=ON (MB-02+ disk interface, mutually exclusive with TR-DOS/DivMMC)
     static bool mb02WP[4];   // MB-02+ per-slot write protect
-    static bool mb02SoundLed;// MB-02+ disk sound & LED
+    static string mb02DiskFile[4]; // remembered MB-02+ disk paths; survive the interface being disabled
+    static uint8_t mb02SoundLed;// MB-02+ disk sound & LED: 0=Off, 1=Led, 2=Sound, 3=Sound+Led
     static bool zcontroller; // Z-Controller SD on ports 0x77/0x57 (mutually exclusive with esxDOS/MB-02+)
+    static uint8_t ide_scheme;   // IDE/HDD: 0=OFF 1=NEMO 2=PROFI (mutually exclusive with esxDOS DivMMC/DivIDE)
+    static string ide_image[2];  // IDE hd0/hd1 image paths ([0]=master, [1]=slave)
+    static uint16_t ide_chs[2][3]; // per-slot geometry override [C,H,S]; 0,0,0 = auto-detect
+    static uint8_t zifi_enabled; // 0=Off, 1=ZiFi NIC
+    // ZiFi UART pins: 0xFE = board default, 0xFF = OFF, else explicit TX/RX
+    // (resolved via BoardPins). See BoardPins.h / Network → GPIO picker.
+    static uint8_t zifi_tx_pin;
+    static uint8_t zifi_rx_pin;
+    static uint32_t zifi_baud;  // ESP-01S UART rate (115200 default; raised via AT+UART_CUR)
+    static string wifi_ssid;
+    static string wifi_pass;
+    static bool wifi_autoconnect;
+    static signed char wifi_tz; // SNTP timezone offset in hours (wifi.cfg key "tz")
+    // Network file-transfer client (Network → File transfer). Stored in wifi.cfg.
+    // Passwords are NOT persisted (re-prompted each session).
+    static string   net_host;   // last remote host
+    static string   net_user;   // last username
+    static uint16_t net_port;   // last port (0 = protocol default: 21 FTP / 22 SFTP)
+    static uint8_t  net_proto;  // 0 = FTP, 1 = SFTP
+    static string   net_dl_dir; // last SD folder a file was downloaded into
+    static string   net_ul_dir; // last SD folder a file was uploaded from
+    // Archive download catalog (Network → Download archive). Either a bare
+    // "host"/"host:port" → dynamic /v1 server over plain HTTP, or a base URL with
+    // a path (e.g. "drewpo28.github.io/pico-spec-catalog", https assumed) → static
+    // GitHub-Pages tree fetched over TLS. See HttpCatalogFs. Empty = unset.
+    static string   catalog_host;
+    static uint16_t catalog_port; // dynamic mode only (0 = 80)
+    // Last F5 browse location across ALL sources (so F5 reopens where you left off,
+    // like the SD ALL_Path does). One global value, tab-separated:
+    //   "L"                                   → Local (SD); path is ALL_Path
+    //   "W\t<siteId>\t<path>"                  → Web catalog source + cur_path
+    //   "R\t<host>\t<port>\t<proto>\t<user>\t<path>" → remote (match a saved remote)
+    // Empty → none (F5 opens Local SD). Stored in wifi.cfg.
+    static string   last_loc;
+    static void loadWifiConfig();
+    static void saveWifiConfig();
+
+    // Saved FTP/SFTP connections (Network → F5 → Remote). Stored in
+    // CONFIG_DIR/remotes.tsv, one tab-separated line per connection:
+    //   proto \t host \t port \t user \t savepass \t pass \t alias \t path
+    // The password is only written when savepass=1 (else re-prompted at connect). `alias`
+    // is an optional display name (shown instead of user@host:port). `path` is an optional
+    // start directory — on connect the browser cd's straight into it. (path is the last
+    // field so older 7-field lines stay readable.)
+    struct Remote {
+        string   host, user, pass, alias, path;
+        uint16_t port;
+        uint8_t  proto;     // 0 = FTP, 1 = SFTP
+        bool     savepass;
+    };
+    static const int MAX_REMOTES = 16;
+    // Load saved remotes into `out` (array of `cap` entries). Returns count loaded.
+    static int  loadRemotes(Remote* out, int cap);
+    // Persist `count` remotes from `list` to remotes.tsv (overwrites).
+    static void saveRemotes(const Remote* list, int count);
 #endif
     
     static signed char aud_volume;
+    static uint8_t audio_boost;
 
     // Video mode enum
     enum {
         VM_640x480_60  = 0,  // 640x480@60Hz (default)
         VM_640x480_50  = 1,  // 640x480@50Hz (arch-dependent timing)
         VM_720x480_60  = 2,  // 720x480@60Hz half border
-        VM_720x576_60  = 3,  // 720x576@60Hz full border (non-standard)
-        VM_720x576_50  = 4,  // 720x576@50Hz full border
+        VM_720x576_50  = 3,  // 720x576@50Hz full border
     };
 
     static uint8_t hdmi_video_mode;
@@ -268,14 +344,13 @@ public:
         HK_RESET_TO     = 19,
         HK_USB_BOOT     = 20,
         HK_GIGASCREEN   = 21,
-        HK_BP_LIST      = 22,
-        HK_JUMP_TO      = 23,
-        HK_POKE         = 24,
-        HK_VIDMODE_60   = 25,
-        HK_VIDMODE_50   = 26,
-        HK_QUICK_LOAD   = 27,
-        HK_QUICK_SAVE   = 28,
-        HK_COUNT        = 29
+        HK_LED_TOGGLE   = 22,
+        HK_POKE         = 23,
+        HK_VIDMODE_60   = 24,
+        HK_VIDMODE_50   = 25,
+        HK_QUICK_LOAD   = 26,
+        HK_QUICK_SAVE   = 27,
+        HK_COUNT        = 28
     };
 
     struct HotkeyBinding {

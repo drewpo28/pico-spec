@@ -271,10 +271,6 @@ static const char *MENU_ROM_TITLE[2] = { MENU_ROM_TITLE_EN,MENU_ROM_TITLE_ES };
 #define MENU_ALL_TITLE_ES "Abrir fichero"
 static const char *MENU_ALL_TITLE[2] = { MENU_ALL_TITLE_EN,MENU_ALL_TITLE_ES };
 
-#define OSD_DSK_NEEDS_PENTAGON_EN "  Disk needs Pentagon mode  "
-#define OSD_DSK_NEEDS_PENTAGON_ES " Disco requiere modo Pentagon "
-static const char *OSD_DSK_NEEDS_PENTAGON[2] = { OSD_DSK_NEEDS_PENTAGON_EN,OSD_DSK_NEEDS_PENTAGON_ES };
-
 #define OSD_16COL_NEEDS_PENTAGON_EN "  16col is Pentagon only  "
 #define OSD_16COL_NEEDS_PENTAGON_ES "  16col solo en Pentagon  "
 static const char *OSD_16COL_NEEDS_PENTAGON[2] = { OSD_16COL_NEEDS_PENTAGON_EN,OSD_16COL_NEEDS_PENTAGON_ES };
@@ -294,6 +290,14 @@ static const char *OSD_ZIP_ERR[2] = { OSD_ZIP_ERR_EN,OSD_ZIP_ERR_ES };
 #define OSD_ZIP_EXTRACTING_EN "    Extracting...    "
 #define OSD_ZIP_EXTRACTING_ES "    Extrayendo...    "
 static const char *OSD_ZIP_EXTRACTING[2] = { OSD_ZIP_EXTRACTING_EN,OSD_ZIP_EXTRACTING_ES };
+
+#define OSD_ZIP_BADMETHOD_EN " ZIP: unsupported compression "
+#define OSD_ZIP_BADMETHOD_ES " ZIP: compresion no admitida "
+static const char *OSD_ZIP_BADMETHOD[2] = { OSD_ZIP_BADMETHOD_EN,OSD_ZIP_BADMETHOD_ES };
+
+#define OSD_PROFI_LOADING_EN "  Loading Profi system...  \n  Please wait (SPI PSRAM)  "
+#define OSD_PROFI_LOADING_ES "  Cargando sistema Profi...  \n  Espere (SPI PSRAM)  "
+static const char *OSD_PROFI_LOADING[2] = { OSD_PROFI_LOADING_EN,OSD_PROFI_LOADING_ES };
 
 #define OSD_FILE_DELETE_TITLE_EN "Delete?"
 #define OSD_FILE_DELETE_TITLE_ES "Borrar?"
@@ -335,7 +339,8 @@ static const char *MENU_SNA[2] = { MENU_SNA_EN, MENU_SNA_ES };
 	"Player mode\t>\n"\
 	"Real sound-in\t>\n"\
 	"Fast tape load\t>\n"\
-	"R.G. ROM timings\t>\n"
+	"R.G. ROM timings\t>\n"\
+	"Auto-start\t>\n"
 #define MENU_TAPE_ES \
     "Casete\n"\
     "Elegir (TAP)\t{HK_LOAD_ANY}>\n"\
@@ -344,7 +349,8 @@ static const char *MENU_SNA[2] = { MENU_SNA_EN, MENU_SNA_ES };
 	"Modo reproductor\t>\n"\
 	"Modo de sonido real\t>\n"\
 	"Carga rapida cinta\t>\n"\
-	"Timings ROM R.G.\t>\n"
+	"Timings ROM R.G.\t>\n"\
+	"Auto-inicio\t>\n"
 static const char *MENU_TAPE[2] = { MENU_TAPE_EN, MENU_TAPE_ES };
 #define MENU_TAPE_NO_SD_EN \
     "Tape menu\n"\
@@ -353,7 +359,8 @@ static const char *MENU_TAPE[2] = { MENU_TAPE_EN, MENU_TAPE_ES };
 	"Player mode\t>\n"\
 	"Real sound-in\t>\n"\
 	"Fast tape load\t>\n"\
-	"R.G. ROM timings\t>\n"
+	"R.G. ROM timings\t>\n"\
+	"Auto-start\t>\n"
 #define MENU_TAPE_NO_SD_ES \
     "Casete\n"\
     "Play/Stop\t{HK_TAPE_PLAY}\n"\
@@ -361,7 +368,8 @@ static const char *MENU_TAPE[2] = { MENU_TAPE_EN, MENU_TAPE_ES };
 	"Modo reproductor\t>\n"\
 	"Modo de sonido real\t>\n"\
 	"Carga rapida cinta\t>\n"\
-	"Timings ROM R.G.\t>\n"
+	"Timings ROM R.G.\t>\n"\
+	"Auto-inicio\t>\n"
 static const char *MENU_TAPE_NO_SD[2] = { MENU_TAPE_NO_SD_EN, MENU_TAPE_NO_SD_ES };
 
 static const char *MENU_TAPEPLAYER[2] = { "Player mode\n", "Modo reproductor\n" };
@@ -375,6 +383,7 @@ static const char *MENU_TAPEPLAYER2[2] = { "Input (P" _PIN_XSTR(LOAD_WAV_PIO) ")
     "esxDOS\t>\n"\
     "MB-02+\t>\n"\
     "Z-Controller\t>\n"\
+    "IDE/HDD\t>\n"\
     "Snapshot\t>\n"
 #define MENU_STORAGE_MAIN_ES \
     "Almacenamiento\n"\
@@ -383,6 +392,7 @@ static const char *MENU_TAPEPLAYER2[2] = { "Input (P" _PIN_XSTR(LOAD_WAV_PIO) ")
     "esxDOS\t>\n"\
     "MB-02+\t>\n"\
     "Z-Controller\t>\n"\
+    "IDE/HDD\t>\n"\
     "Snapshots\t>\n"
 static const char *MENU_STORAGE_MAIN[2] = { MENU_STORAGE_MAIN_EN, MENU_STORAGE_MAIN_ES };
 #else
@@ -412,26 +422,39 @@ static const char *MENU_STORAGE_MAIN_NO_SD[2] = { MENU_STORAGE_MAIN_NO_SD_EN, ME
 #define MENU_BETADISK_TITLE_EN "Drives\n"
 #define MENU_BETADISK_TITLE_ES "Unidades\n"
 static const char *MENU_BETADISK_TITLE[2] = { MENU_BETADISK_TITLE_EN, MENU_BETADISK_TITLE_ES };
-
-#define MENU_BETADISK_TAIL_EN \
-	"Fast Mode\t>\n"\
-	"Disk Sound & LED\t>\n"\
-	"ROM\t>\n"
-#define MENU_BETADISK_TAIL_ES \
-	"Modo rápido\t>\n"\
-	"Sonido y LED del disco\t>\n"\
-	"ROM\t>\n"
-static const char *MENU_BETADISK_TAIL[2] = { MENU_BETADISK_TAIL_EN, MENU_BETADISK_TAIL_ES };
+static const char *MENU_BETADISK_MODE[2]  = { "Mode", "Modo" };
+static const char *MENU_BETADISK_FASTMODE[2] = { "Fast Mode\t>\n",   "Modo rápido\t>\n" };
+static const char *MENU_BETADISK_SNDLED[2]   = { "Sound & LED\t>\n", "Sonido y LED\t>\n" };
+static const char *MENU_BETADISK_ROM[2]      = { "ROM\t>\n",         "ROM\t>\n" };
+static const char *MENU_BETADISK_AUTOBOOT[2] = { "Auto-boot\t>\n",   "Auto-arranque\t>\n" };
+static const char *MENU_AUTOBOOT[2]          = { "Auto-boot\n",      "Auto-arranque\n" };
 
 // Drive labels used by the dynamic menu builder.
 static const char *MENU_BETA_DRIVE_LETTERS[4] = { "A", "B", "C", "D" };
 #if !PICO_RP2040
 static const char *MENU_ESXDOS_TITLE[2] = { "esxDOS\n", "esxDOS\n" };
 static const char *MENU_IMG_TITLE[2] = { "esxDOS Image\n", "Imagen esxDOS\n" };
+static const char *MENU_IDE_TITLE[2] = { "IDE/HDD\n", "IDE/HDD\n" };
+static const char *MENU_IDE_SCHEME[2] = { "Scheme", "Esquema" };
+static const char *MENU_IDE_IMG_TITLE[2] = { "IDE Image", "Imagen IDE" };
+static const char *MENU_IDE_CREATE[2] = { "Create empty image\n", "Crear imagen vacía\n" };
+static const char *MENU_IDE_CREATE_SIZE[2] = { "New HDD size\n", "Tamaño del nuevo HDD\n" };
+static const char *MENU_IDE_CREATE_NAME[2] = { "Image name:\n", "Nombre de imagen:\n" };
 #endif
 
 static const char *MENU_FASTMODE[2] = { "Fast Mode\n", "Modo rápido\n" };
 static const char *MENU_SOUNDLED[2] = { "Sound & LED\n", "Sonido y LED\n" };
+#define MENU_SOUNDLED_SEL_EN \
+    "Off\t[ ]\n"\
+    "LED\t[ ]\n"\
+    "Sound\t[ ]\n"\
+    "Sound+LED\t[ ]\n"
+#define MENU_SOUNDLED_SEL_ES \
+    "Off\t[ ]\n"\
+    "LED\t[ ]\n"\
+    "Sonido\t[ ]\n"\
+    "Sonido+LED\t[ ]\n"
+static const char *MENU_SOUNDLED_SEL[2] = { MENU_SOUNDLED_SEL_EN, MENU_SOUNDLED_SEL_ES };
 static const char *MENU_NMI_TITLE[2] = { "NMI\n", "NMI\n" };
 #define MENU_NMI_EN "NMI\n" "Magic Button\n"
 #define MENU_NMI_ES "NMI\n" "Magic Button\n"
@@ -453,15 +476,22 @@ static const char *MENU_RESETTO_PENT[2] = { MENU_RESETTO_PENT_EN, MENU_RESETTO_P
 #define MENU_RESETTO_PENTGLUK_ES "Resetear a\n" "Mr Gluk Reset Srvs\n" "TR-DOS\n" "128K\n" "48K\n"
 static const char *MENU_RESETTO_PENTGLUK[2] = { MENU_RESETTO_PENTGLUK_EN, MENU_RESETTO_PENTGLUK_ES };
 
+// Profi reset menu: Service ROM=1, TR-DOS=2, 128K=3, 48K=4
+#define MENU_RESETTO_PROFI_EN "Reset to\n" "Service ROM\n" "TR-DOS\n" "128K\n" "48K\n"
+#define MENU_RESETTO_PROFI_ES "Resetear a\n" "Service ROM\n" "TR-DOS\n" "128K\n" "48K\n"
+static const char *MENU_RESETTO_PROFI[2] = { MENU_RESETTO_PROFI_EN, MENU_RESETTO_PROFI_ES };
+
 static const char *MENU_TRDOS_ROM_TITLE[2] = { "TR-DOS ROM\n", "TR-DOS ROM\n" };
 #define MENU_TRDOS_ROM_SEL_EN \
     "5.03\t[ ]\n"\
     "5.04TM\t[ ]\n"\
-    "5.05D\t[ ]\n"
+    "5.05D\t[ ]\n"\
+    "Custom\t[ ]\n"
 #define MENU_TRDOS_ROM_SEL_ES \
     "5.03\t[ ]\n"\
     "5.04TM\t[ ]\n"\
-    "5.05D\t[ ]\n"
+    "5.05D\t[ ]\n"\
+    "Custom\t[ ]\n"
 static const char *MENU_TRDOS_ROM_SEL[2] = { MENU_TRDOS_ROM_SEL_EN, MENU_TRDOS_ROM_SEL_ES };
 
 // Drive submenu — the Write Protect row is filled in (toggle marker) at runtime.
@@ -500,6 +530,13 @@ static const char *MENU_MB02_SNDLED[2] = { "Sound & LED\t>\n",   "Sonido y LED\t
 static const char *MENU_ESX_INTERFACE[2] = { "Interface",  "Interfaz" };
 static const char *MENU_ESX_INSERT[2]    = { "Insert disk\t>\n", "Insertar disco\t>\n" };
 static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco\n" };
+#endif
+
+// Network menu item — present on RP2350 only; empty string on RP2040
+#if !PICO_RP2040
+#define MENU_MAIN_NETWORK_ITEM "Network\t>\n"
+#else
+#define MENU_MAIN_NETWORK_ITEM ""
 #endif
 
 #if TFT
@@ -542,6 +579,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Options\t>\n"\
     "Debug\t>\n"\
     "Hardware\t>\n"\
+    MENU_MAIN_NETWORK_ITEM \
     "ZX Keyboard\n"\
     "Help\n"\
     "About\n"
@@ -555,6 +593,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Opciones\t>\n"\
 	"Depurar\t>\n"\
     "Hardware\t>\n"\
+    MENU_MAIN_NETWORK_ITEM \
     "Teclado ZX\n"\
     "Ayuda\n"\
     "Acerca de\n"
@@ -571,6 +610,7 @@ static const char *MENU_MAIN[2] = { MENU_MAIN_EN, MENU_MAIN_ES };
     "Options\t>\n"\
     "Debug\t>\n"\
     "Hardware\t>\n"\
+    MENU_MAIN_NETWORK_ITEM \
     "ZX Keyboard\n"\
     "Help\n"\
     "About\n"
@@ -584,6 +624,7 @@ static const char *MENU_MAIN[2] = { MENU_MAIN_EN, MENU_MAIN_ES };
     "Opciones\t>\n"\
     "Depurar\t>\n"\
     "Hardware\t>\n"\
+    MENU_MAIN_NETWORK_ITEM \
     "Teclado ZX\n"\
     "Ayuda\n"\
     "Acerca de\n"
@@ -706,7 +747,6 @@ static const char *MENU_VIDEO[2] = { MENU_VIDEO_EN, MENU_VIDEO_ES };
     "640x480@60\t[6]\n"\
     "640x480@50\t[5]\n"\
     "720x480@60\t[H]\n"\
-    "720x576@60!\t[X]\n"\
     "720x576@50\t[F]\n"
 
 #define MENU_VIDEO_MODE_ES \
@@ -714,7 +754,6 @@ static const char *MENU_VIDEO[2] = { MENU_VIDEO_EN, MENU_VIDEO_ES };
     "640x480@60\t[6]\n"\
     "640x480@50\t[5]\n"\
     "720x480@60\t[H]\n"\
-    "720x576@60!\t[X]\n"\
     "720x576@50\t[F]\n"
 #endif
 
@@ -742,9 +781,34 @@ static const char *MENU_ASPECT[2] = { MENU_ASPECT_EN, MENU_ASPECT_ES };
 
 static const char *MENU_SCANLINES[2] = { "Scanlines\n", "Scanlines\n" };
 
+// Scanlines: Off + 4 brightness levels (dark -> light). Level 2 is the default
+// (matches the legacy single-darkness look). Selection marker is [*]/[ ].
+#define MENU_SCANLINES_SEL_EN \
+    "Off\t[0]\n"\
+    "1 Darkest\t[1]\n"\
+    "2 Dark (default)\t[2]\n"\
+    "3 Light\t[3]\n"\
+    "4 Lightest\t[4]\n"
+#define MENU_SCANLINES_SEL_ES \
+    "Off\t[0]\n"\
+    "1 Mas oscuro\t[1]\n"\
+    "2 Oscuro (predet.)\t[2]\n"\
+    "3 Claro\t[3]\n"\
+    "4 Mas claro\t[4]\n"
+static const char *MENU_SCANLINES_SEL[2] = { MENU_SCANLINES_SEL_EN, MENU_SCANLINES_SEL_ES };
+
 static const char *MENU_VSYNC[2] = { "V-Sync\n", "V-Sync\n" };
 
 static const char *MENU_GIGASCREEN[2] = { "Gigascreen\n", "Gigascreen\n" };
+#define MENU_GIGASCREEN_SEL_EN \
+    "Off\t[ ]\n"\
+    "On\t[ ]\n"\
+    "Auto\t[ ]\n"
+#define MENU_GIGASCREEN_SEL_ES \
+    "Off\t[ ]\n"\
+    "On\t[ ]\n"\
+    "Auto\t[ ]\n"
+static const char *MENU_GIGASCREEN_SEL[2] = { MENU_GIGASCREEN_SEL_EN, MENU_GIGASCREEN_SEL_ES };
 
 #if !defined(PICO_RP2040)
 #define MENU_RESET_EN \
@@ -778,11 +842,14 @@ static const char *MENU_RESET[2] = { MENU_RESET_EN, MENU_RESET_ES };
 #define MENU_DEBUG_EN \
     "Debug Menu\n"\
     "Debug dialog\t{HK_DEBUG}\n"\
-    "BreakPoint\t{HK_BP_LIST}\n"\
-    "BP List\t{HK_BP_LIST}\n"\
-    "Jump to\t{HK_JUMP_TO}\n"\
+    "BreakPoint\n"\
+    "BP List\n"\
+    "Jump to\n"\
     "Input Poke\t{HK_POKE}\n"\
-	"Trigger NMI\t{HK_NMI}\n"
+	"Trigger NMI\t{HK_NMI}\n"\
+	"Debug Log\t>\n"
+
+static const char *MENU_DEBUG_LOG[2] = { "Write debug.log\n", "Escribir debug.log\n" };
 
 #define MOS_FILE "/.firmware"
 #define MENU_RESET_MOS_EN \
@@ -839,40 +906,61 @@ static const char *MENU_FLASHLOAD[2] = { "Fast load\n" , "Carga rapida\n"};
 
 static const char *MENU_RGTIMINGS[2] = { "R.G. Timings\n" , "Timings R.G.\n"};
 
+static const char *MENU_TAPE_AUTOSTART[2] = { "Auto-start\n" , "Auto-inicio\n"};
+
+static const char *MENU_LEDINDICATORS[2] = { "LED indicators\n" , "Indicadores LED\n"};
+
+static const char *MENU_SDLEDBLINK[2] = { "SD card LED\n" , "LED tarjeta SD\n"};
+
+
 #if PICO_RP2040
 #define MENU_AUDIO_EN "Audio\n"\
     "AY-3-8912 ON/OFF\t>\n"\
     "AY-3-8912 Stereo\t>\n"\
     "TurboSound\t>\n"\
     "Covox\t>\n"\
-    "Audio Driver\t>\n"
+    "SounDrive\t>\n"\
+    "Audio Driver\t>\n"\
+    "Volume Boost\t>\n"
 #define MENU_AUDIO_ES "Audio\n"\
     "AY-3-8912 ON/OFF\t>\n"\
     "AY-3-8912 Est" "\x82" "reo\t>\n"\
     "TurboSound\t>\n"\
     "Covox\t>\n"\
-    "Controlador de audio\t>\n"
+    "SounDrive\t>\n"\
+    "Controlador de audio\t>\n"\
+    "Aumento de volumen\t>\n"
 #else
 #define MENU_AUDIO_EN "Audio\n"\
     "AY-3-8912 ON/OFF\t>\n"\
     "AY-3-8912 Stereo\t>\n"\
     "TurboSound\t>\n"\
     "Covox\t>\n"\
+    "SounDrive\t>\n"\
     "SAA1099 ON/OFF\t>\n"\
     "MIDI\t>\n"\
-    "Audio Driver\t>\n"
+    "Audio Driver\t>\n"\
+    "Volume Boost\t>\n"
 #define MENU_AUDIO_ES "Audio\n"\
     "AY-3-8912 ON/OFF\t>\n"\
     "AY-3-8912 Est" "\x82" "reo\t>\n"\
     "TurboSound\t>\n"\
     "Covox\t>\n"\
+    "SounDrive\t>\n"\
     "SAA1099 ON/OFF\t>\n"\
     "MIDI\t>\n"\
-    "Controlador de audio\t>\n"
+    "Controlador de audio\t>\n"\
+    "Aumento de volumen\t>\n"
 #endif
 static const char *MENU_AUDIO[2] = { MENU_AUDIO_EN, MENU_AUDIO_ES };
 static const char *MENU_AUDIO_GS_ITEM[2] = { "General Sound\t>\n", "General Sound\t>\n" };
-static const char *MENU_GS[2] = { "Turned on?\n", "Turned on?\n" };
+static const char *MENU_GS_TITLE[2]      = { "General Sound\n",   "General Sound\n" };
+static const char *MENU_GS_MODE[2]       = { "Mode",  "Modo" };
+static const char *MENU_GS_CLOCK[2]      = { "Clock\n", "Reloj\n" };
+static const char *MENU_GS_CLOCK_SEL[2]  = {
+    "12 MHz\t[ ]\n" "13 MHz\t[ ]\n" "14 MHz\t[ ]\n" "20 MHz\t[ ]\n" "24 MHz\t[ ]\n",
+    "12 MHz\t[ ]\n" "13 MHz\t[ ]\n" "14 MHz\t[ ]\n" "20 MHz\t[ ]\n" "24 MHz\t[ ]\n"
+};
 
 #define MENU_OTHER_EN "Other\n"\
     "ALU Timing\t>\n"\
@@ -881,7 +969,9 @@ static const char *MENU_GS[2] = { "Turned on?\n", "Turned on?\n" };
     "Second joystick\t>\n"\
     "Kempston joystick port\t>\n"\
     "Throttling\t>\n"\
-    "Hot Keys\t>\n"
+    "Hot Keys\t>\n"\
+    "LED indicators\t>\n"\
+    "SD card LED\t>\n"
 #define MENU_OTHER_ES "Otros\n"\
     "Temporizaci" "\xA2" "n ULA\t>\n"\
     "48K Issue 2\t>\n"\
@@ -889,8 +979,14 @@ static const char *MENU_GS[2] = { "Turned on?\n", "Turned on?\n" };
     "Segundo joystick\t>\n"\
     "Puerto Kempston joystick\t>\n"\
     "Aceleraci" "\xA2" "n\t>\n"\
-    "Teclas rapidas\t>\n"
+    "Teclas rapidas\t>\n"\
+    "Indicadores LED\t>\n"\
+    "LED tarjeta SD\t>\n"
 static const char *MENU_OTHER[2] = { MENU_OTHER_EN, MENU_OTHER_ES };
+// RP2350-only extra row appended to the Other menu at runtime (Pentagon/Profi
+// Mr Gluk MC146818 clock + battery-backed CMOS persisted to SD).
+static const char *MENU_OTHER_RTC[2] = { "RTC + NVRAM\t>\n", "RTC + NVRAM\t>\n" };
+static const char *MENU_RTC[2]       = { "RTC + NVRAM\n",    "RTC + NVRAM\n" };
 
 #ifdef PICO_RP2040
 #define MENU_CPU_MHZ \
@@ -911,6 +1007,7 @@ static const char *MENU_OTHER[2] = { MENU_OTHER_EN, MENU_OTHER_ES };
     "Board Info\n"\
     "Emulator Info\n"\
     "HID devices\n"\
+    "Speed Test\t>\n"\
     "Overclock (!)\t>\n"
 #define MENU_HARDWARE_ES \
     "Hardware\n"\
@@ -918,8 +1015,25 @@ static const char *MENU_OTHER[2] = { MENU_OTHER_EN, MENU_OTHER_ES };
     "Info placa\n"\
     "Info emulador\n"\
     "Disp. HID\n"\
+    "Test velocidad\t>\n"\
     "Overclock (!)\t>\n"
 static const char *MENU_HARDWARE[2] = { MENU_HARDWARE_EN, MENU_HARDWARE_ES };
+
+#define MENU_SPEEDTEST_EN \
+    "Speed Test\n"\
+    "CPU MIPS\n"\
+    "SRAM R/W\n"\
+    "PSRAM\n"\
+    "SD Card\n"\
+    "All tests\n"
+#define MENU_SPEEDTEST_ES \
+    "Test velocidad\n"\
+    "CPU MIPS\n"\
+    "SRAM L/E\n"\
+    "PSRAM\n"\
+    "Tarjeta SD\n"\
+    "Todos\n"
+static const char *MENU_SPEEDTEST[2] = { MENU_SPEEDTEST_EN, MENU_SPEEDTEST_ES };
 
 #define MENU_OVERCLOCK_EN \
     "Overclock\n"\
@@ -986,16 +1100,19 @@ static const char *MENU_AY48[2] = { "Turned on?\n" , "Turned on?\n"};
 #if !PICO_RP2040
 static const char *MENU_SAA1099[2] = { "Turned on?\n" , "Turned on?\n"};
 #define MENU_MIDI_EN "MIDI(Ext:P" _PIN_XSTR(MIDI_TX_PIN) ")\n"\
-    "OFF     \t[O]\n"\
-    "AY      \t[A]\n"\
-    "ShamaZX \t[S]\n"\
-    "Software\t[W]\n"
+    "OFF             \t[O]\n"\
+    "AY              \t[A]\n"\
+    "ShamaZX         \t[S]\n"\
+    "Software MIDI   \t[W]\n"\
+    "GM.DLS Wavetable\t[G]\n"
 #define MENU_MIDI_ES "MIDI(Ext:P" _PIN_XSTR(MIDI_TX_PIN) ")\n"\
-    "OFF     \t[O]\n"\
-    "AY      \t[A]\n"\
-    "ShamaZX \t[S]\n"\
-    "Software\t[W]\n"
+    "OFF             \t[O]\n"\
+    "AY              \t[A]\n"\
+    "ShamaZX         \t[S]\n"\
+    "Software MIDI   \t[W]\n"\
+    "GM.DLS Wavetable\t[G]\n"
 static const char *MENU_MIDI[2] = { MENU_MIDI_EN, MENU_MIDI_ES };
+// Software MIDI (mode 3) preset selector (procedural synth).
 #define MENU_MIDI_PRESET_EN "Synth Preset\n"\
     "GM       \t[G]\n"\
     "Piano    \t[P]\n"\
@@ -1007,6 +1124,26 @@ static const char *MENU_MIDI[2] = { MENU_MIDI_EN, MENU_MIDI_ES };
     "Synth    \t[Y]\n"
 #define MENU_MIDI_PRESET_ES MENU_MIDI_PRESET_EN
 static const char *MENU_MIDI_PRESET[2] = { MENU_MIDI_PRESET_EN, MENU_MIDI_PRESET_ES };
+// GM.DLS wavetable mode (4): a user-supplied bank (gm_bank.bin) is provisioned
+// once from SD into a flash partition, then read via XIP (no PSRAM, persistent).
+static const char *MSG_MIDI_BANK_OK[2] = {
+    "GM wavetable bank loaded.",
+    "Banco wavetable GM cargado."
+};
+static const char *MSG_MIDI_BANK_MISSING[2] = {
+    "No bank in flash and no gm_bank.bin\non SD. MIDI will be silent.",
+    "Sin banco en flash y sin gm_bank.bin\nen SD. MIDI sin sonido."
+};
+// msgDialog sizes its width to the message length and is single-line only — keep
+// this to ONE short line (a multi-line string makes the box span the whole screen).
+static const char *MSG_MIDI_BANK_REINSTALL_Q[2] = {
+    "Reinstall GM bank from SD?",
+    "Reinstalar banco GM de SD?"
+};
+static const char *MSG_MIDI_BANK_FLASHING[2] = {
+    "Restarting to install GM bank...\nBoot takes ~20-30s (LED blinks). Do\nNOT power off until it comes back.",
+    "Reiniciando para instalar banco GM...\nArranque ~20-30s (LED parpadea). NO\napague hasta que vuelva."
+};
 #if defined(MIDI_TX_PIN) && defined(LOAD_WAV_PIO) && (LOAD_WAV_PIO == MIDI_TX_PIN)
 static const char *MSG_MIDI_PIN_CONFLICT[2] = {
     "MIDI and Real sound-in share GPIO " _PIN_XSTR(MIDI_TX_PIN) ".\nDisable one of them.",
@@ -1071,19 +1208,46 @@ static const char *MENU_TS[2] = { MENU_TS_EN, MENU_TS_EN };
     "#DD    \t[D]\n"
 static const char *MENU_COVOX[2] = { MENU_COVOX_EN, MENU_COVOX_EN };
 
+// SounDrive 8-bit DAC at #0F/#1F/#3F (left), #4F/#5F (right), #FB (both).
+// Auto = enabled on Profi only (Profi CP/M games stream PCM there).
+#define MENU_SOUNDRIVE_EN "SounDrive\n"\
+    "Auto (Profi only)\t[A]\n"\
+    "On               \t[O]\n"\
+    "Off              \t[F]\n"
+static const char *MENU_SOUNDRIVE[2] = { MENU_SOUNDRIVE_EN, MENU_SOUNDRIVE_EN };
+
 #define MENU_I2S_EN "Audio Driver\n"\
     "Auto     \t[A]\n"\
     "PWM      \t[P]\n"\
     "i2s      \t[I]\n"\
-    "AY-3-8910\t[Y]\n"
-	// \"HDMI     \t[H]\n"
+    "AY-3-8910\t[Y]\n"\
+	"HDMI     \t[H]\n"
 #define MENU_I2S_ES "Controlador de audio\n"\
     "Auto     \t[A]\n"\
     "PWM      \t[P]\n"\
     "i2s      \t[I]\n"\
-    "AY-3-8910\t[Y]\n"
-	// \"HDMI     \t[H]\n"
+    "AY-3-8910\t[Y]\n"\
+	"HDMI     \t[H]\n"
 static const char *MENU_I2S[2] = { MENU_I2S_EN, MENU_I2S_ES };
+
+#define MENU_AUDIO_BOOST_EN "Volume Boost\n"\
+    "+0  \t[A]\n"\
+    "+4  \t[B]\n"\
+    "+8  \t[C]\n"\
+    "+12 \t[D]\n"\
+    "+16 \t[E]\n"\
+    "+32 \t[F]\n"\
+    "+64 \t[G]\n"
+#define MENU_AUDIO_BOOST_ES "Aumento de volumen\n"\
+    "+0  \t[A]\n"\
+    "+4  \t[B]\n"\
+    "+8  \t[C]\n"\
+    "+12 \t[D]\n"\
+    "+16 \t[E]\n"\
+    "+32 \t[F]\n"\
+    "+64 \t[G]\n"
+static const char *MENU_AUDIO_BOOST[2] = { MENU_AUDIO_BOOST_EN, MENU_AUDIO_BOOST_ES };
+static const uint8_t AUDIO_BOOST_VALS[] = { 0, 4, 8, 12, 16, 32, 64 };
 
 #define MENU_ALF_JOY_EN "Source\n"\
     "DPAD #1\t[1]\n"\
@@ -1127,7 +1291,8 @@ static const char *MENU_ISSUE2[2] = { "48K Issue 2\n", "48K Issue 2\n"};
 	"Pentagon 512K\t>\n"\
 	"Pentagon 1024K\t>\n"\
 	"Byte\t>\n"\
-	"Murmuzavr mode\t>\n"
+	"Murmuzavr mode\t>\n"\
+	"Profi\t>\n"
 #else
 #define MENU_ARCHS \
     "Spectrum 48K\t>\n"\
@@ -1137,6 +1302,7 @@ static const char *MENU_ISSUE2[2] = { "48K Issue 2\n", "48K Issue 2\n"};
 	"Pentagon 1024K\t>\n"\
 	"Byte\t>\n"\
 	"Murmuzavr mode\t>\n"\
+	"Profi\t>\n"\
 	"ALF TV GAME\n"
 #endif
 static const char *MENU_ARCH[2] = { MENU_ARCH_EN MENU_ARCHS, MENU_ARCH_ES MENU_ARCHS };
@@ -1227,6 +1393,12 @@ static const char *MENU_ROMS128[2] = { MENU_ROMS128_EN, MENU_ROMS128_ES };
 	"128Kp + Mr Gluk Reset Srvs\n"\
     "Custom\n"
 static const char *MENU_ROMS_PENT[2] = { MENU_ROMS_PENT_EN, MENU_ROMS_PENT_ES };
+
+#define MENU_ROMS_PROFI_EN "Select ROM\n"\
+	"1024K\n"
+#define MENU_ROMS_PROFI_ES "Elija ROM\n"\
+	"1024K\n"
+static const char *MENU_ROMS_PROFI[2] = { MENU_ROMS_PROFI_EN, MENU_ROMS_PROFI_ES };
 
 #if PICO_RP2350
 #define MENU_MURMUZAVR_EN "Murmuzavr mode\n"\
@@ -2102,5 +2274,119 @@ const uint8_t ESPectrum_logo[] = {
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00,
 };
+
+
+// ─── ZiFi / Network menu strings ─────────────────────────────────────────────
+#if !PICO_RP2040
+
+#define MENU_NETWORK_EN \
+    "Network\n"\
+    "Status\n"\
+    "Sync time (SNTP)\n"\
+    "Time zone\t>\n"\
+    "ZiFi NIC\t>\n"
+#define MENU_NETWORK_ES \
+    "Red\n"\
+    "Estado\n"\
+    "Sincronizar hora\n"\
+    "Zona horaria\t>\n"\
+    "ZiFi NIC\t>\n"
+static const char *MENU_NETWORK[2] = { MENU_NETWORK_EN, MENU_NETWORK_ES };
+
+#define MENU_ZIFI_NIC_EN "ZiFi NIC\n"\
+    "Off\n"\
+    "On\n"
+#define MENU_ZIFI_NIC_ES "ZiFi NIC\n"\
+    "Apagado\n"\
+    "Encendido\n"
+static const char *MENU_ZIFI_NIC[2] = { MENU_ZIFI_NIC_EN, MENU_ZIFI_NIC_ES };
+
+static const char *MSG_WIFI_CONNECTING[2]    = { "Connecting...",     "Conectando..."      };
+static const char *MSG_WIFI_CONNECTED[2]     = { "Connected",         "Conectado"          };
+static const char *MSG_WIFI_DISCONNECTED[2]  = { "Disconnected",      "Desconectado"       };
+static const char *MSG_WIFI_CONNECT_ERR[2]   = { "Connect failed",    "Error al conectar"  };
+static const char *MSG_WIFI_NO_CFG[2]        = { "No /wifi.cfg found","Sin /wifi.cfg"      };
+static const char *MSG_WIFI_CFG_RELOADED[2]  = { "wifi.cfg reloaded", "wifi.cfg recargado" };
+static const char *MSG_RTC_SYNCING[2]        = { "Syncing time...",   "Sincronizando..."   };
+static const char *MSG_RTC_SYNCED[2]         = { "Time set:",         "Hora ajustada:"     };
+static const char *MSG_RTC_SYNC_ERR[2]       = { "Time sync failed",  "Error de hora"      };
+static const char *MSG_WIFI_SCANNING[2]      = { "Scanning...",       "Buscando..."        };
+static const char *MSG_WIFI_NO_NETS[2]       = { "No networks found", "Sin redes"          };
+static const char *MSG_WIFI_PASS_LABEL[2]    = { "Pass:",             "Clave:"             };
+static const char *MSG_WIFI_DISCONNECT_Q[2]  = { "Disconnect?",       "\xA8" "Desconectar?" };
+static const char *MENU_WIFI_LIST_TITLE[2]   = { "Wi-Fi networks",    "Redes Wi-Fi"        };
+static const char *MENU_TZ_TITLE[2]          = { "Time zone (UTC)",   "Zona horaria (UTC)" };
+static const char *MENU_ZIFI_GPIO_TITLE[2]   = { "ZiFi UART GPIO",    "ZiFi UART GPIO"     };
+static const char *MENU_ESP01_TITLE[2]       = { "ESP-01(S)",         "ESP-01(S)"          };
+static const char *MENU_BAUD_TITLE[2]        = { "UART baud rate",    "Velocidad UART"     };
+
+// ─── SRAM budget manager strings ────────────────────────────────────────────
+// Heavy features (Gigascreen / General Sound / DivMMC / Profi / ZiFi) don't all
+// fit in SRAM on butter-less boards. When enabling one would overflow, the OSD
+// offers to free room or refuses.
+static const char *MSG_BUDGET_TITLE[2]       = { "Not enough SRAM",   "Falta SRAM"         };
+static const char *MSG_BUDGET_DENY[2]        = { "not enough free SRAM",
+                                                 "falta SRAM libre" };
+static const char *MSG_BUDGET_FREE_HINT[2]   = { "Turn off to free room, then Apply:",
+                                                 "Desactive para liberar, luego Aplicar:" };
+static const char *MSG_BUDGET_APPLY[2]       = { "Apply & reboot",    "Aplicar y reiniciar" };
+static const char *MSG_BUDGET_INSUFFICIENT[2]= { "Not enough freed - pick more",
+                                                 "Insuficiente - elija mas" };
+
+// ─── File transfer (FTP/SFTP) client strings ────────────────────────────────
+static const char *MENU_NET_PROTO[2]         = { "Protocol\nFTP\nSFTP\n", "Protocolo\nFTP\nSFTP\n" };
+static const char *MSG_NET_FT_NOWIFI[2]      = { "Connect Wi-Fi first", "Conecte Wi-Fi primero" };
+static const char *MSG_NET_HOST_LABEL[2]     = { "Host:",   "Host:"     };
+static const char *MSG_NET_USER_LABEL[2]     = { "User:",   "Usuario:"  };
+static const char *MSG_NET_PORT_LABEL[2]     = { "Port:",   "Puerto:"   };
+static const char *MSG_NET_PASS_LABEL[2]     = { "Pass:",   "Clave:"    };
+static const char *MSG_PASS_TAB[2]           = { "TAB:show","TAB:ver"   };
+static const char *MSG_NET_CONNECTING[2]     = { "Connecting...",    "Conectando..."     };
+static const char *MSG_NET_CONN_ERR[2]       = { "Connection failed","Error de conexion" };
+static const char *MSG_NET_TRUST_Q[2]        = { "Trust this host key?", "\xA8" "Confiar en la clave?" };
+static const char *MSG_NET_HOSTKEY_BAD[2]    = { "HOST KEY CHANGED!\nPossible MITM", "\xA8" "CLAVE CAMBIADA!\nPosible MITM" };
+static const char *MSG_NET_DOWNLOADING[2]    = { "Downloading...",   "Descargando..."    };
+static const char *MSG_NET_UPLOADING[2]      = { "Uploading...",     "Subiendo..."       };
+static const char *MSG_NET_XFER_OK[2]        = { "Transfer complete","Transferencia OK"  };
+static const char *MSG_NET_XFER_ERR[2]       = { "Transfer failed",  "Fallo al transferir" };
+static const char *MSG_NET_EMPTY_DIR[2]      = { "(empty)",          "(vacio)"           };
+static const char *MSG_NET_DL_OR_UL[2]       = { "Download\nUpload here\n", "Descargar\nSubir aqui\n" };
+static const char *MENU_NET_BROWSE_TITLE[2]  = { "Remote files",     "Archivos remotos"  };
+static const char *MSG_NET_DELETE_Q[2]       = { "Delete?",          "\xA8" "Borrar?"     };
+static const char *MSG_NET_FOOTER[2]         = { "Ent:run Alt:SD F5cp F8del F2ref","Ent:ej Alt:SD F5cp F8bor F2act" };
+static const char *MSG_NET_FOOTER_RO[2]      = { "Enter:run  Alt+Ent:SD  F2:refresh","Ent:ejec Alt:SD F2:actualizar" };
+static const char *MSG_NET_COPYING[2]        = { "Copying...",       "Copiando..."        };
+static const char *MSG_NET_LAUNCHING[2]      = { "Launching...",     "Iniciando..."       };
+static const char *MSG_NET_UNSUPPORTED[2]    = { "Cannot run this type","No ejecutable"     };
+static const char *MSG_NET_REFRESHING[2]     = { "Refreshing...",    "Actualizando..."    };
+
+// ─── F5 location picker + saved-remotes manager ─────────────────────────────
+static const char *MENU_F5_LOCATION[2]       = { "Open from",        "Abrir desde"        };
+static const char *MSG_F5_LOCAL[2]           = { "Local (SD)",       "Local (SD)"         };
+static const char *MSG_F5_REMOTE[2]          = { "Remote (FTP/SFTP)","Remoto (FTP/SFTP)"  };
+static const char *MSG_F5_WEB[2]             = { "Web Archives",     "Archivos web"       };
+static const char *MSG_F5_ADD_REMOTE[2]      = { "Add Remote",       "Anadir remoto"      };
+static const char *MENU_REMOTE_TITLE[2]      = { "Remote connections","Conexiones remotas" };
+static const char *MSG_REMOTE_ADD_ROW[2]     = { "[Add Remote]",     "[Anadir remoto]"    };
+static const char *MSG_REMOTE_FORGET_Q[2]    = { "Forget connection?","\xA8" "Olvidar conexion?" };
+static const char *MENU_REMOTE_SAVEPASS[2]   = { "Save password?\nNo\nYes\n", "\xA8" "Guardar clave?\nNo\nSi\n" };
+static const char *MSG_REMOTE_ALIAS_LABEL[2] = { "Alias:", "Alias:" };
+static const char *MSG_REMOTE_PATH_LABEL[2]  = { "Path:",  "Ruta:"  };
+static const char *MSG_REMOTE_FULL[2]        = { "Too many remotes", "Demasiados remotos" };
+
+// ─── Archive download (catalog server) strings ──────────────────────────────
+static const char *MENU_ARCH_SITE_TITLE[2]   = { "Archive source",   "Fuente de archivo" };
+static const char *MSG_ARCH_SERVER_LABEL[2]  = { "Catalog:",  "Catalogo:" };
+static const char *MSG_ARCH_SITES_ERR[2]     = { "No sources found",  "Sin fuentes"       };
+
+// ─── HTTP test ("curl") strings ─────────────────────────────────────────────
+static const char *MENU_HTTP_TEST_ITEM[2]    = { "HTTP test (curl)\t>\n", "Prueba HTTP (curl)\t>\n" };
+static const char *MENU_HTTP_SCHEME[2]       = { "Scheme\nhttps\nhttp\n", "Esquema\nhttps\nhttp\n" };
+static const char *MSG_HTTP_HOST_LABEL[2]    = { "Host:", "Host:" };
+static const char *MSG_HTTP_PATH_LABEL[2]    = { "Path:", "Ruta:" };
+static const char *MSG_HTTP_TESTING[2]       = { "Requesting...", "Solicitando..." };
+static const char *MSG_HTTP_TEST_TITLE[2]    = { "HTTP test", "Prueba HTTP" };
+
+#endif // !PICO_RP2040
 
 #endif // ESPECTRUM_MESSAGES_h

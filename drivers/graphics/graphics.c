@@ -250,19 +250,19 @@ void graphics_set_pio_clk_div(float div)
 }
 
 #ifdef VGA_HDMI
-extern void hdmi_set_scanlines(bool enabled);
-extern void vga_set_scanlines(bool enabled);
-void graphics_set_scanlines(bool enabled) {
-    hdmi_set_scanlines(enabled);
-    vga_set_scanlines(enabled);
+extern void hdmi_set_scanlines(uint8_t level);
+extern void vga_set_scanlines(uint8_t level);
+void graphics_set_scanlines(uint8_t level) {
+    hdmi_set_scanlines(level);
+    vga_set_scanlines(level);
 }
 extern void hdmi_set_dither(bool enabled);
 void graphics_set_dither(bool enabled) {
     hdmi_set_dither(enabled);
 }
 #else
-void graphics_set_scanlines(bool enabled) {
-    (void)enabled;
+void graphics_set_scanlines(uint8_t level) {
+    (void)level;
 }
 #ifdef HDMI
 extern void hdmi_set_dither(bool enabled);

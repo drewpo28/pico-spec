@@ -109,6 +109,10 @@ for TARGET in $TARGETS; do
             break
         fi
     done
+    # ALF-enabled (NO_ALF=0) variants: m1p2 (MURM_P2) and z0p2 (ZERO2)
+    if [ "$TARGET" = "MURM2_P2" ] || [ "$TARGET" = "MURM_P2" ] || [ "$TARGET" = "ZERO2" ]; then
+        BUILD_PAIRS+=("${TARGET}:VGA_HDMI:ALF")
+    fi
 done
 
 echo "=== pico-spec multi-target build ==="
@@ -126,19 +130,21 @@ LOG_DIR="$SCRIPT_DIR/build-logs"
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 
 build_dir_for() {
-    local target="$1" display="$2"
+    local target="$1" display="$2" alf="$3"
+    local suffix=""
+    [ "$alf" = "ALF" ] && suffix="-ALF"
     if [ "$display" = "VGA_HDMI" ]; then
-        echo "$SCRIPT_DIR/build-$target"
+        echo "$SCRIPT_DIR/build-${target}${suffix}"
     else
-        echo "$SCRIPT_DIR/build-${target}-${display}"
+        echo "$SCRIPT_DIR/build-${target}-${display}${suffix}"
     fi
 }
 
 # Optional clean
 if $CLEAN; then
     for PAIR in "${BUILD_PAIRS[@]}"; do
-        TARGET="${PAIR%%:*}"; DISPLAY="${PAIR##*:}"
-        BUILD_DIR="$(build_dir_for "$TARGET" "$DISPLAY")"
+        IFS=':' read -r TARGET DISPLAY ALF <<<"$PAIR"
+        BUILD_DIR="$(build_dir_for "$TARGET" "$DISPLAY" "$ALF")"
         if [ -d "$BUILD_DIR" ]; then
             echo "Cleaning $BUILD_DIR ..."
             rm -rf "$BUILD_DIR"
@@ -151,16 +157,12 @@ fi
 # Exits 0 on success, non-zero on failure.
 build_one() {
     local pair="$1"
-    local target="${pair%%:*}"
-    local display="${pair##*:}"
+    local target display alf
+    IFS=':' read -r target display alf <<<"$pair"
     local build_dir label log
-    build_dir="$(build_dir_for "$target" "$display")"
-    if [ "$display" = "VGA_HDMI" ]; then
-        label="$target (VGA_HDMI)"
-    else
-        label="$target ($display)"
-    fi
-    log="$LOG_DIR/${target}-${display}.log"
+    build_dir="$(build_dir_for "$target" "$display" "$alf")"
+    label="$target ($display${alf:+ +ALF})"
+    log="$LOG_DIR/${target}-${display}${alf:+-ALF}.log"
 
     {
         echo "========================================"
@@ -208,6 +210,9 @@ build_one() {
             target_flags+=(-DTFT=ON -DST7789=ON -DVGA_HDMI=OFF)
         elif [ "$display" = "SOFTTV" ]; then
             target_flags+=(-DSOFTTV=ON -DVGA_HDMI=OFF)
+        fi
+        if [ "$alf" = "ALF" ]; then
+            target_flags+=(-DNO_ALF=0)
         fi
 
         local cmake_args=(
@@ -271,16 +276,31 @@ while IFS= read -r line; do
 done <"$RESULTS_FILE"
 
 if [ ${#SUCCEEDED[@]} -gt 0 ]; then
+    # Start from a clean firmware dir so it only holds this run's current-version
+    # uf2s (no stale files from earlier PORT_VERSION/clock builds).
+    rm -f "$OUTPUT_DIR"/*.uf2
     echo "Succeeded (${#SUCCEEDED[@]}):"
     for ENTRY in "${SUCCEEDED[@]}"; do
         PAIR="${ENTRY%% (*}"
-        TARGET="${PAIR%%:*}"; DISPLAY="${PAIR##*:}"
-        BUILD_DIR="$(build_dir_for "$TARGET" "$DISPLAY")"
+        IFS=':' read -r TARGET DISPLAY ALF <<<"$PAIR"
+        BUILD_DIR="$(build_dir_for "$TARGET" "$DISPLAY" "$ALF")"
+        LOG="$LOG_DIR/${TARGET}-${DISPLAY}${ALF:+-ALF}.log"
         echo "  $ENTRY"
-        while IFS= read -r FW; do
+        # Copy only the uf2 from THIS run's CMake config (BUILD_NAME embeds the
+        # current PORT_VERSION), not every stale *.uf2 left in the bin dir from
+        # earlier builds with different versions/clocks.
+        BUILD_NAME="$(grep -m1 -- '-- BUILD_NAME:' "$LOG" 2>/dev/null | sed 's/.*-- BUILD_NAME: *//')"
+        if [ -z "$BUILD_NAME" ]; then
+            echo "    !! could not determine BUILD_NAME from $LOG — skipping"
+            continue
+        fi
+        FW="$BUILD_DIR/bin/$BUILD_TYPE/$BUILD_NAME.uf2"
+        if [ -f "$FW" ]; then
             cp "$FW" "$OUTPUT_DIR/"
             echo "    -> $(basename "$FW")"
-        done < <(find "$BUILD_DIR" -name "*.uf2" 2>/dev/null)
+        else
+            echo "    !! expected $FW not found"
+        fi
     done
     echo ""
     echo "All firmware files copied to: $OUTPUT_DIR/"
@@ -291,8 +311,8 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     echo "Failed (${#FAILED[@]}):"
     for ENTRY in "${FAILED[@]}"; do
         PAIR="${ENTRY%% (*}"
-        TARGET="${PAIR%%:*}"; DISPLAY="${PAIR##*:}"
-        echo "  $ENTRY    (see $LOG_DIR/${TARGET}-${DISPLAY}.log)"
+        IFS=':' read -r TARGET DISPLAY ALF <<<"$PAIR"
+        echo "  $ENTRY    (see $LOG_DIR/${TARGET}-${DISPLAY}${ALF:+-ALF}.log)"
     done
     exit 1
 fi

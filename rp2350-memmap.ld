@@ -212,6 +212,19 @@ SECTIONS
         PROVIDE(__flash_binary_end = .);
     } > FLASH =0xaa
 
+    /* ── GM.DLS wavetable bank flash partition ───────────────────────────────
+     * Fixed ~1.6 MB region at the TOP of flash for the user-provisioned wavetable
+     * bank (gm_bank.bin, µ-law). Fixed address (NOT after the firmware, which
+     * moves with code size) so a once-provisioned bank survives firmware
+     * reflashes. NOLOAD: nothing is emitted here at link time, so it is NOT in
+     * the UF2 (keeps the firmware UF2 small). The device writes it at runtime via
+     * flash_range_program (MidiSynth::provision) and reads it via XIP. */
+    __gm_bank_size  = 0x1A0000;   /* 1.625 MB; multiple of 4 KB and > bank size (~1.59 MB) */
+    __gm_bank_start = ORIGIN(FLASH) + LENGTH(FLASH) - __gm_bank_size;
+    __gm_bank_end   = ORIGIN(FLASH) + LENGTH(FLASH);
+    ASSERT(__flash_binary_end <= __gm_bank_start,
+        "ERROR: firmware overflowed into the gm_bank flash partition — shrink firmware or enlarge flash")
+
     __StackLimit = ORIGIN(RAM) + LENGTH(RAM);
     __StackOneTop = ORIGIN(SCRATCH_X) + LENGTH(SCRATCH_X);
     __StackTop = ORIGIN(SCRATCH_Y) + LENGTH(SCRATCH_Y);

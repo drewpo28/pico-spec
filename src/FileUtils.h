@@ -86,7 +86,7 @@ public:
     static void initFileSystem();
     static bool mountSDCard();
     static void unmountSDCard();
-    static void mkdirParents(const char* path);
+    static bool mkdirParents(const char* path);
     static bool checkSDCard();
     static bool remountSD();
     // static String         getAllFilesFrom(const String path);
@@ -110,6 +110,11 @@ public:
 
     static void deleteFilesWithExtension(const char *folder_path, const char *extension);
     static bool deleteDirRecursive(const char *path);
+
+    // UTF-8 → CP1251 (Cyrillic) for OSD display with the Font6x8Cyr face. ASCII
+    // passes through; Russian letters map to their CP1251 byte; other codepoints
+    // become '?'; invalid sequences pass through unchanged.
+    static string utf8ToCp1251(const string& s);
 
     static string MountPoint;
     static bool SDReady;
@@ -139,14 +144,13 @@ private:
 #define DEBUG_LOG_PATH  CONFIG_DIR "/debug.log"
 #define DUMP_LOG_PATH   CONFIG_DIR "/dump.log"
 
-// Single root for everything on the SD card (data + configs + logs) is CONFIG_DIR.
+// CONFIG_DIR (/.config/pico-spec) holds configs + logs (per-version/per-board NVS).
 #define DISK_BOOT_FILENAME CONFIG_DIR "/boot.cfg"
-#define DISK_ROM_DIR "/r"
-#define DISK_SNA_DIR "/s"
-#define DISK_TAP_DIR "/t"
-#define DISK_DSK_DIR "/d"
-#define DISK_SCR_DIR "/.c"
-#define DISK_PSNA_DIR "/.p"
+
+// User data lives in a separate visible root /spec on the SD card.
+#define SPEC_DIR_ROOT "/spec"
+#define DISK_SCR_DIR  SPEC_DIR_ROOT "/screenshots"
+#define DISK_PSNA_DIR SPEC_DIR_ROOT "/snapshots"
 #define DISK_PSNA_FILE "persist"
 
 #define NO_RAM_FILE "none"

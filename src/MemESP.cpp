@@ -42,6 +42,21 @@ std::list<mem_desc_t> mem_desc_t::pages;
 uint8_t* mem_desc_t::plugged_in[4] = { 0, 0, 0, 0 };
 uint32_t MEM_PG_CNT = 64;
 
+// Per-frame SPI PSRAM swap counters — reset each EndFrame, read in Debug::log.
+volatile uint32_t mem_spi_evict_count = 0;  // from_vram calls (SPI DMA loads)
+volatile uint32_t mem_spi_evict_page  = 0;  // last evicted page index
+
+// Cold paths for memory breakpoints — see declaration in MemESP.h.
+__attribute__((noinline)) void MemESP::checkMemReadBP(uint16_t addr) {
+    if (Config::hasBreakPoint(addr, Config::BP_MEM_READ))
+        CPU::portBasedBP = true;
+}
+
+__attribute__((noinline)) void MemESP::checkMemWriteBP(uint16_t addr) {
+    if (Config::hasBreakPoint(addr, Config::BP_MEM_WRITE))
+        CPU::portBasedBP = true;
+}
+
 static FIL f;
 static const char PAGEFILE[] = "/tmp/pico-spec.swap";
 
@@ -69,19 +84,17 @@ uint8_t* mem_desc_t::to_vram(void) {
     uint8_t* res = _int->p;
     uint32_t ba = _int->vram_off;
     if (psram_size() >= ba + MEM_PG_SZ) {
-        for (size_t i = 0; i < MEM_PG_SZ; i += 4) {
-            write32psram(ba + i, *(uint32_t*)(res + i));
-        }
+        psram_write_page(ba, res); // single SPI CS for full 16KB (32-bit PIO, exact x)
         _int->mem_type = PSRAM_SPI;
     } else {
-        #ifdef PICO_DEFAULT_LED_PIN
+        #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
         gpio_put(PICO_DEFAULT_LED_PIN, true);
         #endif
         UINT bw;
         FSIZE_t lba = ba;
         f_lseek(&f, lba);
         f_write(&f, res, MEM_PG_SZ, &bw);
-        #if PICO_DEFAULT_LED_PIN
+        #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
         gpio_put(PICO_DEFAULT_LED_PIN, false);
         #endif
         _int->mem_type = SWAP;
@@ -93,9 +106,9 @@ void mem_desc_t::from_vram(uint8_t* p) {
     this->_int->p = p;
     uint32_t ba = _int->vram_off;
     if (psram_size() >= ba + MEM_PG_SZ) {
-        for (size_t i = 0; i < MEM_PG_SZ; i += 4) {
-            *(uint32_t*)(p + i) = read32psram(ba + i);
-        }
+        mem_spi_evict_count++;
+        mem_spi_evict_page = ba / MEM_PG_SZ;
+        psram_read_page(ba, p); // single SPI CS for full 16KB (32-bit PIO, exact x/y)
     } else {
         UINT br;
         FSIZE_t lba = ba;
@@ -122,21 +135,21 @@ void mem_desc_t::_write(uint16_t addr, uint8_t v) {
         write8psram(ba + addr, v);
         return;
     }
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, true);
     #endif
     UINT br;
     FSIZE_t lba = ba;
     f_lseek(&f, lba + addr);
     f_write(&f, &v, 1, &br);
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, false);
     #endif
 }
 void mem_desc_t::_sync(uint8_t bank) {
     for (auto it = pages.begin(); it != pages.end(); ++it) {
         mem_desc_t& page = *it;
-        if (page._int->mem_type == POINTER) {
+        if (page._int->mem_type == POINTER && !page._int->pinned) {
             for (uint8_t i = 0; i < 4; ++i) {
                 if (i != bank) {
                     if (page._int->p == plugged_in[i]) goto skip;
@@ -166,7 +179,7 @@ void mem_desc_t::from_file(FIL* f_in, size_t sz) {
         }
         return;
     }
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, true);
     #endif
     FSIZE_t lba = ba;
@@ -175,18 +188,18 @@ void mem_desc_t::from_file(FIL* f_in, size_t sz) {
         f_read(f_in, &v, 1, &br);
         f_write(&f, &v, 1, &br);
     }
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, false);
     #endif
 }
 void mem_desc_t::to_file(FIL* f_out, size_t sz) {
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, true);
     #endif
     UINT br;
     if (_int->mem_type == POINTER) {
         f_write(f_out, direct(), sz, &br);
-        #ifdef PICO_DEFAULT_LED_PIN
+        #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
         gpio_put(PICO_DEFAULT_LED_PIN, false);
         #endif
         return;
@@ -198,7 +211,7 @@ void mem_desc_t::to_file(FIL* f_out, size_t sz) {
             v = read8psram(ba + addr);
             f_write(f_out, &v, 1, &br);
         }
-        #ifdef PICO_DEFAULT_LED_PIN
+        #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
         gpio_put(PICO_DEFAULT_LED_PIN, false);
         #endif
         return;
@@ -209,7 +222,7 @@ void mem_desc_t::to_file(FIL* f_out, size_t sz) {
         f_read(&f, &v, 1, &br);
         f_write(f_out, &v, 1, &br);
     }
-    #ifdef PICO_DEFAULT_LED_PIN
+    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, false);
     #endif
 }
@@ -249,30 +262,24 @@ void mem_desc_t::cleanup() {
 }
 
 mem_desc_t MemESP::rom[64];
-// 8 Z80 RAM pages (the full 128 KB Spectrum 128 RAM) live in static SRAM —
-// predictable POINTER backing on every board, never in butter/PSRAM/swap.
-// Required by the 16col rasterizer which reads pages 4-7 via direct() in
-// the HDMI/VGA ISR.
+// Z80 RAM pages placed in the .ram_128k section, which the RP2350 linker
+// script pins to SRAM banks 0-1 (dedicated 128 KB region). The framebuffer
+// lives in heap (banks 2-7) so HDMI DMA reading the framebuffer travels
+// through different AHB ports than CPU access to Z80 RAM — no bus contention.
+// NOLOAD (no init from flash); pages cleared at runtime in MemESP::reset().
 //
-// Placed in the .ram_pages01234567 section, which the RP2350 linker script
-// pins to SRAM banks 0-1 (a dedicated 128 KB region). The framebuffer ends
-// up in heap which lands in banks 2-7, so HDMI DMA reading the framebuffer
-// travels through different AHB ports than CPU access to Z80 RAM pages —
-// no bus contention.
-//
-// .ram_pages01234567 is NOLOAD (no init from flash) and pages are cleared
-// at runtime in MemESP::reset() / Pentagon boot anyway.
-// alignas(4) keeps each page boundary 32-bit-aligned.
+// On RP2350: all 128 KB of Spectrum 128 RAM (pages 0-7) lives here. The
+// 16col rasterizer (gated `#if !PICO_RP2040` in Video.cpp) reads pages 4-7
+// via direct() in the HDMI/VGA ISR and requires guaranteed POINTER backing.
+// On RP2040: only the video pages 5,7 are static (the rasterizer needs them
+// every line). Pages 0/4/6 are conditionally heap-allocated in setup() —
+// 264 KB total SRAM is too tight to spend 96 KB on static Z80 RAM, and
+// 16col mode is disabled, so pages 4/6 don't need predictable backing.
 #define Z80_RAM_PAGE_ATTR __attribute__((section(".ram_128k"), aligned(4)))
-Z80_RAM_PAGE_ATTR static uint8_t pages46[MEM_PG_SZ * 2];
 Z80_RAM_PAGE_ATTR static uint8_t pages57[MEM_PG_SZ * 2];
 #if !PICO_RP2040
-// On RP2350 also keep pages 0-3 in the same SRAM region (64 KB more),
-// freeing ~64 KB of heap that would otherwise hold them via `new[]`.
-// On RP2040 heap is too tight (~148 KB total) to afford this, and page 0
-// is explicitly placed in PSRAM/swap in setup() to save heap for the
-// framebuffer — leave that path intact.
 Z80_RAM_PAGE_ATTR static uint8_t pages0123[MEM_PG_SZ * 4];
+Z80_RAM_PAGE_ATTR static uint8_t pages46[MEM_PG_SZ * 2];
 #endif
 #undef Z80_RAM_PAGE_ATTR
 static mem_desc_t temp[8] = {
@@ -281,16 +288,20 @@ static mem_desc_t temp[8] = {
     { pages0123 + MEM_PG_SZ * 1, 1 },
     { pages0123 + MEM_PG_SZ * 2, 2 },
     { pages0123 + MEM_PG_SZ * 3, 3 },
+    { pages46   + MEM_PG_SZ * 0, 4 },
+    { pages57   + MEM_PG_SZ * 0, 5 },
+    { pages46   + MEM_PG_SZ * 1, 6 },
+    { pages57   + MEM_PG_SZ * 1, 7 },
 #else
     { 0, 0 },
     { 0, 1 },
     { 0, 2 },
     { 0, 3 },
+    { 0, 4 },
+    { pages57 + MEM_PG_SZ * 0, 5 },
+    { 0, 6 },
+    { pages57 + MEM_PG_SZ * 1, 7 },
 #endif
-    { pages46   + MEM_PG_SZ * 0, 4 },
-    { pages57   + MEM_PG_SZ * 0, 5 },
-    { pages46   + MEM_PG_SZ * 1, 6 },
-    { pages57   + MEM_PG_SZ * 1, 7 },
 };
 mem_desc_t* MemESP::ram = temp;
 bool MemESP::newSRAM = false;

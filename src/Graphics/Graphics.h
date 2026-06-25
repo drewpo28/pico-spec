@@ -97,8 +97,9 @@ class Graphics {
 	virtual void drawChar(int x, int y, int ch)	{
 		if (!font)
 			return;
-		// if (!font->valid(ch))
-		if (!(ch >= 32 && ch < 176))
+		// Bound by the font's own glyph count so each face (iso8859_1 = 144 glyphs,
+		// the Cyrillic face = 224) reads only valid pixels — no out-of-bounds.
+		if (!(ch >= font->firstChar && ch < font->firstChar + font->charCount))
 			return;
 		const unsigned char *pix = &font->pixels[font->charWidth * font->charHeight * (ch - font->firstChar)];
 		for (int py = 0; py < font->charHeight; py++)
@@ -114,11 +115,13 @@ class Graphics {
 	void print(const char ch) {
 		if (!font)
 			return;
-		// if (font->valid(ch))
-		if (ch >= 32 && ch < 176)
-			drawChar(cursorX, cursorY, ch);
+		// Cast so bytes >=128 (e.g. CP1251 Cyrillic) stay positive; drawChar then
+		// clamps to the active font's glyph range.
+		unsigned char uch = (unsigned char)ch;
+		if (uch >= font->firstChar)
+			drawChar(cursorX, cursorY, uch);
 		else
-			drawChar(cursorX, cursorY, ' ');		
+			drawChar(cursorX, cursorY, ' ');
 		cursorX += font->charWidth;
 		if (cursorX + font->charWidth > xres) {
 			cursorX = cursorBaseX;

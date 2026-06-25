@@ -10,6 +10,7 @@
 #if !PICO_RP2040
 
 #include <string.h>
+#include <stdlib.h>
 #include "CPU.h"
 #include "Config.h"
 #include "Debug.h"
@@ -67,8 +68,8 @@ bool     Z80DMA::read_sequence_active = false;
 bool     Z80DMA::dma_in_progress = false;
 bool     Z80DMA::mb02_deferred = false;
 
-// Per-scanline attr shadow buffer
-uint8_t  Z80DMA::dma_attr_shadow[192 * 32];
+// Per-scanline attr shadow buffer (heap, allocated while DMA mode is on)
+uint8_t* Z80DMA::dma_attr_shadow = nullptr;
 bool     Z80DMA::dma_attr_valid[192];
 bool     Z80DMA::dma_charrow_active[24];
 static uint8_t charrow_write_cnt[24];
@@ -134,7 +135,8 @@ void Z80DMA::reset() {
 
     dma_in_progress = false;
 
-    memset(dma_attr_shadow, 0, sizeof(dma_attr_shadow));
+    if (Config::dma_mode) ensureAttrShadow();
+    if (dma_attr_shadow) memset(dma_attr_shadow, 0, DMA_ATTR_SHADOW_SZ);
     memset(dma_attr_valid, 0, sizeof(dma_attr_valid));
     memset(dma_charrow_active, 0, sizeof(dma_charrow_active));
     memset(charrow_write_cnt, 0, sizeof(charrow_write_cnt));
@@ -146,6 +148,20 @@ void Z80DMA::resetAttrShadow() {
     memset(dma_charrow_active, 0, sizeof(dma_charrow_active));
     memset(charrow_write_cnt, 0, sizeof(charrow_write_cnt));
     memset(prev_attrs_saved, 0, sizeof(prev_attrs_saved));
+}
+
+bool Z80DMA::ensureAttrShadow() {
+    if (!dma_attr_shadow)
+        dma_attr_shadow = (uint8_t*)calloc(DMA_ATTR_SHADOW_SZ, 1);
+    return dma_attr_shadow != nullptr;
+}
+
+void Z80DMA::freeAttrShadow() {
+    if (dma_attr_shadow) {
+        free(dma_attr_shadow);
+        dma_attr_shadow = nullptr;
+    }
+    memset(dma_attr_valid, 0, sizeof(dma_attr_valid));
 }
 
 IRAM_ATTR void Z80DMA::writePort(uint8_t data) {
@@ -453,6 +469,7 @@ IRAM_ATTR void Z80DMA::handleDMA() {
 // Second write: compare — if different, charrow is "per-scanline active",
 // then all subsequent writes skip compare and always shadow.
 static IRAM_ATTR void captureAttrAfterTransfer(uint16_t dest_start) {
+    if (!Z80DMA::dma_attr_shadow) return; // alloc failed or DMA mode off
     if (dest_start < 0x5800 || dest_start > 0x5AFF) return;
 
     uint8_t charrow = (dest_start - 0x5800) >> 5;

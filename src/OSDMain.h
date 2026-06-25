@@ -94,6 +94,7 @@ public:
     static void BoardInfo();
     static void EmulatorInfo();
     static void HIDDevices();
+    static void SpeedTest();
     static void showTextDialog(const char* title, const char* text, bool blocking = true, int* scroll_state = nullptr);
 
     // Error
@@ -101,6 +102,7 @@ public:
     static void errorHalt(const string& errormsg);
     static void osdCenteredMsg(const string& msg, uint8_t warn_level);
     static void osdCenteredMsg(const string& msg, uint8_t warn_level, uint16_t millispause);
+    static void showLedLegend();
 
     static void osdDump();
     static void osdDebug(uint16_t gotoAddr = 0xFFFF);
@@ -127,6 +129,35 @@ public:
     static string formatSlotRow(const string& label, const string& fname,
                                 bool wp, bool showWP);
     static string fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t mfcols, uint8_t mfrows);
+    // Remote (FTP/SFTP) file browser — bounded RAM via an SD index (see OSDFile.cpp).
+    static void remoteFileDialog(class RemoteFs* fs);
+
+    // Shared "file-browser chrome" list (Open File window + sidebar), reused for the
+    // F5 location level, the saved-remotes list, and the remote/web file browser so
+    // they all look like the SD browser. See OSDFile.cpp.
+    enum { FD_SIDE_LOCATIONS = 0, FD_SIDE_HOSTS, FD_SIDE_REMOTE, FD_SIDE_WEB };
+    enum { FDK_ENTER = 0, FDK_ALT, FDK_F2, FDK_F8, FDK_F5, FDK_F7, FDK_BACK, FDK_ESC };
+    // Render the already-populated `filenames` index; returns the selected row (0-based)
+    // or -1, with *outKey = FDK_*. Caller fills `filenames` (streamed) first. ioFocus/
+    // ioBegin (if given) carry the cursor position in and out, so the caller can remember
+    // it across re-lists and folder navigation (like the SD browser).
+    static int fdChromeNav(const string& title, const string& subtitle, int side,
+                           bool utf8, int* outKey, int* ioFocus = nullptr, int* ioBegin = nullptr);
+    // Convenience: render a small fixed `rows` list (DIR_MARKER prefix = navigable).
+    static int fdChromeList(const vector<string>& rows, const string& title,
+                            const string& subtitle, int side, bool utf8, int* outKey,
+                            int* ioFocus = nullptr, int* ioBegin = nullptr);
+    // When set, the SD fileDialog shows a ".." row even at the root "/" and selecting it
+    // returns "" (the F5 handler then re-opens the locations chooser). Set by the F5
+    // handler only when it entered SD via the locations level.
+    static bool fd_root_parent;
+    // The cwd remoteFileDialog last displayed — read by the caller to record the global
+    // "last F5 location" (Config::last_loc) so F5 reopens where you left off.
+    static string net_last_path;
+    // Set when Esc is pressed in any network browser → unwind all the menu loops and
+    // close the OSD (Esc closes the browser, like the old SD dialog). ".."/Backspace
+    // climb one level instead. Reset by the F5 handler.
+    static bool net_close_all;
     static int menuTape(const string& title);
     static void menuScroll(bool up);
     static void fd_Redraw(const string& title, const string& fdir, uint8_t ftype, const vector<string>& filexts);
@@ -147,9 +178,15 @@ public:
     static unsigned int ndirs;
 
     static uint8_t msgDialog(const string& title, const string& msg);
-    static string inlineTextEdit(int ex, int ey, int maxlen, const string& text);
+    // mask=true → password field: shows '*' until revealed (TAB toggles).
+    // viscols = visible width in chars; when < maxlen the field scrolls
+    // horizontally so up to maxlen characters can be entered. 0 → viscols=maxlen.
+    static string inlineTextEdit(int ex, int ey, int maxlen, const string& text, bool mask = false, int viscols = 0);
     static bool videoModeConfirm(int timeout_sec = 15);
-    static void progressDialog(const string& title, const string& msg, int percent, int action);
+    // Cold-boot the machine into TR-DOS for the current arch (Pentagon/Profi/Gluk);
+    // other archs fall back to a plain reset. Used after Alt+Enter mounts a disk.
+    static void bootTrdos();
+    static void progressDialog(const string& title, const string& msg, int percent, int action, bool cyrillic = false);
     string inputBox(int x, int y, const string& text);
     static void joyDialog(void);
     static void pokeDialog();
@@ -167,6 +204,14 @@ public:
     static string rowGet(const string& menu, unsigned short row_number);
 
     static void esp_hard_reset();
+
+#if !PICO_RP2040
+    // SRAM budget gate for the 5 heavy features. Call BEFORE the enable path.
+    // Returns true → caller may proceed to enable the feature (it fits, or the
+    // user freed room — in which case this reboots and never returns). Returns
+    // false → caller must NOT enable (denied, or user cancelled the popup).
+    static bool featureBudgetGate(int featureId);
+#endif
 
     static bool updateFirmware(FIL *firmware);
     static bool updateROM(const string& file, uint8_t arch);
@@ -190,6 +235,7 @@ public:
     static bool menu_rename_pressed;      // Set by menuRun when R pressed on a row
     static bool menu_quicksave_pressed;   // Set by menuRun when F4 pressed on a row
     static bool menu_quickload_pressed;   // Set by menuRun when F3 pressed on a row
+    static bool net_launch_close;         // Set when an online file was downloaded+launched → unwind menus and close OSD
     static string menu_footer;            // Optional hint line drawn below menu (cleared after each menuRun)
     static string menu;                   // Menu string
     static unsigned short begin_row;      // First real displayed row
