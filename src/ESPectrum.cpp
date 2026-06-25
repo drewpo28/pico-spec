@@ -73,6 +73,7 @@ visit https://zxespectrum.speccy.org/contacto
 #endif
 #include "Midi.h"
 #include "MidiSynth.h"
+#include "SoftSynth.h"
 #include "ZiFi.h"
 #include "ZiFiAT.h"
 #include "BoardPins.h"
@@ -1386,6 +1387,11 @@ void ESPectrum::reset(uint8_t romInUse) {
     saaChip->set_sound_format(Audio_freq, 1, 8);
     saaChip->reset();
   }
+
+  // Silence the MIDI synth on machine reset — otherwise notes that were sounding
+  // when F11 is pressed keep ringing. reset() = all-notes-off for the active engine.
+  if (Midi::enabled == 3)      SoftSynth::reset();
+  else if (Midi::enabled == 4) MidiSynth::reset();
 #endif
 
   CPU::reset();
@@ -2364,9 +2370,12 @@ void ESPectrum::loop() {
             saaChip->gen_sound(samplesPerFrame - faudbufcntSAA, faudbufcntSAA);
           }
         }
-        if (MidiSubsys::enabled && Midi::enabled == 3 && audioBufferMIDI_L && audioBufferMIDI_R)
+        if (MidiSubsys::enabled && audioBufferMIDI_L && audioBufferMIDI_R)
         {
-          MidiSynth::gen_sound(audioBufferMIDI_L, audioBufferMIDI_R, samplesPerFrame);
+          if (Midi::enabled == 3)
+            SoftSynth::gen_sound(audioBufferMIDI_L, audioBufferMIDI_R, samplesPerFrame);
+          else if (Midi::enabled == 4)
+            MidiSynth::gen_sound(audioBufferMIDI_L, audioBufferMIDI_R, samplesPerFrame);
         }
 #endif
         // Hoist frame-invariant source flags outside the mix loop
@@ -2375,7 +2384,7 @@ void ESPectrum::loop() {
         bool mix_covox = CovoxSubsys::enabled && audioBufferCovoxL;
 #if !PICO_RP2040
         bool mix_saa = SaaSubsys::enabled && saaChip;
-        bool mix_midi = MidiSubsys::enabled && (Midi::enabled == 3) && audioBufferMIDI_L && audioBufferMIDI_R;
+        bool mix_midi = MidiSubsys::enabled && (Midi::enabled == 3 || Midi::enabled == 4) && audioBufferMIDI_L && audioBufferMIDI_R;
         bool mix_pit = PitSubsys::enabled && audioBufferPIT;
 #endif
         bool fddSndEnabledMix = (Config::trdosSoundLed & 2) != 0;
@@ -2409,6 +2418,8 @@ void ESPectrum::loop() {
             beeper_R += saaChip->SamplebufSAA_R[i];
           }
           if (mix_midi) {
+            // Wavetable synth output is unipolar, centered at 128 (see MidiSynth::gen_sound);
+            // summed like the beeper/AY, its DC is removed downstream by pwm_audio.
             beeper_L += audioBufferMIDI_L[i];
             beeper_R += audioBufferMIDI_R[i];
           }

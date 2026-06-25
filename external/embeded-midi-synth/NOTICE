@@ -1,0 +1,36 @@
+embeded-midi-synth — fixed-point General MIDI wavetable synthesis engine
+=========================================================================
+
+Upstream: https://github.com/xrip/embeded-midi-synth
+Author:   xrip
+
+Files vendored here (verbatim from upstream; engine from the mulaw-analysis
+branch — v5 banks store PCM as 8-bit G.711 µ-law, ~half the size of int16):
+  - wavetable.c.inl   (the fixed-point synthesis engine)
+  - gm_bank.h         (packed GM sound-bank blob format + validation, v5)
+  - wt_luts.h         (baked fixed-point lookup tables)
+  - mulaw.h           (G.711 µ-law codec + decode LUT)
+
+Permission / licensing
+----------------------
+The upstream repository does not carry a LICENSE file. These files are
+included in pico-spec (which is licensed under the GNU General Public
+License v3.0) with the EXPRESS PERMISSION OF THE AUTHOR (xrip), granted
+for use and redistribution as part of this GPLv3 project.
+
+If you fork or redistribute pico-spec, this MIDI engine is covered by
+pico-spec's GPLv3 by virtue of that grant. Credit to xrip is retained
+here and in the source headers.
+
+Sound banks are NOT code and are NOT covered by the above
+-----------------------------------------------------------
+This engine plays a pre-packed General MIDI sound bank ("gm_bank.bin").
+No sound bank is included in this repository or in pico-spec firmware.
+
+Microsoft's "gm.dls" (shipped with Windows) and any gm_bank.bin derived
+from it are copyrighted and NOT redistributable. You may pack your own
+legally-owned gm.dls into a gm_bank.bin for your own SD card, but you
+must NOT commit it to a public repository or ship it inside firmware.
+
+For a redistributable bank, use an open-licensed source such as the
+"freepats" GUS patch set (see upstream docs/usage.md, gus_pack).

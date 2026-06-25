@@ -97,8 +97,8 @@ public:
     static bool     AY48;
 #if !PICO_RP2040
     static bool     SAA1099;
-    static uint8_t  midi;  // 0=Off, 1=AY bitbang, 2=ShamaZX, 3=Soft Synth
-    static uint8_t  midi_synth_preset; // 0=GM,1=Piano,2=Chiptune,3=Strings,4=Rock,5=Organ,6=MusicBox,7=Synth
+    static uint8_t  midi;  // 0=Off, 1=AY bitbang, 2=ShamaZX, 3=Software synth, 4=GM.DLS wavetable
+    static uint8_t  midi_synth_preset; // Software synth preset: 0=GM,1=Piano,2=Chiptune,3=Strings,4=Rock,5=Organ,6=MusicBox,7=Synth
     static bool     timex_video;  // Timex SCLD video modes (port 0xFF)
     static uint8_t  dma_mode;     // 0=Off, 1=Port #0B (Z80 DMA), 2=Port #6B (zxnDMA)
     static bool     mode16col_onoff; // Pentagon 16col video mode (port #EFF7 D0)

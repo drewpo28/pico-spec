@@ -21,6 +21,9 @@
 #endif
 
 #include "ESPectrum.h"
+#if !PICO_RP2040
+#include "MidiSynth.h"
+#endif
 #include "Config.h"
 #include "BoardPins.h"
 #include "FileUtils.h"
@@ -1086,33 +1089,39 @@ uint8_t* PSRAM_DATA = (uint8_t*)0;
 uint32_t __not_in_flash_func(butter_psram_size)() { return 0; }
 #endif
 
-// Linker-defined core0 stack bounds (SCRATCH_Y). Used to flag stack overflow.
+// Linker-defined per-core stack bounds: core0 = SCRATCH_Y (__Stack*),
+// core1 = SCRATCH_X (__StackOne*). The fault can fire on EITHER core, so pick the
+// right bounds by the SIO CPUID — otherwise a normal core1 SP looks like a core0
+// "overflow" (it sits in SCRATCH_X, below __StackBottom) and mislabels the fault.
 extern char __StackBottom;
 extern char __StackTop;
+extern char __StackOneBottom;
+extern char __StackOneTop;
 
 // C linkage so the naked-asm `b sigbus_handler` resolves without mangling.
 extern "C" void sigbus_handler(uint32_t *frame) {
     static int count = 0;
     if (++count > 3) return;
     // Exception frame: [0]=r0 [1]=r1 [2]=r2 [3]=r3 [4]=r12 [5]=LR [6]=PC [7]=xPSR.
-    // LR = the return address of the function that faulted — that's the caller to
-    // locate with addr2line. `frame` itself ~= the SP at fault time. If SP ran
-    // below __StackBottom the core0 stack overflowed (silent corruption, not a
-    // clean MSTKERR once the guard-less stack fills SCRATCH_Y).
+    // LR = the return address of the function that faulted (addr2line that).
+    // `frame` ~= the SP at fault time; ovf = SP below this core's stack bottom.
     uint32_t pc   = frame[6];
     uint32_t lr   = frame[5];
     uint32_t sp   = (uint32_t)frame;
-    int ovf = (sp < (uint32_t)&__StackBottom);
+    uint32_t core = *(volatile uint32_t*)0xD0000000u;   // SIO CPUID (0 or 1)
+    uint32_t bot  = core ? (uint32_t)(uintptr_t)&__StackOneBottom : (uint32_t)(uintptr_t)&__StackBottom;
+    uint32_t top  = core ? (uint32_t)(uintptr_t)&__StackOneTop    : (uint32_t)(uintptr_t)&__StackTop;
+    int ovf = (sp < bot);
 #ifndef PICO_RP2040
     // CFSR/BFAR only exist on Cortex-M3+ (not M0+)
     uint32_t cfsr = *(volatile uint32_t*)0xE000ED28u;
     uint32_t bfar = *(volatile uint32_t*)0xE000ED38u;
-    printf("SIGBUS[%d]: PC=%08x LR=%08x SP=%08x CFSR=%08x BFAR=%08x stackOvf=%d (bot=%08x top=%08x)\n",
-           count, (unsigned)pc, (unsigned)lr, (unsigned)sp, (unsigned)cfsr, (unsigned)bfar,
-           ovf, (unsigned)(uintptr_t)&__StackBottom, (unsigned)(uintptr_t)&__StackTop);
+    printf("SIGBUS[%d] core%u: PC=%08x LR=%08x SP=%08x CFSR=%08x BFAR=%08x stackOvf=%d (bot=%08x top=%08x)\n",
+           count, (unsigned)core, (unsigned)pc, (unsigned)lr, (unsigned)sp, (unsigned)cfsr, (unsigned)bfar,
+           ovf, (unsigned)bot, (unsigned)top);
 #else
-    printf("SIGBUS[%d]: PC=%08x LR=%08x SP=%08x stackOvf=%d\n",
-           count, (unsigned)pc, (unsigned)lr, (unsigned)sp, ovf);
+    printf("SIGBUS[%d] core%u: PC=%08x LR=%08x SP=%08x stackOvf=%d\n",
+           count, (unsigned)core, (unsigned)pc, (unsigned)lr, (unsigned)sp, ovf);
 #endif
 }
 // Naked trampoline: pass the stacked exception frame to sigbus_handler.
@@ -1320,6 +1329,13 @@ int main() {
     ESPectrum::setup();
     Debug::log("main: after ESPectrum::setup()");
     Debug::log2SD("main: after ESPectrum::setup()");
+
+#if !PICO_RP2040
+    // Install the GM.DLS wavetable bank from SD into flash here — single core,
+    // BEFORE core1/video starts (no HDMI ISR, no multicore_lockout, no freeze).
+    // No-op unless GM.DLS MIDI is selected and the SD bank differs from flash.
+    MidiSynth::provisionAtBoot();
+#endif
 
 #if USE_NESPAD
     // Bring up the NES gamepad now that Config is loaded — unless ZiFi (RP2350)

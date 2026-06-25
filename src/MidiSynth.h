@@ -4,90 +4,57 @@
 
 #include <inttypes.h>
 
-// Polyphonic MIDI synthesizer with multiple waveforms, filters, and percussion
-// 16 voices, General MIDI program → waveform/duty mapping
-// Output: 8-bit unsigned mono mixed into L/R buffers
-
-#define MIDISYNTH_MAX_VOICES 16
-#define MIDISYNTH_SAMPLE_RATE 31250
-
+// MIDI wavetable synth facade.
+//
+// Wraps the xrip embeded-midi-synth fixed-point GM wavetable engine
+// (external/embeded-midi-synth, hosted by src/midi_wt.c). It plays a
+// user-provided General MIDI sound bank ("gm_bank.bin", packed off-device at
+// 31250 Hz from a gm.dls / GUS set). The bank is provisioned once from the SD
+// card into a fixed flash partition (top of flash, see rp2350-memmap.ld) and
+// read directly via XIP — no PSRAM, persists across reboots. No bank ships in
+// the repo/firmware.
+//
+// This keeps the public API the rest of the emulator already calls
+// (Midi.cpp / Subsystem.cpp / ESPectrum.cpp / OSDMain.cpp). The render output is
+// signed (stored as int8 in the uint8 L/R buffers, silence = 0) and added into
+// the audio bus by the mixer in ESPectrum::loop.
 class MidiSynth {
 public:
-    static void init();
-    static void reset();
+    static void init();    // bind bank from the flash partition if present (safe at boot)
+    static void deinit();  // stop using the bank (it stays in flash, persistent)
+    static void reset();   // reset parser + silence all voices
+    // EARLY-BOOT ONLY: write gm_bank.bin from SD into the flash region (single core,
+    // before core1/video). Call once in main() between ESPectrum::setup() and the
+    // core1 launch. Slow (~10 s, LED blinks); no-op unless a write is needed.
+    static void provisionAtBoot();
+    // True if a valid gm_bank.bin on SD differs from / is missing in flash (i.e. a
+    // boot-time write is needed). Used by the OSD to decide whether to reboot.
+    static bool needsProvision();
+    // True if a valid gm_bank.bin exists on SD (gates the "reinstall" offer).
+    static bool sdBankAvailable();
+    // Force re-provision next boot: invalidate the flash header (1-sector erase).
+    // Caller must reboot afterwards. Recovers a broken/partial flash bank.
+    static void requestReflash();
 
-    // Feed raw MIDI byte (called from Midi::send path)
+    // Feed one raw MIDI byte (running-status stream from the Z80 ShamaZX port).
     static void feedByte(uint8_t b);
 
-    // Generate audio samples into buffer (called once per frame)
+    // Render `count` frames into the L/R buffers (called once per audio frame).
     static void gen_sound(uint8_t *buf_L, uint8_t *buf_R, int count);
 
-    static uint8_t preset; // synth preset (mirrors Config::midi_synth_preset)
+    static bool bankReady() { return bank_ready; }
 
 private:
-    // MIDI parser state
-    static uint8_t midi_status;     // running status byte
-    static uint8_t midi_data[2];    // data bytes buffer
-    static uint8_t midi_data_pos;   // how many data bytes collected
-    static uint8_t midi_expected;   // how many data bytes expected
+    // MIDI byte-stream parser state (reconstructs full messages, incl. running status)
+    static uint8_t midi_status;
+    static uint8_t midi_data[2];
+    static uint8_t midi_data_pos;
+    static uint8_t midi_expected;
 
+    static bool  bank_ready;   // a valid bank in flash is bound
+
+    static bool bindFromFlash();  // validate + bind the flash-resident bank (no write)
     static void processMessage(uint8_t status, uint8_t d0, uint8_t d1);
-    static void noteOn(uint8_t ch, uint8_t note, uint8_t vel);
-    static void noteOff(uint8_t ch, uint8_t note);
-    static void controlChange(uint8_t ch, uint8_t cc, uint8_t val);
-    static void programChange(uint8_t ch, uint8_t prog);
-    static void pitchBend(uint8_t ch, int16_t bend);
-
-    // Waveform types
-    enum WaveType : uint8_t {
-        WAVE_SQUARE = 0,
-        WAVE_SAW    = 1,
-        WAVE_TRIANGLE = 2,
-        WAVE_NOISE  = 3,    // for percussion
-    };
-
-    // Voice allocation
-    struct Voice {
-        uint8_t  channel;    // MIDI channel
-        uint8_t  note;       // MIDI note number
-        uint8_t  velocity;   // 0 = free
-        uint32_t phase;      // phase accumulator (Q24 fixed point)
-        uint32_t phase_inc;  // phase increment per sample (Q24)
-        uint8_t  duty;       // duty cycle 0-255 (128 = 50%) for square wave
-        uint8_t  env;        // envelope level 0-255
-        uint8_t  env_stage;  // 0=attack, 1=decay, 2=sustain, 3=release
-        uint8_t  env_target; // sustain level
-        uint8_t  attack_rate;  // envelope rate
-        uint8_t  decay_rate;
-        uint8_t  release_rate;
-        WaveType wave;       // waveform type
-        int16_t  filter_z;   // 1-pole low-pass filter state (Q8)
-        uint8_t  filter_k;   // filter coefficient 0-255 (0=no filter, 255=max)
-        uint32_t noise_lfsr; // LFSR state for noise
-    };
-
-    static Voice voices[MIDISYNTH_MAX_VOICES];
-    static uint8_t channel_program[16];   // current program per channel
-    static uint8_t channel_volume[16];     // CC7 volume per channel
-    static uint8_t channel_expression[16]; // CC11 expression per channel
-    static uint8_t channel_modulation[16]; // CC1 modulation per channel
-    static uint8_t channel_pan[16];       // CC10 pan: 0=left, 64=center, 127=right
-    static int16_t channel_pitchbend[16]; // -8192..+8191, 0 = center
-
-    static int allocVoice(uint8_t ch, uint8_t note);
-    static int findVoice(uint8_t ch, uint8_t note);
-
-    // Get waveform/envelope/filter parameters for a GM program
-    struct PatchParams {
-        WaveType wave;
-        uint8_t  duty;         // for square wave
-        uint8_t  attack_rate;
-        uint8_t  decay_rate;
-        uint8_t  sustain_level;
-        uint8_t  release_rate;
-        uint8_t  filter_k;    // low-pass filter strength
-    };
-    static PatchParams getPatch(uint8_t ch, uint8_t program);
 };
 
 #endif // !PICO_RP2040

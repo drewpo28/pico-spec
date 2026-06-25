@@ -48,7 +48,7 @@ option(ZIFI_NET_VERBOSE "Per-packet trace of the ZiFi net client (+IPD/chanSend)
 # Each enables stdio over the board's Debug-Probe header — see the block for pins.
 set(MURM1_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1) — moves KBD to GP16/GP17, disables NESPAD")
 set(PICO_PC_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on DBG1 header GP0/GP1 (PICO_PC)")
-set(PICO_DV_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
+set(PICO_DV_DBG_UART ON CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
 set(ZERO_DBG_UART    OFF CACHE BOOL "Enable Debug Probe UART0 on GP16/GP13 (ZERO)")
 set(ZERO2_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO2)")
 
@@ -71,7 +71,7 @@ if(NOT DEFINED NO_ALF)
 endif()
 
 set(CPU_MHZ 378)
-set (PORT_VERSION "1.2.23")
+set (PORT_VERSION "1.2.24")
 string(LENGTH "${PORT_VERSION}" PORT_VERSION_LEN)
 
 # Target board (default: PICO_PC; override with -D flags, e.g. cmake -DMURM2=ON)
@@ -233,6 +233,11 @@ set_source_files_properties(src/SAASound.cpp PROPERTIES
     COMPILE_FLAGS "-O3 -ffast-math -funroll-loops")
 set_source_files_properties(src/MidiSynth.cpp PROPERTIES
     COMPILE_FLAGS "-O3 -ffast-math -funroll-loops")
+set_source_files_properties(src/SoftSynth.cpp PROPERTIES
+    COMPILE_FLAGS "-O3 -ffast-math -funroll-loops")
+# Wavetable MIDI engine wrapper (external/embeded-midi-synth) — hot audio path.
+set_source_files_properties(src/midi_wt.c PROPERTIES
+    COMPILE_FLAGS "-O3 -ffast-math -funroll-loops")
 set_source_files_properties(src/Video.cpp PROPERTIES
     COMPILE_FLAGS "-O3 -funroll-loops")
 # Z80 эмулятор — самый горячий код, критично для производительности
@@ -278,6 +283,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     hardware_pwm
     hardware_uart
     hardware_flash
+    hardware_xip_cache
     hardware_exception
     stdc++
 
@@ -287,6 +293,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 target_include_directories(${PROJECT_NAME} PRIVATE
         src
         src/roms
+        external/embeded-midi-synth
 )
 
 if (PICO_CYW43_SUPPORTED)

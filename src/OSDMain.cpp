@@ -67,6 +67,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "AySound.h"
 #include "Midi.h"
 #include "MidiSynth.h"
+#include "SoftSynth.h"
 #include "ZiFi.h"
 #include "ZiFiAT.h"
 #include "BoardPins.h"
@@ -4068,8 +4069,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 midi_menu.replace(midi_menu.find("[A",0),2, prev_midi == 1 ? "[*" : "[ ");
                                 midi_menu.replace(midi_menu.find("[S",0),2, prev_midi == 2 ? "[*" : "[ ");
                                 midi_menu.replace(midi_menu.find("[W",0),2, prev_midi == 3 ? "[*" : "[ ");
+                                midi_menu.replace(midi_menu.find("[G",0),2, prev_midi == 4 ? "[*" : "[ ");
                                 uint8_t opt2 = menuRun(midi_menu);
-                                if (opt2 >= 1 && opt2 <= 4) {
+                                if (opt2 >= 1 && opt2 <= 5) {
                                     Config::midi = opt2 - 1;
                                     if (Config::midi != prev_midi) {
                                         Midi::enabled = prev_midi;
@@ -4084,7 +4086,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             osdCenteredMsg(MSG_MIDI_PIN_CONFLICT[Config::lang], LEVEL_WARN, 3000);
 #endif
                                     }
-                                    // Software selected — open preset submenu
+                                    // Software MIDI selected — open preset submenu
                                     if (Config::midi == 3) {
                                         menu_level = 3;
                                         menu_curopt = 1;
@@ -4100,13 +4102,38 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         uint8_t opt3 = menuRun(preset_menu);
                                         if (opt3) {
                                             Config::midi_synth_preset = opt3 - 1;
-                                            MidiSynth::preset = Config::midi_synth_preset;
+                                            SoftSynth::preset = Config::midi_synth_preset;
                                             Config::save();
                                             VIDEO::SaveRect.restore_last();
                                         }
                                         menu_level = 2;
                                         menu_curopt = opt2;
                                         menu_saverect = false;
+                                    }
+                                    // GM.DLS wavetable selected. The bank is written to
+                                    // flash at EARLY BOOT (single core, no video) — never
+                                    // here, where core1/HDMI would freeze. So any flash
+                                    // write is triggered by REBOOT; the boot path does it.
+                                    if (Config::midi == 4) {
+                                        if (MidiSynth::needsProvision()) {
+                                            // missing / changed bank -> reboot to install
+                                            osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
+                                            OSD::esp_hard_reset();
+                                        } else if (MidiSynth::bankReady()) {
+                                            // already loaded — offer reinstall (recovers a
+                                            // broken/partial bank). Only when SD has a bank,
+                                            // so we never wipe flash with nothing to restore.
+                                            if (MidiSynth::sdBankAvailable() &&
+                                                OSD::msgDialog("GM.DLS Wavetable",
+                                                               MSG_MIDI_BANK_REINSTALL_Q[Config::lang]) == DLG_YES) {
+                                                MidiSynth::requestReflash();   // invalidate header
+                                                osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
+                                                OSD::esp_hard_reset();         // boot rewrites from SD
+                                            }
+                                            osdCenteredMsg(MSG_MIDI_BANK_OK[Config::lang], LEVEL_OK, 2000);
+                                        } else {
+                                            osdCenteredMsg(MSG_MIDI_BANK_MISSING[Config::lang], LEVEL_WARN, 3000);
+                                        }
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -10228,7 +10255,11 @@ void OSD::EmulatorInfo() {
             int pi = Config::midi_synth_preset;
             if (pi > 7) pi = 0;
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                " MIDI           : Synth (%s)\n", presets[pi]);
+                " MIDI           : Software (%s)\n", presets[pi]);
+        } else if (Config::midi == 4) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                " MIDI           : GM.DLS (%s)\n",
+                MidiSynth::bankReady() ? "bank OK" : "no bank");
         } else {
             pos += snprintf(buf + pos, sizeof(buf) - pos,
                 " MIDI           : %s\n",

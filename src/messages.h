@@ -1100,16 +1100,19 @@ static const char *MENU_AY48[2] = { "Turned on?\n" , "Turned on?\n"};
 #if !PICO_RP2040
 static const char *MENU_SAA1099[2] = { "Turned on?\n" , "Turned on?\n"};
 #define MENU_MIDI_EN "MIDI(Ext:P" _PIN_XSTR(MIDI_TX_PIN) ")\n"\
-    "OFF     \t[O]\n"\
-    "AY      \t[A]\n"\
-    "ShamaZX \t[S]\n"\
-    "Software\t[W]\n"
+    "OFF             \t[O]\n"\
+    "AY              \t[A]\n"\
+    "ShamaZX         \t[S]\n"\
+    "Software MIDI   \t[W]\n"\
+    "GM.DLS Wavetable\t[G]\n"
 #define MENU_MIDI_ES "MIDI(Ext:P" _PIN_XSTR(MIDI_TX_PIN) ")\n"\
-    "OFF     \t[O]\n"\
-    "AY      \t[A]\n"\
-    "ShamaZX \t[S]\n"\
-    "Software\t[W]\n"
+    "OFF             \t[O]\n"\
+    "AY              \t[A]\n"\
+    "ShamaZX         \t[S]\n"\
+    "Software MIDI   \t[W]\n"\
+    "GM.DLS Wavetable\t[G]\n"
 static const char *MENU_MIDI[2] = { MENU_MIDI_EN, MENU_MIDI_ES };
+// Software MIDI (mode 3) preset selector (procedural synth).
 #define MENU_MIDI_PRESET_EN "Synth Preset\n"\
     "GM       \t[G]\n"\
     "Piano    \t[P]\n"\
@@ -1121,6 +1124,26 @@ static const char *MENU_MIDI[2] = { MENU_MIDI_EN, MENU_MIDI_ES };
     "Synth    \t[Y]\n"
 #define MENU_MIDI_PRESET_ES MENU_MIDI_PRESET_EN
 static const char *MENU_MIDI_PRESET[2] = { MENU_MIDI_PRESET_EN, MENU_MIDI_PRESET_ES };
+// GM.DLS wavetable mode (4): a user-supplied bank (gm_bank.bin) is provisioned
+// once from SD into a flash partition, then read via XIP (no PSRAM, persistent).
+static const char *MSG_MIDI_BANK_OK[2] = {
+    "GM wavetable bank loaded.",
+    "Banco wavetable GM cargado."
+};
+static const char *MSG_MIDI_BANK_MISSING[2] = {
+    "No bank in flash and no gm_bank.bin\non SD. MIDI will be silent.",
+    "Sin banco en flash y sin gm_bank.bin\nen SD. MIDI sin sonido."
+};
+// msgDialog sizes its width to the message length and is single-line only — keep
+// this to ONE short line (a multi-line string makes the box span the whole screen).
+static const char *MSG_MIDI_BANK_REINSTALL_Q[2] = {
+    "Reinstall GM bank from SD?",
+    "Reinstalar banco GM de SD?"
+};
+static const char *MSG_MIDI_BANK_FLASHING[2] = {
+    "Restarting to install GM bank...\nBoot takes ~20-30s (LED blinks). Do\nNOT power off until it comes back.",
+    "Reiniciando para instalar banco GM...\nArranque ~20-30s (LED parpadea). NO\napague hasta que vuelva."
+};
 #if defined(MIDI_TX_PIN) && defined(LOAD_WAV_PIO) && (LOAD_WAV_PIO == MIDI_TX_PIN)
 static const char *MSG_MIDI_PIN_CONFLICT[2] = {
     "MIDI and Real sound-in share GPIO " _PIN_XSTR(MIDI_TX_PIN) ".\nDisable one of them.",
