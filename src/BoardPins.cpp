@@ -3,7 +3,8 @@
 #if !PICO_RP2040
 
 #include "Config.h"
-#include "ZiFi.h"   // ZiFi::linkUp() — UART link owns its pins even with the NIC off
+#include "ZiFi.h"          // ZiFi::linkUp() — UART link owns its pins even with the NIC off
+#include "ChipPackage.h"   // IS_RP2350B — RUNTIME package detect (NOT usable in #if)
 
 namespace BoardPins {
 
@@ -32,9 +33,8 @@ static const UartPair ZIFI_PAIRS[] = {
     {0, 1, ""},                 // UART0
     {22, 23, "off: MIDI/WAV"},  // UART1
     {26, 27, "off: NESPAD"},    // UART1
-#if IS_RP2350B    
-    {38, 39, ""},               // UART1 (free, RP2350B package)
-#endif
+    {38, 39, ""},               // UART1 (free, RP2350B-only — filtered out at runtime
+                                // on QFN-60/A silicon by pinOnPackage(); see below)
 };
 #elif defined(PICO_PC)
 static const UartPair ZIFI_PAIRS[] = {
@@ -66,8 +66,28 @@ static const UartPair ZIFI_PAIRS[] = {
 
 static const int ZIFI_PAIRS_N = sizeof(ZIFI_PAIRS) / sizeof(ZIFI_PAIRS[0]);
 
-int             zifiPairCount()      { return ZIFI_PAIRS_N; }
-const UartPair* zifiPair(int index)  { return (index >= 0 && index < ZIFI_PAIRS_N) ? &ZIFI_PAIRS[index] : nullptr; }
+// Is this GPIO present on the silicon we're actually running on? QFN-60 (RP2350A)
+// exposes GPIO 0..29; QFN-80 (RP2350B) exposes 0..47. Must be runtime, not #if —
+// the same B build runs on both packages (see ChipPackage.h).
+static inline bool pinOnPackage(uint8_t pin) { return pin <= (IS_RP2350B ? 47 : 29); }
+static inline bool pairOnPackage(const UartPair& p) { return pinOnPackage(p.tx) && pinOnPackage(p.rx); }
+
+// zifiPairCount()/zifiPair() expose a CONTIGUOUS, package-filtered view of
+// ZIFI_PAIRS so the picker's index math (menu_curopt = i+2) stays dense even when
+// a board lists pairs that only exist on the larger package (e.g. MURM2 38/39).
+int zifiPairCount() {
+    int n = 0;
+    for (int i = 0; i < ZIFI_PAIRS_N; i++) if (pairOnPackage(ZIFI_PAIRS[i])) n++;
+    return n;
+}
+const UartPair* zifiPair(int index) {
+    if (index < 0) return nullptr;
+    for (int i = 0; i < ZIFI_PAIRS_N; i++) {
+        if (!pairOnPackage(ZIFI_PAIRS[i])) continue;
+        if (index-- == 0) return &ZIFI_PAIRS[i];
+    }
+    return nullptr;
+}
 uint8_t         zifiDefaultTx()      { return ZIFI_PAIRS[0].tx; }
 uint8_t         zifiDefaultRx()      { return ZIFI_PAIRS[0].rx; }
 
