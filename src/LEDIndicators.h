@@ -29,6 +29,8 @@ namespace LED {
         DMA,           // Z80 DMA / zxnDMA
         KEMPJOY,       // Kempston joystick
         KEMPMOUSE,     // Kempston mouse
+        // Network
+        NET,           // ZiFi ESP-01 UART TX/RX
         COUNT
     };
 
@@ -42,6 +44,13 @@ namespace LED {
     // state also feeds the corner FDD lamp and the FDD motor-hum sound, which are
     // independent settings (Config::trdosSoundLed). Cost is a single byte store on
     // the port path. Whether the border glyph ROW is drawn is gated in draw().
+    //
+    // For FDD, callers count only real data-register transfers: data reads
+    // (touchR → green) and data writes (touchW → red). Commands (seek/read/write/
+    // force-int), track/sector setup, status polling and SYS register (drive/side/
+    // motor) housekeeping are NOT counted. TR-DOS issues a seek + read-sector
+    // command for every read, so counting commands as writes turned every read
+    // yellow (red+green) and pinned the lamp on. Now: read=green, write=red.
     static inline void touchR(Id i) { rdec[i] = DECAY_FRAMES; }
     static inline void touchW(Id i) { wdec[i] = DECAY_FRAMES; }
 

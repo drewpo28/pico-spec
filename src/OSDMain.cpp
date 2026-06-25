@@ -7397,6 +7397,7 @@ void OSD::showLedLegend() {
         { LED::DMA,       "Z80 DMA"         },
         { LED::KEMPJOY,   "Kempston joy"    },
         { LED::KEMPMOUSE, "Kempston mouse"  },
+        { LED::NET,       "Network (ZiFi)"  },
     };
     static constexpr int N = sizeof(entries) / sizeof(entries[0]);
 

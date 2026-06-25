@@ -6,6 +6,7 @@
 #include "BoardPins.h"
 #include "Debug.h"
 #include "Buffer.h"
+#include "LEDIndicators.h"
 #include "ff.h"
 #include <hardware/uart.h>
 #include <hardware/gpio.h>
@@ -132,15 +133,18 @@ uint8_t ZiFi::u16550_dlm = 0;
 
 void __not_in_flash("zifi") ZiFi::uart_rx_irq_handler() {
     if (!g_uart) return;
+    bool got = false;
     while (uart_is_readable(g_uart)) {
         uint8_t b = (uint8_t)uart_getc(g_uart);
         rx_bytes++;
+        got = true;
         if (!in_full())
             zifi_in_buf[zifi_in_head++ & (ZIFI_IN_SZ - 1)] = b;
         else
             rx_dropped++; // ring full — should not happen: rxSpillTick() drains it
                           // to SD every frame, faster than 115200 fills 4 KB
     }
+    if (got) LED::touchR(LED::NET); // RX activity → down arrow (green)
 }
 
 // ─── SD-backed RX swap ───────────────────────────────────────────────────────
@@ -398,10 +402,13 @@ void __not_in_flash("zifi") ZiFi::write(uint8_t hi, uint8_t data) {
 void __not_in_flash("zifi") ZiFi::tick() {
     if (!g_uart) return;
     rxSpillTick(); // spill backed-up RX to SD swap so the ring can't overflow
+    bool tx = false;
     while (!fifo_empty(zifi_out_head, zifi_out_tail) && uart_is_writable(g_uart)) {
         uart_get_hw(g_uart)->dr = zifi_out_buf[zifi_out_tail++];
         tx_bytes++;
+        tx = true;
     }
+    if (tx) LED::touchW(LED::NET); // TX activity → up arrow (red)
 #if ZIFI_TRACE
     // Rate-limited traffic log (main-loop context, never per-byte). Summary every
     // 500 ms while traffic moves, plus immediately on any dropped byte. With the
@@ -430,6 +437,7 @@ void ZiFi::sendRaw(const uint8_t* buf, size_t len) {
         uart_get_hw(g_uart)->dr = buf[i];
     }
     tx_bytes += len;
+    if (len) LED::touchW(LED::NET); // TX activity → up arrow (red)
 }
 
 size_t ZiFi::recvRaw(uint8_t* buf, size_t maxlen) {
@@ -480,6 +488,7 @@ void __not_in_flash("zifi") ZiFi::uart16550Write(uint8_t reg_hi, uint8_t data) {
                 uart_get_hw(g_uart)->dr = zifi_out_buf[zifi_out_tail++];
                 tx_bytes++;
             }
+            LED::touchW(LED::NET); // TX activity → up arrow (red)
             return;
         case 1: // IER / DLM
             if (u16550_lcr & 0x80) u16550_dlm = data; else u16550_ier = data;

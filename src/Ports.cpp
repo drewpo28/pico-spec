@@ -493,15 +493,16 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     if (MB02::enabled) {
       uint8_t lo = address & 0xFF;
       if ((lo & 0x9F) == 0x0F) { // WD2797 registers
-        LED::touchR(LED::FDD);
         FDDStep_MB02(true); // force step — WD2797 needs step advancement for Seek/Restore
         ioContentionLate(MemESP::ramContended[rambank]);
         uint8_t r = (lo >> 5) & 3;
+        // Only count a real data-register read as access (reg 3); status polling
+        // (reg 0) happens continuously at idle and would keep the LED lit.
+        if (r == 3) LED::touchR(LED::FDD);
         uint8_t val = rvmWD1793Read(&ESPectrum::mb02_fdd, r);
         return val;
       }
-      if (lo == 0x13) { // Floppy status
-        LED::touchR(LED::FDD);
+      if (lo == 0x13) { // Floppy status (poll — not counted as access)
         FDDStep_MB02(true);
         ioContentionLate(MemESP::ramContended[rambank]);
         return MB02::readPort13();
@@ -653,12 +654,13 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       // 0xBF & 0x9F == 0x9F ≠ 0x83.
       if (Config::arch == "Profi" && (portDFFD & 0x20) &&
           ((address & 0x9F) == 0x83)) {
-        LED::touchR(LED::FDD);
         // Force FDC advancement (true = force, regardless of HLD/HLT motor state).
         // The case 0xe3 SYS-register path uses FDDStep(true) for the same reason:
         // IN A,(0x83) is polled in tight busy-wait loops at 0x8625/0x862B with no
         // other code advancing the FDC, so we must force each step here.
         FDDStep(true);
+        // Only the data register (reg 3) is real access; reg 0 is status polling.
+        if (((address >> 5) & 0x3) == 3) LED::touchR(LED::FDD);
         return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
       }
 
@@ -670,7 +672,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       // Gate matches the OUT(#3F) SYS write path: CPM=1 & ROM14=1.
       if (Config::arch == "Profi" && (portDFFD & 0x20) && MemESP::romLatch &&
           ((address & 0xFF) == 0x3F)) {
-        LED::touchR(LED::FDD);
+        // SYS status poll — not counted as disk access.
         FDDStep(true);
         uint8_t v = 0;
         if (ESPectrum::fdd.control & kRVMWD177XDRQ)                        v |= 0x40;
@@ -694,8 +696,10 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       case 0x23:
       case 0x43:
       case 0x63:
-        LED::touchR(LED::FDD);
         FDDStep(false);
+        // Only count data-register reads (reg 3); reg 0 status polling runs
+        // continuously while TR-DOS is paged in and would pin the LED on.
+        if (((address >> 5) & 0x3) == 3) LED::touchR(LED::FDD);
         return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
 
       case 0xa3:
@@ -726,7 +730,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       fdc_sys_status: {
         // SYS-register status read: bit 7 = INTRQ, bit 6 = DRQ (Beta-128
         // ordering, verified on Profi 5.06 SYS-ROM at 0x07A4: `JP M`).
-        LED::touchR(LED::FDD);
+        // Pure status poll — not counted as disk access (would pin the LED).
         FDDStep(true);
         uint8_t v = 0;
         if (ESPectrum::fdd.control & kRVMWD177XDRQ)                        v |= 0x40;
@@ -1467,9 +1471,12 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     if (MB02::enabled) {
       uint8_t lo = address & 0xFF;
       if ((lo & 0x9F) == 0x0F) { // WD2797 registers
-        LED::touchW(LED::FDD);
         FDDStep_MB02(false);
         uint8_t reg = (lo >> 5) & 3;
+        // Red = real data written to disk: only the data register (reg 3).
+        // Command (reg 0 = seek/read/write/force-int) and track/sector setup
+        // (reg 1/2) are not transfers — counting them turned every read yellow.
+        if (reg == 3) LED::touchW(LED::FDD);
         rvmWD1793Write(&ESPectrum::mb02_fdd, reg, data);
         // If command register written and DMA transfer is pending, execute it now.
         // On real hardware DMA waits for DRQ from FDC; here we run the whole
@@ -1480,13 +1487,11 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         ioContentionLate(MemESP::ramContended[rambank]);
         return;
       }
-      if (lo == 0x13) { // Floppy control
-        LED::touchW(LED::FDD);
+      if (lo == 0x13) { // Floppy control (motor/drive select — housekeeping)
         MB02::writePort13(data);
         return;
       }
-      if (lo == 0x17) { // Memory paging
-        LED::touchW(LED::FDD);
+      if (lo == 0x17) { // Memory paging (not disk access)
         MB02::writePort17(data);
         return;
       }
@@ -1653,11 +1658,13 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       // 0x83 (e.g. OUT (0x83),0x0C/0x1C at 0x864F/0x866C) with ROM14=1.
       if (Config::arch == "Profi" && (portDFFD & 0x20) &&
           ((address & 0x9F) == 0x83)) {
-        LED::touchW(LED::FDD);
         FDDStep(false);
+        uint8_t fr = (address >> 5) & 0x3;
+        // Count command (reg 0) and data (reg 3) writes; reg 1/2 are setup.
+        if (fr == 0 || fr == 3) LED::touchW(LED::FDD);
         // CMD write via shifted 0x83 → activate shifted-scheme status for IN(0x3F)
-        if (((address >> 5) & 0x3) == 0) profi_shifted_fdc = true;
-        rvmWD1793Write(&ESPectrum::fdd, ((address >> 5) & 0x3), data);
+        if (fr == 0) profi_shifted_fdc = true;
+        rvmWD1793Write(&ESPectrum::fdd, fr, data);
       } else if (Config::arch == "Profi" && (portDFFD & 0x20) && MemESP::romLatch &&
                  (address & 0xFF) == 0x3F) {
         // Per manual "Порты FDD": in the ROM14=1 & CPM=1 (MBOOTHDD) scheme the
@@ -1666,7 +1673,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         // 0x0C=side1). #3F&0xe3==0x23 would otherwise land in the track-register
         // case and silently drop the side select → fdd.side stuck → side-compare
         // rejects the catalog on track0/side0 → "FDD Read Error".
-        LED::touchW(LED::FDD);
+        // SYS register write (drive/side select) — housekeeping, not counted.
         FDDStep(true);
         profiFdcSysWrite(data);
       } else switch (address & 0xe3) {
@@ -1675,8 +1682,10 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       case 0x23:
       case 0x43:
       case 0x63:
-        LED::touchW(LED::FDD);
         FDDStep(false);
+        // Count command (reg 0) and data (reg 3) writes; reg 1/2 (track/sector)
+        // are setup writes that recur during idle seeks.
+        if (((address >> 5) & 0x3) == 0 || ((address >> 5) & 0x3) == 3) LED::touchW(LED::FDD);
         // CMD write via normal path → deactivate shifted-scheme status
         if (((address >> 5) & 0x3) == 0) profi_shifted_fdc = false;
 #if !PICO_RP2040
@@ -1756,7 +1765,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         // #3F (the ROM14=1 & CPM=1 / MBOOTHDD scheme, handled before this switch).
         if (Config::arch != "Profi" || MemESP::romLatch)
           break;
-        LED::touchW(LED::FDD);
+        // SYS register write — housekeeping, not counted as disk access.
         FDDStep(true);
         profiFdcSysWrite(data);
         break;
@@ -1772,7 +1781,8 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         // So gate out CP/M mode: only the standard TR-DOS scheme uses #FF as SYS.
         if (Config::arch == "Profi" && (portDFFD & 0x20))
           break;
-        LED::touchW(LED::FDD);
+        // SYS register write (#FF: drive/side/motor select) — housekeeping,
+        // recurs continuously while TR-DOS is paged in; not counted as access.
         FDDStep(true);
         profiFdcSysWrite(data);
         break;

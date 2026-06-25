@@ -198,6 +198,15 @@ static const uint8_t SPRITE[COUNT][8] = {
        .X...X.
        ..XXX.. */
                    { 0x38, 0x6C, 0x54, 0x6C, 0x44, 0x44, 0x38, 0x00 },
+    /* NET      — two arrows: TX up (left) + RX down (right)
+       .X...X.
+       XXX..X.
+       .X...X.
+       .X...X.
+       .X...X.
+       .X..XXX
+       .X...X. */
+                   { 0x44, 0xE4, 0x44, 0x44, 0x44, 0x4E, 0x44, 0x00 },
 };
 
 bool isVisible(Id i) {
@@ -218,10 +227,11 @@ bool isVisible(Id i) {
 #endif
         case ULAPLUS:    return Config::ulaplus;
         case GIGASCREEN: return Config::gigascreen_enabled;
+        case NET:        return Config::zifi_enabled != 0;
 #else
         case SD: case ZCTRL: case IDE: case MIDI:
         case SAA: case TIMEX: case DMA: case GS:
-        case ULAPLUS: case GIGASCREEN: return false;
+        case ULAPLUS: case GIGASCREEN: case NET: return false;
         case FDD:      return Config::betadisk;
 #endif
         case TAPE:     return true;
@@ -273,11 +283,28 @@ static inline uint8_t fgColor(Id i) {
     // Pick a 0..15 ZX colour index. ORANGE (16) has no DS80 palette slot, so use
     // BRI_YELLOW for the read+write state — keeps a valid index in both modes.
     uint8_t zx;
-    if (r && w)      zx = BRI_YELLOW;
+    // FDD: colour by the actual WD1793 command, NOT raw port I/O direction. A disk
+    // READ still issues command/data-register *writes* (seek, read-sector cmd), so
+    // direction-based colouring lit touchW during every load → red blended with the
+    // data-read green → permanent yellow. The corner lamp already colours by command;
+    // do the same here. read/seek → green, write-sector/write-track → red.
+    if (i == FDD && (r || w)) {
+        rvmWD1793* f = &ESPectrum::fdd;
+#if !PICO_RP2040
+        if (MB02::enabled) f = &ESPectrum::mb02_fdd;
+#endif
+        bool write = ((f->command & 0xE0) == 0xA0) ||   // Write Sector (0xA_/0xB_)
+                     ((f->command & 0xF0) == 0xF0);     // Write Track  (0xF_)
+        zx = write ? BRI_RED : BRI_GREEN;
+    }
+    else if (r && w) zx = BRI_YELLOW;
     else if (r)      zx = BRI_GREEN;
     else if (w)      zx = BRI_RED;
-    // Idle: complementary ZX colour — always contrasts with current border.
-    else             zx = VIDEO::borderColor ^ 7;
+    // Idle: neutral WHITE so the enabled-but-inactive glyph never collides with the
+    // green/red/yellow activity hues. (The old complementary borderColor^7 produced
+    // non-bright YELLOW on a blue border — indistinguishable from the read+write
+    // state.) Swap to BLUE on a white border so it always stays visible.
+    else             zx = (VIDEO::borderColor == WHITE) ? BLUE : WHITE;
 
 #if !PICO_RP2040
     // DS80 mode: the framebuffer byte indexes the DS80 packed-pair conv_color
