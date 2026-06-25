@@ -201,8 +201,7 @@ void Config::initHotkeys() {
         { fabgl::VK_F11,    true,  false, false }, // HK_RESET_TO
         { fabgl::VK_F12,    true,  false, false }, // HK_USB_BOOT
         { fabgl::VK_PAGEUP, true,  false, false }, // HK_GIGASCREEN
-        { fabgl::VK_F7,     true,  false, false }, // HK_BP_LIST
-        { fabgl::VK_F8,     true,  false, false }, // HK_JUMP_TO
+        { fabgl::VK_F8,     true,  false, false }, // HK_LED_TOGGLE
         { fabgl::VK_F9,     true,  false, false }, // HK_POKE
         { fabgl::VK_HOME,   true,  true,  false }, // HK_VIDMODE_60
         { fabgl::VK_END,    true,  true,  false }, // HK_VIDMODE_50

@@ -344,14 +344,13 @@ public:
         HK_RESET_TO     = 19,
         HK_USB_BOOT     = 20,
         HK_GIGASCREEN   = 21,
-        HK_BP_LIST      = 22,
-        HK_JUMP_TO      = 23,
-        HK_POKE         = 24,
-        HK_VIDMODE_60   = 25,
-        HK_VIDMODE_50   = 26,
-        HK_QUICK_LOAD   = 27,
-        HK_QUICK_SAVE   = 28,
-        HK_COUNT        = 29
+        HK_LED_TOGGLE   = 22,
+        HK_POKE         = 23,
+        HK_VIDMODE_60   = 24,
+        HK_VIDMODE_50   = 25,
+        HK_QUICK_LOAD   = 26,
+        HK_QUICK_SAVE   = 27,
+        HK_COUNT        = 28
     };
 
     struct HotkeyBinding {

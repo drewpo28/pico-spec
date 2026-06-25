@@ -1739,12 +1739,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
         if (hkIdx == Config::HK_DEBUG) {
             osdDebug();
         }
-        else if (hkIdx == Config::HK_BP_LIST) {
-            uint16_t bpAddr = BPListDialog();
-            if (bpAddr != 0xFFFF) osdDebug(bpAddr);
-        } else
-        if (hkIdx == Config::HK_JUMP_TO) {
-            jumpToDialog();
+        else if (hkIdx == Config::HK_LED_TOGGLE) { // Toggle LED indicators
+            Config::ledIndicators = !Config::ledIndicators;
+            if (!Config::ledIndicators) LED::clear();
+            Config::save();
+            osdCenteredMsg(Config::ledIndicators ? " LED indicators ON  " : " LED indicators OFF ", LEVEL_INFO, 500);
         } else
         if (hkIdx == Config::HK_POKE) { // Input Poke
             pokeDialog();
@@ -9117,6 +9116,11 @@ c:
                 redrawTitle = true;
                 goto c;
             } else
+            if (Nextkey.vk == fabgl::VK_F9 && !alt) {
+                pokeDialog();
+                redrawTitle = true;
+                goto c;
+            } else
             if (Nextkey.vk == fabgl::VK_F9 && alt) {
                 // Fullscreen debug: show Spectrum screen, step with Space/ALT+Space, ESC to return
                 VIDEO::SaveRect.restore_last();
@@ -11838,7 +11842,7 @@ static const char* hkIdNames[Config::HK_COUNT] = {
     "HK_VOL_DOWN", "HK_VOL_UP", "HK_HARD_RESET", "HK_REBOOT",
     "HK_MAX_SPEED", "HK_PAUSE", "HK_HW_INFO", "HK_TURBO",
     "HK_DEBUG", "HK_DISK", "HK_NMI", "HK_RESET_TO",
-    "HK_USB_BOOT", "HK_GIGASCREEN", "HK_BP_LIST", "HK_JUMP_TO",
+    "HK_USB_BOOT", "HK_GIGASCREEN", "HK_LED_TOGGLE",
     "HK_POKE", "HK_VIDMODE_60", "HK_VIDMODE_50",
     "HK_QUICK_LOAD", "HK_QUICK_SAVE"
 };
@@ -11892,8 +11896,7 @@ const char* const hkDescEN[Config::HK_COUNT] = {
     "Reset to...",          // HK_RESET_TO
     "USB Boot mode",        // HK_USB_BOOT
     "Gigascreen toggle",    // HK_GIGASCREEN
-    "Breakpoint list",      // HK_BP_LIST
-    "Jump to address",      // HK_JUMP_TO
+    "LED indicators",       // HK_LED_TOGGLE
     "Input poke",           // HK_POKE
     "HDMI 60Hz mode",       // HK_VIDMODE_60
     "HDMI 50Hz mode",       // HK_VIDMODE_50
@@ -11928,8 +11931,7 @@ const char* const hkDescES[Config::HK_COUNT] = {
     "Resetear a...",         // HK_RESET_TO
     "Modo USB Boot",         // HK_USB_BOOT
     "Gigascreen",            // HK_GIGASCREEN
-    "Lista breakpoints",     // HK_BP_LIST
-    "Ir a direccion",        // HK_JUMP_TO
+    "Indicadores LED",       // HK_LED_TOGGLE
     "Introducir poke",       // HK_POKE
     "Modo HDMI 60Hz",        // HK_VIDMODE_60
     "Modo HDMI 50Hz",        // HK_VIDMODE_50

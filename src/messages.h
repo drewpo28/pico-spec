@@ -842,9 +842,9 @@ static const char *MENU_RESET[2] = { MENU_RESET_EN, MENU_RESET_ES };
 #define MENU_DEBUG_EN \
     "Debug Menu\n"\
     "Debug dialog\t{HK_DEBUG}\n"\
-    "BreakPoint\t{HK_BP_LIST}\n"\
-    "BP List\t{HK_BP_LIST}\n"\
-    "Jump to\t{HK_JUMP_TO}\n"\
+    "BreakPoint\n"\
+    "BP List\n"\
+    "Jump to\n"\
     "Input Poke\t{HK_POKE}\n"\
 	"Trigger NMI\t{HK_NMI}\n"\
 	"Debug Log\t>\n"
