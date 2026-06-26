@@ -668,6 +668,11 @@ void Config::load() {
         nvs_get_b("SAA1099", SAA1099, sts);
         nvs_get_u8("midi", midi, sts);
         nvs_get_u8("midipreset", midi_synth_preset, sts);
+#if NO_GM_DLS
+        // GM.DLS wavetable (mode 4) is unavailable in ALF builds (no bank
+        // partition). Demote a stale NVS value so it never activates.
+        if (midi == 4) midi = 0;
+#endif
 #endif
         nvs_get_u16("cpu_mhz", cpu_mhz, sts);
         if (cpu_mhz == 0) cpu_mhz = CPU_MHZ;

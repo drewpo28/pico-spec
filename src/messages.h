@@ -1099,18 +1099,27 @@ static const char *MENU_AY48[2] = { "Turned on?\n" , "Turned on?\n"};
 
 #if !PICO_RP2040
 static const char *MENU_SAA1099[2] = { "Turned on?\n" , "Turned on?\n"};
+// GM.DLS wavetable (mode 4) needs the top-of-flash bank partition, which ALF
+// builds reclaim for firmware (NO_GM_DLS). Drop the menu row in that case.
+#if NO_GM_DLS
+#define MENU_MIDI_GMDLS_EN ""
+#define MENU_MIDI_GMDLS_ES ""
+#else
+#define MENU_MIDI_GMDLS_EN "GM.DLS Wavetable\t[G]\n"
+#define MENU_MIDI_GMDLS_ES "GM.DLS Wavetable\t[G]\n"
+#endif
 #define MENU_MIDI_EN "MIDI(Ext:P" _PIN_XSTR(MIDI_TX_PIN) ")\n"\
     "OFF             \t[O]\n"\
     "AY              \t[A]\n"\
     "ShamaZX         \t[S]\n"\
     "Software MIDI   \t[W]\n"\
-    "GM.DLS Wavetable\t[G]\n"
+    MENU_MIDI_GMDLS_EN
 #define MENU_MIDI_ES "MIDI(Ext:P" _PIN_XSTR(MIDI_TX_PIN) ")\n"\
     "OFF             \t[O]\n"\
     "AY              \t[A]\n"\
     "ShamaZX         \t[S]\n"\
     "Software MIDI   \t[W]\n"\
-    "GM.DLS Wavetable\t[G]\n"
+    MENU_MIDI_GMDLS_ES
 static const char *MENU_MIDI[2] = { MENU_MIDI_EN, MENU_MIDI_ES };
 // Software MIDI (mode 3) preset selector (procedural synth).
 #define MENU_MIDI_PRESET_EN "Synth Preset\n"\
