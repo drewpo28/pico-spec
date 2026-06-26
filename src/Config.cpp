@@ -215,6 +215,9 @@ void Config::initHotkeys() {
 void Config::requestMachine(const string& newArch, const string& newRomSet)
 {
     arch = newArch;
+    // Re-bind ROM overlays from scratch for this machine (RomOverlay.h). Each romset
+    // below registers the overlays it needs; clearing first avoids stale entries.
+    MemESP::clearOverlays();
     if (arch == "48K") {
         if (newRomSet=="") romSet = "48K"; else romSet = newRomSet;
         if (newRomSet=="") romSet48 = "48K"; else romSet48 = newRomSet;
@@ -228,16 +231,24 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
 #else
             MemESP::rom[0].assign_rom(gb_rom_Alf_cart);
 #endif
+            MemESP::registerOverlay(gb_rom_0_sinclair_48k, nullptr);
         } else
 #if !NO_SPAIN_ROM_48k
-        if (romSet48 == "48Kes")
-            MemESP::rom[0].assign_rom(gb_rom_0_48k_es);
-        else
-#endif
-        if (romSet48 == "48Kby")
-            MemESP::rom[0].assign_rom(Config::byte_cobmect_mode ? gb_rom_0_byte_sovmest_48k : gb_rom_0_byte_48k);
-        else
+        if (romSet48 == "48Kes") {
+            // 48K Spanish: read-only overlay over the Sinclair 48K base (RomOverlay.h)
             MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_48k, gb_overlay_48k_es);
+        } else
+#endif
+        if (romSet48 == "48Kby") {
+            // Both BYTE and BYTE-compat are overlays over the Sinclair 48K base.
+            MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_48k,
+                Config::byte_cobmect_mode ? gb_overlay_48k_byte_sovmest : gb_overlay_48k_byte);
+        } else {
+            MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_48k, nullptr);
+        }
     }
 #if !NO_ALF
     else if (arch == "ALF") {
@@ -261,21 +272,29 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
 #endif
 #if !NO_SPAIN_ROM_128k
         } else if (romSet128 == "128Kes") {
+            // rom[0] (128K editor) differs too much positionally -> stays raw.
+            // rom[1] (BASIC) is an overlay over the Sinclair 128K second ROM half.
             MemESP::rom[0].assign_rom(gb_rom_0_128k_es);
-            MemESP::rom[1].assign_rom(gb_rom_1_128k_es);
+            MemESP::rom[1].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_128k_es);
         } else if (romSet128 == "+2es") {
             MemESP::rom[0].assign_rom(gb_rom_0_plus2_es);
-            MemESP::rom[1].assign_rom(gb_rom_1_plus2_es);
+            MemESP::rom[1].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_128k_plus2es);
         } else if (romSet128 == "+2") {
             MemESP::rom[0].assign_rom(gb_rom_0_plus2);
-            MemESP::rom[1].assign_rom(gb_rom_1_plus2);
+            MemESP::rom[1].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_128k_plus2);
         } else if (romSet128 == "ZX81+") {
             MemESP::rom[0].assign_rom(gb_rom_0_s128_zx81);
             MemESP::rom[1].assign_rom(gb_rom_1_sinclair_128k);
 #endif
         } else if (romSet128 == "128Kby" || romSet128 == "128Kbg") {
             MemESP::rom[0].assign_rom(gb_rom_0_sinclair_128k);
-            MemESP::rom[1].assign_rom(gb_rom_0_byte_48k);
+            // rom[1] = BYTE 48K, now a read-only overlay over the Sinclair 48K base
+            // (applied on the fly by MemESP when this bank is paged to page 0).
+            MemESP::rom[1].assign_rom(gb_rom_0_sinclair_48k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_48k, gb_overlay_48k_byte);
             if (romSet128 == "128Kbg") {
                 MemESP::rom[3].assign_rom(gb_rom_gluk);
             }
@@ -288,10 +307,14 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
     } else if (arch == "Profi") {
         if (newRomSet=="") romSet = "Profi"; else romSet = newRomSet;
         if (newRomSet=="") romSetProfi = "Profi"; else romSetProfi = newRomSet;
-        MemESP::rom[0].assign_rom(gb_rom_profi);
-        MemESP::rom[1].assign_rom(gb_rom_profi + (16 << 10));
-        MemESP::rom[2].assign_rom(gb_rom_profi + (32 << 10));
-        MemESP::rom[3].assign_rom(gb_rom_profi + (48 << 10));
+        // bank0 (service) + bank1 (Profi TR-DOS) stay raw; bank2/bank3 are overlays
+        // over the Sinclair 128K halves (rom[0]/rom[1]). See RomOverlay.h.
+        MemESP::rom[0].assign_rom(gb_rom_profi_bank0);
+        MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
+        MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
+        MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2);
+        MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
+        MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_profi_bank3);
 #endif
     } else { // Pentagon by default
         if (newRomSet=="") romSet = "128Kp"; else romSet = newRomSet;
@@ -305,18 +328,30 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
             MemESP::rom[1].assign_rom(gb_rom_Alf_cart + (16 << 10)); /// 16392;
 #endif
         } else {
-            MemESP::rom[0].assign_rom(gb_rom_pentagon_128k);
-            MemESP::rom[1].assign_rom(gb_rom_pentagon_128k + (16 << 10));
+            // Pentagon = Sinclair 128K with a 101-byte overlay on rom[0]; rom[1] is
+            // byte-identical to the Sinclair 128K second half (no overlay needed).
+            MemESP::rom[0].assign_rom(gb_rom_0_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_pentagon_rom0);
+            MemESP::rom[1].assign_rom(gb_rom_1_sinclair_128k);
             if (romSetPent == "128Kpg") {
                 MemESP::rom[3].assign_rom(gb_rom_gluk);
             }
         }
     }
-    switch (Config::trdosBios) {
-        case 0: MemESP::rom[4].assign_rom(gb_rom_4_trdos_503); break;
-        case 1: MemESP::rom[4].assign_rom(gb_rom_4_trdos_504tm); break;
-        case 3: MemESP::rom[4].assign_rom(gb_rom_4_trdos_custom); break;
-        default: MemESP::rom[4].assign_rom(gb_rom_4_trdos_505d); break;
+    // 5.03 / 5.04TM are small read-only overlays over the 5.05D base, applied on the
+    // fly by MemESP (RomOverlay.h): rom[4] points at the 5.05D base in flash, and the
+    // active overlay supplies the differing bytes. No slot, no flash write, no reboot.
+    {
+        const uint8_t* base = gb_rom_4_trdos_505d;
+        const uint8_t* ov = nullptr;
+        switch (Config::trdosBios) {
+            case 0: ov = gb_overlay_trdos_503;   break;  // 5.03
+            case 1: ov = gb_overlay_trdos_504tm; break;  // 5.04TM
+            case 3: base = gb_rom_4_trdos_custom; break; // user-uploaded custom (raw)
+            default: break;                              // 5.05D base
+        }
+        MemESP::rom[4].assign_rom(base);
+        MemESP::registerOverlay(gb_rom_4_trdos_505d, ov);
     }
 }
 

@@ -54,12 +54,12 @@ uint8_t page;
  if (page == 0 && MemESP::divmmc_mapped) \
      result = ((address) < 0x2000) ? MemESP::page0_lo[address] : MemESP::page0_hi[(address) & 0x1FFF]; \
  else \
-     result = MemESP::ramCurrent[page][address & 0x3fff];
+     result = MemESP::romPeek(page, MemESP::ramCurrent[page], (address) & 0x3fff);
 #else
 #define PEEK8(result,address) \
  page = address >> 14; \
  VIDEO::Draw(3,MemESP::ramContended[page]); \
- result = MemESP::ramCurrent[page][address & 0x3fff];
+ result = MemESP::romPeek(page, MemESP::ramCurrent[page], (address) & 0x3fff);
 #endif
 
 // miembros estáticos
@@ -1272,14 +1272,14 @@ IRAM_ATTR void Z80::exec_nocheck() {
             if (pg == 0 && MemESP::divmmc_mapped) {
                 opCode = (REG_PC < 0x2000) ? MemESP::page0_lo[REG_PC] : MemESP::page0_hi[REG_PC & 0x1FFF];
             } else {
-                opCode = MemESP::ramCurrent[pg][REG_PC & 0x3fff];
+                opCode = MemESP::romPeek(pg, MemESP::ramCurrent[pg], REG_PC & 0x3fff);
             }
             DivMMC::postOpcFetch();
         } else if (pg == 0 && MemESP::divmmc_mapped) {
             opCode = (REG_PC < 0x2000) ? MemESP::page0_lo[REG_PC] : MemESP::page0_hi[REG_PC & 0x1FFF];
         } else
 #endif
-        opCode = MemESP::ramCurrent[pg][REG_PC & 0x3fff];
+        opCode = MemESP::romPeek(pg, MemESP::ramCurrent[pg], REG_PC & 0x3fff);
 
         regR++;
         REG_PC++;

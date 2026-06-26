@@ -56,10 +56,16 @@ extern "C" const unsigned char gb_rom_Alf[];
 extern "C" const unsigned char gb_rom_Alf_ep[];
 #endif
 extern "C" unsigned char gb_rom_4_trdos_505d[];
-extern "C" unsigned char gb_rom_4_trdos_503[];
-extern "C" unsigned char gb_rom_4_trdos_504tm[];
+// gb_rom_4_trdos_503 / _504tm are no longer raw arrays: they are stored as small
+// read-only overlays over 5.05D (src/roms/trdos/, tools/rom_pack.py) and applied on
+// the fly by MemESP (see RomOverlay.h) — no RAM copy, no flash write, no reboot.
+#include "roms/trdos/trdos_overlays.h"
+#include "roms/48k/48k_overlays.h"
+#include "roms/128k/128k_overlays.h"
+#include "roms/pentagon/pentagon_overlays.h"
 extern "C" const unsigned char gb_rom_4_trdos_custom[];
-extern "C" const unsigned char gb_rom_pentagon_128k[];
+// gb_rom_pentagon_128k (32K blob) removed: Pentagon is a 101-byte overlay over the
+// Sinclair 128K base now (roms/pentagon/). Custom Pentagon uses the 128K custom slot.
 #if !PICO_RP2040
 extern "C" unsigned char gb_rom_esxdos[];
 extern "C" unsigned char gb_rom_esxide[];

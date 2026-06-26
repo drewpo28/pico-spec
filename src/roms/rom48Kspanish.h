@@ -1,11 +1,7 @@
 #ifndef ROM_48K_ES_H
 #define ROM_48K_ES_H
 
-#if !NO_SPAIN_ROM_48k
-//ROM 0 48K SPANISH
-#include <hardware/flash.h>
-
-extern "C" const unsigned char __in_flash() __aligned(4096) gb_rom_0_48k_es[];
-#endif
+// gb_rom_0_48k_es is now a read-only overlay (see roms/48k/48k_overlays.h),
+// applied over the Sinclair 48K base by MemESP — no standalone array.
 
 #endif

@@ -386,7 +386,7 @@ IRAM_ATTR uint8_t Z80Ops::fetchOpcode() {
         if (pg == 0 && MemESP::divmmc_mapped) {
             opCode = (pc < 0x2000) ? MemESP::page0_lo[pc] : MemESP::page0_hi[pc & 0x1FFF];
         } else {
-            opCode = MemESP::ramCurrent[pg][pc & 0x3fff];
+            opCode = MemESP::romPeek(pg, MemESP::ramCurrent[pg], pc & 0x3fff);
         }
         DivMMC::postOpcFetch();
         return opCode;
@@ -396,7 +396,7 @@ IRAM_ATTR uint8_t Z80Ops::fetchOpcode() {
         return (pc < 0x2000) ? MemESP::page0_lo[pc] : MemESP::page0_hi[pc & 0x1FFF];
     }
 #endif
-    return MemESP::ramCurrent[pg][pc & 0x3fff];
+    return MemESP::romPeek(pg, MemESP::ramCurrent[pg], pc & 0x3fff);
 }
 
 // // Write byte to RAM

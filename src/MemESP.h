@@ -43,6 +43,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Debug.h"
 #include "Config.h"
 #include "CPU.h"
+#include "RomOverlay.h"
 #include "ChipPackage.h"
 
 #define MEM_PG_SZ 0x4000
@@ -192,6 +193,34 @@ public:
 
     static uint8_t romInUse;
 
+    // ROM overlay registry (RomOverlay.h). A base+patch ROM variant (e.g. TR-DOS
+    // 5.03/5.04TM, 48K Spanish) leaves rom[bank] pointing at its base ROM and
+    // registers a flash overlay keyed by the base pointer. On a page-0 ROM read,
+    // MemESP looks up the overlay by the bank pointer and substitutes patched bytes.
+    // Keyed by base pointer so multiple families (rom[0] machine ROM + rom[4] TR-DOS)
+    // coexist. Empty registry => zero hot-path cost (default ROMs).
+    static const uint8_t* overlayBase[8];
+    static const uint8_t* overlayPtr[8];
+    static uint8_t        overlayCount;
+    // ov == nullptr unregisters `base`. Call at ROM-bank assignment.
+    static void registerOverlay(const uint8_t* base, const uint8_t* ov);
+    static inline void clearOverlays() { overlayCount = 0; }  // call before re-binding a machine's ROMs
+    static inline const uint8_t* overlayFor(const uint8_t* p) {
+        for (uint8_t i = 0; i < overlayCount; i++)
+            if (overlayBase[i] == p) return overlayPtr[i];
+        return nullptr;
+    }
+    // Read byte `off` (0..0x3FFF) from page `page` whose bank pointer is `p`,
+    // applying any registered page-0 ROM overlay. Use at EVERY ROM read fast path
+    // (readbyte, fetchOpcode, the Z80 core's inline fetch) so overlays are consistent.
+    static inline uint8_t romPeek(uint8_t page, uint8_t* p, uint16_t off) {
+        if (__builtin_expect(overlayCount != 0, 0) && page == 0) {
+            const uint8_t* ov = overlayFor(p);
+            if (ov) return rom_overlay_byte(ov, p, off);
+        }
+        return p[off];
+    }
+
 #if !PICO_RP2040
     static uint8_t* page0_lo;      // 0x0000-0x1FFF when DivMMC/MB02 mapped
     static uint8_t* page0_hi;      // 0x2000-0x3FFF when DivMMC/MB02 mapped
@@ -246,7 +275,7 @@ inline uint8_t MemESP::readbyte(uint16_t addr) {
         return (addr < 0x2000) ? page0_lo[addr] : page0_hi[addr & 0x1FFF];
     }
 #endif
-    return ramCurrent[page][addr & 0x3fff];
+    return romPeek(page, ramCurrent[page], addr & 0x3fff);
 }
 
 inline uint16_t MemESP::readword(uint16_t addr) {

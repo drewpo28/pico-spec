@@ -1775,7 +1775,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 } else if (opt == 2) {
                     Config::byte_cobmect_mode = !Config::byte_cobmect_mode;
                     Config::save();
-                    MemESP::rom[0].assign_rom(Config::byte_cobmect_mode ? gb_rom_0_byte_sovmest_48k : gb_rom_0_byte_48k);
+                    // BYTE and BYTE-compat are both overlays over the Sinclair 48K base.
+                    MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+                    MemESP::registerOverlay(gb_rom_0_sinclair_48k,
+                        Config::byte_cobmect_mode ? gb_overlay_48k_byte_sovmest : gb_overlay_48k_byte);
                     MemESP::recoverPage0();
                     osdCenteredMsg(Config::byte_cobmect_mode ? OSD_COBMECT_ON[Config::lang] : OSD_COBMECT_OFF[Config::lang], LEVEL_INFO, 500);
                 }
@@ -3050,12 +3053,19 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         Config::trdosBios = opt2 - 1;
                                         if (Config::trdosBios != prev) {
                                             Config::save();
+                                            // 5.03 / 5.04TM are read-only overlays over 5.05D applied on
+                                            // the fly by MemESP (RomOverlay.h) — bind immediately, no
+                                            // reboot, on every board.
+                                            const uint8_t* base = gb_rom_4_trdos_505d;
+                                            const uint8_t* ov = nullptr;
                                             switch (Config::trdosBios) {
-                                                case 0: MemESP::rom[4].assign_rom(gb_rom_4_trdos_503); break;
-                                                case 1: MemESP::rom[4].assign_rom(gb_rom_4_trdos_504tm); break;
-                                                case 3: MemESP::rom[4].assign_rom(gb_rom_4_trdos_custom); break;
-                                                default: MemESP::rom[4].assign_rom(gb_rom_4_trdos_505d); break;
+                                                case 0: ov = gb_overlay_trdos_503;   break;
+                                                case 1: ov = gb_overlay_trdos_504tm; break;
+                                                case 3: base = gb_rom_4_trdos_custom; break;
+                                                default: break;
                                             }
+                                            MemESP::rom[4].assign_rom(base);
+                                            MemESP::registerOverlay(gb_rom_4_trdos_505d, ov);
                                         }
                                         menu_curopt = opt2;
                                         menu_saverect = false;
@@ -5061,7 +5071,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 
                                                 if (Config::byte_cobmect_mode != prev_opt) {
                                                     Config::save();
-                                                    MemESP::rom[0].assign_rom(Config::byte_cobmect_mode ? gb_rom_0_byte_sovmest_48k : gb_rom_0_byte_48k);
+                                                    // BYTE and BYTE-compat are both overlays over Sinclair 48K.
+                                                    MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+                                                    MemESP::registerOverlay(gb_rom_0_sinclair_48k,
+                                                        Config::byte_cobmect_mode ? gb_overlay_48k_byte_sovmest : gb_overlay_48k_byte);
                                                     MemESP::recoverPage0();
                                                 }
                                                 menu_curopt = opt2;
@@ -10709,14 +10722,21 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
             fclose2(f);
             return false;
         }
-        rom = gb_rom_pentagon_128k;
+        // Custom Pentagon ROM: the factory Pentagon is now a 101-byte overlay over the
+        // Sinclair 128K base (no 32K blob), so a user ROM flashes into the shared 128K
+        // custom slot and the machine switches to the "128Kcs" romset.
+#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+        rom = gb_rom_0_128k_custom;
+#else
+        rom = gb_rom_Alf_cart;
+#endif
         max_rom_size = bytesfirmware > (16ul << 10) ? (32ul << 10) : (16ul << 10);
         dlgTitle += " Pentagon#0 ";
         Config::arch = "Pentagon";
-        Config::romSet = "128Kp";
-        Config::romSetPent = "128Kp";
+        Config::romSet = "128Kcs";
+        Config::romSetPent = "128Kcs";
         Config::pref_arch = "Pentagon";
-        Config::pref_romSetPent = "128Kp";
+        Config::pref_romSetPent = "128Kcs";
     }
     else if ( arch == 8 ) {
         if( bytesfirmware > (16 << 10) ) {
@@ -10724,14 +10744,18 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
             fclose2(f);
             return false;
         }
-        rom = gb_rom_pentagon_128k;
+#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+        rom = gb_rom_0_128k_custom;
+#else
+        rom = gb_rom_Alf_cart;
+#endif
         max_rom_size = 16 << 10;
         dlgTitle += " Pentagon#1 ";
         Config::arch = "Pentagon";
-        Config::romSet = "128Kp";
-        Config::romSetPent = "128Kp";
+        Config::romSet = "128Kcs";
+        Config::romSetPent = "128Kcs";
         Config::pref_arch = "Pentagon";
-        Config::pref_romSetPent = "128Kp";
+        Config::pref_romSetPent = "128Kcs";
     }
     else {
         osdCenteredMsg("Unexpected ROM type: " + to_string(arch), LEVEL_WARN, 2000);
@@ -12613,7 +12637,7 @@ void OSD::pokeDialog() {
     snprintf(tmp1, 8, "%04X", address);
     char* tmp2 = tmp1 + 5;
     uint8_t page = address >> 14;
-    snprintf(tmp2, 8, "%02X", MemESP::ramCurrent[page][address & 0x3fff]);
+    snprintf(tmp2, 8, "%02X", MemESP::romPeek(page, MemESP::ramCurrent[page], address & 0x3fff));
 
     string dlgValues[5] = {
         "   -   ", // Bank

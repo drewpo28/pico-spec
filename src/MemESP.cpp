@@ -318,6 +318,30 @@ uint8_t MemESP::romLatch = 0;
 uint8_t MemESP::pagingLock = 0;
 uint8_t MemESP::romInUse = 0;
 
+const uint8_t* MemESP::overlayBase[8] = {0};
+const uint8_t* MemESP::overlayPtr[8]  = {0};
+uint8_t        MemESP::overlayCount   = 0;
+
+void MemESP::registerOverlay(const uint8_t* base, const uint8_t* ov) {
+    for (uint8_t i = 0; i < overlayCount; i++) {
+        if (overlayBase[i] == base) {
+            if (ov) {
+                overlayPtr[i] = ov;                       // update existing
+            } else {                                      // unregister: swap-remove
+                overlayBase[i] = overlayBase[overlayCount - 1];
+                overlayPtr[i]  = overlayPtr[overlayCount - 1];
+                overlayCount--;
+            }
+            return;
+        }
+    }
+    if (ov && overlayCount < 8) {
+        overlayBase[overlayCount] = base;
+        overlayPtr[overlayCount]  = ov;
+        overlayCount++;
+    }
+}
+
 #if !PICO_RP2040
 uint8_t* MemESP::page0_lo = nullptr;
 uint8_t* MemESP::page0_hi = nullptr;

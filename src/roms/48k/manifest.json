@@ -1,0 +1,32 @@
+{
+  "id": "48k",
+  "base": "sinclair_48k",
+  "base_sym": "gb_rom_0_sinclair_48k",
+  "base_len": 16384,
+  "variants": [
+    {
+      "name": "48K Spanish",
+      "sym": "gb_rom_0_48k_es",
+      "overlay_sym": "gb_overlay_48k_es",
+      "len": 2000,
+      "runs": 42,
+      "diff_bytes": 1736
+    },
+    {
+      "name": "BYTE",
+      "sym": "gb_rom_0_byte_48k",
+      "overlay_sym": "gb_overlay_48k_byte",
+      "len": 2092,
+      "runs": 56,
+      "diff_bytes": 1744
+    },
+    {
+      "name": "BYTE compat",
+      "sym": "gb_rom_0_byte_sovmest_48k",
+      "overlay_sym": "gb_overlay_48k_byte_sovmest",
+      "len": 175,
+      "runs": 12,
+      "diff_bytes": 91
+    }
+  ]
+}

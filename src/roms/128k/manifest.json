@@ -1,0 +1,32 @@
+{
+  "id": "128k",
+  "base": "sinclair_128k_1",
+  "base_sym": "gb_rom_1_sinclair_128k",
+  "base_len": 16384,
+  "variants": [
+    {
+      "name": "128K Spanish",
+      "sym": "gb_rom_1_128k_es",
+      "overlay_sym": "gb_overlay_128k_es",
+      "len": 914,
+      "runs": 34,
+      "diff_bytes": 698
+    },
+    {
+      "name": "+2",
+      "sym": "gb_rom_1_plus2",
+      "overlay_sym": "gb_overlay_128k_plus2",
+      "len": 92,
+      "runs": 7,
+      "diff_bytes": 38
+    },
+    {
+      "name": "+2 Spanish",
+      "sym": "gb_rom_1_plus2_es",
+      "overlay_sym": "gb_overlay_128k_plus2es",
+      "len": 177,
+      "runs": 15,
+      "diff_bytes": 75
+    }
+  ]
+}

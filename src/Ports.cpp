@@ -1619,8 +1619,8 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         uint16_t sp = Z80::getRegSP();
         uint16_t found_addr = 0;
         for (int i = 0; i < 256 && sp < 0xFF00; i++, sp += 2) {
-          uint16_t lo = MemESP::ramCurrent[sp >> 14][(sp) & 0x3FFF];
-          uint16_t hi = MemESP::ramCurrent[(sp+1) >> 14][(sp+1) & 0x3FFF];
+          uint16_t lo = MemESP::romPeek(sp >> 14, MemESP::ramCurrent[sp >> 14], (sp) & 0x3FFF);
+          uint16_t hi = MemESP::romPeek((sp+1) >> 14, MemESP::ramCurrent[(sp+1) >> 14], (sp+1) & 0x3FFF);
           uint16_t frame = lo | (hi << 8);
           if (frame != 0x40DE) {
             found_addr = frame;
