@@ -14,7 +14,6 @@ extern "C" {
 #endif
 
 extern const uint8_t ROM_GS_M[32768];      /* v1.05b — RomanRom2, 2015 (default) */
-extern const uint8_t ROM_GS_V104B[32768]; /* v1.04 Beta — psb & Evgeny Muchkin, 2007 */
 
 #ifdef __cplusplus
 }

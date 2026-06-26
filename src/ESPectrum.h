@@ -143,32 +143,60 @@ public:
     // Dynamically allocated by PitSubsys when Pentagon Byte arch is active.
     static uint8_t* audioBufferPIT;
 #endif
-    // Compact FDD sound description (~22 bytes instead of 640-byte buffer)
+    // Compact FDD sound description (~28 bytes instead of 640-byte buffer)
+    static constexpr int FDD_CLICK_LEN = 72; // samples per head-step click waveform
     struct FDDSound {
         uint16_t click_pos[8]; // sample positions of clicks
-        uint16_t fdd_lfsr;     // LFSR state for motor noise
+        uint16_t fdd_lfsr;     // LFSR state for motor noise / click grain
         uint8_t click_count;   // number of clicks (0-8)
         bool motor_noise;      // generate motor noise instead of clicks
         // Per-frame state for inline generation
         int click_idx;         // current index into click_pos
-        int decay_pos;         // offset within current click decay
+        int decay_pos;         // offset within current click waveform
+        int fdd_lp;            // 1-pole low-pass state for motor rumble
+        uint16_t fdd_phase;    // phase accumulator for motor whir tone
+        int fdd_crackle;       // decaying level of the current motor crackle/pop
     };
     static FDDSound fddSound;
-    static const uint8_t fdd_click_decay[12];
+    static const uint8_t fdd_click_decay[FDD_CLICK_LEN];
     static inline int getFDDSample(int i) {
         if (fddSound.motor_noise) {
+            // Motor = a bright tonal whir (triangle) + a lightly-filtered rumble
+            // + a touch of raw hiss, so it reads as a buzzing, noisy drive.
             fddSound.fdd_lfsr ^= fddSound.fdd_lfsr >> 7;
             fddSound.fdd_lfsr ^= fddSound.fdd_lfsr << 9;
             fddSound.fdd_lfsr ^= fddSound.fdd_lfsr >> 13;
-            return fddSound.fdd_lfsr & 0xF;
+            int n = (int)(fddSound.fdd_lfsr & 0x3F) - 32;  // bipolar -32..31
+            fddSound.fdd_lp += (n - fddSound.fdd_lp) >> 3; // 1-pole LPF (mellower)
+            fddSound.fdd_phase += 200;                     // ~135 Hz whir (Fs-dep.)
+            int ph = fddSound.fdd_phase;
+            int tri = (ph < 0x8000 ? ph : (0x10000 - ph)) >> 10; // triangle 0..32
+            int v = tri + (fddSound.fdd_lp >> 2)           // tone + rumble
+                        + (int)(fddSound.fdd_lfsr & 0x3);  // + faint hiss
+            // Sparse crackle/pops layered on the hum: rarely fire a sharp
+            // impulse, then let it decay fast over a few samples.
+            if ((fddSound.fdd_lfsr & 0x3FF) == 0)
+                fddSound.fdd_crackle = 28 + (int)((fddSound.fdd_lfsr >> 10) & 0x1F);
+            if (fddSound.fdd_crackle > 0) {
+                v += fddSound.fdd_crackle;
+                fddSound.fdd_crackle -= (fddSound.fdd_crackle >> 1) + 1;
+            }
+            return v < 0 ? 0 : v;
         }
         if (fddSound.click_count > 0) {
             if (fddSound.click_idx < fddSound.click_count && i >= fddSound.click_pos[fddSound.click_idx]) {
                 fddSound.click_idx++;
                 fddSound.decay_pos = 0;
             }
-            if (fddSound.decay_pos < 12)
-                return fdd_click_decay[fddSound.decay_pos++];
+            if (fddSound.decay_pos < FDD_CLICK_LEN) {
+                // Grainy amplitude modulation turns the smooth decay into a
+                // rough mechanical "clack" instead of a soft tone.
+                int env = fdd_click_decay[fddSound.decay_pos++];
+                fddSound.fdd_lfsr ^= fddSound.fdd_lfsr >> 7;
+                fddSound.fdd_lfsr ^= fddSound.fdd_lfsr << 9;
+                fddSound.fdd_lfsr ^= fddSound.fdd_lfsr >> 13;
+                return (env * (16 - (fddSound.fdd_lfsr & 0x7))) >> 4; // ×0.56..1.0
+            }
         }
         return 0;
     }

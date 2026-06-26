@@ -222,8 +222,18 @@ uint32_t ESPectrum::faudbufcntSAA = 0;
 bool ESPectrum::SAA_emu = false;
 #endif
 
-ESPectrum::FDDSound ESPectrum::fddSound = {{}, 0xACE1, 0, false, 0, 12};
-const uint8_t ESPectrum::fdd_click_decay[12] = {48,36,27,20,15,11,8,6,4,3,2,1};
+ESPectrum::FDDSound ESPectrum::fddSound = {{}, 0xACE1, 0, false, 0, ESPectrum::FDD_CLICK_LEN, 0, 0, 0};
+// Decay envelope (64*0.93^n) for a head-step click; modulated by LFSR grain in
+// getFDDSample so it sounds like a rough, long mechanical "clack".
+const uint8_t ESPectrum::fdd_click_decay[ESPectrum::FDD_CLICK_LEN] =
+    {64,60,55,51,48,44,41,38,36,33,
+     31,29,27,25,23,21,20,19,17,16,
+     15,14,13,12,11,10,10,9,8,8,
+     7,7,6,6,5,5,5,4,4,4,
+     3,3,3,3,3,2,2,2,2,2,
+     2,2,1,1,1,1,1,1,1,1,
+     1,1,1,1,1,1,1,0,0,0,
+     0,0};
 int ESPectrum::lastaudioBit = 0;
 int ESPectrum::lastCovoxVal = 0;
 int ESPectrum::lastCovoxValR = 0;
@@ -2050,8 +2060,20 @@ void ESPectrum::FDDGenSound() {
         fddSound.click_count = clicks;
         fddSound.motor_noise = false;
         int spacing = samplesPerFrame / (clicks + 1);
+        int jrange = spacing / 3; // jitter bound keeps clicks ordered (< spacing/2)
         for (int c = 0; c < clicks; c++) {
-            fddSound.click_pos[c] = spacing * (c + 1);
+            int pos = spacing * (c + 1);
+            if (jrange > 0) {
+                // Deterministic per-frame jitter so a seek sounds like a real
+                // drive instead of a perfectly even drum roll.
+                fddSound.fdd_lfsr ^= fddSound.fdd_lfsr >> 7;
+                fddSound.fdd_lfsr ^= fddSound.fdd_lfsr << 9;
+                fddSound.fdd_lfsr ^= fddSound.fdd_lfsr >> 13;
+                pos += (int)(fddSound.fdd_lfsr % (2 * jrange + 1)) - jrange;
+            }
+            if (pos < 1) pos = 1;
+            if (pos > samplesPerFrame - 1) pos = samplesPerFrame - 1;
+            fddSound.click_pos[c] = pos;
         }
     } else if (LED::readActive(LED::FDD) || LED::writeActive(LED::FDD)) {
         // Motor hum while the drive is being accessed (recent FDC port activity).
@@ -2063,7 +2085,7 @@ void ESPectrum::FDDGenSound() {
         fddSound.motor_noise = false;
     }
     fddSound.click_idx = 0;
-    fddSound.decay_pos = 12;
+    fddSound.decay_pos = FDD_CLICK_LEN;
 }
 
 // === Таймер ===

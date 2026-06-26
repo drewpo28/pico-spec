@@ -36,17 +36,16 @@ visit https://zxespectrum.speccy.org/contacto
 #ifndef ROMS_H
 #define ROMS_H
 
-#include "roms/romSinclair48K.h"
-#include "roms/rom48Kspanish.h"
-#include "roms/rom48Kcustom.h"
-#include "roms/romSinclair128K.h"
-#include "roms/rom128Kspanish.h"
-#include "roms/romPlus2.h"
-#include "roms/RomPlus2spanish.h"
-#include "roms/rom128Kcustom.h"
-#include "roms/S128_ZX81+_ROM.h"
+#include "roms/48k/romSinclair48K.h"
+#include "roms/48k/rom48Kcustom.h"
+#include "roms/128k/romSinclair128K.h"
+#include "roms/128k/rom128Kspanish.h"
+#include "roms/128k/romPlus2.h"
+#include "roms/128k/RomPlus2spanish.h"
+#include "roms/128k/rom128Kcustom.h"
+#include "roms/128k/S128_ZX81+_ROM.h"
 
-#include "romByte48k.h"
+#include "roms/48k/byte/romByte48k.h"
 #include "romGluk.h"
 #include "roms/romSTS75.h"
 
@@ -70,5 +69,5 @@ extern "C" const unsigned char gb_rom_4_trdos_custom[];
 extern "C" unsigned char gb_rom_esxdos[];
 extern "C" unsigned char gb_rom_esxide[];
 #endif
-#include "roms/romProfi.h"
+#include "roms/profi/romProfi.h"
 #endif

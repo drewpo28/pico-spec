@@ -7049,11 +7049,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 VIDEO::vga.setTextColor(zxColor(0, 0), zxColor(7, 0));
                 VIDEO::vga.setCursor(kbd_x + 4, kbd_y - 10);
                 VIDEO::vga.print(Config::lang ? "Teclado ZX" : "ZX Keyboard");
-                // Draw bitmap: byte = ZX palette index (0..15), 0xFF and other non-palette values = transparent
+                // Draw bitmap: packed 4 bits/pixel, palette index 1..7 (0 = skip).
+                // Black (idx 0) and transparent pixels are not drawn — the area is
+                // already filled with paper black above, so the result is identical.
                 for (int y = 0; y < kbd_h; y++) {
                     for (int x = 0; x < kbd_w; x++) {
-                        uint8_t idx = kbd_img[x + y * kbd_w];
-                        if (idx >= 0x10) continue; // skip transparent and out-of-range
+                        int i = x + y * kbd_w;
+                        uint8_t idx = (kbd_img[i >> 1] >> ((i & 1) << 2)) & 0x0F;
+                        if (!idx) continue;
                         VIDEO::vga.dotFast(kbd_x + x, kbd_y + y, zxColor(idx & 7, (idx >> 3) & 1));
                     }
                 }
