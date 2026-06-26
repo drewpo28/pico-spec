@@ -52,7 +52,7 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - Covox 8-bit DAC emulation: selectable port (#FB or #DD) from the Audio menu.
 - SounDrive 8-bit stereo DAC emulation: left channel on ports #0F/#1F/#3F, right on #4F/#5F, both on #FB. Own Audio-menu item (Off/On/Auto; Auto enables it on Profi only, where CP/M games stream PCM there).
 - General Sound (GS) emulation: dedicated Z80 with selectable clock (12/13/14/20/24 MHz) on core1 with 2 MB sample RAM, ring-buffered DAC, host→GS FIFO for no-handshake loaders. Auto-enabled on RP2350 boards with butter PSRAM.
-- MIDI support: external UART output (AY bit-bang, ShamaZX) and built-in software synthesizer (RP2350 only).
+- MIDI support: external UART output (AY bit-bang, ShamaZX), a built-in procedural software synthesizer, and a **GM.DLS wavetable synth** that plays a real General MIDI sound bank loaded from SD (RP2350 only).
 - Beeper & Mic emulation (Cobra’s Arc).
 - Dual keyboard support: you can connect two devices: first using PS/2 protocol and second using USB at the same time.
 - PS/2 Joystick emulation (Cursor, Sinclair, Kempston and Fuller).
@@ -157,7 +157,7 @@ Finally, keep in mind that when updating the firmware, you will need to re-flash
 
 The emulator supports MIDI output on RP2350 boards only. Enable it in the OSD menu: **Audio → MIDI**.
 
-Three modes are available:
+Four modes are available:
 
 - **AY** — Decodes bit-bang UART transmitted through AY-3-8912 register 14 (IOPortA, bit 2). Software like [zx-midiplayer](https://github.com/UzixLS/zx-midiplayer) uses this method in "128std" / "TS1" / "TS2" output modes. MIDI bytes are sent to an external synth via UART TX pin at 31250 baud.
 - **ShamaZX** — Emulates the ShamaZX parallel MIDI interface (SAM2695 synth module). Port 0xA0CF is used for TX data, port 0xA1CF for status (bit 6 = busy). This corresponds to the "ShamaZX" output mode in [zx-midiplayer](https://github.com/UzixLS/zx-midiplayer). Output via UART TX pin.
@@ -170,6 +170,20 @@ Three modes are available:
   - **Organ** — All square wave (75% duty), sustained tone with minimal decay.
   - **Music Box** — Triangle wave with fast decay and low sustain — delicate and percussive.
   - **Synth** — All saw wave with medium low-pass filter.
+- **GM.DLS Wavetable** — A fixed-point General MIDI **wavetable** synthesizer that plays a real GM sound bank, for far more realistic instruments than the procedural Software synth. No external hardware. You supply the bank (`gm_bank.bin`): pack it once on a PC, copy it to the SD card, and select this mode — the device installs the bank into a dedicated flash partition on the next boot (one-time write, ~20–30 s, LED blinks). The bank then persists across reboots and firmware updates.
+
+### GM.DLS instrument bank
+
+The GM.DLS wavetable mode needs a packed `gm_bank.bin` on the SD card — it is **not** included, you provide your own. Convert a sound bank on a PC with the bundled pure-Python tools (no dependencies), packed at the emulator's 31250 Hz rate:
+
+- DLS bank (e.g. Microsoft `gm.dls`): `python3 tools/dls_pack.py gm.dls gm_bank.bin 31250`
+- GUS / freepats patch set: `python3 tools/gus_pack.py timidity.cfg gm_bank.bin 31250`
+
+Copy the resulting `gm_bank.bin` (~1.6 MB, 8-bit µ-law) to `/gm_bank.bin` or `/.config/pico-spec/gm_bank.bin` on the SD card, then select **Audio → MIDI → GM.DLS Wavetable**. To update/reinstall, drop a new bank on SD and re-select the mode (confirm the reinstall prompt). Requires an RP2350 board with ≥ 4 MB flash.
+
+> Microsoft's `gm.dls` is copyrighted and **not redistributable** — pack your own copy for personal use, or use the freely-licensed [freepats](https://freepats.zenvoid.org/) GUS set.
+
+The GM.DLS wavetable engine and the `dls_pack` / `gus_pack` conversion tools are based on **[xrip/embedded-midi-synth](https://github.com/xrip/embedded-midi-synth)** — thanks to **[@xrip](https://github.com/xrip)**. Full details: the [MIDI wiki page](https://github.com/drewpo28/pico-spec/wiki/EN-MIDI).
 
 ### MIDI TX Pin Configuration
 
@@ -282,4 +296,5 @@ Single-target builds produce artifacts in `pico-spec/bin/`.
 
 - [Original repo](https://github.com/EremusOne/ESPectrum)
 - [Murmulator community](https://t.me/ZX_MURMULATOR)
+- [@xrip](https://github.com/xrip) — GM.DLS wavetable MIDI engine and packing tools ([embedded-midi-synth](https://github.com/xrip/embedded-midi-synth))
 

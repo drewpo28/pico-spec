@@ -48,7 +48,7 @@ option(ZIFI_NET_VERBOSE "Per-packet trace of the ZiFi net client (+IPD/chanSend)
 # Each enables stdio over the board's Debug-Probe header — see the block for pins.
 set(MURM1_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1) — moves KBD to GP16/GP17, disables NESPAD")
 set(PICO_PC_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on DBG1 header GP0/GP1 (PICO_PC)")
-set(PICO_DV_DBG_UART ON CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
+set(PICO_DV_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
 set(ZERO_DBG_UART    OFF CACHE BOOL "Enable Debug Probe UART0 on GP16/GP13 (ZERO)")
 set(ZERO2_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO2)")
 
@@ -402,6 +402,16 @@ if(NO_ALF)
     target_compile_definitions(${PROJECT_NAME} PRIVATE NO_ALF=1)
 endif()
 
+# ALF builds (RP2350 only) carry an extra ROM that pushes the firmware past the
+# top-of-flash GM.DLS wavetable partition (gm_bank, 1.625 MB) reserved in
+# rp2350-memmap.ld. Drop the partition for ALF so the whole flash is available,
+# and disable the GM.DLS wavetable feature in code (NO_GM_DLS). RP2040 has no
+# gm_bank/MIDI, so this only matters for RP2350.
+if(NOT NO_ALF AND NOT PICO_PLATFORM STREQUAL "rp2040")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NO_GM_DLS=1)
+    target_link_options(${PROJECT_NAME} PRIVATE -Wl,--defsym=__no_gm_bank=1)
+endif()
+
 IF(KBDUSB)
     add_subdirectory(drivers/ps2kbd)
     target_link_libraries(${PROJECT_NAME} PRIVATE ps2kbd)
@@ -538,6 +548,7 @@ ELSEIF(PICO_PC)
         $<$<BOOL:${PICO_PC_DBG_UART}>:PICO_DEFAULT_UART=0>
         $<$<BOOL:${PICO_PC_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=0>
         $<$<BOOL:${PICO_PC_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=1>
+        $<$<BOOL:${PICO_PC_DBG_UART}>:DBG_UART_ENABLED=1>
 
         PORT_VERSION="${PORT_VERSION}" PORT_VERSION_LEN=${PORT_VERSION_LEN}
         CPU_MHZ=${CPU_MHZ}
@@ -619,6 +630,11 @@ ELSEIF(PICO_DV)
         $<$<BOOL:${PICO_DV_DBG_UART}>:PICO_DEFAULT_UART=1>
         $<$<BOOL:${PICO_DV_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=20>
         $<$<BOOL:${PICO_DV_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=21>
+        # Console UART intentionally enabled. The board header (pico2.h) ALWAYS
+        # defines PICO_DEFAULT_UART=0 on GP0/GP1 — which is exactly the ZiFi UART
+        # on PICO_DV — so Debug::log/stdio must gate on this explicit flag, NOT on
+        # PICO_DEFAULT_UART, or logs corrupt the ESP AT stream and FTP won't start.
+        $<$<BOOL:${PICO_DV_DBG_UART}>:DBG_UART_ENABLED=1>
 
         PORT_VERSION="${PORT_VERSION}" PORT_VERSION_LEN=${PORT_VERSION_LEN}
         CPU_MHZ=${CPU_MHZ}
@@ -690,6 +706,7 @@ ELSEIF(ZERO)
         $<$<BOOL:${ZERO_DBG_UART}>:PICO_DEFAULT_UART=0>
         $<$<BOOL:${ZERO_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=16>
         $<$<BOOL:${ZERO_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=13>
+        $<$<BOOL:${ZERO_DBG_UART}>:DBG_UART_ENABLED=1>
 
         PORT_VERSION="${PORT_VERSION}" PORT_VERSION_LEN=${PORT_VERSION_LEN}
         CPU_MHZ=${CPU_MHZ}
@@ -755,6 +772,7 @@ ELSEIF(ZERO2)
         $<$<BOOL:${ZERO2_DBG_UART}>:PICO_DEFAULT_UART=1>
         $<$<BOOL:${ZERO2_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=20>
         $<$<BOOL:${ZERO2_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=21>
+        $<$<BOOL:${ZERO2_DBG_UART}>:DBG_UART_ENABLED=1>
 
         PORT_VERSION="${PORT_VERSION}" PORT_VERSION_LEN=${PORT_VERSION_LEN}
         CPU_MHZ=${CPU_MHZ}
@@ -838,6 +856,7 @@ ELSE()
         $<$<BOOL:${MURM1_DBG_UART}>:PICO_DEFAULT_UART=0>
         $<$<BOOL:${MURM1_DBG_UART}>:PICO_DEFAULT_UART_TX_PIN=0>
         $<$<BOOL:${MURM1_DBG_UART}>:PICO_DEFAULT_UART_RX_PIN=1>
+        $<$<BOOL:${MURM1_DBG_UART}>:DBG_UART_ENABLED=1>
 
         PORT_VERSION="${PORT_VERSION}" PORT_VERSION_LEN=${PORT_VERSION_LEN}
         CPU_MHZ=${CPU_MHZ}

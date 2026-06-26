@@ -1262,8 +1262,11 @@ int main() {
     #endif
 #endif
 
-#if defined(PICO_DEFAULT_UART_TX_PIN) && PICO_DEFAULT_UART_TX_PIN >= 0
-    // UART is configured (PICO_DEFAULT_UART can be 0 = UART0, so use TX pin as gate)
+#if defined(DBG_UART_ENABLED)
+    // Console UART explicitly enabled via <BOARD>_DBG_UART. We deliberately gate on
+    // DBG_UART_ENABLED, NOT on PICO_DEFAULT_UART_TX_PIN: the board header always
+    // defines a default UART (uart0/GP0-1 on pico2), which on PICO_DV is the ZiFi
+    // line — calling stdio_init_all() there would grab GP0/1 and break the NIC/FTP.
     stdio_init_all();
 #endif
 
