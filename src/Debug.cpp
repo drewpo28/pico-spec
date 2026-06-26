@@ -40,7 +40,13 @@ void Debug::led_off()
 // FIFO fills — a per-packet log flood in the ZiFi net pump then freezes the main
 // loop and breaks WiFi scan / FTP / transfers (timing-sensitive). Best-effort,
 // lossy-under-flood logging keeps the diagnostics without ever stalling.
-#ifdef PICO_DEFAULT_UART
+//
+// Gate on DBG_UART_ENABLED (set by CMake only when <BOARD>_DBG_UART is ON), NOT on
+// PICO_DEFAULT_UART: the board header always defines a default UART (uart0/GP0-1 on
+// pico2), which on PICO_DV is the ZiFi UART. Writing logs there corrupts the ESP AT
+// stream and the FTP server / WiFi fail to start. With the console UART off, logging
+// falls through to printf (no stdio driver linked → dropped, harmless).
+#if defined(DBG_UART_ENABLED) && defined(PICO_DEFAULT_UART)
 static inline bool dbg_uart_put(char c)
 {
     // Bounded wait for FIFO space. At boot the 115200 UART keeps up if we wait a
@@ -65,7 +71,7 @@ void Debug::log(const char* fmt, ...)
     if (n < 0) return;
     if (n > (int)sizeof(buf) - 1) n = sizeof(buf) - 1;
 
-#ifdef PICO_DEFAULT_UART
+#if defined(DBG_UART_ENABLED) && defined(PICO_DEFAULT_UART)
     for (int i = 0; i < n; i++) {
         if (buf[i] == '\n' && !dbg_uart_put('\r')) return; // CRLF for terminals
         if (!dbg_uart_put(buf[i])) return;                 // FIFO full → drop remainder
