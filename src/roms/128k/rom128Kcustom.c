@@ -1,6 +1,6 @@
 #include <hardware/flash.h>
 
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
 
 const unsigned char __in_flash() __aligned(4096) gb_rom_0_128k_custom[(32 << 10)] = { // 32776
 

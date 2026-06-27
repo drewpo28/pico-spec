@@ -84,7 +84,7 @@ bool Z80Ops::is1024 = false;
 bool Z80Ops::isProfi = false;
 
 void CPU::updateStatesInFrame() {
-#if !NO_ALF
+#if !PICO_RP2040
     Z80Ops::isALF = (Config::arch == "ALF");
 #endif
     // Early/Late ULA timing: Early=latetiming=0, Late=latetiming=1.
@@ -136,7 +136,7 @@ void CPU::reset() {
 
     CPU::latetiming = Config::AluTiming;
 
-#if !NO_ALF
+#if !PICO_RP2040
     Z80Ops::isALF = (Config::arch == "ALF");
 #endif
     if (Config::arch == "48K") {

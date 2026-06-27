@@ -674,6 +674,11 @@ void ESPectrum::setup() {
   Config::initHotkeys(); // fill hotkey defaults even without SD
   if (FileUtils::fsMount)
     Config::load();
+#if !PICO_RP2040
+  // Point the ALF cartridge at the built-in Elf-1 or a cart loaded into the shared
+  // flash region, per Config::alfCartBanks (set before ALF banking can run).
+  { extern void alfBindCart(); alfBindCart(); }
+#endif
   sdcard_set_led_blink(Config::sdLedBlink); // onboard LED blink on SD access
   VIDEO::loadCustomPalettes();
   Debug::log("setup: Config loaded");
@@ -700,7 +705,7 @@ void ESPectrum::setup() {
         else
           Config::romSet = Config::romSet48;
       }
-#if !NO_ALF
+#if !PICO_RP2040
       else if (Config::arch == "ALF") {
         Config::romSet = "ALF";
       }

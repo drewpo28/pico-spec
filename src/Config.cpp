@@ -46,6 +46,7 @@ bool     Config::AY48 = true;
 bool     Config::SAA1099 = false;
 uint8_t  Config::midi = 0;
 uint8_t  Config::midi_synth_preset = 0;
+string   Config::midi_bank = "";
 #endif
 uint16_t Config::cpu_mhz = CPU_MHZ;
 uint16_t Config::max_flash_freq = 66;
@@ -118,6 +119,8 @@ bool     Config::trdosFastMode = false;
 bool     Config::trdosAutoBoot = true;
 uint8_t  Config::trdosSoundLed = 0; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
 uint8_t  Config::trdosBios = 2; // Default: 5.05D
+uint8_t  Config::alfCartBanks = 0; // 0 = built-in Elf-1; >0 = loaded cart size in 16K banks
+string   Config::alfCartPath = ""; // pending cart to flash into the shared region at boot
 bool     Config::driveWP[4] = { true, true, true, true };
 #if !PICO_RP2040
 uint8_t  Config::esxdos = 0;
@@ -222,7 +225,7 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
         if (newRomSet=="") romSet = "48K"; else romSet = newRomSet;
         if (newRomSet=="") romSet48 = "48K"; else romSet48 = newRomSet;
         if (romSet48 == "48Kcs") {
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
 #if NO_SEPARATE_48K_CUSTOM
             MemESP::rom[0].assign_rom(gb_rom_0_128k_custom);
 #else
@@ -250,7 +253,7 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
             MemESP::registerOverlay(gb_rom_0_sinclair_48k, nullptr);
         }
     }
-#if !NO_ALF
+#if !PICO_RP2040
     else if (arch == "ALF") {
         const uint8_t* base = gb_rom_Alf;
         for (int i = 0; i < 64; ++i) {
@@ -263,7 +266,7 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
         if (newRomSet=="") romSet = "128K"; else romSet = newRomSet;
         if (newRomSet=="") romSet128 = "128K"; else romSet128 = newRomSet;
         if (romSet128 == "128Kcs") {
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
             MemESP::rom[0].assign_rom(gb_rom_0_128k_custom);
             MemESP::rom[1].assign_rom(gb_rom_0_128k_custom + (16 << 10)); /// 16392;
 #else
@@ -320,7 +323,7 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
         if (newRomSet=="") romSet = "128Kp"; else romSet = newRomSet;
         if (romSetPent=="") romSetPent = "128Kp"; else romSetPent = newRomSet;
         if (romSetPent == "128Kcs") {
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
             MemESP::rom[0].assign_rom(gb_rom_0_128k_custom);
             MemESP::rom[1].assign_rom(gb_rom_0_128k_custom + (16 << 10)); /// 16392;
 #else
@@ -703,6 +706,7 @@ void Config::load() {
         nvs_get_b("SAA1099", SAA1099, sts);
         nvs_get_u8("midi", midi, sts);
         nvs_get_u8("midipreset", midi_synth_preset, sts);
+        nvs_get_str("midibank", midi_bank, sts);
 #if NO_GM_DLS
         // GM.DLS wavetable (mode 4) is unavailable in ALF builds (no bank
         // partition). Demote a stale NVS value so it never activates.
@@ -832,6 +836,8 @@ void Config::load() {
             trdosSoundLed = old ? 3 : 0;
         }
         nvs_get_u8("trdosBios", trdosBios, sts);
+        nvs_get_u8("alfCartBanks", alfCartBanks, sts);
+        nvs_get_str("alfcart", alfCartPath, sts);
         for (int i = 0; i < 4; i++) {
             char k[12]; snprintf(k, sizeof(k), "drive%d.wp", i);
             nvs_get_b(k, driveWP[i], sts);
@@ -1104,6 +1110,7 @@ void Config::save() {
     nvs_set_str(buf,"SAA1099", SAA1099 ? "true" : "false");
     nvs_set_u8(buf,"midi", midi);
     nvs_set_u8(buf,"midipreset", midi_synth_preset);
+    nvs_set_str(buf,"midibank", midi_bank.c_str());
     nvs_set_u8(buf,"zifi_enabled", zifi_enabled);
     nvs_set_u8(buf,"zifi_tx_pin", zifi_tx_pin);
     nvs_set_u8(buf,"zifi_rx_pin", zifi_rx_pin);
@@ -1166,6 +1173,8 @@ void Config::save() {
     nvs_set_str(buf,"trdosAutoBoot", trdosAutoBoot ? "true" : "false");
     nvs_set_u8(buf,"trdosSoundLedMode", trdosSoundLed);
     nvs_set_u8(buf,"trdosBios", trdosBios);
+    nvs_set_u8(buf,"alfCartBanks", alfCartBanks);
+    nvs_set_str(buf,"alfcart", alfCartPath.c_str());
     for (int i = 0; i < 4; i++) {
         char k[12]; snprintf(k, sizeof(k), "drive%d.wp", i);
         nvs_set_str(buf, k, driveWP[i] ? "true" : "false");

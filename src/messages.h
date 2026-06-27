@@ -1139,6 +1139,22 @@ static const char *MSG_MIDI_BANK_OK[2] = {
     "GM wavetable bank loaded.",
     "Banco wavetable GM cargado."
 };
+// Title of the "instrument set" (.bin bank) picker, shown when SD holds >1 bank.
+static const char *MENU_MIDI_BANK_TITLE[2] = {
+    "Instrument set\n",
+    "Set de instrumentos\n"
+};
+// The GM bank and an ALF cartridge share ONE flash region (mutually exclusive). If
+// a cart is loaded when GM.DLS is selected, offer to unload it (revert to built-in
+// Elf-1; the cart file stays on SD) so the bank can be installed. Single short line.
+static const char *MSG_MIDI_ALF_CONFLICT_Q[2] = {
+    "Unload ALF cart to use GM.DLS?",
+    "Quitar cart ALF para usar GM.DLS?"
+};
+static const char *MSG_MIDI_ALF_KEPT[2] = {
+    "ALF cart kept. GM.DLS stays silent\n(both share one flash region).",
+    "Cart ALF conservado. GM.DLS sin sonido\n(comparten una region de flash)."
+};
 static const char *MSG_MIDI_BANK_MISSING[2] = {
     "No bank in flash and no gm_bank.bin\non SD. MIDI will be silent.",
     "Sin banco en flash y sin gm_bank.bin\nen SD. MIDI sin sonido."
@@ -1148,6 +1164,12 @@ static const char *MSG_MIDI_BANK_MISSING[2] = {
 static const char *MSG_MIDI_BANK_REINSTALL_Q[2] = {
     "Reinstall GM bank from SD?",
     "Reinstalar banco GM de SD?"
+};
+// Shown when a newly picked bank differs from flash: confirm the (reboot-to-)flash
+// so the user can decline and keep the current bank. Single short line.
+static const char *MSG_MIDI_BANK_INSTALL_Q[2] = {
+    "Install this bank? (reboots)",
+    "Instalar este banco? (reinicia)"
 };
 static const char *MSG_MIDI_BANK_FLASHING[2] = {
     "Restarting to install GM bank...\nBoot takes ~20-30s (LED blinks). Do\nNOT power off until it comes back.",
@@ -1292,7 +1314,7 @@ static const char *MENU_ISSUE2[2] = { "48K Issue 2\n", "48K Issue 2\n"};
 
 #define MENU_ARCH_ES "Elija modelo\n"
 
-#if NO_ALF
+#if PICO_RP2040
 #define MENU_ARCHS \
     "Spectrum 48K\t>\n"\
     "Spectrum 128K\t>\n"\
@@ -1320,27 +1342,14 @@ static const char *MENU_ARCH[2] = { MENU_ARCH_EN MENU_ARCHS, MENU_ARCH_ES MENU_A
 // RP2040 without SD/PSRAM/butter has no backing for ram[0], ram[4], ram[6] —
 // 48K boots by luck (writes to 0xC000-0xFFFF silently drop, reads from bootrom).
 // 128K/Pentagon do real paging → NULL deref → Z80 loops on junk → hang.
-#if NO_ALF
 #define MENU_ARCHS_NO_SD \
     "Spectrum 48K\t>\n"
-#else
-#define MENU_ARCHS_NO_SD \
-    "Spectrum 48K\t>\n"\
-	"ALF TV GAME\n"
-#endif
-#else
-#if NO_ALF
-#define MENU_ARCHS_NO_SD \
-    "Spectrum 48K\t>\n"\
-    "Spectrum 128K\t>\n"\
-	"Pentagon 128K\t>\n"
 #else
 #define MENU_ARCHS_NO_SD \
     "Spectrum 48K\t>\n"\
     "Spectrum 128K\t>\n"\
 	"Pentagon 128K\t>\n"\
 	"ALF TV GAME\n"
-#endif
 #endif
 static const char *MENU_ARCH_NO_SD[2] = { MENU_ARCH_EN MENU_ARCHS_NO_SD, MENU_ARCH_ES MENU_ARCHS_NO_SD };
 

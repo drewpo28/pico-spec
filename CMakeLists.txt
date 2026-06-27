@@ -66,9 +66,9 @@ set(ZERO2_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO
 if(NOT VGA_HDMI AND NOT SOFTTV AND NOT TFT AND NOT ILI9341 AND NOT TV)
     set(VGA_HDMI ON)
 endif()
-if(NOT DEFINED NO_ALF)
-    set(NO_ALF 1)
-endif()
+# ALF is always available on RP2350 (4MB) — small 256KB default cart + shared flash
+# region — but excluded on flash-constrained 2MB RP2040 builds via the SDK's
+# PICO_RP2040 macro directly in the source guards (no separate define needed).
 
 set(CPU_MHZ 378)
 set (PORT_VERSION "1.2.24")
@@ -393,24 +393,16 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 #        NO_SEPARATE_48K_CUSTOM=1
 #        NO_SPAIN_ROM_48k=1
 #        NO_SPAIN_ROM_128k=1
-        CARTRIDGE_AS_CUSTOM=1
-        NO_ALF=1
 )
 ENDIF()
 
-if(NO_ALF)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE NO_ALF=1)
-endif()
-
-# ALF builds (RP2350 only) carry an extra ROM that pushes the firmware past the
-# top-of-flash GM.DLS wavetable partition (gm_bank, 1.625 MB) reserved in
-# rp2350-memmap.ld. Drop the partition for ALF so the whole flash is available,
-# and disable the GM.DLS wavetable feature in code (NO_GM_DLS). RP2040 has no
-# gm_bank/MIDI, so this only matters for RP2350.
-if(NOT NO_ALF AND NOT PICO_PLATFORM STREQUAL "rp2040")
-    target_compile_definitions(${PROJECT_NAME} PRIVATE NO_GM_DLS=1)
-    target_link_options(${PROJECT_NAME} PRIVATE -Wl,--defsym=__no_gm_bank=1)
-endif()
+# ALF is now a standard runtime machine (256KB default cart "Elf-1" in flash; bigger
+# cartridges load into the shared flash region from SD/Web). CARTRIDGE_AS_CUSTOM is
+# gone — custom ROMs use their own dedicated slots. ALF is excluded on 2MB RP2040
+# builds via the PICO_RP2040 macro in the source guards.
+# ALF no longer carries a 1.6MB cartridge in the image, so the GM.DLS gm_bank
+# partition stays available alongside ALF on RP2350 (they share the region at
+# runtime — one occupant at a time; see SharedFlash/RomManager).
 
 IF(KBDUSB)
     add_subdirectory(drivers/ps2kbd)
@@ -960,8 +952,10 @@ ENDIF()
 
 SET(BUILD_NAME "${BUILD_NAME}-${PORT_VERSION}")
 
-IF (NOT NO_ALF)
-    SET(BUILD_NAME "${BUILD_NAME}-ALF")
+# ALF is now a standard runtime machine on RP2350 (not a separate build), so no
+# "-ALF" suffix. The 2MB RP2040 builds exclude ALF (no room).
+IF (FLASH_SIZE_GREEN)
+    SET(BUILD_NAME "${BUILD_NAME}-noALF")
 ENDIF()
 
 IF(m1p2launcher)

@@ -22,6 +22,8 @@
 #include "FileUtils.h"           // fopen2/fclose2, FIL, f_read, f_size
 #include "Config.h"              // Config::midi
 #include "Debug.h"
+#include <string>
+#include <vector>
 
 // The bank lives in a fixed flash partition at the top of flash (NOLOAD region in
 // rp2350-memmap.ld — not in the UF2), provisioned once from SD and read directly
@@ -124,23 +126,36 @@ void MidiSynth::init() {
     bindFromFlash();          // use the flash copy if present; never writes here
 }
 
-// Open gm_bank.bin on SD and validate its header. Returns the open FIL* (caller
-// fcloses) + size/header on success, or nullptr.
+// Open one candidate path and validate its GMWB v5 header. Returns the open FIL*
+// (caller fcloses) + size/header on success, or nullptr.
+static FIL* tryOpenBank(const char* path, size_t* outSize, gm_bank_header_t* outHdr) {
+    FIL* f = fopen2(path, FA_READ);
+    if (!f) return nullptr;
+    size_t size = (size_t)f_size(f);
+    UINT br = 0;
+    if (size >= sizeof(*outHdr) && size <= bankRegionSize() &&
+        f_read(f, outHdr, sizeof(*outHdr), &br) == FR_OK && br == sizeof(*outHdr) &&
+        outHdr->magic[0] == 'G' && outHdr->magic[1] == 'M' &&
+        outHdr->magic[2] == 'W' && outHdr->magic[3] == 'B' &&
+        outHdr->version == GM_BANK_VERSION) {
+        *outSize = size;
+        return f;
+    }
+    fclose2(f);
+    return nullptr;
+}
+
+// Open the GM wavetable bank on SD and validate its header. Prefers the user-chosen
+// bank (Config::midi_bank, set by the OSD picker) and falls back to the default
+// gm_bank.bin locations. Returns the open FIL* (caller fcloses) + size/header.
 static FIL* openValidSdBank(size_t* outSize, gm_bank_header_t* outHdr) {
+    if (!Config::midi_bank.empty()) {
+        FIL* f = tryOpenBank(Config::midi_bank.c_str(), outSize, outHdr);
+        if (f) return f;                        // chosen bank still present & valid
+    }
     for (size_t i = 0; i < sizeof(kBankPaths) / sizeof(kBankPaths[0]); i++) {
-        FIL* f = fopen2(kBankPaths[i], FA_READ);
-        if (!f) continue;
-        size_t size = (size_t)f_size(f);
-        UINT br = 0;
-        if (size >= sizeof(*outHdr) && size <= bankRegionSize() &&
-            f_read(f, outHdr, sizeof(*outHdr), &br) == FR_OK && br == sizeof(*outHdr) &&
-            outHdr->magic[0] == 'G' && outHdr->magic[1] == 'M' &&
-            outHdr->magic[2] == 'W' && outHdr->magic[3] == 'B' &&
-            outHdr->version == GM_BANK_VERSION) {
-            *outSize = size;
-            return f;
-        }
-        fclose2(f);
+        FIL* f = tryOpenBank(kBankPaths[i], outSize, outHdr);
+        if (f) return f;
     }
     return nullptr;
 }
@@ -165,6 +180,13 @@ bool MidiSynth::needsProvision() {
 // LED blinks, no display yet). Commit-last so an interrupted write stays safe.
 void MidiSynth::provisionAtBoot() {
     if (Config::midi != 4) return;              // only when GM.DLS mode is selected
+#if !PICO_RP2040
+    // The shared flash region currently holds an ALF cartridge — do NOT overwrite it
+    // with the gm_bank. GM.DLS and a loaded cartridge are mutually exclusive; unload
+    // the cart (alfCartBanks=0) to use GM.DLS. bindFromFlash() below also fails (no
+    // GMWB header in the region), so GM.DLS stays silently off.
+    if (Config::alfCartBanks > 0) return;
+#endif
     // "Reinstall" sets this magic then reboots → force a rewrite even if the flash
     // header matches SD (the only way to recover a valid-header-but-broken body).
     bool force = (watchdog_hw->scratch[MIDI_REFLASH_SCRATCH] == MIDI_REFLASH_MAGIC);
@@ -211,6 +233,76 @@ void MidiSynth::provisionAtBoot() {
     xip_cache_invalidate_all();
     Debug::log2SD("MidiSynth: provisioned %u KB to flash", (unsigned)(size >> 10));
     bindFromFlash();
+}
+
+#if !PICO_RP2040
+// EARLY-BOOT: flash a pending ALF cartridge (Config::alfCartPath) into the shared
+// flash region (same region as gm_bank — mutually exclusive). Runs single-core,
+// before core1/video, so flashWriteSector needs no multicore_lockout (a large
+// synchronous flash from the OSD with lockout deadlocks the HDMI ISR — that was the
+// "hang"). Streams 4KB sectors from SD; only a 4KB buffer of RAM. Clears the pending
+// path when done (alfCartBanks>0 marks the loaded cart for alfBindCart()).
+void alfCartProvisionAtBoot() {
+    if (Config::alfCartPath.empty()) return;
+    FIL* f = fopen2(Config::alfCartPath.c_str(), FA_READ);
+    if (!f) { Debug::log("ALF cart: open failed %s", Config::alfCartPath.c_str());
+              Config::alfCartPath = ""; Config::save(); return; }
+    size_t size = (size_t)f_size(f);
+    if (size == 0 || size > bankRegionSize()) { fclose2(f); Config::alfCartPath = ""; Config::save(); return; }
+    uint8_t* buf = (uint8_t*)malloc(FLASH_SECTOR_SIZE);
+    if (!buf) { fclose2(f); Debug::log("ALF cart: OOM"); return; }
+    uint32_t base = (uint32_t)((uintptr_t)__gm_bank_start - XIP_BASE);
+    size_t done = 0; UINT br = 0; bool ok = true;
+    while (done < size) {
+        UINT want = (UINT)((size - done > FLASH_SECTOR_SIZE) ? FLASH_SECTOR_SIZE : (size - done));
+        memset(buf, 0xFF, FLASH_SECTOR_SIZE);                 // pad tail sector
+        if (f_read(f, buf, want, &br) != FR_OK || br != want) { ok = false; break; }
+        flashWriteSector(base + done, buf);
+        done += want;
+    }
+    free(buf); fclose2(f);
+    xip_cache_invalidate_all();
+    Config::alfCartPath = ""; Config::save();                 // consumed
+    Debug::log("ALF cart: %sflashed %u KB to shared region", ok ? "" : "PARTIAL ", (unsigned)(size >> 10));
+}
+#endif
+
+// Scan the SD for selectable GM wavetable banks: any *.bin in CONFIG_DIR or the
+// card root that carries a valid GMWB v5 header. Fills `paths` (full path, used as
+// Config::midi_bank) and `names` (basename, shown in the OSD picker), index-aligned.
+// Bounded (heap-light; RP2350-only path). Returns the count found.
+size_t MidiSynth::scanBanks(std::vector<std::string>& paths,
+                            std::vector<std::string>& names) {
+    paths.clear();
+    names.clear();
+    static const char* kScanDirs[] = { CONFIG_DIR, "/" };
+    const size_t kMaxBanks = 24;
+    for (size_t d = 0; d < sizeof(kScanDirs) / sizeof(kScanDirs[0]); d++) {
+        DIR dir;
+        if (f_opendir(&dir, kScanDirs[d]) != FR_OK) continue;
+        FILINFO fno;
+        while (paths.size() < kMaxBanks &&
+               f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != '\0') {
+            if (fno.fattrib & AM_DIR) continue;
+            const char* nm = fno.fname;
+            size_t len = strlen(nm);
+            if (len < 4 || strcasecmp(nm + len - 4, ".bin") != 0) continue;
+            bool isRoot = (kScanDirs[d][0] == '/' && kScanDirs[d][1] == '\0');
+            std::string full = isRoot ? (std::string("/") + nm)
+                                      : (std::string(kScanDirs[d]) + "/" + nm);
+            bool dup = false;                       // same path already listed
+            for (auto& p : paths) if (p == full) { dup = true; break; }
+            if (dup) continue;
+            size_t size; gm_bank_header_t hdr;
+            FIL* f = tryOpenBank(full.c_str(), &size, &hdr);
+            if (!f) continue;
+            fclose2(f);
+            paths.push_back(full);
+            names.push_back(nm);
+        }
+        f_closedir(&dir);
+    }
+    return paths.size();
 }
 
 // True if a valid gm_bank.bin is present on SD (used to gate the "reinstall" offer

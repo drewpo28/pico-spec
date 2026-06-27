@@ -1338,6 +1338,10 @@ int main() {
     // BEFORE core1/video starts (no HDMI ISR, no multicore_lockout, no freeze).
     // No-op unless GM.DLS MIDI is selected and the SD bank differs from flash.
     MidiSynth::provisionAtBoot();
+#if !PICO_RP2040
+    // Flash a pending ALF cartridge into the shared region (same safe window).
+    { extern void alfCartProvisionAtBoot(); alfCartProvisionAtBoot(); }
+#endif
 #endif
 
 #if USE_NESPAD

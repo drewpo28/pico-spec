@@ -3,6 +3,8 @@
 #if !PICO_RP2040
 
 #include <inttypes.h>
+#include <string>
+#include <vector>
 
 // MIDI wavetable synth facade.
 //
@@ -32,6 +34,11 @@ public:
     static bool needsProvision();
     // True if a valid gm_bank.bin exists on SD (gates the "reinstall" offer).
     static bool sdBankAvailable();
+    // Enumerate selectable banks on SD (*.bin with a valid GMWB v5 header) in
+    // CONFIG_DIR + card root. Fills index-aligned full paths + display names;
+    // returns the count. Used by the OSD "instrument set" picker.
+    static size_t scanBanks(std::vector<std::string>& paths,
+                            std::vector<std::string>& names);
     // Force re-provision next boot: invalidate the flash header (1-sector erase).
     // Caller must reboot afterwards. Recovers a broken/partial flash bank.
     static void requestReflash();

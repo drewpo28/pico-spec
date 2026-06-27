@@ -215,6 +215,12 @@ public:
 
     static bool updateFirmware(FIL *firmware);
     static bool updateROM(const string& file, uint8_t arch);
+#if !PICO_RP2040
+    // Defer-flash an ALF cartridge from `fname` into the shared region and reboot
+    // into ALF (does NOT return on success). Used by the F5 browser, the Update menu
+    // and the Web-Archive download launcher.
+    static bool loadAlfCart(const string& fname);
+#endif
 
     static char stats_lin1[25]; // "CPU: 00000 / IDL: 00000 ";
     static char stats_lin2[25]; // "FPS:000.00 / FND:000.00 ";

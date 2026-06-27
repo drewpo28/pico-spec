@@ -2343,6 +2343,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     }
                 }
 #if !PICO_RP2040
+                else if (ext == "rom" || ext == "bin") {
+                    // ALF cartridge — defer-flash into the shared region and boot ALF.
+                    loadAlfCart(fname);   // reboots on success
+                }
+#endif
+#if !PICO_RP2040
                 else if (ext == "mmc" || ext == "hdf") {
                     // DivMMC/DivIDE image — Enter loads into hd0 (slot 0); F5 opens
                     // the slot popup which mounts in-place and keeps the popup open.
@@ -4125,24 +4131,85 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     // here, where core1/HDMI would freeze. So any flash
                                     // write is triggered by REBOOT; the boot path does it.
                                     if (Config::midi == 4) {
-                                        if (MidiSynth::needsProvision()) {
-                                            // missing / changed bank -> reboot to install
-                                            osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
-                                            OSD::esp_hard_reset();
-                                        } else if (MidiSynth::bankReady()) {
-                                            // already loaded — offer reinstall (recovers a
-                                            // broken/partial bank). Only when SD has a bank,
-                                            // so we never wipe flash with nothing to restore.
-                                            if (MidiSynth::sdBankAvailable() &&
-                                                OSD::msgDialog("GM.DLS Wavetable",
-                                                               MSG_MIDI_BANK_REINSTALL_Q[Config::lang]) == DLG_YES) {
-                                                MidiSynth::requestReflash();   // invalidate header
-                                                osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
-                                                OSD::esp_hard_reset();         // boot rewrites from SD
+                                        // The GM bank and an ALF cartridge share ONE flash region.
+                                        // While a cart is loaded, provisionAtBoot() bails and the
+                                        // bank can never be installed -> GM.DLS is silent. Offer to
+                                        // unload the cart (revert to built-in Elf-1; the cart file
+                                        // stays on SD) so the boot provisioner can write the bank.
+                                        bool alfBlocked = false;
+                                        if (Config::alfCartBanks > 0) {
+                                            if (OSD::msgDialog("GM.DLS Wavetable",
+                                                    MSG_MIDI_ALF_CONFLICT_Q[Config::lang]) == DLG_YES) {
+                                                Config::alfCartBanks = 0;   // revert to built-in ROM
+                                                Config::alfCartPath  = "";  // no pending cart to re-flash
+                                                Config::save();             // needsProvision() now true -> reboot installs bank
+                                            } else {
+                                                osdCenteredMsg(MSG_MIDI_ALF_KEPT[Config::lang], LEVEL_WARN, 3000);
+                                                alfBlocked = true;
                                             }
-                                            osdCenteredMsg(MSG_MIDI_BANK_OK[Config::lang], LEVEL_OK, 2000);
-                                        } else {
-                                            osdCenteredMsg(MSG_MIDI_BANK_MISSING[Config::lang], LEVEL_WARN, 3000);
+                                        }
+                                        if (!alfBlocked) {
+                                            // Let the user pick which instrument set (.bin bank) to use
+                                            // when SD holds more than one. The choice is applied to
+                                            // Config::midi_bank only TENTATIVELY: it is committed (saved)
+                                            // only if the user confirms the flash below, and reverted to
+                                            // `prevBank` otherwise — so declining never changes the bank
+                                            // (and never triggers a flash on the next boot).
+                                            std::vector<std::string> bankPaths, bankNames;
+                                            size_t nBanks = MidiSynth::scanBanks(bankPaths, bankNames);
+                                            string prevBank = Config::midi_bank;
+                                            if (nBanks > 1) {
+                                                menu_level = 3;
+                                                menu_curopt = 1;
+                                                menu_saverect = true;
+                                                string bankMenu = MENU_MIDI_BANK_TITLE[Config::lang];
+                                                for (size_t b = 0; b < nBanks; b++) {
+                                                    bool cur = (Config::midi_bank == bankPaths[b]);
+                                                    bankMenu += string(cur ? "[*] " : "[ ] ") + bankNames[b] + "\n";
+                                                }
+                                                uint8_t optB = menuRun(bankMenu);
+                                                menu_level = 2;
+                                                menu_curopt = opt2;
+                                                menu_saverect = false;
+                                                VIDEO::SaveRect.restore_last();
+                                                if (optB && optB <= nBanks)
+                                                    Config::midi_bank = bankPaths[optB - 1];   // tentative
+                                            } else if (nBanks == 1) {
+                                                // exactly one set on SD -> use it (even if not named
+                                                // gm_bank.bin) so the default-path fallback can't miss it
+                                                Config::midi_bank = bankPaths[0];              // tentative
+                                            }
+
+                                            bool haveSd = MidiSynth::sdBankAvailable();
+                                            if (MidiSynth::needsProvision()) {
+                                                // picked bank differs from / missing in flash -> CONFIRM the
+                                                // flash so the user can decline (keeps the current bank).
+                                                if (haveSd &&
+                                                    OSD::msgDialog("GM.DLS Wavetable",
+                                                                   MSG_MIDI_BANK_INSTALL_Q[Config::lang]) == DLG_YES) {
+                                                    Config::save();   // commit the choice only on confirm
+                                                    osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
+                                                    OSD::esp_hard_reset();
+                                                } else {
+                                                    Config::midi_bank = prevBank;   // declined -> revert, no flash
+                                                }
+                                            } else if (MidiSynth::bankReady()) {
+                                                // picked bank already resident in flash. Persist a (same-as-
+                                                // flash) switch, then offer reinstall (recovers a broken/
+                                                // partial bank). Both the switch and reinstall are declinable.
+                                                if (Config::midi_bank != prevBank) Config::save();
+                                                if (haveSd &&
+                                                    OSD::msgDialog("GM.DLS Wavetable",
+                                                                   MSG_MIDI_BANK_REINSTALL_Q[Config::lang]) == DLG_YES) {
+                                                    MidiSynth::requestReflash();   // invalidate header
+                                                    osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
+                                                    OSD::esp_hard_reset();         // boot rewrites from SD
+                                                }
+                                                osdCenteredMsg(MSG_MIDI_BANK_OK[Config::lang], LEVEL_OK, 2000);
+                                            } else {
+                                                Config::midi_bank = prevBank;   // nothing usable -> revert
+                                                osdCenteredMsg(MSG_MIDI_BANK_MISSING[Config::lang], LEVEL_WARN, 3000);
+                                            }
                                         }
                                     }
                                     menu_curopt = opt2;
@@ -5275,7 +5342,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                             }
                         }
-#if !NO_ALF
+#if !PICO_RP2040
                         else if (arch_num == 9 || (ext_ram && !show_profi && arch_num == 8) || !ext_ram) { // ALF TV GAME (shifts to 8 when Profi hidden)
                             arch = "ALF";
                             romset = "ALF1";
@@ -5292,8 +5359,28 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #endif
 
                         if (opt2) {
-                            if (arch != Config::arch || romset != Config::romSet) {
 #if !PICO_RP2040
+                            // Leaving ALF for another machine. loadAlfCart() pinned
+                            // pref_arch="ALF" so the cart machine survives the flash-reboot; that
+                            // pin also makes setup() force ALF back at every boot and blocks the
+                            // menu from committing a new Config::arch (it only does so when
+                            // pref_arch=="Last"). Detect the switch-away here, BEFORE the
+                            // "did anything change?" gate below — because ALF entered via this
+                            // menu (the early branch) runs requestMachine() without writing
+                            // Config::arch, so arch==Config::arch can look unchanged and the gate
+                            // would skip the un-pin + save, leaving pref_arch="ALF" → F12 = ALF.
+                            bool leavingAlf = (arch != "ALF" &&
+                                (Config::pref_arch == "ALF" || Config::alfCartBanks > 0));
+#else
+                            bool leavingAlf = false;
+#endif
+                            if (arch != Config::arch || romset != Config::romSet || leavingAlf) {
+#if !PICO_RP2040
+                                if (leavingAlf) {
+                                    if (Config::pref_arch == "ALF") Config::pref_arch = "Last";
+                                    Config::alfCartBanks = 0;   // unload cart (built-in Elf-1 ROM)
+                                    Config::alfCartPath  = "";  // frees the shared GM-bank flash region
+                                }
                                 // Entering Profi needs ~96 KB SRAM on butter-less boards.
                                 // Gate it: the popup frees room (Gigascreen/ZiFi/DivMMC
                                 // auto-handled by the code below; offers GS) or refuses. A freeing
@@ -6415,14 +6502,25 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     //close_all()
                                     reset_usb_boot(0, 0);
                                     while(1);
-                                } else {
+                                }
+                                else {
                                     string mFile = fileDialog(FileUtils::ROM_Path, MENU_ROM_TITLE[Config::lang], DISK_ROMFILE, 26, 15);
                                     if (mFile != "") {
                                         mFile.erase(0, 1);
                                         string fname = FileUtils::ROM_Path + mFile;
-                                        bool res = updateROM(fname, opt2 - 1);
-                                        if (res) {
-                                            return;
+                                        // ALF cartridges (and ROMs) ship zipped (zxbyte.org) — extract
+                                        // the .rom/.bin inside before flashing.
+                                        if (FileUtils::getLCaseExt(fname) == "zip") {
+                                            string zf = ZipExtract::extract(fname, DISK_ROMFILE);
+                                            if (zf.empty()) { OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN); fname.clear(); }
+                                            else if (zf != "\x1b") fname = zf;
+                                            else fname.clear();
+                                        }
+                                        if (!fname.empty()) {
+                                            bool res = updateROM(fname, opt2 - 1);
+                                            if (res) {
+                                                return;
+                                            }
                                         }
                                     }
                                     menu_curopt = 1;
@@ -10536,6 +10634,10 @@ void OSD::HIDDevices() {
     VIDEO::SaveRect.restore_last();
 }
 
+#if !PICO_RP2040
+extern "C" uint8_t __gm_bank_start[];   // shared flash region (RP2350) — ALF cart load target
+#endif
+
 static void __not_in_flash_func(flash_block)(const uint8_t* buffer, size_t flash_target_offset) {
     // ensure it is required to write block (may be, it is already the same)
     for (size_t i = 0; i < 512; ++i) {
@@ -10561,6 +10663,27 @@ flash_it:
     #endif
 }
 
+#if !PICO_RP2040
+bool OSD::loadAlfCart(const string& fname) {
+    FIL* f = fopen2(fname.c_str(), FA_READ);
+    if (!f) { OSD::osdCenteredMsg(OSD_NOROMFILE_ERR[Config::lang], LEVEL_WARN, 2000); return false; }
+    size_t size = (size_t)f_size(f);
+    fclose2(f);
+    if (size == 0 || size > (1ul << 20)) {
+        OSD::osdCenteredMsg("Unsupported file (by size)", LEVEL_WARN, 2000);
+        return false;
+    }
+    // Deferred: a large synchronous flash with multicore_lockout deadlocks the HDMI
+    // ISR. Record the path + reboot; the early-boot provisioner flashes it.
+    Config::alfCartBanks = (uint8_t)((size + (16ul << 10) - 1) >> 14);   // ceil to 16K banks
+    Config::alfCartPath  = fname;
+    Config::arch = "ALF"; Config::romSet = "ALF"; Config::pref_arch = "ALF";
+    Config::save();
+    OSD::esp_hard_reset();   // boot provisioner flashes the cart, then runs ALF
+    return true;
+}
+#endif
+
 bool OSD::updateROM(const string& fname, uint8_t arch) {
     FIL* f = fopen2(fname.c_str(), FA_READ);
     if (!f) {
@@ -10573,7 +10696,7 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
     string dlgTitle = OSD_ROM[Config::lang];
     // Flash custom ROM 48K
     if ( arch == 1 ) {
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
         if( bytesfirmware > 0x4000 ) {
             osdCenteredMsg("Too long file", LEVEL_WARN, 2000);
             fclose2(f);
@@ -10603,7 +10726,7 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
     }
     // Flash custom ROM 128K
     else if ( arch == 2 ) {
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
         if( bytesfirmware > 0x8000 ) {
             osdCenteredMsg("Unsupported file (by size)", LEVEL_WARN, 2000);
             fclose2(f);
@@ -10638,7 +10761,7 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
         Config::pref_romSet_128 = "128Kcs";
     }
     else if ( arch == 3 ) {
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
         if( bytesfirmware > 0x8000 ) {
             osdCenteredMsg("Unsupported file (by size)", LEVEL_WARN, 2000);
             fclose2(f);
@@ -10672,7 +10795,7 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
         Config::pref_arch = "Pentagon";
         Config::pref_romSetPent = "128Kcs";
     }
-#if !NO_ALF
+#if !PICO_RP2040
     else if ( arch == 4 ) {
         if( bytesfirmware > (256ul << 10) ) {
             osdCenteredMsg("Unsupported file (by size)", LEVEL_WARN, 2000);
@@ -10687,17 +10810,14 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
         Config::pref_arch = "ALF";
     }
     else if ( arch == 5 ) {
-        if( (size_t)((bytesfirmware >> 10) & 0xFFFFFFFF) > (1ul << 10) ) {
-            char b[40];
-            snprintf(b, 40, "Unsupported file (by size: %d KB)", (size_t)((bytesfirmware >> 10) & 0xFFFFFFFF));
-            osdCenteredMsg(b, LEVEL_WARN, 2000);
-            fclose2(f);
-            return false;
-        }
-        rom = gb_rom_Alf_cart;
-        max_rom_size = 1ul << 20;
-        dlgTitle += " ALF Cartridge ";
-        Config::arch = "ALF";
+        // Load an ALF cartridge (up to 1MB) into the SHARED flash region (gm_bank
+        // region), displacing the GM.DLS bank (mutually exclusive). DEFERRED to boot:
+        // a large synchronous flash with multicore_lockout deadlocks the HDMI ISR
+        // (this used to "hang" mid-flash). We record the path + reboot; the early-boot
+        // provisioner (single core, no lockout) flashes it. The built-in Elf-1 stays
+        // intact; set alfCartBanks=0 to revert to it.
+        fclose2(f);
+        return loadAlfCart(fname);   // defer-flash + reboot into ALF
     }
 #endif
     else if ( arch == 6 ) {
@@ -10728,7 +10848,7 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
         // Custom Pentagon ROM: the factory Pentagon is now a 101-byte overlay over the
         // Sinclair 128K base (no 32K blob), so a user ROM flashes into the shared 128K
         // custom slot and the machine switches to the "128Kcs" romset.
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
         rom = gb_rom_0_128k_custom;
 #else
         rom = gb_rom_Alf_cart;
@@ -10747,7 +10867,7 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
             fclose2(f);
             return false;
         }
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
         rom = gb_rom_0_128k_custom;
 #else
         rom = gb_rom_Alf_cart;

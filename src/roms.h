@@ -49,7 +49,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "romGluk.h"
 #include "roms/romSTS75.h"
 
-#ifndef NO_ALF
+#if !PICO_RP2040
 extern "C" const unsigned char gb_rom_Alf_cart[];
 extern "C" const unsigned char gb_rom_Alf[];
 extern "C" const unsigned char gb_rom_Alf_ep[];

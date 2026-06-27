@@ -246,6 +246,25 @@ IRAM_ATTR static void FDDStep_MB02(bool force) {
 
 uint8_t nes_pad2_for_alf(void);
 static uint8_t newAlfBit = 0;
+#if !PICO_RP2040
+// Active ALF cartridge: g_alf_cart points at the built-in 256KB "Elf-1" by default,
+// or at the shared flash region when a cartridge was loaded there. alf_cart_banks is
+// its size in 16K banks; banks beyond it map to gb_rom_Alf_ep (open bus).
+extern "C" uint8_t __gm_bank_start[];   // shared flash region (RP2350 top-of-flash)
+const uint8_t* g_alf_cart = gb_rom_Alf_cart;
+int alf_cart_banks = 16;
+// Bind g_alf_cart/alf_cart_banks from Config (call at boot after Config::load and
+// whenever a cartridge is loaded/unloaded).
+void alfBindCart() {
+    if (Config::alfCartBanks > 0) {
+        g_alf_cart = (const uint8_t*)__gm_bank_start;
+        alf_cart_banks = Config::alfCartBanks;
+    } else {
+        g_alf_cart = gb_rom_Alf_cart;
+        alf_cart_banks = 16;
+    }
+}
+#endif
 static uint8_t profi_fdc_busy = 0;
 // Profi CP/M: detect DSKKE9A "CALL 0x40EA → JR 0x40D9" re-issue loop.
 // When drive has no disk, successive OUT(0x1F) commands are issued at CPU
@@ -424,7 +443,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
                  address, Z80::getRegPC(), Ports::portEFF7, RTC::dbgSel());
 #endif
 #endif
-#ifndef NO_ALF
+#if !PICO_RP2040
     if (ia && bitRead(p8, 7) == 0) {
       if (bitRead(p8, 1) == 0) { // 1D
         MemESP::newSRAM = true;
@@ -1173,16 +1192,19 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
 #endif
 
   bool ia = Z80Ops::isALF;
-#ifndef NO_ALF
+#if !PICO_RP2040
   if (ia) {
     if (a8 == 0xFE) {
       newAlfBit = (data >> 3) & 1;
     }
     if (bitRead(address, 7) == 0 &&
         (address & 1) == 1) { // ALF ROM selector A7=0, A0=1
-      const uint8_t *base = bitRead(data, 7) ? gb_rom_Alf_cart : gb_rom_Alf;
+      const uint8_t *base = bitRead(data, 7) ? g_alf_cart : gb_rom_Alf;
       if (MemESP::ramCurrent[0] != base) { /// TODO: ensure
-        int border_page = base == gb_rom_Alf ? 16 : 64;
+        // System ROM (gb_rom_Alf) is 256KB=16 banks; cartridge (g_alf_cart) is the
+        // built-in Elf-1 (16 banks) or a loaded cart in the shared region
+        // (alf_cart_banks). Banks beyond the cart map to gb_rom_Alf_ep (open bus).
+        int border_page = (base == gb_rom_Alf) ? 16 : alf_cart_banks;
         for (int i = 0; i < 64; ++i) {
           MemESP::rom[i].assign_rom(i >= border_page ? gb_rom_Alf_ep
                                                      : base + ((16 * i) << 10));

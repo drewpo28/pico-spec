@@ -1807,6 +1807,11 @@ static bool rfd_launch_tmp(string path) {
         OSD::bootTrdos();              // cold-boot into TR-DOS so the disk auto-runs
         return true;
     }
+#if !PICO_RP2040
+    if (ext == "rom" || ext == "bin") {
+        return OSD::loadAlfCart(path); // ALF cartridge — defer-flash + reboot into ALF
+    }
+#endif
     OSD::osdCenteredMsg(string(MSG_NET_UNSUPPORTED[Config::lang]) + " (." + ext + ")",
                         LEVEL_WARN, 2200);
     return false;
