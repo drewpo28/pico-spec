@@ -826,7 +826,8 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         Debug::log("[FLOAT-IN] addr=%04X ts=%u ia=%d", address, CPU::tstates, (int)ia);
 #endif
       data = getFloatBusData();
-      if ((!Z80Ops::is48) && !Z80Ops::isALF && ((address & 0x8002) == 0)) {
+      if ((!Z80Ops::is48) && ((address & 0x8002) == 0) &&
+          (!Z80Ops::isALF || (address & 0x0080))) { // ALF: #7FFD reflect, A7=1 only
         LED::touchR(LED::RAM);
         // //  Solo en el modelo 128K, pero no en los +2/+2A/+3, si se lee el
         // puerto
@@ -1841,10 +1842,14 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   }
   // 128K, Pentagon
   // ==================================================================
-  // ALF excluded: it shares the 128K codepath in CPU.cpp but uses port #5F
-  // for banking, not #7FFD. Letting #7FFD writes through here corrupts
-  // videoLatch/pagingLock and produces a black screen on ALF.
-  if ((!Z80Ops::is48) && !Z80Ops::isALF && ((address & 0x8002) == 0)) { // 8002 !-> 7FFD
+  // ALF shares the 128K codepath but uses port #5F (A7=0, A0=1) for its ROM-bank
+  // latch, handled earlier and returned. #7FFD RAM paging (A7=1) does not collide
+  // with that, and 128K-only cart games need it (else they abort with "requires
+  // 128K RAM"). The cart ROM in page0 is preserved: romInUse is gated by !ia below,
+  // so recoverPage0() keeps it. Require A7=1 for ALF so the loose #7FFD decode
+  // (which ignores A7) can't catch the A7=0 port region used by ALF peripherals.
+  if ((!Z80Ops::is48) && ((address & 0x8002) == 0) &&
+      (!Z80Ops::isALF || (address & 0x0080))) { // 8002 !-> 7FFD
     ++Ports::port7ffd_cnt;
     LED::touchW(LED::RAM);
 #if PROFI_PORT_TRACE
