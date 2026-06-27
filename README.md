@@ -23,8 +23,9 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 
 - ZX Spectrum 48K, 128K, Pentagon 128k/512k/1024k, Profi 1024K, Byte and ALF TV Game. 100% cycle accurate emulation.
 - State of the art Z80 emulation (Authored by [José Luis Sánchez](https://github.com/jsanchezv/z80cpp))
-- Selectable Sinclair 48K, Sinclair 128K and Amstrad +2 english and spanish ROMs. Byte and ALF TV Game - russian ROMs, + Pentagons with Gluck services ROMs & TR-DOS 5.05D ROM. Profi 1024K ROM set (Service / TR-DOS / 128K / 48K).
+- Selectable Sinclair 48K, Sinclair 128K and Amstrad +2 english and spanish ROMs. Byte and ALF TV Game - russian ROMs, + Pentagons with Gluck services ROMs & selectable TR-DOS ROM (5.03 / 5.04TM / 5.05D / custom). Profi 1024K ROM set (Service / TR-DOS / 128K / 48K).
 - Possibility of using custom ROM with easy flashing procedure from SD card.
+- ALF TV Game cartridge loading: load any ALF cartridge (up to 1 MB) from the SD card into a dedicated flash region and boot it (RP2350 only).
 - ZX81+ IF2 ROM by courtesy Paul Farrow with .P file loading from SD card.
 - Timex SCLD video modes emulation (hi-res 512->256 OR-merge, hi-color, dual-screen).
 - Pentagon 16-color video mode (Pentagon only): per-pixel 16-color attribute mode toggleable from the OSD Video menu.
@@ -68,7 +69,7 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - ZiFi WiFi network interface via an ESP-01S module (stock Espressif AT firmware — no reflash): network access for ZX-Spectrum software (e.g. the MRF terminal), plus an MC146818 RTC (Pentagon "Mr Gluk" TimeKeeper) with SNTP time sync over WiFi (RP2350 only).
 - Unified F5 file browser with a location chooser (RP2350, when WiFi is configured): **Local (SD)**, **Remote (FTP/SFTP)**, **Web Archives** and **Add Remote** — all rendered in the same "Open File" window. **Enter** quick-starts a file (downloads to RAM and runs/mounts), **F5** saves it to a chosen SD folder; `..`/Backspace go up a level, Esc closes. Per-source listing cache (with manual F2 refresh) and remembered cursor/last location.
 - Network file transfer (FTP / SFTP / SSH client): saved connections with optional alias and start path (passwords optionally stored, masked entry; TAB reveals); browse / download / upload / copy (recursive) / delete; SSH/SFTP crypto (curve25519, AES-CTR, HMAC-SHA256) runs on the RP2350 via mbedTLS; SFTP host-key trust-on-first-use; selectable ESP-01S UART baud up to 921600 (RP2350 only). See the [Network wiki page](https://github.com/drewpo28/pico-spec/wiki/EN-Network).
-- Web Archives: browse and download ZX disk/tape images from online catalogs (Virtual TR-DOS, Spectrum Computing, ZX-Art) over HTTPS straight to SD or RAM. Serverless GitHub-Pages catalog, on-device TLS, Cyrillic titles rendered (RP2350 only).
+- Web Archives: browse and download ZX disk/tape images and ALF cartridges from online catalogs (Virtual TR-DOS, Spectrum Computing, ZX-Art, ALF) over HTTPS straight to SD or RAM. Serverless GitHub-Pages catalog, on-device TLS, Cyrillic titles rendered (RP2350 only).
 - FTP server: share the SD card over the LAN (anonymous, active mode) from the Network menu (RP2350 only).
 - Realtime (with OSD) TZX, TAP and PZX file loading.
 - Flashload of TZX/TAP/PZX files (standard loaders only).
@@ -85,8 +86,9 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - Overclock menu: CPU frequency (RP2350: 252/378/504 MHz; RP2040: 252/378 MHz), Flash frequency (33–166 MHz), PSRAM frequency (66–166 MHz), VReg voltage (RP2350: 1.15–1.80 V).
 - Complete file navigation system with autoindexing, folder support and search functions.
 - Complete OSD menu in two languages: English & Spanish.
-- On-screen LED indicators: real-time overlay showing FDD activity, SD card, IDE/HDD, MIDI TX, tape, and other port-driven hardware states.
+- On-screen LED indicators: real-time overlay showing FDD activity, SD card, IDE/HDD, MIDI TX, tape, network (ZiFi TX/RX), and other port-driven hardware states.
 - Volume boost: configurable audio amplification (0–64) in the Audio menu.
+- Factory reset: hold R at boot to wipe all settings and restore defaults (with confirmation prompt).
 - BMP screen capture to SD Card (thanks David Crespo 😉).
 
 ## Byte Emulation Details (https://zxbyte.org/)
@@ -123,8 +125,7 @@ Default hotkey bindings (all hotkeys except F1 and ALT+F1 are reconfigurable via
 - ALT+F2 Turbo mode
 - ALT+F5 Debug
 - ALT+F6 Disk menu
-- ALT+F7 Breakpoint list
-- ALT+F8 Jump to address
+- ALT+F8 Toggle LED indicators
 - ALT+F9 Input poke
 - ALT+F10 NMI (Pentagon: modal menu with NMI / Magic Button options)
 - ALT+F11 Reset to... (modal menu: Service/Gluk/Service ROM, TR-DOS, 128K, 48K — depends on machine; Profi has its own Service ROM / TR-DOS / 128K / 48K set)
@@ -179,7 +180,7 @@ The GM.DLS wavetable mode needs a packed `gm_bank.bin` on the SD card — it is 
 - DLS bank (e.g. Microsoft `gm.dls`): `python3 tools/dls_pack.py gm.dls gm_bank.bin 31250`
 - GUS / freepats patch set: `python3 tools/gus_pack.py timidity.cfg gm_bank.bin 31250`
 
-Copy the resulting `gm_bank.bin` (~1.6 MB, 8-bit µ-law) to `/gm_bank.bin` or `/.config/pico-spec/gm_bank.bin` on the SD card, then select **Audio → MIDI → GM.DLS Wavetable**. To update/reinstall, drop a new bank on SD and re-select the mode (confirm the reinstall prompt). Requires an RP2350 board with ≥ 4 MB flash.
+Copy the resulting `gm_bank.bin` (~1.6 MB, 8-bit µ-law) to `/gm_bank.bin` or `/.config/pico-spec/gm_bank.bin` on the SD card, then select **Audio → MIDI → GM.DLS Wavetable**. To update/reinstall, drop a new bank on SD and re-select the mode (confirm the reinstall prompt). When the SD card holds more than one bank, an **Instrument set** picker lets you choose which one to install. Requires an RP2350 board with ≥ 4 MB flash.
 
 > Microsoft's `gm.dls` is copyrighted and **not redistributable** — pack your own copy for personal use, or use the freely-licensed [freepats](https://freepats.zenvoid.org/) GUS set.
 
