@@ -329,6 +329,7 @@ void MidiSynth::deinit() {
     bank_ready = false;       // bank stays in flash (persistent); just stop using it
     midi_status = midi_data_pos = midi_expected = 0;
     g_gate = 0;
+    midi_wt_unbind();         // release the ~5 KB voice array (lazy; back to .bss-free)
 }
 
 void MidiSynth::reset() {

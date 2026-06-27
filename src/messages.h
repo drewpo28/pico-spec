@@ -207,6 +207,13 @@ static const char *OSD_DLG_JOYDISCARD[2] = { OSD_DLG_JOYDISCARD_EN, OSD_DLG_JOYD
 #define OSD_DLG_SETJOYMAPDEFAULTS_ES "\xA8" "Cargar mapeo por defecto?"
 static const char *OSD_DLG_SETJOYMAPDEFAULTS[2] = { OSD_DLG_SETJOYMAPDEFAULTS_EN, OSD_DLG_SETJOYMAPDEFAULTS_ES};
 
+// Factory reset: hold R at boot → confirm → wipe storage.nvs → reboot to defaults.
+static const char *MSG_FACTORY_RESET_TITLE[2] = { "Factory reset", "Reset de fabrica" };
+static const char *MSG_FACTORY_RESET_Q[2] = {
+    "Reset all settings to defaults?",
+    "Restablecer todos los ajustes?"
+};
+
 #define OSD_FIRMW_EN "Updating firmware"
 #define OSD_FIRMW_ES "Actualizando firmware"
 static const char *OSD_FIRMW[2] = { OSD_FIRMW_EN,OSD_FIRMW_ES};

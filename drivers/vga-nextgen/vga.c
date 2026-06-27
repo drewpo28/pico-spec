@@ -81,16 +81,19 @@ static uint16_t palette16_mask = 0;
 
 // VGA8 dithered palette LUT: /42 checkerboard dithering (7 levels per channel, 343 colors)
 // [0][i] = even scanline pixel pair,  [1][i] = odd scanline pixel pair
-static uint16_t palette_vga16[2][256] = { 0 };
+// pico-spec: these VGA-only tables (~4 KB total) are lazily heap-allocated and only
+// exist when VGA is the active output (SELECT_VGA). On HDMI boots they stay NULL —
+// the setters below no-op — so the SRAM isn't reserved. See vga_alloc_buffers().
+static uint16_t (*palette_vga16)[256] = (uint16_t (*)[256]) 0;
 
 // Scanline dimmed palette: dithered at reduced brightness for scanline effect.
 // Rebuilt from vga_color888[] whenever the scanline level changes.
-static uint16_t palette_vga16_scanline[256] = { 0 };
+static uint16_t *palette_vga16_scanline = (uint16_t *) 0;
 // Original RGB888 per palette index + whether it was set via the solid path.
 // Cached so the dimmed palette can be rebuilt on a brightness-level change
 // without re-walking the whole palette from the emulator side.
-static uint32_t vga_color888[256] = { 0 };
-static bool     vga_color_solid[256] = { 0 };
+static uint32_t *vga_color888 = (uint32_t *) 0;
+static bool     *vga_color_solid = (bool *) 0;
 
 // Profi DS80 packed-pair palette: slot byte → uint16_t with two distinct VGA pixels.
 // Built by vga_set_profi_ds80_mode(); slot comes from profi_pair_lookup[p0][p1].
@@ -99,8 +102,30 @@ static bool     vga_color_solid[256] = { 0 };
 // Profi DS80 is RP2350-only; the 1 KB palette is excluded on RP2040 to save RAM
 // (heap is ~5 KB after the framebuffer there).
 #if !PICO_RP2040
-static uint16_t palette_vga_ds80[2][256] = { { 0 } };
+static uint16_t (*palette_vga_ds80)[256] = (uint16_t (*)[256]) 0;  // pico-spec: lazy (see above)
 #endif
+
+// Allocate the VGA-only palette tables on first use (VGA active only). Idempotent.
+// Keeps ~4 KB out of .bss on HDMI boots, where these are never touched.
+static void vga_alloc_buffers(void) {
+    if (vga_color888) return;                                   // already allocated
+    palette_vga16          = (uint16_t (*)[256]) calloc(2 * 256, sizeof(uint16_t));
+    palette_vga16_scanline = (uint16_t *)        calloc(256,     sizeof(uint16_t));
+    vga_color888           = (uint32_t *)        calloc(256,     sizeof(uint32_t));
+    vga_color_solid        = (bool *)            calloc(256,     sizeof(bool));
+#if !PICO_RP2040
+    palette_vga_ds80       = (uint16_t (*)[256]) calloc(2 * 256, sizeof(uint16_t));
+#endif
+}
+
+// True once the VGA tables exist. On HDMI (SELECT_VGA false) returns false so the
+// palette setters become no-ops; on VGA it allocates lazily on first call.
+static inline bool vga_buffers_ready(void) {
+    if (vga_color888) return true;
+    if (!SELECT_VGA) return false;
+    vga_alloc_buffers();
+    return vga_color888 != (uint32_t *) 0;
+}
 // Unified DS80-active flag: set by both vga_set_profi_ds80_mode and hdmi_set_profi_ds80_mode.
 // Kept on all platforms (1 byte) — stays false on RP2040.
 volatile bool profi_ds80_active = false;
@@ -319,6 +344,7 @@ void graphics_set_mode(enum graphics_mode_t mode) {
         graphics_mode = mode;
         return;
     }
+    vga_alloc_buffers();   // VGA active — the palette-mask loop below needs the tables
     text_buffer_width = 80;
     text_buffer_height = 30;
 ///    memset(graphics_buffer, 0, graphics_buffer_height * graphics_buffer_width);
@@ -435,6 +461,7 @@ void graphics_set_mode(enum graphics_mode_t mode) {
 }
 
 void vga_reinit() {
+    vga_alloc_buffers();   // VGA is the active output here — ensure the palette tables exist
     // Update VGA sync parameters, horizontal layout, and PIO pixel clock from current video_mode.
     // 50Hz modes use vga_pixel_clk override (lower clock + smaller v_total) so
     // monitors detect the signal as 640x480@50, not PAL 720x576@50.
@@ -543,6 +570,7 @@ static uint32_t dim_rgb888(uint32_t color888) {
 
 // Recompute the dimmed scanline pixel for a single index from its cached color.
 static void vga_build_scanline_entry(uint8_t i) {
+    if (!vga_color888) return;                 // VGA tables not allocated (HDMI active)
     uint32_t dim = dim_rgb888(vga_color888[i]);
     if (vga_color_solid[i]) {
         uint8_t r2 = ((dim >> 16) & 0xff) / 85;
@@ -558,6 +586,7 @@ static void vga_build_scanline_entry(uint8_t i) {
 
 // Update a single VGA palette LUT entry with Bayer dithering
 void vga_set_palette_entry(uint8_t i, uint32_t color888) {
+    if (!vga_buffers_ready()) return;          // HDMI active → VGA tables unused
     vga_rgb888_dither(color888, &palette_vga16[0][i], &palette_vga16[1][i]);
     vga_color888[i] = color888;
     vga_color_solid[i] = false;
@@ -568,6 +597,7 @@ void vga_set_palette_entry(uint8_t i, uint32_t color888) {
 // Update a VGA palette entry WITHOUT dithering (both palettes get identical solid color)
 // Use for the 16 standard Spectrum colors to avoid visible dithering artifacts
 void vga_set_palette_entry_solid(uint8_t i, uint32_t color888) {
+    if (!vga_buffers_ready()) return;          // HDMI active → VGA tables unused
     uint8_t r2 = ((color888 >> 16) & 0xff) / 85;
     uint8_t g2 = ((color888 >> 8) & 0xff) / 85;
     uint8_t b2 = (color888 & 0xff) / 85;
@@ -598,7 +628,7 @@ void vga_set_profi_ds80_mode(bool active,
     (void)active; (void)palette16_rgb888; (void)pair_lut;
     profi_ds80_active = false;
 #else
-    if (active && palette16_rgb888 && pair_lut) {
+    if (active && palette16_rgb888 && pair_lut && vga_buffers_ready()) {
         // Dithered VGA pixel values for each of 16 Profi colors.
         uint8_t vga_even_left[16];   // even scan-line, left  pixel (even screen x)
         uint8_t vga_even_right[16];  // even scan-line, right pixel (odd screen x)
@@ -658,6 +688,7 @@ void graphics_set_palette(const uint8_t i, const uint32_t color888) {
 #endif
 
 void vga_set_scanlines(uint8_t level) {
+    if (!vga_buffers_ready()) return;          // HDMI active → VGA tables unused
     if (level > 4) level = 4;
     vga_scanlines = (level != 0);
     // Off keeps the previous brightness so toggling back is cheap; only a real

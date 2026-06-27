@@ -2170,6 +2170,38 @@ void ESPectrum::loop() {
       }
   }
 
+  // Factory reset: hold R at boot -> confirm -> wipe storage.nvs -> reboot to
+  // defaults. Pump the keyboard at FULL SPEED here, BEFORE the emulation for(;;)
+  // starts: once it runs, a thrashing machine (Profi DS80 on SPI-PSRAM, ~4 FPS)
+  // pumps tuh_task too rarely for USB to even enumerate, so a per-frame check inside
+  // the loop never saw the key. ~1.5 s gives USB time to enumerate; we break as soon
+  // as R is seen (held). R reads as VK_R or VK_r depending on CAPSLOCK — test both.
+  {
+      extern void repeat_me_for_input();
+      auto Kbd = PS2Controller.keyboard();
+      uint32_t fr_t0 = time_us_32();
+      bool rHeld = false;
+      Debug::log("factory-reset: probing for held R (~1.5s)");
+      while ((uint32_t)(time_us_32() - fr_t0) < 1500000) {
+          repeat_me_for_input();   // pump USB (tuh_task) + PS/2 at full speed
+          if (Kbd && (Kbd->isVKDown(fabgl::VK_R) || Kbd->isVKDown(fabgl::VK_r))) { rHeld = true; break; }
+          sleep_ms(2);
+      }
+      if (rHeld) {
+          Debug::log("factory-reset: R held -> confirm");
+          if (OSD::msgDialog(MSG_FACTORY_RESET_TITLE[Config::lang],
+                             MSG_FACTORY_RESET_Q[Config::lang]) == DLG_YES) {
+              bool ok = false;
+              if (FileUtils::fsMount) ok = (f_unlink(STORAGE_NVS) == FR_OK);
+              Debug::log("factory-reset: unlink %s -> reboot", ok ? "OK" : "FAIL");
+              OSD::esp_hard_reset();   // never returns; Config::load() then uses defaults
+          }
+          Debug::log("factory-reset: declined");
+      } else {
+          Debug::log("factory-reset: no R (continue)");
+      }
+  }
+
 #if !PICO_RP2040
   // Profi DS80 (hires) on SPI-PSRAM-only boards (no fast butter/QSPI-XIP PSRAM)
   // loads slowly through the slow SPI bus.  When DS80 mode turns on we want a

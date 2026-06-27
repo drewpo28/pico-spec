@@ -198,8 +198,10 @@ bool SaaSubsys::apply() {
 }
 
 // ----------------------------------------------------------------------------
-// MidiSubsys — software MIDI synth + 2x640 B L/R sample buffers.
-// Voices (~600 B static) stay in .bss — too small to be worth dynamizing.
+// MidiSubsys — MIDI synth + 2x640 B L/R sample buffers.
+// GM.DLS (mode 4) additionally heap-allocates its ~5 KB wavetable voice array on
+// bind (MidiSynth::init → midi_wt_bind) and frees it on MidiSynth::deinit, so it
+// is never reserved in .bss when MIDI is off / not in GM.DLS mode. See FEAT_MIDI.
 // ----------------------------------------------------------------------------
 volatile bool MidiSubsys::enabled = false;
 bool MidiSubsys::wanted = false;
@@ -405,6 +407,7 @@ size_t featureCost(FeatureId f) {
         // popup (and freeing GS yields comfortable headroom) rather than a false DENY.
         case FEAT_PROFI:         return spi ? 64 * 1024 : 0;
         case FEAT_ZIFI:          return 12 * 1024;   // in/out rings + rx_buf
+        case FEAT_MIDI:          return 7 * 1024;    // GM.DLS: ~5K voice array + 2x ~640B L/R buffers
         default:                 return 0;
     }
 }
@@ -416,6 +419,7 @@ bool featureEnabled(FeatureId f) {
         case FEAT_DIVMMC:        return Config::esxdos != 0;
         case FEAT_PROFI:         return Config::arch == "Profi";
         case FEAT_ZIFI:          return Config::zifi_enabled != 0;
+        case FEAT_MIDI:          return Config::midi == 4;   // GM.DLS wavetable (the RAM-heavy mode)
         default:                 return false;
     }
 }
@@ -428,6 +432,7 @@ const char* featureName(FeatureId f) {
         case FEAT_DIVMMC:        return "DivMMC";
         case FEAT_PROFI:         return "Profi";
         case FEAT_ZIFI:          return "ZiFi";
+        case FEAT_MIDI:          return "MIDI (GM.DLS)";
         default:                 return "?";
     }
 }
@@ -447,9 +452,24 @@ void featureSetEnabled(FeatureId f, bool on) {
             break;
         case FEAT_PROFI:
             if (on) Config::requestMachine("Profi", ""); // disable handled by switching arch elsewhere
+            else {
+                // Budget candidate: free Profi's ~64 KB SRAM by leaving it for Pentagon
+                // (the default machine). Caller saves Config + reboots; setup() then
+                // re-lays out memory without the Profi forced-SRAM pages.
+                Config::arch   = "Pentagon";
+                Config::romSet = !Config::romSetPent.empty() ? Config::romSetPent : "128Kp";
+                if (Config::pref_arch == "Profi") Config::pref_arch = "Last";
+                Config::betadisk = true;   // Pentagon mandates TR-DOS
+            }
             break;
         case FEAT_ZIFI:
             Config::zifi_enabled = on ? 1 : 0;
+            break;
+        case FEAT_MIDI:
+            // Budget candidate: only ever turned OFF here (freed to make room).
+            // Enabling MIDI happens from its own menu. Caller reboots afterwards.
+            if (!on) Config::midi = 0;
+            else if (Config::midi != 4) Config::midi = 4;
             break;
         default: break;
     }
@@ -458,7 +478,11 @@ void featureSetEnabled(FeatureId f, bool on) {
 // Features that enabling F already turns off on its own — they're freed "for free"
 // (added back into freeNow) and must NOT appear in the popup's candidate list.
 static uint32_t autoDisabledMask(FeatureId f) {
-    if (f == FEAT_PROFI) return (1u << FEAT_GIGASCREEN) | (1u << FEAT_ZIFI) | (1u << FEAT_DIVMMC);
+    // Entering Profi auto-disables these (OSDMain arch-switch) — credited as freed
+    // and excluded from the manual free-list popup. FEAT_MIDI: GM.DLS is turned off
+    // on Profi entry on butter-less boards (g_voices + Profi SRAM don't fit).
+    if (f == FEAT_PROFI) return (1u << FEAT_GIGASCREEN) | (1u << FEAT_ZIFI)
+                              | (1u << FEAT_DIVMMC) | (1u << FEAT_MIDI);
     return 0;
 }
 
@@ -504,7 +528,10 @@ BudgetResult budgetCheck(FeatureId enabling, FeatureId* candidates, int* nCand, 
     for (int i = 0; i < FEAT_COUNT; i++) {
         FeatureId c = (FeatureId)i;
         if (c == enabling) continue;
-        if (c == FEAT_PROFI) continue;           // Profi only ever an *enabling* feature, never a candidate
+        // Profi may be offered as a candidate to free (switch to Pentagon) when
+        // enabling something else on a tight board — on m1p2 Profi it's often the
+        // only block big enough to fit e.g. GM.DLS MIDI. (It can never be a candidate
+        // for enabling itself — the c==enabling check above already handles that.)
         if (autoMask & (1u << i)) continue;      // already auto-freed above
         if (!featureEnabled(c)) continue;
         candidates[(*nCand)++] = c;

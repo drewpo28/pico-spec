@@ -343,9 +343,18 @@ bool OSD::featureBudgetGate(int featureId) {
         return false;
     }
 
-    // BUDGET_NEEDS_FREE: multi-select popup of the freeable features.
+    // BUDGET_NEEDS_FREE: multi-select popup of the freeable features. Run it as a
+    // CHILD dialog (menu_level+1) so it uses its own prev_y slot — at the caller's
+    // level its menu_saverect draw would overwrite prev_y[level] with the popup's
+    // (lower) Y, and the parent menu's next saverect=false redraw (y=prev_y[level])
+    // would then draw shifted down, compounding each cycle.
+    int savedMenuLevel = menu_level;
+    if (menu_level < 4) menu_level++;
     bool sel[FEAT_COUNT] = { false };
     menu_saverect = true;
+    menu_curopt = 1;   // start focus at row 1 — the caller's menu_curopt (e.g. 5 for
+                       // GM.DLS, the 5th MIDI row) would be out of range for this small
+                       // popup → "Unknown menu row" + corrupted geometry/SaveRect → hang.
     bool result = false;
     while (1) {
         size_t freed = 0;
@@ -387,6 +396,11 @@ bool OSD::featureBudgetGate(int featureId) {
         esp_hard_reset();   // never returns
         result = true; break;
     }
+    // NOTE: do NOT restore_last() here — menuRun() already pops the popup's saved rect
+    // on its Esc/back path (OSDMenu.cpp, is_back → SaveRect.restore_last when level!=0).
+    // A manual restore here is a double-pop → SaveRect stack underflow → shifted menus
+    // and eventually a wild-pointer SIGBUS.
+    menu_level = savedMenuLevel;   // restore parent level (popup ran one level deeper)
     menu_saverect = false;
     return result;
 }
@@ -4077,8 +4091,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         else if (options_num == 7) {
                             menu_level = 2;
                             menu_curopt = 1;
-                            menu_saverect = true;
-                            while (1) {
+                            bool midiFirstDraw = true;   // save the rect only on the first draw;
+                            while (1) {                  // redraws (after gate/submenu) must NOT re-save → no duplicate menu
+                                menu_level = 2;
                                 string midi_menu = MENU_MIDI[Config::lang];
                                 uint8_t prev_midi = Config::midi;
                                 midi_menu.replace(midi_menu.find("[O",0),2, prev_midi == 0 ? "[*" : "[ ");
@@ -4086,8 +4101,23 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 midi_menu.replace(midi_menu.find("[S",0),2, prev_midi == 2 ? "[*" : "[ ");
                                 midi_menu.replace(midi_menu.find("[W",0),2, prev_midi == 3 ? "[*" : "[ ");
                                 midi_menu.replace(midi_menu.find("[G",0),2, prev_midi == 4 ? "[*" : "[ ");
+                                menu_saverect = midiFirstDraw;
                                 uint8_t opt2 = menuRun(midi_menu);
+                                midiFirstDraw = false;
                                 if (opt2 >= 1 && opt2 <= 5) {
+#if !PICO_RP2040
+                                    // GM.DLS (mode 4) is the RAM-heavy MIDI engine: gate it through
+                                    // the SRAM budget manager so a tight machine (Profi/m1p2) offers
+                                    // heavy features to free — including Profi itself (→ Pentagon) —
+                                    // instead of OOMing at allocation time. ALLOW → true (fits as-is);
+                                    // user frees + applies → reboots (never returns); decline → false.
+                                    if ((opt2 - 1) == 4 && Config::midi != 4 &&
+                                        !OSD::featureBudgetGate(Subsystems::FEAT_MIDI)) {
+                                        menu_curopt = opt2;
+                                        menu_saverect = false;
+                                        continue;   // declined / not enough — leave MIDI unchanged
+                                    }
+#endif
                                     Config::midi = opt2 - 1;
                                     if (Config::midi != prev_midi) {
                                         Midi::enabled = prev_midi;
@@ -5351,6 +5381,21 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             Config::romSet = romset;
                             click();
                             if (VIDEO::OSD) OSD::drawStats(); // Redraw stats for 16:9 modes
+#if !PICO_RP2040
+                            // Leaving Profi's forced-SRAM layout (no butter PSRAM) MUST reboot:
+                            // ESPectrum::reset() does NOT free the ~96 KB Profi pages + DS80
+                            // framebuffer (only setup() re-lays out memory), so a soft reset
+                            // here leaves them allocated and ALF OOMs (SPI-PSRAM thrash → panic).
+                            // Persist arch=ALF so the reboot lands on ALF, not the old Profi arch.
+                            if (butter_psram_size() == 0 &&
+                                MemESP::ram[56].memType() == mem_type_t::POINTER) {
+                                Config::arch = "ALF";
+                                if (Config::pref_arch == "Profi") Config::pref_arch = "Last";
+                                Config::save();
+                                OSD::esp_hard_reset();   // never returns; setup() re-lays out for ALF
+                                return;
+                            }
+#endif
                             Config::save();
                             Config::requestMachine(arch, romset);
                             ESPectrum::reset();
@@ -5480,6 +5525,19 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::esxdos = 0;
                                     DivMMC::init();   // teardown path frees buffers
                                     OSD::osdCenteredMsg("DivMMC disabled", LEVEL_WARN, 1500);
+                                }
+                                // Switching into Profi on a butter-less board: GM.DLS MIDI
+                                // (g_voices ~5 KB + L/R buffers, re-allocated at boot) plus
+                                // Profi's ~96 KB forced-SRAM pages + DS80 FB don't fit → boot
+                                // OOMs. Turn GM.DLS off (budgetCheck credits this — FEAT_MIDI in
+                                // autoDisabledMask(FEAT_PROFI)). Butter boards keep MIDI (Profi
+                                // costs 0 SRAM there).
+                                if (Config::arch == "Profi" && Config::midi == 4 &&
+                                    butter_psram_size() == 0) {
+                                    Config::midi = 0;
+                                    Midi::enabled = 0;
+                                    Midi::deinit();
+                                    OSD::osdCenteredMsg("GM.DLS MIDI disabled", LEVEL_WARN, 1500);
                                 }
 #endif
                                 Config::save();

@@ -68,7 +68,10 @@ static uint8_t hdmi_scanline_buf[400];
 static alignas(4096) uint32_t conv_color[1240];
 // Snapshot of the standard palette taken at DS80-enable time. Used to restore
 // conv_color back to the doubled-pixel mode when DS80 turns off.
-static uint32_t conv_color_std_snapshot[1240];
+// pico-spec: lazily heap-allocated (~5 KB) — kept out of .bss while DS80 is off
+// (the common case: boot/Service ROM/std screen). Allocated on DS80 enable, freed
+// on DS80 disable. Cold path (DS80 toggle only), no alignment requirement.
+static uint32_t *conv_color_std_snapshot = (uint32_t *) 0;
 static bool conv_color_std_snapshot_valid = false;
 // map64colors removed — frame buffer now stores direct 8-bit palette indices
 
@@ -1019,6 +1022,12 @@ void hdmi_set_profi_ds80_mode(bool active,
     if (active) {
         // Snapshot only on first activation, not on refresh
         if (!profi_ds80_active) {
+            // Lazily allocate the ~5 KB snapshot now (freed again on DS80 disable).
+            // If it fails, refuse to enter DS80 (stay in std mode) rather than crash
+            // or leave no way to restore — degraded but safe.
+            if (!conv_color_std_snapshot)
+                conv_color_std_snapshot = (uint32_t *) malloc(1240 * sizeof(uint32_t));
+            if (!conv_color_std_snapshot) return;
             for (int i = 0; i < 1240; i++) conv_color_std_snapshot[i] = conv_color[i];
             conv_color_std_snapshot_valid = true;
         }
@@ -1081,7 +1090,7 @@ void hdmi_set_profi_ds80_mode(bool active,
         __dmb(); // ensure all conv_color writes are visible to core1 before flag is set
         profi_ds80_active = true;
     } else {
-        if (conv_color_std_snapshot_valid) {
+        if (conv_color_std_snapshot_valid && conv_color_std_snapshot) {
             for (int i = 0; i < 1240; i++) {
 #if !PICO_RP2040
                 // With audio live, the core1 ISR owns the DI slots: data sets are
@@ -1097,6 +1106,10 @@ void hdmi_set_profi_ds80_mode(bool active,
             }
         }
         profi_ds80_active = false;
+        // Release the ~5 KB snapshot while DS80 is off (re-taken on next enable).
+        free(conv_color_std_snapshot);
+        conv_color_std_snapshot = (uint32_t *) 0;
+        conv_color_std_snapshot_valid = false;
     }
 }
 

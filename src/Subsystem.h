@@ -26,7 +26,7 @@ namespace Subsystems {
     // fit, OSD::featureBudgetGate() pops up the currently-enabled heavy features to
     // turn off (user picks → Config + reboot). Costs are a static table (board-aware);
     // getFreeHeap() is only the live baseline. Keep >=SRAM_MARGIN free.
-    enum FeatureId { FEAT_GIGASCREEN, FEAT_GENERAL_SOUND, FEAT_DIVMMC, FEAT_PROFI, FEAT_ZIFI, FEAT_COUNT };
+    enum FeatureId { FEAT_GIGASCREEN, FEAT_GENERAL_SOUND, FEAT_DIVMMC, FEAT_PROFI, FEAT_ZIFI, FEAT_MIDI, FEAT_COUNT };
 
     static constexpr size_t SRAM_MARGIN = 10 * 1024;  // keep this much SRAM free
 
