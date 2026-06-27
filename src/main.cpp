@@ -1333,16 +1333,10 @@ int main() {
     Debug::log("main: after ESPectrum::setup()");
     Debug::log2SD("main: after ESPectrum::setup()");
 
-#if !PICO_RP2040
-    // Install the GM.DLS wavetable bank from SD into flash here — single core,
-    // BEFORE core1/video starts (no HDMI ISR, no multicore_lockout, no freeze).
-    // No-op unless GM.DLS MIDI is selected and the SD bank differs from flash.
-    MidiSynth::provisionAtBoot();
-#if !PICO_RP2040
-    // Flash a pending ALF cartridge into the shared region (same safe window).
-    { extern void alfCartProvisionAtBoot(); alfCartProvisionAtBoot(); }
-#endif
-#endif
+    // NOTE: GM.DLS bank + pending ALF cartridge flash provisioning now runs inside
+    // ESPectrum::setup(), right after Config::load() and BEFORE VIDEO::Init(). It must
+    // precede VIDEO::Init() or the live HDMI engine stalls the QMI bus during the flash
+    // erase (XIP-PSRAM goes away with XIP-flash) and hangs the board. See ESPectrum.cpp.
 
 #if USE_NESPAD
     // Bring up the NES gamepad now that Config is loaded — unless ZiFi (RP2350)

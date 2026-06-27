@@ -10727,10 +10727,13 @@ bool OSD::loadAlfCart(const string& fname) {
     if (!f) { OSD::osdCenteredMsg(OSD_NOROMFILE_ERR[Config::lang], LEVEL_WARN, 2000); return false; }
     size_t size = (size_t)f_size(f);
     fclose2(f);
-    if (size == 0 || size > (1ul << 20)) {
+    if (size == 0) {
         OSD::osdCenteredMsg("Unsupported file (by size)", LEVEL_WARN, 2000);
         return false;
     }
+    // Some distributions append a small text footer (e.g. "filename=.../size=.../crc32=...")
+    // after the 1MB cart image. Clamp to 1MB and flash only the cart data, ignoring the tail.
+    if (size > (1ul << 20)) size = (1ul << 20);
     // Deferred: a large synchronous flash with multicore_lockout deadlocks the HDMI
     // ISR. Record the path + reboot; the early-boot provisioner flashes it.
     Config::alfCartBanks = (uint8_t)((size + (16ul << 10) - 1) >> 14);   // ceil to 16K banks

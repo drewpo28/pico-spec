@@ -665,6 +665,17 @@ void ESPectrum::setup() {
   if (FileUtils::fsMount)
     Config::load();
 #if !PICO_RP2040
+  // EARLY-BOOT flash provisioning MUST run here — after SD mount + Config::load but
+  // BEFORE VIDEO::Init(). flash_range_erase/program disables XIP for the whole QMI
+  // (flash CS0 *and* PSRAM CS1); once VIDEO::Init() has started the HDMI engine its
+  // DMA streams the framebuffer out of XIP-PSRAM, so erasing flash with the engine
+  // live stalls the QMI bus and hangs the board. VGA's framebuffer path doesn't hit
+  // XIP the same way, which is why this only froze on HDMI. (It was previously run
+  // from main() after setup() returned — i.e. after VIDEO::Init — which was the bug.)
+  if (FileUtils::fsMount) {
+    MidiSynth::provisionAtBoot();                                  // GM.DLS bank (no-op unless selected)
+    { extern void alfCartProvisionAtBoot(); alfCartProvisionAtBoot(); } // pending ALF cartridge
+  }
   // Point the ALF cartridge at the built-in Elf-1 or a cart loaded into the shared
   // flash region, per Config::alfCartBanks (set before ALF banking can run).
   { extern void alfBindCart(); alfBindCart(); }
