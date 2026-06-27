@@ -5379,6 +5379,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             menu_curopt = opt2;
                             menu_saverect = false;
                             Config::romSet = romset;
+                            // GM.DLS wavetable shares the cart's flash region — turn it off on
+                            // entering ALF (see loadAlfCart). Re-select GM.DLS later to reload it.
+                            if (Config::midi == 4) Config::midi = 0;
                             click();
                             if (VIDEO::OSD) OSD::drawStats(); // Redraw stats for 16:9 modes
 #if !PICO_RP2040
@@ -10739,6 +10742,12 @@ bool OSD::loadAlfCart(const string& fname) {
     Config::alfCartBanks = (uint8_t)((size + (16ul << 10) - 1) >> 14);   // ceil to 16K banks
     Config::alfCartPath  = fname;
     Config::arch = "ALF"; Config::romSet = "ALF"; Config::pref_arch = "ALF";
+    // GM.DLS wavetable shares ONE flash region with the ALF cart (mutually exclusive).
+    // Turn it off when a cart takes the region so leaving ALF later doesn't silently
+    // auto-reflash the bank on a plain reset — the user re-selects GM.DLS in the menu
+    // when wanted, which reloads the instruments then. (Applies to F5/Enter cart loads
+    // and the Web Archive path, which all funnel through here.)
+    if (Config::midi == 4) Config::midi = 0;
     Config::save();
     OSD::esp_hard_reset();   // boot provisioner flashes the cart, then runs ALF
     return true;
