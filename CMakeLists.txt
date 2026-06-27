@@ -955,7 +955,7 @@ SET(BUILD_NAME "${BUILD_NAME}-${PORT_VERSION}")
 # ALF is now a standard runtime machine on RP2350 (not a separate build), so no
 # "-ALF" suffix. The 2MB RP2040 builds exclude ALF (no room).
 IF (FLASH_SIZE_GREEN)
-    SET(BUILD_NAME "${BUILD_NAME}-noALF")
+    SET(BUILD_NAME "${BUILD_NAME}")
 ENDIF()
 
 IF(m1p2launcher)
