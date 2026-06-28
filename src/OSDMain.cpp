@@ -51,6 +51,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Debug.h"
 #include "Snapshot.h"
 #include "MemESP.h"
+#include "AlfCart.h"
 #include "Buffer.h"
 #include "Tape.h"
 #include "LEDIndicators.h"
@@ -2358,8 +2359,8 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 }
 #if !PICO_RP2040
                 else if (ext == "rom" || ext == "bin") {
-                    // ALF cartridge — defer-flash into the shared region and boot ALF.
-                    loadAlfCart(fname);   // reboots on success
+                    // ALF cartridge — lazy-mount from SD (no flash) and switch into ALF in place.
+                    if (loadAlfCart(fname)) return;   // clean exit into the running machine
                 }
 #endif
 #if !PICO_RP2040
@@ -4161,24 +4162,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     // here, where core1/HDMI would freeze. So any flash
                                     // write is triggered by REBOOT; the boot path does it.
                                     if (Config::midi == 4) {
-                                        // The GM bank and an ALF cartridge share ONE flash region.
-                                        // While a cart is loaded, provisionAtBoot() bails and the
-                                        // bank can never be installed -> GM.DLS is silent. Offer to
-                                        // unload the cart (revert to built-in Elf-1; the cart file
-                                        // stays on SD) so the boot provisioner can write the bank.
-                                        bool alfBlocked = false;
-                                        if (Config::alfCartBanks > 0) {
-                                            if (OSD::msgDialog("GM.DLS Wavetable",
-                                                    MSG_MIDI_ALF_CONFLICT_Q[Config::lang]) == DLG_YES) {
-                                                Config::alfCartBanks = 0;   // revert to built-in ROM
-                                                Config::alfCartPath  = "";  // no pending cart to re-flash
-                                                Config::save();             // needsProvision() now true -> reboot installs bank
-                                            } else {
-                                                osdCenteredMsg(MSG_MIDI_ALF_KEPT[Config::lang], LEVEL_WARN, 3000);
-                                                alfBlocked = true;
-                                            }
-                                        }
-                                        if (!alfBlocked) {
+                                        // ALF cartridges stream from SD (AlfCart) and no longer occupy
+                                        // this flash region, so GM.DLS and a loaded cart coexist — no
+                                        // unload prompt needed.
+                                        {
                                             // Let the user pick which instrument set (.bin bank) to use
                                             // when SD holds more than one. The choice is applied to
                                             // Config::midi_bank only TENTATIVELY: it is committed (saved)
@@ -5379,9 +5366,8 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             menu_curopt = opt2;
                             menu_saverect = false;
                             Config::romSet = romset;
-                            // GM.DLS wavetable shares the cart's flash region — turn it off on
-                            // entering ALF (see loadAlfCart). Re-select GM.DLS later to reload it.
-                            if (Config::midi == 4) Config::midi = 0;
+                            // (ALF carts stream from SD now, not the GM.DLS flash region, so
+                            // GM.DLS may stay enabled when entering ALF — no disable needed.)
                             click();
                             if (VIDEO::OSD) OSD::drawStats(); // Redraw stats for 16:9 modes
 #if !PICO_RP2040
@@ -5426,8 +5412,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if !PICO_RP2040
                                 if (leavingAlf) {
                                     if (Config::pref_arch == "ALF") Config::pref_arch = "Last";
-                                    Config::alfCartBanks = 0;   // unload cart (built-in Elf-1 ROM)
-                                    Config::alfCartPath  = "";  // frees the shared GM-bank flash region
+                                    Config::alfCartBanks = 0;   // unmount cart (empty drive)
+                                    Config::alfCartPath  = "";
+                                    AlfCart::unmount();         // close the SD cart file
                                 }
                                 // Entering Profi needs ~96 KB SRAM on butter-less boards.
                                 // Gate it: the popup frees room (Gigascreen/ZiFi/DivMMC
@@ -10735,21 +10722,39 @@ bool OSD::loadAlfCart(const string& fname) {
         return false;
     }
     // Some distributions append a small text footer (e.g. "filename=.../size=.../crc32=...")
-    // after the 1MB cart image. Clamp to 1MB and flash only the cart data, ignoring the tail.
+    // after the 1MB cart image. Clamp to 1MB; only the cart data is served, the tail ignored.
     if (size > (1ul << 20)) size = (1ul << 20);
-    // Deferred: a large synchronous flash with multicore_lockout deadlocks the HDMI
-    // ISR. Record the path + reboot; the early-boot provisioner flashes it.
+    // Lazy load: the cart is served from SD on demand (like a wd1793 disk) — NO 1MB
+    // flash write; banks fault in via #5F as the guest pages them (see AlfCart / Ports).
+    // Switch into ALF IN PLACE (no reboot), the same way the Hardware menu and snapshot
+    // loads switch machines: mount the cart, requestMachine + reset, then return so the
+    // OSD closes cleanly into the running machine. GM.DLS no longer conflicts (the cart
+    // does not use the shared flash region), so it is left untouched.
     Config::alfCartBanks = (uint8_t)((size + (16ul << 10) - 1) >> 14);   // ceil to 16K banks
     Config::alfCartPath  = fname;
-    Config::arch = "ALF"; Config::romSet = "ALF"; Config::pref_arch = "ALF";
-    // GM.DLS wavetable shares ONE flash region with the ALF cart (mutually exclusive).
-    // Turn it off when a cart takes the region so leaving ALF later doesn't silently
-    // auto-reflash the bank on a plain reset — the user re-selects GM.DLS in the menu
-    // when wanted, which reloads the instruments then. (Applies to F5/Enter cart loads
-    // and the Web Archive path, which all funnel through here.)
-    if (Config::midi == 4) Config::midi = 0;
+    Config::arch = "ALF"; Config::romSet = "ALF1"; Config::pref_arch = "ALF";
     Config::save();
-    OSD::esp_hard_reset();   // boot provisioner flashes the cart, then runs ALF
+    // Mount FRESH every load — open a new FIL on the file as it is NOW. ZIP carts always
+    // extract to the same temp path (/tmp/.zip_extract.rom), so reloading would otherwise
+    // keep a stale handle open on a file that was unlinked+rewritten underneath it
+    // (progressively empty catalog until a reboot). mount() closes any previous handle.
+    if (!AlfCart::mount(fname)) {
+        OSD::osdCenteredMsg("ALF cart mount failed", LEVEL_WARN, 2000);
+        return false;
+    }
+    Config::alfCartBanks = (uint8_t)AlfCart::bankCount();
+#if !PICO_RP2040
+    // Leaving Profi's forced-SRAM layout (no butter PSRAM) needs a reboot to re-lay out
+    // memory — an in-place reset() does not free the ~96 KB Profi pages and ALF would
+    // OOM. Same guard the Hardware→ALF menu entry uses. Boot re-mounts the cart from SD.
+    if (butter_psram_size() == 0 &&
+        MemESP::ram[56].memType() == mem_type_t::POINTER) {
+        OSD::esp_hard_reset();   // never returns
+        return true;
+    }
+#endif
+    Config::requestMachine("ALF", "ALF1");   // in-place machine switch (no reboot)
+    ESPectrum::reset();
     return true;
 }
 #endif
@@ -10880,14 +10885,11 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
         Config::pref_arch = "ALF";
     }
     else if ( arch == 5 ) {
-        // Load an ALF cartridge (up to 1MB) into the SHARED flash region (gm_bank
-        // region), displacing the GM.DLS bank (mutually exclusive). DEFERRED to boot:
-        // a large synchronous flash with multicore_lockout deadlocks the HDMI ISR
-        // (this used to "hang" mid-flash). We record the path + reboot; the early-boot
-        // provisioner (single core, no lockout) flashes it. The built-in Elf-1 stays
-        // intact; set alfCartBanks=0 to revert to it.
+        // Load an ALF cartridge (up to 1MB) served lazily from SD on demand (like a
+        // wd1793 disk — see AlfCart). No 1MB flash write; the file stays on SD and 16K
+        // banks fault in as the guest pages them. Switches into ALF in place (no reboot).
         fclose2(f);
-        return loadAlfCart(fname);   // defer-flash + reboot into ALF
+        return loadAlfCart(fname);   // lazy-mount from SD + switch into ALF in place
     }
 #endif
     else if ( arch == 6 ) {

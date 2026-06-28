@@ -42,6 +42,7 @@ using namespace std;
 
 #include "OSDMain.h"
 #include "FileUtils.h"
+#include "AlfCart.h"
 #include "Config.h"
 #include "ESPectrum.h"
 #include "CPU.h"
@@ -1809,7 +1810,7 @@ static bool rfd_launch_tmp(string path) {
     }
 #if !PICO_RP2040
     if (ext == "rom" || ext == "bin") {
-        return OSD::loadAlfCart(path); // ALF cartridge — defer-flash + reboot into ALF
+        return OSD::loadAlfCart(path); // ALF cartridge — lazy-mount from SD + switch into ALF
     }
 #endif
     OSD::osdCenteredMsg(string(MSG_NET_UNSUPPORTED[Config::lang]) + " (." + ext + ")",
@@ -1829,6 +1830,11 @@ static void rfd_release_tmp(const string& tmpp) {
     if (Tape::tapeFileType != TAPE_FTYPE_EMPTY &&
         FileUtils::TAP_Path + Tape::tapeFileName == tmpp)
         Tape::Init();   // closes the open tape FIL
+#if !PICO_RP2040
+    // An ALF cart mounted lazily from this temp path holds the FIL open; release it
+    // so the next quick-start can truncate/rewrite the same /tmp/_run.<ext> file.
+    if (AlfCart::active() && AlfCart::path() == tmpp) AlfCart::unmount();
+#endif
 }
 
 // ── Listing-index cache (Remote/Web) ─────────────────────────────────────────

@@ -2,7 +2,12 @@
 
 #if !PICO_RP2040
 
-const unsigned char __in_flash() __aligned(4096) gb_rom_Alf[256 << 10] = {
+// ALF system ROM: 32KB of real BIOS (2 banks of 16K). The #5F bank latch selects
+// system-ROM banks 0..63; banks 2+ are not real ROM and map to the zero page
+// gb_rom_Alf_ep below. This array was formerly [256<<10] (16 banks) but only the first
+// 32KB held data — the other 224KB were flash zeros. Trimmed; the bind loops in
+// Config.cpp / Ports.cpp use border_page=2 so banks 2..63 → gb_rom_Alf_ep (16KB zeros).
+const unsigned char __in_flash() __aligned(4096) gb_rom_Alf[32 << 10] = {
 	0xf3, 0xaf, 0xed, 0x47, 0xed, 0x4f, 0xed, 0x46, 0x00, 0x21, 0x00, 0x40,
 	0x36, 0x00, 0x23, 0x7c, 0xb5, 0x20, 0xf9, 0x21, 0x00, 0x01, 0x11, 0x00,
 	0xa1, 0x01, 0x00, 0x02, 0xed, 0xb0, 0x21, 0x00, 0x20, 0x11, 0x00, 0x80,
@@ -2736,6 +2741,9 @@ const unsigned char __in_flash() __aligned(4096) gb_rom_Alf[256 << 10] = {
 	0x3c, 0x42, 0x99, 0xa1, 0xa1, 0x99, 0x42, 0x3c
 };
 
-const unsigned char gb_rom_Alf_ep[] = { 0, 0, 0, 0 };
+// Open-bus / empty page for unmapped ALF ROM banks. A full 16KB of zeros so a ROM
+// page bound here reads deterministic 0x00 across the whole 0x0000-0x3FFF window
+// (the bind loops point every non-real system bank, and out-of-range cart banks, here).
+const unsigned char __in_flash() __aligned(4096) gb_rom_Alf_ep[16 << 10] = { 0 };
 
 #endif

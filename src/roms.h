@@ -50,7 +50,8 @@ visit https://zxespectrum.speccy.org/contacto
 #include "roms/romSTS75.h"
 
 #if !PICO_RP2040
-extern "C" const unsigned char gb_rom_Alf_cart[];
+// gb_rom_Alf_cart (built-in "Elf-1") removed — ALF carts are served lazily from SD
+// (see AlfCart). gb_rom_Alf = ALF system ROM; gb_rom_Alf_ep = open-bus filler.
 extern "C" const unsigned char gb_rom_Alf[];
 extern "C" const unsigned char gb_rom_Alf_ep[];
 #endif

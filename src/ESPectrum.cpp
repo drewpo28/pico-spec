@@ -674,10 +674,10 @@ void ESPectrum::setup() {
   // from main() after setup() returned — i.e. after VIDEO::Init — which was the bug.)
   if (FileUtils::fsMount) {
     MidiSynth::provisionAtBoot();                                  // GM.DLS bank (no-op unless selected)
-    { extern void alfCartProvisionAtBoot(); alfCartProvisionAtBoot(); } // pending ALF cartridge
   }
-  // Point the ALF cartridge at the built-in Elf-1 or a cart loaded into the shared
-  // flash region, per Config::alfCartBanks (set before ALF banking can run).
+  // Mount the ALF cartridge from SD (served lazily on demand like a wd1793 disk),
+  // per Config::alfCartPath. Empty drive if none is set or the SD file is missing —
+  // there is no built-in cart. Must run before ALF banking can read it.
   { extern void alfBindCart(); alfBindCart(); }
 #endif
   sdcard_set_led_blink(Config::sdLedBlink); // onboard LED blink on SD access

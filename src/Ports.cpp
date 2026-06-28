@@ -42,6 +42,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "ESPectrum.h"
 #include "LEDIndicators.h"
 #include "MemESP.h"
+#include "AlfCart.h"
 #include "Tape.h"
 #include "Video.h"
 #include "Z80_JLS/z80.h"
@@ -247,21 +248,24 @@ IRAM_ATTR static void FDDStep_MB02(bool force) {
 uint8_t nes_pad2_for_alf(void);
 static uint8_t newAlfBit = 0;
 #if !PICO_RP2040
-// Active ALF cartridge: g_alf_cart points at the built-in 256KB "Elf-1" by default,
-// or at the shared flash region when a cartridge was loaded there. alf_cart_banks is
-// its size in 16K banks; banks beyond it map to gb_rom_Alf_ep (open bus).
-extern "C" uint8_t __gm_bank_start[];   // shared flash region (RP2350 top-of-flash)
-const uint8_t* g_alf_cart = gb_rom_Alf_cart;
-int alf_cart_banks = 16;
-// Bind g_alf_cart/alf_cart_banks from Config (call at boot after Config::load and
-// whenever a cartridge is loaded/unloaded).
+// ALF cartridges are served lazily from SD on demand (AlfCart), like a wd1793 disk:
+// no built-in cart, no flash region. There is no default cart — the cart "drive" is
+// empty (open bus) until the user mounts a .rom/.bin from SD, exactly like TR-DOS
+// with no disk inserted. The system ROM (gb_rom_Alf) runs when nothing is mounted.
+// Bind/refresh the cart from Config (call at boot after Config::load and whenever a
+// cartridge is loaded/unloaded). On a missing SD file: empty drive, never hang.
 void alfBindCart() {
-    if (Config::alfCartBanks > 0) {
-        g_alf_cart = (const uint8_t*)__gm_bank_start;
-        alf_cart_banks = Config::alfCartBanks;
+    if (!Config::alfCartPath.empty()) {
+        if (!AlfCart::active() || AlfCart::path() != Config::alfCartPath) {
+            if (!AlfCart::mount(Config::alfCartPath)) {
+                Config::alfCartBanks = 0;   // SD file gone (card removed) → empty drive
+                Config::alfCartPath  = "";
+                return;
+            }
+        }
+        Config::alfCartBanks = (uint8_t)AlfCart::bankCount();
     } else {
-        g_alf_cart = gb_rom_Alf_cart;
-        alf_cart_banks = 16;
+        AlfCart::unmount();
     }
 }
 #endif
@@ -1200,20 +1204,28 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     }
     if (bitRead(address, 7) == 0 &&
         (address & 1) == 1) { // ALF ROM selector A7=0, A0=1
-      const uint8_t *base = bitRead(data, 7) ? g_alf_cart : gb_rom_Alf;
-      if (MemESP::ramCurrent[0] != base) { /// TODO: ensure
-        // System ROM (gb_rom_Alf) is 256KB=16 banks; cartridge (g_alf_cart) is the
-        // built-in Elf-1 (16 banks) or a loaded cart in the shared region
-        // (alf_cart_banks). Banks beyond the cart map to gb_rom_Alf_ep (open bus).
-        int border_page = (base == gb_rom_Alf) ? 16 : alf_cart_banks;
-        for (int i = 0; i < 64; ++i) {
-          MemESP::rom[i].assign_rom(i >= border_page ? gb_rom_Alf_ep
-                                                     : base + ((16 * i) << 10));
-        }
-      }
+      bool cart = bitRead(data, 7);
       MemESP::romInUse = (data & 0b01111111);
       while (MemESP::romInUse >= 64)
         MemESP::romInUse -= 64; // rolling ROM
+      if (cart && AlfCart::active()) {
+        // Lazy SD cartridge: fault the selected 16K bank into the window on demand
+        // (like wd1793 faults a sector). Cart ROM is only ever visible at page 0, so
+        // binding just the selected bank suffices. Banks past the image = open bus.
+        int b = MemESP::romInUse;
+        MemESP::rom[b].assign_rom(b < AlfCart::bankCount()
+                                    ? AlfCart::residentBank(b) : gb_rom_Alf_ep);
+      } else if (cart) {
+        // Cart selected but none mounted: empty drive (open bus), like TR-DOS w/o disk.
+        MemESP::rom[MemESP::romInUse].assign_rom(gb_rom_Alf_ep);
+      } else {
+        // System ROM (gb_rom_Alf, 32KB = 2 banks in flash); banks 2+ → open-bus zeros.
+        if (MemESP::ramCurrent[0] != gb_rom_Alf) {
+          for (int i = 0; i < 64; ++i)
+            MemESP::rom[i].assign_rom(i >= 2 ? gb_rom_Alf_ep
+                                             : gb_rom_Alf + ((16 * i) << 10));
+        }
+      }
       MemESP::recoverPage0();
       // ALF uses incomplete decoding (A7=0, A0=1) for the bank latch, so the
       // same OUT also hits MB-02 FDC (#0F/#2F/#4F/#6F), DMA (#0B/#6B), Beta-128

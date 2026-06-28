@@ -180,13 +180,8 @@ bool MidiSynth::needsProvision() {
 // LED blinks, no display yet). Commit-last so an interrupted write stays safe.
 void MidiSynth::provisionAtBoot() {
     if (Config::midi != 4) return;              // only when GM.DLS mode is selected
-#if !PICO_RP2040
-    // The shared flash region currently holds an ALF cartridge — do NOT overwrite it
-    // with the gm_bank. GM.DLS and a loaded cartridge are mutually exclusive; unload
-    // the cart (alfCartBanks=0) to use GM.DLS. bindFromFlash() below also fails (no
-    // GMWB header in the region), so GM.DLS stays silently off.
-    if (Config::alfCartBanks > 0) return;
-#endif
+    // (ALF cartridges no longer occupy this flash region — they stream from SD via
+    // AlfCart — so GM.DLS and a loaded cart coexist; no cart check needed here.)
     // "Reinstall" sets this magic then reboots → force a rewrite even if the flash
     // header matches SD (the only way to recover a valid-header-but-broken body).
     bool force = (watchdog_hw->scratch[MIDI_REFLASH_SCRATCH] == MIDI_REFLASH_MAGIC);
@@ -241,51 +236,9 @@ void MidiSynth::provisionAtBoot() {
     bindFromFlash();
 }
 
-#if !PICO_RP2040
-// EARLY-BOOT: flash a pending ALF cartridge (Config::alfCartPath) into the shared
-// flash region (same region as gm_bank — mutually exclusive). Runs single-core,
-// before core1/video, so flashWriteSector needs no multicore_lockout (a large
-// synchronous flash from the OSD with lockout deadlocks the HDMI ISR — that was the
-// "hang"). Streams 4KB sectors from SD; only a 4KB buffer of RAM. Clears the pending
-// path when done (alfCartBanks>0 marks the loaded cart for alfBindCart()).
-void alfCartProvisionAtBoot() {
-    if (Config::alfCartPath.empty()) return;
-    FIL* f = fopen2(Config::alfCartPath.c_str(), FA_READ);
-    if (!f) { Debug::log("ALF cart: open failed %s", Config::alfCartPath.c_str());
-              Config::alfCartPath = ""; Config::save(); return; }
-    size_t size = (size_t)f_size(f);
-    if (size == 0) { fclose2(f); Config::alfCartPath = ""; Config::save(); return; }
-    // Ignore any trailing metadata footer past the cart image (see OSD::loadAlfCart):
-    // flash only what fits the shared bank region.
-    if (size > bankRegionSize()) size = bankRegionSize();
-    uint8_t* buf = (uint8_t*)malloc(FLASH_SECTOR_SIZE);
-    if (!buf) { fclose2(f); Debug::log("ALF cart: OOM"); return; }
-    uint32_t base = (uint32_t)((uintptr_t)__gm_bank_start - XIP_BASE);
-    size_t done = 0; UINT br = 0; bool ok = true;
-    // Watchdog guard: a 1 MB cart streams ~256 SD-read + flash-erase/program sectors,
-    // and a single transient SD/flash stall can wedge a sector indefinitely (observed
-    // intermittently on the largest carts). We don't clear alfCartPath until the whole
-    // write completes, so a reboot here simply re-runs this provisioner on next boot —
-    // exactly the manual "press reset, it flashes again and finishes" recovery, made
-    // automatic. The watchdog keeps counting even while IRQs are disabled inside a
-    // flash op, so it catches a stall in either f_read or flash_range_*. 8 s is far
-    // above a healthy per-sector time (tens of ms) yet bounds a real hang.
-    watchdog_enable(8000, true);
-    while (done < size) {
-        watchdog_update();                                    // healthy sector → keep alive
-        UINT want = (UINT)((size - done > FLASH_SECTOR_SIZE) ? FLASH_SECTOR_SIZE : (size - done));
-        memset(buf, 0xFF, FLASH_SECTOR_SIZE);                 // pad tail sector
-        if (f_read(f, buf, want, &br) != FR_OK || br != want) { ok = false; break; }
-        flashWriteSector(base + done, buf);
-        done += want;
-    }
-    watchdog_disable();                                       // done flashing; don't reboot the rest of boot
-    free(buf); fclose2(f);
-    xip_cache_invalidate_all();
-    Config::alfCartPath = ""; Config::save();                 // consumed
-    Debug::log("ALF cart: %sflashed %u KB to shared region", ok ? "" : "PARTIAL ", (unsigned)(size >> 10));
-}
-#endif
+// alfCartProvisionAtBoot() removed: ALF cartridges are no longer flashed into the
+// shared region — they are served lazily from SD on demand (see src/AlfCart.*).
+// The shared flash region is now GM.DLS-only.
 
 // Scan the SD for selectable GM wavetable banks: any *.bin in CONFIG_DIR or the
 // card root that carries a valid GMWB v5 header. Fills `paths` (full path, used as

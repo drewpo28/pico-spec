@@ -256,8 +256,9 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
 #if !PICO_RP2040
     else if (arch == "ALF") {
         const uint8_t* base = gb_rom_Alf;
+        // gb_rom_Alf is 32KB = 2 real banks; banks 2..63 → gb_rom_Alf_ep (zero page).
         for (int i = 0; i < 64; ++i) {
-            MemESP::rom[i].assign_rom(i >= 16 ? gb_rom_Alf_ep : base + ((16 * i) << 10));
+            MemESP::rom[i].assign_rom(i >= 2 ? gb_rom_Alf_ep : base + ((16 * i) << 10));
         }
         Config::kempstonPort = 0x1F; // TODO: ensure, save?
     }

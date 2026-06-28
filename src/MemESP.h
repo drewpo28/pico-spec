@@ -61,6 +61,9 @@ extern volatile uint32_t mem_spi_evict_count; // SPI PSRAM loads per frame
 extern volatile uint32_t mem_spi_evict_page;  // last evicted page index
 uint32_t butter_psram_size();
 extern uint8_t rx[4];
+#if !PICO_RP2040
+extern uint8_t* g_alfWindow;   // AlfCart's 16K SD-faulted window (nullptr = unmounted)
+#endif
 
 enum mem_type_t {
     POINTER = 0,
@@ -288,6 +291,7 @@ inline void MemESP::writebyte(uint16_t addr, uint8_t data)
         checkMemWriteBP(addr);
     uint8_t page = addr >> 14;
 #if !PICO_RP2040
+    if (page == 0 && ramCurrent[0] == g_alfWindow) return; // ALF lazy cart: page 0 is ROM
     if (page == 0 && divmmc_mapped) {
         if (addr < 0x2000) {
             // 0x0000-0x1FFF: writable only when MAPRAM (RAM bank)
