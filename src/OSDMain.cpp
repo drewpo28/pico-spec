@@ -3685,8 +3685,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         uint16_t oc=Config::ide_chs[slot][0], oh=Config::ide_chs[slot][1], os=Config::ide_chs[slot][2];
                                         uint16_t C=IDE::geomC(slot), H=IDE::geomH(slot), S=IDE::geomS(slot);
                                         bool over = (oc&&oh&&os);
+                                        bool profi = (IDE::scheme == IDE::PROFI);
                                         if (C && H && S)
-                                            snprintf(geo, sizeof(geo), "CHS\t%u/%u/%u%s\n", C, H, S, over?"":" (auto)");
+                                            // Profi locks H=16/S=16 (BIOS CHS addressing); only C is user-editable.
+                                            snprintf(geo, sizeof(geo), "CHS\t%u/%u/%u%s\n", C, H, S,
+                                                     profi ? " (Profi: C only)" : (over?"":" (auto)"));
                                         else
                                             snprintf(geo, sizeof(geo), "CHS\t<empty>\n");
                                         drvmenu += geo;
@@ -3723,6 +3726,35 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     } else if (opt2 == 3 && !IDE::isCD(slot)) {
                                         // Edit CHS override. Empty input = auto-detect (0/0/0).
                                         // (Skipped for ATAPI CD-ROM — geometry N/A.)
+                                        // Inline-edit on the CHS row (row index 3 within submenu).
+                                        int ex = OSD::x + (1 + 4) * OSD_FONT_W;     // after "CHS\t"
+                                        int ey = OSD::y + 1 + 3 * OSD_FONT_H;
+                                        if (IDE::scheme == IDE::PROFI) {
+                                            // Profi locks H=16/S=16 for BIOS CHS addressing; only the
+                                            // cylinder count is meaningful. Edit C alone (empty = auto).
+                                            char cur[8];
+                                            snprintf(cur, sizeof(cur), "%u", IDE::geomC(slot));
+                                            string in = OSD::inlineTextEdit(ex, ey, 6, string(cur));
+                                            if (in != "\x1B") {
+                                                unsigned c=0;
+                                                if (in.empty()) { c=0; }   // auto
+                                                if (in.empty() || sscanf(in.c_str(), "%u", &c)==1) {
+                                                    if (c==0) {            // auto-detect
+                                                        Config::ide_chs[slot][0]=0;
+                                                        Config::ide_chs[slot][1]=0;
+                                                        Config::ide_chs[slot][2]=0;
+                                                    } else {               // keep H=16 S=16
+                                                        Config::ide_chs[slot][0]=(uint16_t)c;
+                                                        Config::ide_chs[slot][1]=16;
+                                                        Config::ide_chs[slot][2]=16;
+                                                    }
+                                                    IDE::init();
+                                                    Config::save();
+                                                } else {
+                                                    OSD::osdCenteredMsg("Cylinders: number or empty", LEVEL_WARN, 2000);
+                                                }
+                                            }
+                                        } else {
                                         char cur[20];
                                         if (Config::ide_chs[slot][0] && Config::ide_chs[slot][1] && Config::ide_chs[slot][2])
                                             snprintf(cur, sizeof(cur), "%u/%u/%u",
@@ -3730,10 +3762,6 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         else
                                             snprintf(cur, sizeof(cur), "%u/%u/%u",
                                                      IDE::geomC(slot), IDE::geomH(slot), IDE::geomS(slot));
-                                        // Inline-edit on the CHS row (row index 3 within submenu).
-                                        uint8_t vrow = (uint8_t)(3 - OSD::begin_row + 1);
-                                        int ex = OSD::x + (1 + 4) * OSD_FONT_W;     // after "CHS\t"
-                                        int ey = OSD::y + 1 + 3 * OSD_FONT_H;
                                         string in = OSD::inlineTextEdit(ex, ey, 14, string(cur));
                                         if (in != "\x1B") {
                                             unsigned c=0,h=0,s=0;
@@ -3752,6 +3780,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             } else {
                                                 OSD::osdCenteredMsg("Format: C/H/S", LEVEL_WARN, 2000);
                                             }
+                                        }
                                         }
                                         menu_saverect = false;
                                         menu_curopt = 3;
