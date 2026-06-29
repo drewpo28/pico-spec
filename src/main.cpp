@@ -10,6 +10,7 @@
 #include <hardware/i2c.h>
 #include <hardware/vreg.h>
 #include <hardware/sync.h>
+#include <hardware/xip_cache.h>   // xip_cache_invalidate_all (clock/flash-timing fix-up)
 #include <hardware/flash.h>
 #include <hardware/clocks.h>
 
@@ -1229,6 +1230,26 @@ static bool __not_in_flash_func(try_set_sys_clock_khz)(uint32_t freq_khz) {
     hw_set_bits(&pll_sys_hw->pwr, PLL_PWR_PD_BITS | PLL_PWR_VCOPD_BITS | PLL_PWR_POSTDIVPD_BITS);
     return false;
 }
+
+#if !PICO_RP2040
+// Switch clk_sys to `mhz` and re-tune QMI flash (+ PSRAM) timing to match it — IRQs
+// off and entirely from RAM — then drop the XIP cache. After a flash erase/program the
+// bootrom leaves XIP at a conservative DEFAULT timing; reading flash at the overclock
+// with that stale timing faults intermittently (same QMI hazard as the clock-switch
+// block in main()). Buffer's flash-write window calls this to drop to 252 MHz for the
+// write and to restore the running clock + correct timing afterwards.
+void __not_in_flash_func(board_set_clock_and_timing)(uint32_t mhz) {
+    const uint32_t ints = save_and_disable_interrupts();
+    if (!try_set_sys_clock_khz(mhz * KHZ))
+        set_sys_clock_khz(mhz * KHZ, true);
+    flash_timings((int)mhz);
+#if defined(BUTTER_PSRAM_GPIO) && BUTTER_PSRAM_GPIO != 255
+    psram_retiming();
+#endif
+    xip_cache_invalidate_all();
+    restore_interrupts(ints);
+}
+#endif
 
 #ifdef VGA_HDMI
 extern "C" uint8_t linkVGA01;

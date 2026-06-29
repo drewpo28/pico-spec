@@ -665,20 +665,13 @@ void ESPectrum::setup() {
   if (FileUtils::fsMount)
     Config::load();
 #if !PICO_RP2040
-  // EARLY-BOOT flash provisioning MUST run here — after SD mount + Config::load but
-  // BEFORE VIDEO::Init(). flash_range_erase/program disables XIP for the whole QMI
-  // (flash CS0 *and* PSRAM CS1); once VIDEO::Init() has started the HDMI engine its
-  // DMA streams the framebuffer out of XIP-PSRAM, so erasing flash with the engine
-  // live stalls the QMI bus and hangs the board. VGA's framebuffer path doesn't hit
-  // XIP the same way, which is why this only froze on HDMI. (It was previously run
-  // from main() after setup() returned — i.e. after VIDEO::Init — which was the bug.)
-  if (FileUtils::fsMount) {
-    MidiSynth::provisionAtBoot();                                  // GM.DLS bank (no-op unless selected)
-  }
   // Mount the ALF cartridge from SD (served lazily on demand like a wd1793 disk),
   // per Config::alfCartPath. Empty drive if none is set or the SD file is missing —
   // there is no built-in cart. Must run before ALF banking can read it.
   { extern void alfBindCart(); alfBindCart(); }
+  // NOTE: the GM.DLS bank (MidiSynth::provisionAtBoot) is set up later — after
+  // Buffer::initPools() so the butter PSRAM arena exists — but still before
+  // VIDEO::Init() (flash erase must precede the live HDMI DMA over XIP).
 #endif
   sdcard_set_led_blink(Config::sdLedBlink); // onboard LED blink on SD access
   VIDEO::loadCustomPalettes();
@@ -962,6 +955,16 @@ void ESPectrum::setup() {
   // consumers above (MemESP/Profi pages, DivMMC, GS) have NOT claimed. Must run
   // after all of them so the boundaries are final. See Buffer.cpp.
   Buffer::initPools();
+
+#if !PICO_RP2040
+  // GM.DLS MIDI bank: load into butter PSRAM (preferred) or provision the flash
+  // partition from SD. MUST be here — AFTER initPools() (the PSRAM arena is now
+  // final) and BEFORE VIDEO::Init(): a flash erase disables XIP for the whole QMI
+  // (flash CS0 + PSRAM CS1), so once the HDMI engine streams the framebuffer out of
+  // XIP-PSRAM it would stall the bus and hang. Still single core (core1 launches
+  // later in main()). No-op unless GM.DLS mode (Config::midi==4) is selected.
+  if (FileUtils::fsMount) MidiSynth::provisionAtBoot();
+#endif
 
   //=======================================================================================
   // VIDEO

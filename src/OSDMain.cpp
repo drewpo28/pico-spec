@@ -2452,13 +2452,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             Midi::enabled = 4; Midi::init();
                             MidiSubsys::request(true);
                             Config::save();
-                            if (MidiSynth::needsProvision()) {
-                                if (OSD::msgDialog("DLS Wavetable", MSG_MIDI_BANK_INSTALL_Q[Config::lang]) == DLG_YES) {
-                                    osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
-                                    OSD::esp_hard_reset();   // boot writes the bank to flash
-                                }
-                            } else {
+                            // applyBankLive() loads THIS freshly-converted bank: live on PSRAM
+                            // (no reboot), else false → it must be written to flash at early boot.
+                            if (MidiSynth::applyBankLive()) {
                                 osdCenteredMsg(MSG_MIDI_BANK_OK[Config::lang], LEVEL_OK, 2000);
+                            } else if (OSD::msgDialog("DLS Wavetable", MSG_MIDI_BANK_INSTALL_Q[Config::lang]) == DLG_YES) {
+                                osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
+                                OSD::esp_hard_reset();   // no PSRAM: provisionAtBoot writes it pre-video
                             }
                         }
                     }
@@ -4318,34 +4318,30 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             }
 
                                             bool haveSd = MidiSynth::sdBankAvailable();
-                                            if (MidiSynth::needsProvision()) {
-                                                // picked bank differs from / missing in flash -> CONFIRM the
-                                                // flash so the user can decline (keeps the current bank).
-                                                if (haveSd &&
-                                                    OSD::msgDialog("DLS Wavetable",
-                                                                   MSG_MIDI_BANK_INSTALL_Q[Config::lang]) == DLG_YES) {
-                                                    Config::save();   // commit the choice only on confirm
-                                                    osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
-                                                    OSD::esp_hard_reset();
+                                            if (!haveSd) {
+                                                // No SD bank: keep an already-bound (flash) bank, else nothing.
+                                                if (MidiSynth::bankReady()) {
+                                                    if (Config::midi_bank != prevBank) Config::save();
+                                                    osdCenteredMsg(MSG_MIDI_BANK_OK[Config::lang], LEVEL_OK, 2000);
                                                 } else {
-                                                    Config::midi_bank = prevBank;   // declined -> revert, no flash
+                                                    Config::midi_bank = prevBank;
+                                                    osdCenteredMsg(MSG_MIDI_BANK_MISSING[Config::lang], LEVEL_WARN, 3000);
                                                 }
-                                            } else if (MidiSynth::bankReady()) {
-                                                // picked bank already resident in flash. Persist a (same-as-
-                                                // flash) switch, then offer reinstall (recovers a broken/
-                                                // partial bank). Both the switch and reinstall are declinable.
-                                                if (Config::midi_bank != prevBank) Config::save();
-                                                if (haveSd &&
-                                                    OSD::msgDialog("DLS Wavetable",
-                                                                   MSG_MIDI_BANK_REINSTALL_Q[Config::lang]) == DLG_YES) {
-                                                    MidiSynth::requestReflash();   // invalidate header
-                                                    osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
-                                                    OSD::esp_hard_reset();         // boot rewrites from SD
-                                                }
+                                            } else if (MidiSynth::applyBankLive()) {
+                                                // Applied without a reboot: PSRAM boards load the bank live,
+                                                // and a flash bank that is already current just rebinds.
+                                                Config::save();
                                                 osdCenteredMsg(MSG_MIDI_BANK_OK[Config::lang], LEVEL_OK, 2000);
+                                            } else if (OSD::msgDialog("DLS Wavetable",
+                                                                      MSG_MIDI_BANK_INSTALL_Q[Config::lang]) == DLG_YES) {
+                                                // No PSRAM and the flash bank differs → it must be written at
+                                                // EARLY BOOT (single core, pre-video). Commit + reboot.
+                                                Config::save();
+                                                osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
+                                                OSD::esp_hard_reset();
                                             } else {
-                                                Config::midi_bank = prevBank;   // nothing usable -> revert
-                                                osdCenteredMsg(MSG_MIDI_BANK_MISSING[Config::lang], LEVEL_WARN, 3000);
+                                                Config::midi_bank = prevBank;   // declined -> revert + restore
+                                                MidiSynth::init();
                                             }
                                         }
                                     }

@@ -47,6 +47,13 @@ public:
     // Caller must reboot afterwards. Recovers a broken/partial flash bank.
     static void requestReflash();
 
+    // Try to (re)load + bind the currently-selected bank WITHOUT a reboot. Returns
+    // true if applied live (it fit RAM/PSRAM, or the flash partition already holds it);
+    // false only when a flash *write* is required — the caller then reboots so
+    // provisionAtBoot() can write it pre-video. On a PSRAM board this always succeeds,
+    // so changing the bank never reboots. On false the previous bank is left unbound.
+    static bool applyBankLive();
+
     // Feed one raw MIDI byte (running-status stream from the Z80 ShamaZX port).
     static void feedByte(uint8_t b);
 
@@ -62,9 +69,13 @@ private:
     static uint8_t midi_data_pos;
     static uint8_t midi_expected;
 
-    static bool  bank_ready;   // a valid bank in flash is bound
+    static bool  bank_ready;   // a valid bank (PSRAM or flash) is bound
 
-    static bool bindFromFlash();  // validate + bind the flash-resident bank (no write)
+    static bool bindFromFlash();  // validate + bind the persistent flash-partition bank (no write)
+    // Load the SD bank into a Buffer (which places it in PSRAM or the flash partition —
+    // MidiSynth stays oblivious) and bind. mayWriteFlash=false forbids a flash erase
+    // (post-VIDEO::Init); a PSRAM load is always allowed (no reboot needed).
+    static bool loadBank(bool force, bool mayWriteFlash);
     static void processMessage(uint8_t status, uint8_t d0, uint8_t d1);
 };
 

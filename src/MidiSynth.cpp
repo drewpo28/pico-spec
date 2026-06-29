@@ -23,15 +23,23 @@
 #include "gm_bank.h"             // gm_bank_view, gm_bank_header_t, GM_BANK_VERSION
 #include "FileUtils.h"           // fopen2/fclose2, FIL, f_read, f_size
 #include "Config.h"              // Config::midi
+#include "Buffer.h"              // tiered allocator: butter PSRAM, else flash partition
+#include "MemESP.h"              // butter_psram_size()
 #include "Debug.h"
 #include <string>
 #include <vector>
 
-// The bank lives in a fixed flash partition at the top of flash (NOLOAD region in
-// rp2350-memmap.ld — not in the UF2), provisioned once from SD and read directly
-// via XIP. No PSRAM; persists across firmware reflashes.
+// The bank lives wherever Buffer places it: QSPI/butter PSRAM when present (loaded
+// from SD each boot), else a fixed flash partition (top of flash, NOLOAD region in
+// rp2350-memmap.ld — not in the UF2; provisioned once from SD, persists across
+// firmware reflashes). Both are XIP-addressable, and the bank format is
+// position-independent, so the engine binds the same way to either.
 extern "C" uint8_t __gm_bank_start[];
 extern "C" uint8_t __gm_bank_end[];
+
+// When the bank lives in PSRAM this holds the allocation; empty when it lives in
+// flash (then bankBase() returns the XIP partition pointer directly).
+static Buffer g_bankBuf;
 
 // The audio bus is unsigned 0..255 (silence = 0), summed with beeper/AY/SAA then
 // scaled by volume in pwm_audio_write(); the main mixer/driver needs no change.
@@ -92,34 +100,14 @@ static uint8_t dataLenForStatus(uint8_t status) {
 static inline const uint8_t* bankFlashPtr()   { return (const uint8_t*)__gm_bank_start; }
 static inline size_t         bankRegionSize() { return (size_t)(__gm_bank_end - __gm_bank_start); }
 
-// Flash erase/program helpers. XIP-unsafe → IRQs off, run from RAM. NO
-// multicore_lockout: this only runs at EARLY BOOT before core1/video is launched
-// (single core), so there is no other core to park and no HDMI ISR to fight (that
-// fight was the freeze/deadlock). Blink the LED as a liveness sign.
-//
-// Erase is done in 64 KB BLOCKS, not 4 KB sectors: the bootrom uses the flash's
-// block-erase command for 64 KB-aligned ranges, which is ~4-5x faster per KB than
-// erasing the same area as individual 4 KB sectors. `bytes` must be a multiple of
-// FLASH_SECTOR_SIZE (caller passes 64 KB chunks).
-static void __not_in_flash_func(flashEraseRange)(uint32_t off, uint32_t bytes) {
-#if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
-    gpio_put(PICO_DEFAULT_LED_PIN, (off >> 16) & 1);   // toggle each 64 KB block
-#endif
-    uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(off, bytes);
-    restore_interrupts(ints);
+// The base the engine is bound to: the PSRAM copy when present, else the flash
+// partition (XIP). Both are directly addressable; the format is position-independent.
+static inline const uint8_t* bankBase() {
+    return g_bankBuf.ok() ? (const uint8_t*)g_bankBuf.data() : bankFlashPtr();
 }
 
-// Program only (region must already be erased). `bytes` must be a multiple of
-// FLASH_PAGE_SIZE (caller passes whole 4 KB sectors, 0xFF-padded).
-static void __not_in_flash_func(flashProgram)(uint32_t off, const uint8_t* src, uint32_t bytes) {
-#if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
-    gpio_put(PICO_DEFAULT_LED_PIN, (off >> 15) & 1);   // toggle ~every 8 sectors
-#endif
-    uint32_t ints = save_and_disable_interrupts();
-    flash_range_program(off, src, bytes);
-    restore_interrupts(ints);
-}
+// Defined below; needed by bindFromPsram() above its definition.
+static FIL* openValidSdBank(size_t* outSize, gm_bank_header_t* outHdr);
 
 // Bind the engine to the bank already resident in the flash partition. No SD, no
 // write → safe anytime. Returns true if a valid v5 bank is present in flash.
@@ -131,10 +119,45 @@ bool MidiSynth::bindFromFlash() {
     return true;
 }
 
+// Buffer::LoadReader over the open SD bank file: fill `dst` with `n` bytes at `off`.
+static bool bankFileReader(void* ctx, void* dst, uint32_t off, uint32_t n) {
+    FIL* f = (FIL*)ctx;
+    UINT br = 0;
+    if (f_lseek(f, off) != FR_OK) return false;
+    return f_read(f, dst, n, &br) == FR_OK && br == n;
+}
+
+// Load the SD bank via Buffer, which places it in PSRAM (preferred) or the flash
+// partition and writes it accordingly — MidiSynth does not branch on memory type.
+// mayWriteFlash=false forbids a flash erase (post-VIDEO::Init); a PSRAM load is always
+// allowed, so on PSRAM boards this never needs a reboot. Returns true once bound.
+bool MidiSynth::loadBank(bool force, bool mayWriteFlash) {
+    size_t size; gm_bank_header_t hdr;
+    FIL* f = openValidSdBank(&size, &hdr);
+    if (!f) return false;                                  // no usable SD bank
+    g_bankBuf.free();
+    if (!g_bankBuf.alloc(size, Buffer::NEED_POINTER | Buffer::PREFER_PSRAM | Buffer::ALLOW_FLASH)) {
+        fclose2(f);
+        Debug::log("MidiSynth: bank alloc failed (%uKB)", (unsigned)(size >> 10));
+        return false;
+    }
+    bool ok = g_bankBuf.load((uint32_t)size, force, bankFileReader, f, mayWriteFlash);
+    fclose2(f);
+    gm_bank_view_t v;
+    if (!ok || !gm_bank_view(g_bankBuf.data(), &v)) { g_bankBuf.free(); return false; }
+    midi_wt_bind(g_bankBuf.data());
+    bank_ready = true;
+    Debug::log("MidiSynth: bank ready (%s, %uKB)", g_bankBuf.tierName(), (unsigned)(size >> 10));
+    return true;
+}
+
 void MidiSynth::init() {
     midi_status = midi_data_pos = midi_expected = 0;
-    if (bank_ready) return;   // idempotent
-    bindFromFlash();          // use the flash copy if present; never writes here
+    if (bank_ready) return;   // idempotent (already bound at boot by provisionAtBoot)
+    // Runtime / post-VIDEO::Init: a PSRAM load is safe (no reboot); a flash *write* is
+    // not (mayWriteFlash=false). If neither applies, bind any already-persisted flash bank.
+    if (loadBank(/*force=*/false, /*mayWriteFlash=*/false)) return;
+    bindFromFlash();
 }
 
 // Open one candidate path and validate its GMWB v5 header. Returns the open FIL*
@@ -185,106 +208,27 @@ bool MidiSynth::needsProvision() {
     return true;
 }
 
-// EARLY-BOOT provisioning: write gm_bank.bin from SD into the flash region, then
-// bind. MUST be called before core1/video is launched (single core) — that is the
-// whole point: no HDMI ISR, no multicore_lockout, no freeze/deadlock. Slow (~20-30 s,
-// LED blinks, no display yet). Commit-last so an interrupted write stays safe.
+// EARLY-BOOT bank setup. MUST be called from setup() AFTER Buffer::initPools() (the
+// butter arena must exist) and BEFORE VIDEO::Init() — still single core (core1 is
+// launched later in main()), and a flash write needs XIP free of the live HDMI DMA.
+// Buffer decides the placement: QSPI/butter PSRAM if present (copy from SD, no flash
+// write, no reboot), else the flash partition (slow, LED blinks, commit-last,
+// retry-safe). The "reinstall" watchdog magic forces a flash rewrite.
 void MidiSynth::provisionAtBoot() {
-    if (Config::midi != 4) return;              // only when GM.DLS mode is selected
-    // (ALF cartridges no longer occupy this flash region — they stream from SD via
-    // AlfCart — so GM.DLS and a loaded cart coexist; no cart check needed here.)
-    // "Reinstall" sets this magic then reboots → force a rewrite even if the flash
-    // header matches SD (the only way to recover a valid-header-but-broken body).
+    // Always register the flash partition (even when GM.DLS is off) so runtime apply
+    // decisions (applyBankLive) can compare against / write the flash tier.
+    Buffer::initFlashPool(__gm_bank_start, bankRegionSize());
+    if (Config::midi != 4) return;              // only GM.DLS mode provisions a bank
+
     bool force = (watchdog_hw->scratch[MIDI_REFLASH_SCRATCH] == MIDI_REFLASH_MAGIC);
     if (force) watchdog_hw->scratch[MIDI_REFLASH_SCRATCH] = 0;   // consume it
     Debug::log("MidiSynth: provisionAtBoot enter @%u ms (force=%d)",
                   (unsigned)to_ms_since_boot(get_absolute_time()), (int)force);
-    if (!force && !needsProvision()) {
-        Debug::log("MidiSynth: flash already current, no write");
-        bindFromFlash(); return;
-    }
 
-    size_t size; gm_bank_header_t sdh;
-    FIL* f = openValidSdBank(&size, &sdh);
-    if (!f) { Debug::log("MidiSynth: no valid SD bank, skip"); bindFromFlash(); return; }
-    Debug::log("MidiSynth: will flash %u KB bank", (unsigned)(size >> 10));
+    // Pre-video, single core → a flash write is permitted here.
+    if (loadBank(force, /*mayWriteFlash=*/true)) return;
 
-    uint8_t* hdr = (uint8_t*)malloc(FLASH_SECTOR_SIZE);   // first sector (carries the magic)
-    uint8_t* buf = (uint8_t*)malloc(FLASH_SECTOR_SIZE);   // body sectors
-    if (!hdr || !buf) { free(hdr); free(buf); fclose2(f); Debug::log("MidiSynth: provision OOM"); return; }
-    uint32_t base = (uint32_t)((uintptr_t)__gm_bank_start - XIP_BASE);
-    UINT br = 0;
-
-    // COMMIT-LAST: hold the header sector, invalidate the old header up front, write
-    // the body, then write the header LAST. An interrupted/failed write leaves the
-    // header erased → gm_bank_view() rejects it → bank treated as absent (boots
-    // fine, retry-safe), never a valid-looking-but-broken bank.
-    f_lseek(f, 0);
-    memset(hdr, 0xFF, FLASH_SECTOR_SIZE);
-    UINT hwant = (UINT)(size < FLASH_SECTOR_SIZE ? size : FLASH_SECTOR_SIZE);
-    bool ok = (f_read(f, hdr, hwant, &br) == FR_OK && br == hwant);
-
-    // Flash erase/program at a conservative 252 MHz, then restore the boot clock.
-    // The selected runtime CPU freq is applied later in main() after setup() returns,
-    // so this only governs the flash-write window. Safe to retune clk_sys here: still
-    // single-core, before VIDEO::Init/core1/the audio ISR. Lowering clk_sys while QMI
-    // read timing is still set for the (higher) boot clock is the safe direction —
-    // the QMI-hang risk is RAISING the clock with stale timing, not lowering it.
-    const uint32_t boot_hz = clock_get_hz(clk_sys);
-    if (ok && boot_hz > 252 * MHZ) {
-        set_sys_clock_khz(252 * KHZ, true);
-        Debug::log("MidiSynth: flashing bank at 252 MHz (boot was %u MHz)", (unsigned)(boot_hz / MHZ));
-    }
-
-    // Watchdog guard (see alfCartProvisionAtBoot): a transient SD/flash stall can wedge
-    // a sector. COMMIT-LAST already makes an interrupted write retry-safe (header left
-    // invalid → re-provisioned next boot), so an 8 s watchdog reboot here self-heals.
-    watchdog_enable(8000, true);
-
-    // ── PHASE 1: erase. Erase the whole region we will write (rounded up to 64 KB)
-    // in 64 KB blocks — block erase is ~4-5x faster than per-4 KB-sector erase, which
-    // dominated the old flash time. This also invalidates the header (→ 0xFF) up front,
-    // preserving COMMIT-LAST: an interrupted write leaves the header erased = absent. */
-    const uint32_t BLK = 65536u;                          // FLASH_BLOCK_SIZE (64 KB)
-    uint32_t eraseBytes = ((uint32_t)size + (BLK - 1)) & ~(BLK - 1);   // round up to 64 KB
-    const uint32_t t_start = to_ms_since_boot(get_absolute_time());
-    for (uint32_t off = 0; ok && off < eraseBytes; off += BLK) {
-        watchdog_update();                                // one 64 KB block ≪ 8 s
-        flashEraseRange(base + off, BLK);
-    }
-    const uint32_t t_erased = to_ms_since_boot(get_absolute_time());
-    Debug::log("MidiSynth: erased %u KB in %u ms", (unsigned)(eraseBytes >> 10),
-                  (unsigned)(t_erased - t_start));
-
-    // ── PHASE 2: program the body (skip the header sector), then the header LAST.
-    size_t done = FLASH_SECTOR_SIZE;
-    while (ok && done < size) {
-        watchdog_update();
-        UINT want = (UINT)((size - done > FLASH_SECTOR_SIZE) ? FLASH_SECTOR_SIZE : (size - done));
-        memset(buf, 0xFF, FLASH_SECTOR_SIZE);             // pad the tail sector
-        if (f_read(f, buf, want, &br) != FR_OK || br != want) { ok = false; break; }
-        flashProgram(base + done, buf, FLASH_SECTOR_SIZE);  // region already erased — no erase here
-        done += want;
-    }
-    if (ok) flashProgram(base, hdr, FLASH_SECTOR_SIZE);   // COMMIT the header LAST
-    const uint32_t t_done = to_ms_since_boot(get_absolute_time());
-    watchdog_disable();                                   // done flashing; don't reboot the rest of boot
-    Debug::log("MidiSynth: programmed %u KB in %u ms (total %u ms)", (unsigned)(size >> 10),
-                  (unsigned)(t_done - t_erased), (unsigned)(t_done - t_start));
-
-    // Restore the boot clock; main() applies the user-selected CPU freq after setup().
-    if (clock_get_hz(clk_sys) != boot_hz)
-        set_sys_clock_khz(boot_hz / KHZ, true);
-
-    free(hdr); free(buf);
-    fclose2(f);
-#if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
-    gpio_put(PICO_DEFAULT_LED_PIN, 0);
-#endif
-    if (!ok) { Debug::log("MidiSynth: provision failed (header left invalid, retry safe)"); return; }
-    // Single core here → safe to drop the XIP cache and read the fresh bank now.
-    xip_cache_invalidate_all();
-    Debug::log("MidiSynth: provisioned %u KB to flash", (unsigned)(size >> 10));
+    // No usable SD bank → bind whatever is already persisted in the flash partition.
     bindFromFlash();
 }
 
@@ -352,17 +296,31 @@ void MidiSynth::requestReflash() {
     bank_ready = false;
 }
 
+bool MidiSynth::applyBankLive() {
+    size_t size; gm_bank_header_t h;
+    FIL* f = openValidSdBank(&size, &h);
+    if (!f) return bank_ready;            // no SD bank → keep whatever is bound
+    fclose2(f);
+    bank_ready = false;                   // tear down current; loadBank rebinds on success
+    midi_wt_unbind();
+    g_bankBuf.free();
+    // No flash write here: lands in PSRAM (live), or a flash bank that is already
+    // current (skip). Returns false only if a flash write is needed → caller reboots.
+    return loadBank(/*force=*/false, /*mayWriteFlash=*/false);
+}
+
 void MidiSynth::deinit() {
-    bank_ready = false;       // bank stays in flash (persistent); just stop using it
+    bank_ready = false;       // stop using the bank
     midi_status = midi_data_pos = midi_expected = 0;
     g_gate = 0;
     midi_wt_unbind();         // release the ~5 KB voice array (lazy; back to .bss-free)
+    g_bankBuf.free();         // release the PSRAM copy (no-op if the bank was in flash)
 }
 
 void MidiSynth::reset() {
     midi_status = midi_data_pos = midi_expected = 0;
     g_gate = 0;
-    if (bank_ready) midi_wt_bind(bankFlashPtr());   // re-bind = all-notes-off
+    if (bank_ready) midi_wt_bind(bankBase());   // re-bind = all-notes-off (PSRAM or flash)
 }
 
 void MidiSynth::feedByte(uint8_t b) {

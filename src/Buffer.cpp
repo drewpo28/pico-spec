@@ -11,6 +11,15 @@
 
 #if !PICO_RP2040
 #include "DivMMC.h"        // DivMMC::use_psram + bank constants
+#include "pico.h"                       // __not_in_flash_func
+#include "hardware/flash.h"             // flash_range_erase/program, FLASH_SECTOR_SIZE
+#include "hardware/sync.h"              // save_and_disable_interrupts
+#include "hardware/clocks.h"            // clock_get_hz(clk_sys)
+#include "hardware/xip_cache.h"         // xip_cache_invalidate_all
+#include "hardware/watchdog.h"          // watchdog_enable/update/disable (long flash write)
+#include "hardware/gpio.h"              // LED liveness blink during flash write
+#include "hardware/regs/addressmap.h"   // XIP_BASE
+#include "pico/stdlib.h"                // set_sys_clock_khz
 #endif
 #ifdef USE_GS
 #include "GS/GS.h"         // GS::gs_ram_size
@@ -109,6 +118,19 @@ uint8_t* g_arena_base = nullptr;
 uint32_t g_arena_size = 0;
 bool     g_arena_on   = false;
 
+Region   g_flash;             // single registered flash partition (XIP read, flash* write)
+uint8_t* g_flash_xip   = nullptr;   // partition XIP base (== absolute read pointer at off 0)
+uint32_t g_flash_total = 0;
+#if !PICO_RP2040
+uint32_t g_flash_saved_hz = 0;      // clk_sys captured by flashClockEnter(), restored by Exit()
+#endif
+
+inline bool inFlash(const void* p) {
+    if (!g_flash_xip || !g_flash_total) return false;
+    uintptr_t a = (uintptr_t)p;
+    return a >= (uintptr_t)g_flash_xip && a < (uintptr_t)g_flash_xip + g_flash_total;
+}
+
 inline bool inArena(const void* p) {
     if (!g_arena_on) return false;
     uintptr_t a = (uintptr_t)p;
@@ -179,6 +201,142 @@ void Buffer::initPools() {
                (int)g_swap_ready);
 }
 
+void Buffer::initFlashPool(void* xipBase, size_t size) {
+    if (g_flash_xip == (uint8_t*)xipBase && g_flash_total == size) return;  // idempotent
+    g_flash_xip   = (uint8_t*)xipBase;
+    g_flash_total = (uint32_t)size;
+    g_flash.init(g_flash_total);
+    Debug::log("Buffer::initFlashPool %uKB @ %p", (unsigned)(size >> 10), xipBase);
+}
+
+#if !PICO_RP2040
+// ── Flash partition write primitives (TIER_FLASH) ────────────────────────────────
+// Erase is done in 64 KB blocks (block-erase ~4-5x faster per KB than 4 KB sectors);
+// caller passes 64 KB-aligned ranges. flashErase/flashProgram MUST run from RAM,
+// IRQs off, single-core, before VIDEO::Init() — while flash is erased/programmed XIP
+// is disabled, so the executing code (and the live HDMI DMA) must not touch XIP.
+void __not_in_flash_func(Buffer::flashErase)(uint32_t off, uint32_t bytes) {
+    if (!g_flash_xip || off + bytes > g_flash_total) return;
+    uint32_t foff = (uint32_t)((uintptr_t)g_flash_xip - XIP_BASE) + off;
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(foff, bytes);
+    restore_interrupts(ints);
+}
+
+void __not_in_flash_func(Buffer::flashProgram)(uint32_t off, const void* src, uint32_t bytes) {
+    if (!g_flash_xip || off + bytes > g_flash_total) return;
+    uint32_t foff = (uint32_t)((uintptr_t)g_flash_xip - XIP_BASE) + off;
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_program(foff, (const uint8_t*)src, bytes);
+    restore_interrupts(ints);
+}
+
+// board_set_clock_and_timing (main.cpp): switch clk_sys + re-tune QMI flash/PSRAM
+// timing for it + drop the XIP cache, IRQs off and from RAM. Re-tuning is essential:
+// a flash erase/program leaves XIP at the bootrom DEFAULT timing, which is marginal at
+// the overclock, so the next flash code-fetch faults intermittently unless we re-apply
+// flash_timings() for the running clock here.
+extern void board_set_clock_and_timing(uint32_t mhz);
+
+// Capture clk_sys and drop to a conservative 252 MHz for the flash-write window.
+void Buffer::flashClockEnter() {
+    g_flash_saved_hz = clock_get_hz(clk_sys);
+    if (g_flash_saved_hz > 252 * MHZ) board_set_clock_and_timing(252);
+}
+
+// Restore the captured clock AND re-tune QMI timing for it (always — the flash write
+// disturbed the timing even if the clock was not lowered) + drop the XIP cache.
+void Buffer::flashClockExit() {
+    uint32_t mhz = (g_flash_saved_hz ? g_flash_saved_hz : clock_get_hz(clk_sys)) / MHZ;
+    board_set_clock_and_timing(mhz);
+    g_flash_saved_hz = 0;
+}
+#else
+void Buffer::flashErase(uint32_t, uint32_t) {}
+void Buffer::flashProgram(uint32_t, const void*, uint32_t) {}
+void Buffer::flashClockEnter() {}
+void Buffer::flashClockExit() {}
+#endif
+
+// ── Tier-agnostic block load ─────────────────────────────────────────────────────
+bool Buffer::load(uint32_t size, bool force, LoadReader reader, void* ctx, bool mayWriteFlash) {
+    if (_tier == TIER_NONE || size > _size || !reader) return false;
+    const uint32_t CHUNK = 4096;                          // == FLASH_SECTOR_SIZE; also flash page multiple
+    uint8_t* bounce = (uint8_t*)malloc(CHUNK);
+    if (!bounce) { Debug::log("Buffer::load OOM"); return false; }
+    bool ok = true;
+
+#if !PICO_RP2040
+    if (_tier == TIER_FLASH) {
+        // Skip the (slow, wearing) rewrite when the partition already holds these exact
+        // bytes — unless forced (recovers a valid-header-but-broken body).
+        if (!force) {
+            bool same = true;
+            for (uint32_t off = 0; off < size && same; off += CHUNK) {
+                uint32_t n = (size - off > CHUNK) ? CHUNK : (size - off);
+                if (!reader(ctx, bounce, off, n)) { same = false; break; }
+                if (memcmp(_ptr + off, bounce, n) != 0) same = false;
+            }
+            if (same) { ::free(bounce); Debug::log("Buffer::load: flash already current"); return true; }
+        }
+        if (!mayWriteFlash) {                             // erase not allowed here (e.g. after VIDEO::Init)
+            ::free(bounce);
+            Debug::log("Buffer::load: flash write needed but not permitted now");
+            return false;
+        }
+        // Erase + program at 252 MHz, IRQs off, COMMIT-LAST. Watchdog-guarded: an
+        // interrupted write leaves sector 0 erased (invalid) → retry-safe.
+        flashClockEnter();
+        watchdog_enable(8000, true);
+        const uint32_t BLK = 65536u;                      // 64 KB block erase (fast)
+        uint32_t eraseBytes = (size + (BLK - 1)) & ~(BLK - 1);
+        for (uint32_t off = 0; off < eraseBytes; off += BLK) {
+            watchdog_update();
+#if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
+            gpio_put(PICO_DEFAULT_LED_PIN, (off >> 16) & 1);
+#endif
+            uint32_t e = (off + BLK <= g_flash_total) ? BLK : (g_flash_total - off);
+            flashErase(off, e);
+        }
+        // Program the body sectors [CHUNK..size), then sector 0 LAST.
+        for (uint32_t off = CHUNK; off < size && ok; off += CHUNK) {
+            watchdog_update();
+#if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
+            gpio_put(PICO_DEFAULT_LED_PIN, (off >> 15) & 1);
+#endif
+            uint32_t n = (size - off > CHUNK) ? CHUNK : (size - off);
+            memset(bounce, 0xFF, CHUNK);                  // 0xFF-pad the tail sector
+            if (!reader(ctx, bounce, off, n)) { ok = false; break; }
+            flashProgram(off, bounce, CHUNK);
+        }
+        if (ok) {                                         // COMMIT: sector 0 last
+            uint32_t n0 = (size > CHUNK) ? CHUNK : size;
+            memset(bounce, 0xFF, CHUNK);
+            if (reader(ctx, bounce, 0, n0)) flashProgram(0, bounce, CHUNK);
+            else ok = false;
+        }
+        watchdog_disable();
+        flashClockExit();                                 // restore clock + drop XIP cache
+#if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
+        gpio_put(PICO_DEFAULT_LED_PIN, 0);
+#endif
+    } else
+#endif
+    {
+        // Addressable RAM tiers (HEAP/BUTTER/ARENA): copy chunk-by-chunk via the SRAM
+        // bounce, then a CPU store into place (a direct DMA into XIP-PSRAM is avoided).
+        (void)force; (void)mayWriteFlash;
+        if (!_ptr) ok = false;                            // SPI/SWAP have no pointer → unsupported
+        for (uint32_t off = 0; ok && off < size; off += CHUNK) {
+            uint32_t n = (size - off > CHUNK) ? CHUNK : (size - off);
+            if (!reader(ctx, bounce, off, n)) { ok = false; break; }
+            memcpy(_ptr + off, bounce, n);
+        }
+    }
+    ::free(bounce);
+    return ok;
+}
+
 // ─── Pointer alloc / free (heap or butter) ──────────────────────────────────────
 void* Buffer::palloc(size_t bytes, uint32_t flags) {
     if (!bytes) return nullptr;
@@ -200,6 +358,14 @@ void* Buffer::palloc(size_t bytes, uint32_t flags) {
         return (void*)(PSRAM_DATA + g_butter_base + off);
     };
 #endif
+    // Flash partition (read-only pointer). Opt-in via ALLOW_FLASH — the caller must
+    // treat it as read-only and write through flashErase/flashProgram.
+    auto tryFlash = [&]() -> void* {
+        if (!(flags & ALLOW_FLASH) || !g_flash.ready()) return nullptr;
+        uint32_t off = g_flash.alloc((uint32_t)bytes);
+        if (off == UINT32_MAX) return nullptr;
+        return (void*)(g_flash_xip + off);
+    };
     auto tryHeap = [&]() -> void* {
         if (getFreeHeap() < bytes + HEAP_SAFETY_MARGIN) return nullptr;
         return malloc(bytes);
@@ -208,13 +374,16 @@ void* Buffer::palloc(size_t bytes, uint32_t flags) {
 #if !PICO_RP2040
     if (preferPsram) {
         if (void* p = tryButter()) return p;
+        if (void* p = tryFlash())  return p;   // PSRAM absent/full → flash partition
         if (void* p = tryHeap())   return p;
     } else {
         if (void* p = tryHeap())   return p;
         if (void* p = tryButter()) return p;
+        if (void* p = tryFlash())  return p;
     }
 #else
     if (void* p = tryHeap()) return p;
+    if (void* p = tryFlash()) return p;
 #endif
     // Last resort: heap regardless of the safety margin (caller handles nullptr).
     return malloc(bytes);
@@ -232,6 +401,10 @@ void Buffer::pfree(void* p) {
         return;
     }
 #endif
+    if (inFlash(p)) {
+        g_flash.free((uint32_t)((uintptr_t)p - (uintptr_t)g_flash_xip));
+        return;
+    }
     ::free(p);
 }
 
@@ -273,6 +446,9 @@ bool Buffer::alloc(size_t bytes, uint32_t flags) {
         } else if (inButter(p)) {
             _tier = TIER_BUTTER;
             _off  = (uint32_t)((uintptr_t)p - (uintptr_t)PSRAM_DATA - g_butter_base);
+        } else if (inFlash(p)) {
+            _tier = TIER_FLASH;
+            _off  = (uint32_t)((uintptr_t)p - (uintptr_t)g_flash_xip);
         } else {
             _tier = TIER_HEAP;
         }
@@ -314,6 +490,7 @@ void Buffer::free() {
 #endif
         case TIER_SPI:    g_spi.free(_off); break;
         case TIER_SWAP:   g_swapAlloc.free(_off); break;
+        case TIER_FLASH:  g_flash.free(_off); break;   // bookkeeping only; flash persists
         default: break;
     }
     _tier = TIER_NONE; _ptr = nullptr; _off = 0; _size = 0;
@@ -340,6 +517,7 @@ const char* Buffer::tierName() const {
         case TIER_ARENA:  return "arena";
         case TIER_SPI:    return "spi";
         case TIER_SWAP:   return "swap";
+        case TIER_FLASH:  return "flash";
         default:          return "none";
     }
 }
@@ -350,6 +528,7 @@ uint8_t Buffer::read(size_t off) {
     switch (_tier) {
         case TIER_HEAP:
         case TIER_ARENA:
+        case TIER_FLASH:
         case TIER_BUTTER: return _ptr[off];
         case TIER_SPI:    return read8psram(g_spi_base + _off + (uint32_t)off);
         case TIER_SWAP: {
@@ -365,6 +544,7 @@ uint8_t Buffer::read(size_t off) {
 void Buffer::write(size_t off, uint8_t v) {
     if (off >= _size) return;
     switch (_tier) {
+        case TIER_FLASH:  Debug::log("Buffer: write() to TIER_FLASH ignored (use flashProgram)"); break;
         case TIER_HEAP:
         case TIER_ARENA:
         case TIER_BUTTER: _ptr[off] = v; break;
@@ -385,6 +565,7 @@ void Buffer::readBlock(void* dst, size_t off, size_t n) {
     switch (_tier) {
         case TIER_HEAP:
         case TIER_ARENA:
+        case TIER_FLASH:
         case TIER_BUTTER: memcpy(dst, _ptr + off, n); break;
         case TIER_SPI:    psram_read_range(g_spi_base + _off + (uint32_t)off, (uint8_t*)dst, n); break;
         case TIER_SWAP: {
@@ -401,6 +582,7 @@ void Buffer::writeBlock(const void* src, size_t off, size_t n) {
     if (off >= _size) return;
     if (off + n > _size) n = _size - off;
     switch (_tier) {
+        case TIER_FLASH:  Debug::log("Buffer: writeBlock() to TIER_FLASH ignored (use flashProgram)"); break;
         case TIER_HEAP:
         case TIER_ARENA:
         case TIER_BUTTER: memcpy(_ptr + off, src, n); break;
