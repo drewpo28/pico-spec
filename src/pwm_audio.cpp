@@ -289,6 +289,22 @@ static bool hw_get_bit_LOAD() {
 #endif
 
 void init_sound() {
+#ifdef LOAD_WAV_PIO
+    // Audio (tape) input pin — independent of the audio OUTPUT path, so init it
+    // first. Must run for every output mode, including HDMI: the HDMI branch
+    // below returns early, and leaving this at the end meant the input GPIO was
+    // never configured in HDMI mode, breaking tape-in.
+    //пин ввода звука (не инициализировать если MIDI использует тот же пин)
+#if defined(PICO_RP2350) && defined(MIDI_TX_PIN) && (LOAD_WAV_PIO == MIDI_TX_PIN)
+    if (Config::midi != 1 && Config::midi != 2)
+#endif
+    {
+#if !PICO_RP2040
+        if (!BoardPins::zifiOwnsPin(LOAD_WAV_PIO)) // yield WAV input pin to ZiFi
+#endif
+            inInit(LOAD_WAV_PIO);
+    }
+#endif
 #if !PICO_RP2040 && defined(VGA_HDMI)
     // Buffers (~36.9 KB) are allocated/freed by HdmiAudioSubsys::apply() at
     // the next Subsystems::applyPending() — both init_sound() call sites are
@@ -366,18 +382,6 @@ void init_sound() {
             /// PWM_init_pin(BEEPER_PIN, (1 << 8) - 1);
         }
     }
-#ifdef LOAD_WAV_PIO
-    //пин ввода звука (не инициализировать если MIDI использует тот же пин)
-#if defined(PICO_RP2350) && defined(MIDI_TX_PIN) && (LOAD_WAV_PIO == MIDI_TX_PIN)
-    if (Config::midi != 1 && Config::midi != 2)
-#endif
-    {
-#if !PICO_RP2040
-        if (!BoardPins::zifiOwnsPin(LOAD_WAV_PIO)) // yield WAV input pin to ZiFi
-#endif
-            inInit(LOAD_WAV_PIO);
-    }
-#endif
 }
 
 #if LOAD_WAV_PIO
