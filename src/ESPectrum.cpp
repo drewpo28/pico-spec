@@ -940,21 +940,24 @@ void ESPectrum::setup() {
     DivMMC::zc_init();
   }
 #endif
+  // Tiered buffer pools: carve PSRAM/SD-swap arenas from whatever the existing
+  // consumers above (MemESP/Profi pages, DivMMC) have NOT claimed, reserving GS's
+  // sample-RAM region via GS::configuredRamBytes(). Must run after those so the
+  // boundaries are final, and BEFORE GS::init so GS's work/ring buffers can draw
+  // from the butter arena. See Buffer.cpp.
+  Buffer::initPools();
+
 #ifdef USE_GS
+  // AFTER initPools: GS::init allocates its work RAM + DAC rings from the butter
+  // arena (NEED_POINTER|PREFER_PSRAM), freeing ~32 KB SRAM on PSRAM boards. The
+  // sample-RAM region it claims at the PSRAM top was already excluded from the arena.
   if (Config::gs_enabled) {
-    uint32_t gs_ram = 2u << 20;
-    if (Config::gs_ram_size == 0) gs_ram = 512u << 10;
-    else if (Config::gs_ram_size == 1) gs_ram = 1u << 20;
+    uint32_t gs_ram = GS::configuredRamBytes();
     Debug::log2SD("setup: GS::init ram=%u", (unsigned)gs_ram);
     GS::init(gs_ram);
     Debug::log2SD("setup: GS::init done, freeHeap=%u", (unsigned)getFreeHeap());
   }
 #endif
-
-  // Tiered buffer pools: carve PSRAM/SD-swap arenas from whatever the existing
-  // consumers above (MemESP/Profi pages, DivMMC, GS) have NOT claimed. Must run
-  // after all of them so the boundaries are final. See Buffer.cpp.
-  Buffer::initPools();
 
 #if !PICO_RP2040
   // GM.DLS MIDI bank: load into butter PSRAM (preferred) or provision the flash

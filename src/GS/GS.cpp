@@ -50,6 +50,7 @@ extern int butter_pages;
 
 #include "MemESP.h"
 #include "DivMMC.h"
+#include "../Buffer.h"
 
 // Host Z80 PC proxy. Defined in Ports.cpp where Z80_JLS/z80.h is included.
 // We can't pull that header in here because Z80_redcode.h already defines
@@ -246,6 +247,12 @@ static volatile uint32_t s_perf_h_spin_us = 0;     // total spinwait µs/sec in 
 // ~24 KB SRAM on configurations where GS cannot run anyway.
 #define GS_WORK_RAM_SIZE 0x4000
 static uint8_t* s_gs_work_ram = nullptr;
+// Backing store for the work RAM + DAC rings: butter PSRAM preferred (frees ~32 KB
+// SRAM on PSRAM boards), heap fallback. NEED_POINTER keeps them addressable for the
+// core1 Z80 hot path (SPI PSRAM / SD-swap are never picked → SPI-only boards keep
+// them in SRAM, same as before). The PC prefetch cache stays in SRAM (new[]) — it
+// exists to HIDE sample-RAM latency, so moving it into PSRAM would defeat it.
+static Buffer s_workRamBuf, s_ringLBuf, s_ringRBuf;
 
 // Host→GS FIFO. Some loaders (e.g. FH1_GS_TZ.scl) stream samples into port
 // 0xB3 in a tight LD A,(HL) / OUT (B3),A loop with no IN (BB) handshake,
@@ -665,6 +672,16 @@ zuint8 __not_in_flash_func(gs_direct_in          )(zuint16 port)    { return gs_
 void   __not_in_flash_func(gs_direct_out         )(zuint16 port, zuint8 value) { gs_cb_out     (nullptr, port, value); }
 }
 
+uint32_t GS::configuredRamBytes() {
+    uint32_t bytes = 2u << 20;                       // default 2 MB
+    if (Config::gs_ram_size == 0)      bytes = 512u << 10;
+    else if (Config::gs_ram_size == 1) bytes = 1u  << 20;
+    // Round up to power-of-2, min 128 KB, cap 2 MB (matches init()).
+    uint32_t rounded = 0x20000;
+    while (rounded < bytes && rounded < (2u << 20)) rounded <<= 1;
+    return rounded;
+}
+
 bool GS::init(uint32_t ram_size_bytes) {
     if (enabled) return true;
     {
@@ -722,12 +739,26 @@ bool GS::init(uint32_t ram_size_bytes) {
     s_gs_ram_mask = ram_size_bytes - 1;
     gs_ram_size   = ram_size_bytes;
 
-    if (!s_gs_work_ram) s_gs_work_ram = new uint8_t[GS_WORK_RAM_SIZE];
+    // Work RAM + DAC rings → butter PSRAM (else heap). Allocated via Buffer, so this
+    // MUST run after Buffer::initPools() (see ESPectrum::setup ordering).
+    if (!s_gs_work_ram) {
+        if (!s_workRamBuf.alloc(GS_WORK_RAM_SIZE, Buffer::NEED_POINTER | Buffer::PREFER_PSRAM)) return false;
+        s_gs_work_ram = s_workRamBuf.data();
+    }
+    if (!s_ring_L) {
+        if (!s_ringLBuf.alloc(GS_RING_SIZE * sizeof(int16_t), Buffer::NEED_POINTER | Buffer::PREFER_PSRAM)) return false;
+        s_ring_L = (int16_t*)s_ringLBuf.data();
+    }
+    if (!s_ring_R) {
+        if (!s_ringRBuf.alloc(GS_RING_SIZE * sizeof(int16_t), Buffer::NEED_POINTER | Buffer::PREFER_PSRAM)) return false;
+        s_ring_R = (int16_t*)s_ringRBuf.data();
+    }
+    Debug::log("GS::init: work/rings on %s/%s/%s",
+               s_workRamBuf.tierName(), s_ringLBuf.tierName(), s_ringRBuf.tierName());
+    // PC prefetch cache stays in SRAM/heap — it hides PSRAM latency, don't move it.
     if (!s_pc_data)     s_pc_data     = new uint8_t[GS_PC_SETS][GS_PC_WAYS][GS_PC_LINE_SZ];
     if (!s_pc_tag)      s_pc_tag      = new uint32_t[GS_PC_SETS][GS_PC_WAYS];
     if (!s_pc_next)     s_pc_next     = new uint8_t[GS_PC_SETS];
-    if (!s_ring_L)      s_ring_L      = new int16_t[GS_RING_SIZE];
-    if (!s_ring_R)      s_ring_R      = new int16_t[GS_RING_SIZE];
 
     memset(s_gs_work_ram, 0, GS_WORK_RAM_SIZE);
     gs_init_fetch_pages();   // hot-path fetch table: see gs_cb_fetch_opcode
@@ -774,12 +805,12 @@ void GS::deinit() {
     s_gs_use_spi = false;
     s_gs_ram_mask = 0;
     gs_ram_size = 0;
-    delete[] s_gs_work_ram; s_gs_work_ram = nullptr;
+    s_workRamBuf.free();    s_gs_work_ram = nullptr;
+    s_ringLBuf.free();      s_ring_L      = nullptr;
+    s_ringRBuf.free();      s_ring_R      = nullptr;
     delete[] s_pc_data;     s_pc_data     = nullptr;
     delete[] s_pc_tag;      s_pc_tag      = nullptr;
     delete[] s_pc_next;     s_pc_next     = nullptr;
-    delete[] s_ring_L;      s_ring_L      = nullptr;
-    delete[] s_ring_R;      s_ring_R      = nullptr;
 }
 
 void GS::reset() {

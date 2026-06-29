@@ -477,7 +477,10 @@ size_t featureCost(FeatureId f) {
         // boards it lands in XIP and costs 0 SRAM; only a butter-less board pays the
         // full prev-FB out of the heap.
         case FEAT_GIGASCREEN:    return spi ? VIDEO::gigascreenPrevFBBytes() : 0; // exact, current mode
-        case FEAT_GENERAL_SOUND: return 38 * 1024;   // work16 + 2x8K rings + 4K PC cache + fifos
+        // Butter boards: work RAM (16K) + DAC rings (16K) move to butter PSRAM
+        // (Buffer NEED_POINTER|PREFER_PSRAM); only the PC prefetch cache (~4.3K) stays
+        // in SRAM. Butter-less: NEED_POINTER falls back to heap → full 38K.
+        case FEAT_GENERAL_SOUND: return spi ? 38 * 1024 : 5 * 1024;
         case FEAT_DIVMMC:        return spi ? 33 * 1024 : 9 * 1024; // SPI: 3x8K cache+8K ROM+misc
         // Profi's *marginal* SRAM cost relative to a non-Profi baseline, NOT the
         // absolute forced-page reservation (~80-96 KB). Switching arch re-lays out

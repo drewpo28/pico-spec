@@ -170,8 +170,12 @@ void Buffer::initPools() {
         if (DivMMC::use_psram) bottom += (size_t)DIVMMC_NUM_BANKS * DIVMMC_BANK_SIZE;
         size_t top = bsize;
 #ifdef USE_GS
-        if (Config::gs_enabled && GS::gs_ram_size)
-            top = (GS::gs_ram_size <= bsize) ? (size_t)bsize - GS::gs_ram_size : bottom;
+        // initPools now runs BEFORE GS::init (so GS's work/ring buffers can draw from
+        // this arena), hence GS::gs_ram_size isn't set yet — derive the reserved
+        // sample-RAM region from Config via the shared helper.
+        size_t gs_res = Config::gs_enabled ? GS::configuredRamBytes() : 0;
+        if (gs_res)
+            top = (gs_res <= bsize) ? (size_t)bsize - gs_res : bottom;
 #endif
         if (top > bottom) {
             g_butter_base = (uint32_t)bottom;
@@ -187,8 +191,9 @@ void Buffer::initPools() {
         size_t low  = (size_t)MEM_PG_CNT * MEM_PG_SZ;
         size_t high = spi;
 #if !PICO_RP2040 && defined(USE_GS)
-        if (Config::gs_enabled && butter_psram_size() == 0 && GS::gs_ram_size)
-            high = (GS::gs_ram_size <= spi) ? (size_t)spi - GS::gs_ram_size : low;
+        size_t gs_res = (Config::gs_enabled && butter_psram_size() == 0) ? GS::configuredRamBytes() : 0;
+        if (gs_res)
+            high = (gs_res <= spi) ? (size_t)spi - gs_res : low;
 #endif
         if (high > low) {
             g_spi_base = (uint32_t)low;

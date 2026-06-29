@@ -14,6 +14,11 @@ public:
     static void deinit();
     static void reset();
 
+    // Sample-RAM size (bytes) GS will reserve at the top of PSRAM, derived purely
+    // from Config (no side effects). Single source of truth shared by init() and
+    // Buffer::initPools() — initPools must reserve this region BEFORE GS::init runs.
+    static uint32_t configuredRamBytes();
+
     // Returns actual T-states executed (may exceed requested due to z80_run
     // completing the current instruction; pump() uses this to maintain exact
     // 12 MHz wall-clock rate via debt tracking).
