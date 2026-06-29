@@ -469,7 +469,10 @@ namespace Subsystems {
 size_t featureCost(FeatureId f) {
     const bool spi = (butter_psram_size() == 0); // no XIP PSRAM → everything in SRAM
     switch (f) {
-        case FEAT_GIGASCREEN:    return VIDEO::gigascreenPrevFBBytes();      // exact, current mode
+        // prevFB is allocated via Buffer(NEED_POINTER|PREFER_PSRAM): on butter PSRAM
+        // boards it lands in XIP and costs 0 SRAM; only a butter-less board pays the
+        // full prev-FB out of the heap.
+        case FEAT_GIGASCREEN:    return spi ? VIDEO::gigascreenPrevFBBytes() : 0; // exact, current mode
         case FEAT_GENERAL_SOUND: return 38 * 1024;   // work16 + 2x8K rings + 4K PC cache + fifos
         case FEAT_DIVMMC:        return spi ? 33 * 1024 : 9 * 1024; // SPI: 3x8K cache+8K ROM+misc
         // Profi's *marginal* SRAM cost relative to a non-Profi baseline, NOT the
@@ -648,6 +651,28 @@ static uint32_t autoDisabledMask(FeatureId f) {
 static size_t featureMargin(FeatureId f) {
     if (f == FEAT_GIGASCREEN) return GIGASCREEN_PREVFB_HEADROOM;
     return SRAM_MARGIN;
+}
+
+bool gigascreenPrevFBAffordable(size_t want) {
+    // Butter PSRAM present → prev-FB lands in XIP (Buffer NEED_POINTER|PREFER_PSRAM),
+    // never touches the heap, so it always fits. Mirrors featureCost()'s butter==free
+    // assumption.
+    if (butter_psram_size() != 0) return true;
+    // Butter-less: the prev-FB (~52 KB) is the biggest *optional* heap block and the
+    // bare malloc in Buffer's last-resort path PANICS on failure (no NULL). Decline
+    // unless it both fits the largest obtainable block AND leaves headroom afterwards:
+    //  • getLargestAllocatable() probes the real allocator, so a freed-then-reusable
+    //    prev-FB block (Gigascreen off→on) is seen (sbrk-only getContiguousHeap() would
+    //    miss it → false decline).
+    //  • total free must still leave GIGASCREEN_PREVFB_HEADROOM after the block — that
+    //    headroom need not be contiguous, so it's a getFreeHeap() check, not a block one.
+    if (getLargestAllocatable() < want || getFreeHeap() < want + GIGASCREEN_PREVFB_HEADROOM) {
+        Debug::log("Subsys: Gigascreen prevFB declined (largest=%u free=%u want=%u+head=%u)",
+                   (unsigned)getLargestAllocatable(), (unsigned)getFreeHeap(),
+                   (unsigned)want, (unsigned)GIGASCREEN_PREVFB_HEADROOM);
+        return false;
+    }
+    return true;
 }
 
 BudgetResult budgetCheck(FeatureId enabling, FeatureId* candidates, int* nCand, size_t* deficit) {

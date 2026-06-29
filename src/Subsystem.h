@@ -49,6 +49,13 @@ namespace Subsystems {
     // features that can be turned off, excl. ones `enabling` already auto-disables) and
     // *deficit (bytes still needed). candidates[] must hold FEAT_COUNT entries.
     BudgetResult budgetCheck(FeatureId enabling, FeatureId* candidates, int* nCand, size_t* deficit);
+
+    // Can the Gigascreen prev-FB (`want` bytes) be allocated without starving the
+    // heap? Butter-PSRAM boards always pass (prev-FB goes to XIP, no heap cost);
+    // butter-less boards must fit it in the largest block AND keep
+    // GIGASCREEN_PREVFB_HEADROOM of total free heap. Called by VIDEO::ensurePrevFB
+    // before the Buffer alloc so the memory policy stays here, not in Video.
+    bool gigascreenPrevFBAffordable(size_t want);
 #endif
 }
 

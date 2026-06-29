@@ -36,6 +36,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Video.h"
 #include "Debug.h"
 #include "Subsystem.h"
+#include "Buffer.h"
 #include "Tape.h"
 #include "FileUtils.h"
 #include "VidPrecalc.h"
@@ -1306,6 +1307,11 @@ static uint8_t *sharedFB_main = nullptr;  // sized for current mode
 static uint8_t *sharedFB_prev = nullptr;  // sized for current mode (Gigascreen only)
 static size_t sharedFB_main_size = 0;     // actual byte capacity of sharedFB_main
 static size_t sharedFB_prev_size = 0;     // actual byte capacity of sharedFB_prev
+// Backing store for sharedFB_prev. Tiered: butter PSRAM (XIP-addressable) is
+// preferred so the ~52 KB prev-FB no longer eats SRAM on PSRAM boards; falls back
+// to the heap when no butter PSRAM is present. NEED_POINTER keeps it addressable
+// for the per-pixel blend hot path (SPI PSRAM/SD-swap are never selected).
+static Buffer sharedFB_prevBuf;
 static void **sharedFB_arr1 = nullptr;    // pointer array for frameBuffer (FB_MAX_LINES slots)
 static void **sharedFB_arr2 = nullptr;    // pointer array for prevFrameBuffer
 
@@ -1340,34 +1346,22 @@ static bool ensurePrevFB(int lines, int stride) {
     if (Config::arch == "Profi") return true; // Gigascreen not available for Profi
     size_t want = fbPrevBytes(lines, stride);
     if (sharedFB_prev && sharedFB_prev_size == want) return true;
-    if (sharedFB_prev) { free(sharedFB_prev); sharedFB_prev = nullptr; sharedFB_prev_size = 0; }
-    // Heap-headroom guard. prevFB (~52 KB) is the biggest *optional* buffer. On a
-    // butter-less board it collides with other big SRAM users that landed on the
-    // heap before us (General Sound's ~36 KB work/cache/rings; the framebuffer),
-    // and a bare malloc-succeeds check isn't enough — the 52 KB fits *now* but
-    // starves the rest of boot (WD1793/Z80/DivMMC/ZiFi) → OOM panic loop. Only take
-    // it if enough heap remains afterwards; otherwise decline and the caller
-    // (GsSubsys::apply) cleanly disables Gigascreen for the session.
-    // The bare malloc() below PANICS on failure (no NULL return). Two-part guard:
-    //  • the prevFB block itself must fit in the largest obtainable block (else panic).
-    //    getLargestAllocatable() probes the real allocator, so it sees a freed-then-
-    //    reusable prevFB block (Gigascreen off→on) that sbrk-only getContiguousHeap()
-    //    would miss (false decline).
-    //  • total free must still leave headroom AFTER the block — that headroom need not
-    //    be contiguous with the block, so it's a getFreeHeap() check, not a block check.
-    extern size_t getLargestAllocatable(void);
-    extern size_t getFreeHeap(void);
-    if (getLargestAllocatable() < want || getFreeHeap() < want + GIGASCREEN_PREVFB_HEADROOM) {
-        Debug::log("VIDEO: prevFB declined (largest=%u free=%u want=%u+head=%u) — Gigascreen off this session",
-                   (unsigned)getLargestAllocatable(), (unsigned)getFreeHeap(),
-                   (unsigned)want, (unsigned)GIGASCREEN_PREVFB_HEADROOM);
+    if (sharedFB_prev) { sharedFB_prevBuf.free(); sharedFB_prev = nullptr; sharedFB_prev_size = 0; }
+    // Memory policy lives in Subsystem: can this prevFB be allocated without starving
+    // the heap on a butter-less board? (Butter-PSRAM boards always pass — it goes to
+    // XIP.) Decline → GsSubsys::apply() cleanly disables Gigascreen for the session.
+    if (!Subsystems::gigascreenPrevFBAffordable(want)) return false;
+    // Butter PSRAM first (frees SRAM), heap fallback. NEED_POINTER keeps it
+    // addressable for the per-pixel blend; SPI PSRAM / SD-swap are never picked.
+    if (!sharedFB_prevBuf.alloc(want, Buffer::NEED_POINTER | Buffer::PREFER_PSRAM)) {
+        Debug::log("VIDEO: prevFB alloc failed (want=%u) — Gigascreen off this session", (unsigned)want);
         return false;
     }
-    uint8_t *p = (uint8_t*)malloc(want);
-    if (!p) return false;
+    uint8_t *p = sharedFB_prevBuf.data();
     memset(p, 0, want);
     sharedFB_prev = p;
     sharedFB_prev_size = want;
+    Debug::log("VIDEO: prevFB %uKB on %s", (unsigned)(want >> 10), sharedFB_prevBuf.tierName());
     return true;
 }
 
@@ -1416,7 +1410,7 @@ bool GsSubsys::apply() {
         if (!sharedFB_arr2) {
             sharedFB_arr2 = (void**)malloc(FB_MAX_LINES * sizeof(void*));
             if (!sharedFB_arr2) {
-                free(sharedFB_prev); sharedFB_prev = nullptr; sharedFB_prev_size = 0;
+                sharedFB_prevBuf.free(); sharedFB_prev = nullptr; sharedFB_prev_size = 0;
                 wanted = false;
                 Config::gigascreen_enabled = false;
                 VIDEO::gigascreen_enabled = false;
@@ -1437,7 +1431,7 @@ bool GsSubsys::apply() {
         VIDEO::vga.prevFrameBuffer = nullptr;
         enabled = false;
         free(sharedFB_arr2);  sharedFB_arr2  = nullptr;
-        free(sharedFB_prev);  sharedFB_prev  = nullptr;
+        sharedFB_prevBuf.free();  sharedFB_prev  = nullptr;
         sharedFB_prev_size = 0;
     }
     return true;
