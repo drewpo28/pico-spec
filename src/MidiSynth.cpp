@@ -10,6 +10,8 @@
 #include "hardware/gpio.h"       // LED blink during the flash write
 #include "hardware/xip_cache.h"  // xip_cache_invalidate_all (safe: single-core boot)
 #include "hardware/watchdog.h"   // watchdog scratch reg carries the "force reflash" request across reboot
+#include "hardware/clocks.h"     // clock_get_hz(clk_sys) — capture/restore boot clock around the flash write
+#include "pico/stdlib.h"         // set_sys_clock_khz — flash the bank at a conservative 252 MHz
 
 // Force-reflash request, carried through the warm reset in a free watchdog scratch
 // register (SDK uses scratch[4..7]; [0..3] are free). No flash write at runtime —
@@ -90,23 +92,32 @@ static uint8_t dataLenForStatus(uint8_t status) {
 static inline const uint8_t* bankFlashPtr()   { return (const uint8_t*)__gm_bank_start; }
 static inline size_t         bankRegionSize() { return (size_t)(__gm_bank_end - __gm_bank_start); }
 
-// Erase + program one flash sector from a RAM buffer. XIP-unsafe → IRQs off, run
-// from RAM. NO multicore_lockout: this only runs at EARLY BOOT before core1/video
-// is launched (single core), so there is no other core to park and no HDMI ISR to
-// fight (that fight was the freeze/deadlock). Blink the LED as a liveness sign.
-static void __not_in_flash_func(flashWriteSector)(uint32_t off, const uint8_t* src) {
+// Flash erase/program helpers. XIP-unsafe → IRQs off, run from RAM. NO
+// multicore_lockout: this only runs at EARLY BOOT before core1/video is launched
+// (single core), so there is no other core to park and no HDMI ISR to fight (that
+// fight was the freeze/deadlock). Blink the LED as a liveness sign.
+//
+// Erase is done in 64 KB BLOCKS, not 4 KB sectors: the bootrom uses the flash's
+// block-erase command for 64 KB-aligned ranges, which is ~4-5x faster per KB than
+// erasing the same area as individual 4 KB sectors. `bytes` must be a multiple of
+// FLASH_SECTOR_SIZE (caller passes 64 KB chunks).
+static void __not_in_flash_func(flashEraseRange)(uint32_t off, uint32_t bytes) {
 #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
-    gpio_put(PICO_DEFAULT_LED_PIN, (off >> 14) & 1);   // toggle ~every 4 sectors
+    gpio_put(PICO_DEFAULT_LED_PIN, (off >> 16) & 1);   // toggle each 64 KB block
 #endif
     uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(off, FLASH_SECTOR_SIZE);
-    flash_range_program(off, src, FLASH_SECTOR_SIZE);
+    flash_range_erase(off, bytes);
     restore_interrupts(ints);
 }
 
-static void __not_in_flash_func(flashEraseSector)(uint32_t off) {
+// Program only (region must already be erased). `bytes` must be a multiple of
+// FLASH_PAGE_SIZE (caller passes whole 4 KB sectors, 0xFF-padded).
+static void __not_in_flash_func(flashProgram)(uint32_t off, const uint8_t* src, uint32_t bytes) {
+#if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
+    gpio_put(PICO_DEFAULT_LED_PIN, (off >> 15) & 1);   // toggle ~every 8 sectors
+#endif
     uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(off, FLASH_SECTOR_SIZE);
+    flash_range_program(off, src, bytes);
     restore_interrupts(ints);
 }
 
@@ -186,15 +197,21 @@ void MidiSynth::provisionAtBoot() {
     // header matches SD (the only way to recover a valid-header-but-broken body).
     bool force = (watchdog_hw->scratch[MIDI_REFLASH_SCRATCH] == MIDI_REFLASH_MAGIC);
     if (force) watchdog_hw->scratch[MIDI_REFLASH_SCRATCH] = 0;   // consume it
-    if (!force && !needsProvision()) { bindFromFlash(); return; }
+    Debug::log("MidiSynth: provisionAtBoot enter @%u ms (force=%d)",
+                  (unsigned)to_ms_since_boot(get_absolute_time()), (int)force);
+    if (!force && !needsProvision()) {
+        Debug::log("MidiSynth: flash already current, no write");
+        bindFromFlash(); return;
+    }
 
     size_t size; gm_bank_header_t sdh;
     FIL* f = openValidSdBank(&size, &sdh);
-    if (!f) { bindFromFlash(); return; }
+    if (!f) { Debug::log("MidiSynth: no valid SD bank, skip"); bindFromFlash(); return; }
+    Debug::log("MidiSynth: will flash %u KB bank", (unsigned)(size >> 10));
 
     uint8_t* hdr = (uint8_t*)malloc(FLASH_SECTOR_SIZE);   // first sector (carries the magic)
     uint8_t* buf = (uint8_t*)malloc(FLASH_SECTOR_SIZE);   // body sectors
-    if (!hdr || !buf) { free(hdr); free(buf); fclose2(f); Debug::log2SD("MidiSynth: provision OOM"); return; }
+    if (!hdr || !buf) { free(hdr); free(buf); fclose2(f); Debug::log("MidiSynth: provision OOM"); return; }
     uint32_t base = (uint32_t)((uintptr_t)__gm_bank_start - XIP_BASE);
     UINT br = 0;
 
@@ -206,33 +223,68 @@ void MidiSynth::provisionAtBoot() {
     memset(hdr, 0xFF, FLASH_SECTOR_SIZE);
     UINT hwant = (UINT)(size < FLASH_SECTOR_SIZE ? size : FLASH_SECTOR_SIZE);
     bool ok = (f_read(f, hdr, hwant, &br) == FR_OK && br == hwant);
+
+    // Flash erase/program at a conservative 252 MHz, then restore the boot clock.
+    // The selected runtime CPU freq is applied later in main() after setup() returns,
+    // so this only governs the flash-write window. Safe to retune clk_sys here: still
+    // single-core, before VIDEO::Init/core1/the audio ISR. Lowering clk_sys while QMI
+    // read timing is still set for the (higher) boot clock is the safe direction —
+    // the QMI-hang risk is RAISING the clock with stale timing, not lowering it.
+    const uint32_t boot_hz = clock_get_hz(clk_sys);
+    if (ok && boot_hz > 252 * MHZ) {
+        set_sys_clock_khz(252 * KHZ, true);
+        Debug::log("MidiSynth: flashing bank at 252 MHz (boot was %u MHz)", (unsigned)(boot_hz / MHZ));
+    }
+
     // Watchdog guard (see alfCartProvisionAtBoot): a transient SD/flash stall can wedge
     // a sector. COMMIT-LAST already makes an interrupted write retry-safe (header left
     // invalid → re-provisioned next boot), so an 8 s watchdog reboot here self-heals.
     watchdog_enable(8000, true);
-    if (ok) flashEraseSector(base);
 
+    // ── PHASE 1: erase. Erase the whole region we will write (rounded up to 64 KB)
+    // in 64 KB blocks — block erase is ~4-5x faster than per-4 KB-sector erase, which
+    // dominated the old flash time. This also invalidates the header (→ 0xFF) up front,
+    // preserving COMMIT-LAST: an interrupted write leaves the header erased = absent. */
+    const uint32_t BLK = 65536u;                          // FLASH_BLOCK_SIZE (64 KB)
+    uint32_t eraseBytes = ((uint32_t)size + (BLK - 1)) & ~(BLK - 1);   // round up to 64 KB
+    const uint32_t t_start = to_ms_since_boot(get_absolute_time());
+    for (uint32_t off = 0; ok && off < eraseBytes; off += BLK) {
+        watchdog_update();                                // one 64 KB block ≪ 8 s
+        flashEraseRange(base + off, BLK);
+    }
+    const uint32_t t_erased = to_ms_since_boot(get_absolute_time());
+    Debug::log("MidiSynth: erased %u KB in %u ms", (unsigned)(eraseBytes >> 10),
+                  (unsigned)(t_erased - t_start));
+
+    // ── PHASE 2: program the body (skip the header sector), then the header LAST.
     size_t done = FLASH_SECTOR_SIZE;
     while (ok && done < size) {
-        watchdog_update();                                // healthy sector → keep alive
+        watchdog_update();
         UINT want = (UINT)((size - done > FLASH_SECTOR_SIZE) ? FLASH_SECTOR_SIZE : (size - done));
         memset(buf, 0xFF, FLASH_SECTOR_SIZE);             // pad the tail sector
         if (f_read(f, buf, want, &br) != FR_OK || br != want) { ok = false; break; }
-        flashWriteSector(base + done, buf);
+        flashProgram(base + done, buf, FLASH_SECTOR_SIZE);  // region already erased — no erase here
         done += want;
     }
-    if (ok) flashWriteSector(base, hdr);                  // COMMIT the header LAST
+    if (ok) flashProgram(base, hdr, FLASH_SECTOR_SIZE);   // COMMIT the header LAST
+    const uint32_t t_done = to_ms_since_boot(get_absolute_time());
     watchdog_disable();                                   // done flashing; don't reboot the rest of boot
+    Debug::log("MidiSynth: programmed %u KB in %u ms (total %u ms)", (unsigned)(size >> 10),
+                  (unsigned)(t_done - t_erased), (unsigned)(t_done - t_start));
+
+    // Restore the boot clock; main() applies the user-selected CPU freq after setup().
+    if (clock_get_hz(clk_sys) != boot_hz)
+        set_sys_clock_khz(boot_hz / KHZ, true);
 
     free(hdr); free(buf);
     fclose2(f);
 #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, 0);
 #endif
-    if (!ok) { Debug::log2SD("MidiSynth: provision failed (header left invalid, retry safe)"); return; }
+    if (!ok) { Debug::log("MidiSynth: provision failed (header left invalid, retry safe)"); return; }
     // Single core here → safe to drop the XIP cache and read the fresh bank now.
     xip_cache_invalidate_all();
-    Debug::log2SD("MidiSynth: provisioned %u KB to flash", (unsigned)(size >> 10));
+    Debug::log("MidiSynth: provisioned %u KB to flash", (unsigned)(size >> 10));
     bindFromFlash();
 }
 
@@ -287,6 +339,8 @@ bool MidiSynth::sdBankAvailable() {
     fclose2(f);
     return true;
 }
+
+size_t MidiSynth::flashBankCapacity() { return bankRegionSize(); }
 
 // Force a re-provision on the NEXT boot. NO flash op here (that needs core1
 // locked out vs the HDMI ISR → froze): just drop a magic in a watchdog scratch

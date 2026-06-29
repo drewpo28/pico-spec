@@ -1106,14 +1106,14 @@ static const char *MENU_AY48[2] = { "Turned on?\n" , "Turned on?\n"};
 
 #if !PICO_RP2040
 static const char *MENU_SAA1099[2] = { "Turned on?\n" , "Turned on?\n"};
-// GM.DLS wavetable (mode 4) needs the top-of-flash bank partition, which ALF
+// DLS wavetable (mode 4) needs the top-of-flash bank partition, which ALF
 // builds reclaim for firmware (NO_GM_DLS). Drop the menu row in that case.
 #if NO_GM_DLS
 #define MENU_MIDI_GMDLS_EN ""
 #define MENU_MIDI_GMDLS_ES ""
 #else
-#define MENU_MIDI_GMDLS_EN "GM.DLS Wavetable\t[G]\n"
-#define MENU_MIDI_GMDLS_ES "GM.DLS Wavetable\t[G]\n"
+#define MENU_MIDI_GMDLS_EN "DLS Wavetable\t[G]\n"
+#define MENU_MIDI_GMDLS_ES "DLS Wavetable\t[G]\n"
 #endif
 #define MENU_MIDI_EN "MIDI(Ext:P" _PIN_XSTR(MIDI_TX_PIN) ")\n"\
     "OFF             \t[O]\n"\
@@ -1140,37 +1140,26 @@ static const char *MENU_MIDI[2] = { MENU_MIDI_EN, MENU_MIDI_ES };
     "Synth    \t[Y]\n"
 #define MENU_MIDI_PRESET_ES MENU_MIDI_PRESET_EN
 static const char *MENU_MIDI_PRESET[2] = { MENU_MIDI_PRESET_EN, MENU_MIDI_PRESET_ES };
-// GM.DLS wavetable mode (4): a user-supplied bank (gm_bank.bin) is provisioned
+// DLS wavetable mode (4): a user-supplied bank (gm_bank.bin) is provisioned
 // once from SD into a flash partition, then read via XIP (no PSRAM, persistent).
 static const char *MSG_MIDI_BANK_OK[2] = {
-    "GM wavetable bank loaded.",
-    "Banco wavetable GM cargado."
+    "DLS wavetable bank loaded.",
+    "Banco wavetable DLS cargado."
 };
 // Title of the "instrument set" (.bin bank) picker, shown when SD holds >1 bank.
 static const char *MENU_MIDI_BANK_TITLE[2] = {
     "Instrument set\n",
     "Set de instrumentos\n"
 };
-// The GM bank and an ALF cartridge share ONE flash region (mutually exclusive). If
-// a cart is loaded when GM.DLS is selected, offer to unload it (revert to built-in
-// Elf-1; the cart file stays on SD) so the bank can be installed. Single short line.
-static const char *MSG_MIDI_ALF_CONFLICT_Q[2] = {
-    "Unload ALF cart to use GM.DLS?",
-    "Quitar cart ALF para usar GM.DLS?"
-};
-static const char *MSG_MIDI_ALF_KEPT[2] = {
-    "ALF cart kept. GM.DLS stays silent\n(both share one flash region).",
-    "Cart ALF conservado. GM.DLS sin sonido\n(comparten una region de flash)."
-};
 static const char *MSG_MIDI_BANK_MISSING[2] = {
-    "No bank in flash and no gm_bank.bin\non SD. MIDI will be silent.",
-    "Sin banco en flash y sin gm_bank.bin\nen SD. MIDI sin sonido."
+    "No DLS bank in flash or on SD.\nConvert a .dls first. MIDI silent.",
+    "Sin banco DLS en flash ni en SD.\nConvierte un .dls. MIDI sin sonido."
 };
 // msgDialog sizes its width to the message length and is single-line only — keep
 // this to ONE short line (a multi-line string makes the box span the whole screen).
 static const char *MSG_MIDI_BANK_REINSTALL_Q[2] = {
-    "Reinstall GM bank from SD?",
-    "Reinstalar banco GM de SD?"
+    "Reinstall DLS bank from SD?",
+    "Reinstalar banco DLS de SD?"
 };
 // Shown when a newly picked bank differs from flash: confirm the (reboot-to-)flash
 // so the user can decline and keep the current bank. Single short line.
@@ -1179,8 +1168,37 @@ static const char *MSG_MIDI_BANK_INSTALL_Q[2] = {
     "Instalar este banco? (reinicia)"
 };
 static const char *MSG_MIDI_BANK_FLASHING[2] = {
-    "Restarting to install GM bank...\nBoot takes ~20-30s (LED blinks). Do\nNOT power off until it comes back.",
-    "Reiniciando para instalar banco GM...\nArranque ~20-30s (LED parpadea). NO\napague hasta que vuelva."
+    "Restarting to install DLS bank...\nBoot takes ~20-30s (LED blinks). Do\nNOT power off until it comes back.",
+    "Reiniciando para instalar banco DLS...\nArranque ~20-30s (LED parpadea). NO\napague hasta que vuelva."
+};
+// On-device .dls -> gm_bank.bin conversion (RP2350). Title of the .dls file
+// picker, the bank-picker row that opens it, and the convert progress/result.
+static const char *MENU_DLS_TITLE[2] = {
+    "Select .dls soundbank\n",
+    "Elegir banco .dls\n"
+};
+static const char *MENU_MIDI_CONVERT_DLS[2] = {
+    "[+] Convert a .dls...",
+    "[+] Convertir un .dls..."
+};
+static const char *MSG_MIDI_CONVERTING[2] = {
+    "Converting .dls to bank...",
+    "Convirtiendo .dls a banco..."
+};
+static const char *MSG_MIDI_CONVERT_OK[2] = {
+    "Soundbank created.",
+    "Banco creado."
+};
+static const char *MSG_MIDI_CONVERT_FAIL[2] = {
+    "Conversion failed (bad .dls or low\nspace). See debug log.",
+    "Conversion fallida (.dls invalido o\npoco espacio). Ver log."
+};
+// A converted bank can exceed the fixed flash partition (~1.6 MB) — it is then
+// written to SD but cannot be installed, so the picker hides it. Tell the user
+// (the actual KB sizes are appended at runtime). Single short line for msgDialog.
+static const char *MSG_MIDI_BANK_TOOBIG[2] = {
+    "Bank too big for flash",
+    "Banco muy grande para flash"
 };
 #if defined(MIDI_TX_PIN) && defined(LOAD_WAV_PIO) && (LOAD_WAV_PIO == MIDI_TX_PIN)
 static const char *MSG_MIDI_PIN_CONFLICT[2] = {

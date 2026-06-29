@@ -68,6 +68,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "AySound.h"
 #include "Midi.h"
 #include "MidiSynth.h"
+#include "dls_conv.h"
 #include "SoftSynth.h"
 #include "ZiFi.h"
 #include "ZiFiAT.h"
@@ -85,6 +86,54 @@ visit https://zxespectrum.speccy.org/contacto
 #include "HttpsGet.h"
 #endif
 #include "kbd_img.h"
+
+#if !PICO_RP2040
+// GM.DLS on-device .dls -> bank conversion progress: throttle OSD redraws to whole
+// percent steps so the long (~tens of s) encode shows life without flickering.
+static int s_dlsConvLastPct = -1;
+static void osdDlsConvProgress(int pct, void* /*user*/) {
+    if (pct == s_dlsConvLastPct) return;
+    s_dlsConvLastPct = pct;
+    OSD::osdCenteredMsg(string(MSG_MIDI_CONVERTING[Config::lang]) + " " + std::to_string(pct) + "%",
+                        LEVEL_INFO, 0);
+}
+
+// Convert a .dls (full SD path) to a GMWB bank named <stem>.bin in CONFIG_DIR, with
+// on-screen progress. Returns the bank path on success, or "" on failure / too-large-
+// for-flash (shows the matching message itself). Does NOT touch Config — the caller
+// selects the bank + drives provisioning. Shared by the MIDI menu and the F5 browser.
+static string osdConvertDlsToBank(const string& dlsPath) {
+    string base = dlsPath;
+    size_t slash = base.find_last_of('/');
+    if (slash != string::npos) base.erase(0, slash + 1);   // basename
+    size_t dot = base.rfind('.');
+    if (dot != string::npos) base.erase(dot);              // strip extension
+    string outBin = string(CONFIG_DIR) + "/" + base + ".bin";
+
+    s_dlsConvLastPct = -1;
+    OSD::osdCenteredMsg(string(MSG_MIDI_CONVERTING[Config::lang]) + " 0%", LEVEL_INFO, 0);
+    if (!DlsConv::convert(dlsPath.c_str(), outBin.c_str(), 31250, osdDlsConvProgress, nullptr)) {
+        OSD::osdCenteredMsg(MSG_MIDI_CONVERT_FAIL[Config::lang], LEVEL_WARN, 3000);
+        return "";
+    }
+    // A bank larger than the flash partition is written to SD but can never be
+    // installed (scanBanks/provision reject it) — delete it and warn, don't select it.
+    size_t bankSz = 0;
+    FIL* bf = fopen2(outBin.c_str(), FA_READ);
+    if (bf) { bankSz = (size_t)f_size(bf); fclose2(bf); }
+    size_t cap = MidiSynth::flashBankCapacity();
+    if (bankSz > cap) {
+        f_unlink(outBin.c_str());
+        OSD::osdCenteredMsg(string(MSG_MIDI_BANK_TOOBIG[Config::lang]) + " (" +
+                            std::to_string(bankSz >> 10) + " > " + std::to_string(cap >> 10) + " KB)",
+                            LEVEL_WARN, 4000);
+        return "";
+    }
+    OSD::osdCenteredMsg(MSG_MIDI_CONVERT_OK[Config::lang], LEVEL_OK, 1500);
+    return outBin;
+}
+#endif
+
 extern "C" void graphics_set_scanlines(uint8_t level);
 extern "C" void graphics_set_dither(bool enabled);
 #if !PICO_RP2040
@@ -2386,6 +2435,35 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     }
                 }
 #endif
+#if !PICO_RP2040
+                else if (ext == "dls") {
+                    // GM.DLS soundbank — convert to a GMWB bank in CONFIG_DIR and flash
+                    // it, the same pipeline as Audio→MIDI→GM.DLS→"Convert a .dls".
+                    if (!fromZip) FileUtils::DLS_Path = FileUtils::ALL_Path;
+                    string outBin = osdConvertDlsToBank(fname);
+                    if (!outBin.empty()) {
+                        // Enabling GM.DLS (mode 4) is the RAM-heavy engine → gate it
+                        // through the SRAM budget manager, like the MIDI menu does.
+                        if (Config::midi == 4 || OSD::featureBudgetGate(Subsystems::FEAT_MIDI)) {
+                            uint8_t prev_midi = Config::midi;
+                            Config::midi = 4;
+                            Config::midi_bank = outBin;
+                            Midi::enabled = prev_midi; Midi::deinit();
+                            Midi::enabled = 4; Midi::init();
+                            MidiSubsys::request(true);
+                            Config::save();
+                            if (MidiSynth::needsProvision()) {
+                                if (OSD::msgDialog("DLS Wavetable", MSG_MIDI_BANK_INSTALL_Q[Config::lang]) == DLG_YES) {
+                                    osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
+                                    OSD::esp_hard_reset();   // boot writes the bank to flash
+                                }
+                            } else {
+                                osdCenteredMsg(MSG_MIDI_BANK_OK[Config::lang], LEVEL_OK, 2000);
+                            }
+                        }
+                    }
+                }
+#endif
             }
             if (VIDEO::OSD) OSD::drawStats(); // Redraw stats for 16:9 modes
         } else if (hkIdx == Config::HK_TAPE_PLAY) {
@@ -4204,26 +4282,39 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             std::vector<std::string> bankPaths, bankNames;
                                             size_t nBanks = MidiSynth::scanBanks(bankPaths, bankNames);
                                             string prevBank = Config::midi_bank;
-                                            if (nBanks > 1) {
-                                                menu_level = 3;
-                                                menu_curopt = 1;
-                                                menu_saverect = true;
-                                                string bankMenu = MENU_MIDI_BANK_TITLE[Config::lang];
-                                                for (size_t b = 0; b < nBanks; b++) {
-                                                    bool cur = (Config::midi_bank == bankPaths[b]);
-                                                    bankMenu += string(cur ? "[*] " : "[ ] ") + bankNames[b] + "\n";
+                                            // Always show the picker: row 1 converts any .dls on the card
+                                            // into a bank (gm_bank.bin in CONFIG_DIR), the rest are the
+                                            // banks already present. The choice is applied to
+                                            // Config::midi_bank only TENTATIVELY: committed on flash-confirm
+                                            // below, reverted to `prevBank` otherwise.
+                                            menu_level = 3;
+                                            menu_curopt = 1;
+                                            menu_saverect = true;
+                                            string bankMenu = MENU_MIDI_BANK_TITLE[Config::lang];
+                                            bankMenu += string(MENU_MIDI_CONVERT_DLS[Config::lang]) + "\n";  // row 1
+                                            for (size_t b = 0; b < nBanks; b++) {
+                                                bool cur = (Config::midi_bank == bankPaths[b]);
+                                                bankMenu += string(cur ? "[*] " : "[ ] ") + bankNames[b] + "\n";
+                                            }
+                                            uint8_t optB = menuRun(bankMenu);
+                                            menu_level = 2;
+                                            menu_curopt = opt2;
+                                            menu_saverect = false;
+                                            VIDEO::SaveRect.restore_last();
+                                            if (optB == 1) {
+                                                // Convert a .dls -> <stem>.bin in CONFIG_DIR, then select it.
+                                                // Streams the .dls from SD (no big RAM buffer); runs on core0
+                                                // at runtime — the actual flash install still happens at the
+                                                // next boot via MidiSynth::provisionAtBoot().
+                                                string mFile = fileDialog(FileUtils::DLS_Path, MENU_DLS_TITLE[Config::lang], DISK_DLSFILE, 51, 22);
+                                                if (mFile != "") {
+                                                    mFile.erase(0, 1);
+                                                    string outBin = osdConvertDlsToBank(FileUtils::DLS_Path + mFile);
+                                                    if (!outBin.empty())
+                                                        Config::midi_bank = outBin;   // tentative; committed on flash-confirm below
                                                 }
-                                                uint8_t optB = menuRun(bankMenu);
-                                                menu_level = 2;
-                                                menu_curopt = opt2;
-                                                menu_saverect = false;
-                                                VIDEO::SaveRect.restore_last();
-                                                if (optB && optB <= nBanks)
-                                                    Config::midi_bank = bankPaths[optB - 1];   // tentative
-                                            } else if (nBanks == 1) {
-                                                // exactly one set on SD -> use it (even if not named
-                                                // gm_bank.bin) so the default-path fallback can't miss it
-                                                Config::midi_bank = bankPaths[0];              // tentative
+                                            } else if (optB >= 2 && (size_t)(optB - 1) <= nBanks) {
+                                                Config::midi_bank = bankPaths[optB - 2];   // tentative
                                             }
 
                                             bool haveSd = MidiSynth::sdBankAvailable();
@@ -4231,7 +4322,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                                 // picked bank differs from / missing in flash -> CONFIRM the
                                                 // flash so the user can decline (keeps the current bank).
                                                 if (haveSd &&
-                                                    OSD::msgDialog("GM.DLS Wavetable",
+                                                    OSD::msgDialog("DLS Wavetable",
                                                                    MSG_MIDI_BANK_INSTALL_Q[Config::lang]) == DLG_YES) {
                                                     Config::save();   // commit the choice only on confirm
                                                     osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
@@ -4245,7 +4336,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                                 // partial bank). Both the switch and reinstall are declinable.
                                                 if (Config::midi_bank != prevBank) Config::save();
                                                 if (haveSd &&
-                                                    OSD::msgDialog("GM.DLS Wavetable",
+                                                    OSD::msgDialog("DLS Wavetable",
                                                                    MSG_MIDI_BANK_REINSTALL_Q[Config::lang]) == DLG_YES) {
                                                     MidiSynth::requestReflash();   // invalidate header
                                                     osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
@@ -5556,7 +5647,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::midi = 0;
                                     Midi::enabled = 0;
                                     Midi::deinit();
-                                    OSD::osdCenteredMsg("GM.DLS MIDI disabled", LEVEL_WARN, 1500);
+                                    OSD::osdCenteredMsg("DLS MIDI disabled", LEVEL_WARN, 1500);
                                 }
 #endif
                                 Config::save();
@@ -10449,7 +10540,7 @@ void OSD::EmulatorInfo() {
                 " MIDI           : Software (%s)\n", presets[pi]);
         } else if (Config::midi == 4) {
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                " MIDI           : GM.DLS (%s)\n",
+                " MIDI           : DLS (%s)\n",
                 MidiSynth::bankReady() ? "bank OK" : "no bank");
         } else {
             pos += snprintf(buf + pos, sizeof(buf) - pos,

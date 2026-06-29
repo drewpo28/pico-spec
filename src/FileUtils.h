@@ -55,6 +55,7 @@ using namespace std;
 #define DISK_ROMFILE 3
 #define DISK_IMGFILE 4
 #define DISK_ALLFILE 5
+#define DISK_DLSFILE 6   // GM.DLS soundbank picker (on-device .dls -> gm_bank.bin conversion)
 
 struct DISK_FTYPE {
     string fileExts;
@@ -125,8 +126,9 @@ public:
     static string ROM_Path; // Current DSK path on the SD
     static string IMG_Path; // Current MMC/HDF image path on the SD
     static string ALL_Path; // Current path for unified file dialog
+    static string DLS_Path; // Current .dls path (GM.DLS soundbank conversion)
 
-    static DISK_FTYPE fileTypes[6];
+    static DISK_FTYPE fileTypes[7];
 
 private:
     friend class Config;

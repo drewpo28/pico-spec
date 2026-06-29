@@ -34,6 +34,10 @@ public:
     static bool needsProvision();
     // True if a valid gm_bank.bin exists on SD (gates the "reinstall" offer).
     static bool sdBankAvailable();
+    // Size in bytes of the flash bank partition. A bank larger than this cannot be
+    // installed (scanBanks/tryOpenBank reject it) — the OSD warns when a freshly
+    // converted .dls overflows it.
+    static size_t flashBankCapacity();
     // Enumerate selectable banks on SD (*.bin with a valid GMWB v5 header) in
     // CONFIG_DIR + card root. Fills index-aligned full paths + display names;
     // returns the count. Used by the OSD "instrument set" picker.
