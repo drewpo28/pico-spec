@@ -144,6 +144,13 @@ public:
     static bool reclaimArena();
     static bool arenaActive();
 
+    // ── Pool introspection (read-only) ─────────────────────────────────────────
+    // Snapshot of one arena's occupancy, for the Memory Info screen / diagnostics.
+    // `total` is the arena window carved in initPools(); `used`/`free` reflect the
+    // Region free-list right now. Tiers without an arena (HEAP/ARENA/NONE) report 0.
+    struct PoolStat { size_t total; size_t used; size_t free; };
+    static PoolStat poolStat(Tier t);
+
     // Round-trip every available tier (alloc → writeBlock pattern → readBlock →
     // verify → free). Logs the result per tier. Returns true if all present tiers pass.
     static bool selfTest();

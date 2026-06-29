@@ -39,7 +39,8 @@ namespace Subsystems {
 
     static constexpr size_t SRAM_MARGIN = 10 * 1024;  // keep this much SRAM free
 
-    size_t      featureCost(FeatureId f);     // static estimate, board-aware (butter vs SPI)
+    size_t      featureCost(FeatureId f);     // SRAM estimate, board-aware (butter vs SPI)
+    size_t      featurePsramCost(FeatureId f);// PSRAM (butter/SPI) the feature occupies, 0 if none
     bool        featureEnabled(FeatureId f);  // reads Config (arch=="Profi" for FEAT_PROFI)
     const char* featureName(FeatureId f);     // localised, for the popup
     void        featureSetEnabled(FeatureId f, bool on);  // writes Config only (caller reboots)

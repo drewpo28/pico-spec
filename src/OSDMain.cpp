@@ -6862,18 +6862,24 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         menu_saverect = false;
                     }
                     else if (hw_opt == 3) {
-                        // Emulator Info
-                        OSD::EmulatorInfo();
+                        // Memory Info
+                        OSD::MemoryInfo();
                         menu_curopt = 3;
                         menu_saverect = false;
                     }
                     else if (hw_opt == 4) {
-                        // HID devices
-                        OSD::HIDDevices();
+                        // Emulator Info
+                        OSD::EmulatorInfo();
                         menu_curopt = 4;
                         menu_saverect = false;
                     }
-                    else if (hw_opt == 6) {
+                    else if (hw_opt == 5) {
+                        // HID devices
+                        OSD::HIDDevices();
+                        menu_curopt = 5;
+                        menu_saverect = false;
+                    }
+                    else if (hw_opt == 7) {
                         // Overclock submenu — warn user
                         osdCenteredMsg(Config::lang ? "Peligroso! Puede no arrancar!" : "Dangerous! Board may not boot!", LEVEL_WARN, 2000);
                         menu_level = 2;
@@ -7059,10 +7065,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             }
                         }
                     }
-                    else if (hw_opt == 5) {
+                    else if (hw_opt == 6) {
                         // Speed Test
                         OSD::SpeedTest();
-                        menu_curopt = 5;
+                        menu_curopt = 6;
                         menu_saverect = false;
                     }
                     else {
@@ -10499,6 +10505,102 @@ void OSD::BoardInfo() {
         PICO_BUILD_NAME, __DATE__, __TIME__, PICO_GIT_BRANCH, PICO_GIT_COMMIT);
 
     showTextDialog("Board Info", buf);
+}
+
+// Memory Info — overall FLASH/SRAM/PSRAM occupancy plus the Buffer tier pools and the
+// SRAM cost of the features currently enabled via the Subsystem budget manager. Data
+// sources: linker symbols (firmware/static/heap extents), getFreeHeap/getLargestAllocatable,
+// butter_psram_size/psram_size + page counters, Buffer::poolStat() and Subsystems::feature*.
+void OSD::MemoryInfo() {
+    extern char __flash_binary_start, __flash_binary_end;  // pico-sdk linker symbols
+    extern char end, __HeapLimit;                          // heap arena [end, __HeapLimit)
+
+    char (&buf)[OSD_INFO_BUF_SZ] = osd_info_buf;
+    int pos = 0;
+    const int KB = 1024;
+
+    // ── SRAM ───────────────────────────────────────────────────────────────────
+    size_t sram_total  = (size_t)((uintptr_t)&__HeapLimit - SRAM_BASE);  // up to stack top
+    size_t sram_static = (size_t)((uintptr_t)&end - SRAM_BASE);          // data + bss
+    size_t heap_total  = (size_t)((uintptr_t)&__HeapLimit - (uintptr_t)&end);
+    size_t heap_free   = getFreeHeap();
+    size_t heap_used   = heap_total > heap_free ? heap_total - heap_free : 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, " SRAM (%d KB usable):\n", (int)(sram_total / KB));
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Static bss+data: %d KB\n", (int)(sram_static / KB));
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Heap used/total: %d/%d KB\n", (int)(heap_used / KB), (int)(heap_total / KB));
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Heap free      : %d KB\n", (int)(heap_free / KB));
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Largest block  : %d KB\n", (int)(getLargestAllocatable() / KB));
+
+    // ── FLASH ──────────────────────────────────────────────────────────────────
+    size_t fw = (size_t)((uintptr_t)&__flash_binary_end - (uintptr_t)&__flash_binary_start);
+    uint32_t flash_total = (1u << rx[3]);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, " FLASH (%d MB):\n", (int)(flash_total >> 20));
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Firmware       : %d KB\n", (int)(fw / KB));
+    Buffer::PoolStat fp = Buffer::poolStat(Buffer::TIER_FLASH);
+    if (fp.total)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Buffer pool    : %d/%d KB\n", (int)(fp.used / KB), (int)(fp.total / KB));
+
+    // ── PSRAM ──────────────────────────────────────────────────────────────────
+#ifdef BUTTER_PSRAM_GPIO
+    if (butter_psram_size()) {
+        uint32_t bsz = butter_psram_size();
+        size_t emu = (size_t)butter_pages * MEM_PG_SZ;
+        Buffer::PoolStat bp = Buffer::poolStat(Buffer::TIER_BUTTER);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, " Butter PSRAM (%d.%d MB):\n",
+            (int)(bsz >> 20), (int)(((bsz & 0xFFFFF) * 10) >> 20));
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Emu RAM pages  : %d KB\n", (int)(emu / KB));
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Buffer arena   : %d/%d KB\n", (int)(bp.used / KB), (int)(bp.total / KB));
+    }
+#endif
+    if (psram_size()) {
+        uint32_t psz = psram_size();
+        size_t emu = (size_t)psram_pages * MEM_PG_SZ;
+        Buffer::PoolStat sp = Buffer::poolStat(Buffer::TIER_SPI);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, " SPI PSRAM (%d.%d MB):\n",
+            (int)(psz >> 20), (int)(((psz & 0xFFFFF) * 10) >> 20));
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Emu RAM pages  : %d KB\n", (int)(emu / KB));
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Buffer arena   : %d/%d KB\n", (int)(sp.used / KB), (int)(sp.total / KB));
+    }
+    Buffer::PoolStat swp = Buffer::poolStat(Buffer::TIER_SWAP);
+    if (swp.total)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, " SD swap pool   : %d/%d KB\n", (int)(swp.used / KB), (int)(swp.total / KB));
+
+#if !PICO_RP2040
+    // ── Enabled features (Subsystem SRAM budget) ────────────────────────────────
+    using namespace Subsystems;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n Enabled features (SRAM):\n");
+    size_t feat_total = 0;
+    for (int i = 0; i < FEAT_COUNT; i++) {
+        FeatureId f = (FeatureId)i;
+        if (!featureEnabled(f)) continue;
+        size_t c = featureCost(f);
+        feat_total += c;
+        // Round up so a sub-KB feature (e.g. 512 B Z-Controller) isn't shown as 0 KB;
+        // a genuinely-zero cost (Gigascreen on butter, ULA+/Timex) stays 0.
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  %-14s : %d KB\n", featureName(f), (int)((c + KB - 1) / KB));
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  %-14s : %d KB\n", "TOTAL", (int)((feat_total + KB - 1) / KB));
+
+    // ── PSRAM by feature ────────────────────────────────────────────────────────
+    // The big tiered buffers (GM.DLS bank, GS sample RAM, prevFB, DivMMC banks) live
+    // in PSRAM, not the heap — invisible in the SRAM list above. List the PSRAM users.
+    size_t psram_feat_total = 0;
+    int psram_feat_n = 0;
+    for (int i = 0; i < FEAT_COUNT; i++) {
+        FeatureId f = (FeatureId)i;
+        if (!featureEnabled(f)) continue;
+        size_t pc = featurePsramCost(f);
+        if (!pc) continue;
+        if (!psram_feat_n++)
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "\n PSRAM by feature:\n");
+        psram_feat_total += pc;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  %-14s : %d KB\n", featureName(f), (int)((pc + KB - 1) / KB));
+    }
+    if (psram_feat_n)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  %-14s : %d KB\n", "TOTAL", (int)((psram_feat_total + KB - 1) / KB));
+#endif
+
+    showTextDialog("Memory Info", buf);
 }
 
 // Helper: append just the filename part of a path, truncated to maxlen chars

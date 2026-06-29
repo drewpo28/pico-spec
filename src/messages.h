@@ -1012,6 +1012,7 @@ static const char *MENU_RTC[2]       = { "RTC + NVRAM\n",    "RTC + NVRAM\n" };
     "Hardware\n"\
     "Chip Info\n"\
     "Board Info\n"\
+    "Memory Info\n"\
     "Emulator Info\n"\
     "HID devices\n"\
     "Speed Test\t>\n"\
@@ -1020,6 +1021,7 @@ static const char *MENU_RTC[2]       = { "RTC + NVRAM\n",    "RTC + NVRAM\n" };
     "Hardware\n"\
     "Chip Info\n"\
     "Info placa\n"\
+    "Info memoria\n"\
     "Info emulador\n"\
     "Disp. HID\n"\
     "Test velocidad\t>\n"\

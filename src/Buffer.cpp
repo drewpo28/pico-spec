@@ -51,9 +51,17 @@ public:
     void init(uint32_t total) {
         _nblocks = 0;
         _ready = total > 0;
+        _total = total;
         if (_ready) { _blocks[0] = { 0, total, false }; _nblocks = 1; }
     }
     bool ready() const { return _ready; }
+
+    uint32_t total() const { return _total; }
+    uint32_t usedBytes() const {
+        uint32_t u = 0;
+        for (int i = 0; i < _nblocks; i++) if (_blocks[i].used) u += _blocks[i].size;
+        return u;
+    }
 
     // Returns an arena-relative offset, or UINT32_MAX on failure.
     uint32_t alloc(uint32_t want) {
@@ -103,6 +111,7 @@ private:
     Block _blocks[MAX_BLOCKS];
     int   _nblocks = 0;
     bool  _ready   = false;
+    uint32_t _total = 0;
 };
 
 Region   g_butter;            // absolute base = g_butter_base (XIP addressable)
@@ -520,6 +529,23 @@ const char* Buffer::tierName() const {
         case TIER_FLASH:  return "flash";
         default:          return "none";
     }
+}
+
+Buffer::PoolStat Buffer::poolStat(Tier t) {
+    Region* r = nullptr;
+    switch (t) {
+#if !PICO_RP2040
+        case TIER_BUTTER: r = &g_butter;    break;
+#endif
+        case TIER_SPI:    r = &g_spi;       break;
+        case TIER_SWAP:   r = &g_swapAlloc; break;
+        case TIER_FLASH:  r = &g_flash;     break;
+        default: break;
+    }
+    if (!r || !r->ready()) return { 0, 0, 0 };
+    size_t total = r->total();
+    size_t used  = r->usedBytes();
+    return { total, used, total > used ? total - used : 0 };
 }
 
 // ─── Accessor API ────────────────────────────────────────────────────────────────

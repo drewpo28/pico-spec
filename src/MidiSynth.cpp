@@ -106,6 +106,12 @@ static inline const uint8_t* bankBase() {
     return g_bankBuf.ok() ? (const uint8_t*)g_bankBuf.data() : bankFlashPtr();
 }
 
+size_t MidiSynth::bankPsramBytes() {
+    if (!g_bankBuf.ok()) return 0;
+    Buffer::Tier t = g_bankBuf.tier();
+    return (t == Buffer::TIER_BUTTER || t == Buffer::TIER_SPI) ? g_bankBuf.size() : 0;
+}
+
 // Defined below; needed by bindFromPsram() above its definition.
 static FIL* openValidSdBank(size_t* outSize, gm_bank_header_t* outHdr);
 

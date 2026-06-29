@@ -62,6 +62,10 @@ public:
 
     static bool bankReady() { return bank_ready; }
 
+    // GM.DLS bank size if it landed in PSRAM (butter/SPI), else 0 (flash-resident or
+    // no bank). For the Memory Info per-feature PSRAM breakdown.
+    static size_t bankPsramBytes();
+
 private:
     // MIDI byte-stream parser state (reconstructs full messages, incl. running status)
     static uint8_t midi_status;

@@ -92,6 +92,7 @@ public:
     static void HWInfo();
     static void ChipInfo();
     static void BoardInfo();
+    static void MemoryInfo();
     static void EmulatorInfo();
     static void HIDDevices();
     static void SpeedTest();

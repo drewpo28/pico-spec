@@ -26,6 +26,10 @@ extern size_t getLargestAllocatable(void);  // largest block malloc() can really
 #include "Z80DMA.h"
 #include "MemESP.h"   // butter_psram_size()
 #include "Video.h"    // VIDEO::gigascreenPrevFBBytes()
+#ifdef USE_GS
+#include "GS/GS.h"    // GS::gs_ram_size
+#endif
+#include "psram_spi.h" // psram_size()
 #ifdef VGA_HDMI
 #include "hdmi.h"
 #endif
@@ -497,6 +501,28 @@ size_t featureCost(FeatureId f) {
         case FEAT_TIMEX:         return 0;           // ~3B static state, no heap
         case FEAT_DMA:           return 8 * 1024;    // DmaAttrBuf (6K shadow + valid/charrow/prev_attrs)
         case FEAT_16COL:         return 512;         // decode LUT (256 x uint16_t)
+        default:                 return 0;
+    }
+}
+
+// PSRAM (butter/SPI) a feature occupies — the big buffers that don't show up in the
+// SRAM featureCost(). Pulled live from the owning module so it tracks the actual
+// allocation (e.g. GM.DLS bank only counts when it landed in PSRAM, not flash).
+size_t featurePsramCost(FeatureId f) {
+    const bool butter   = (butter_psram_size() != 0);
+    const bool anyPsram = butter || (psram_size() != 0);
+    switch (f) {
+        // prevFB → butter PSRAM when present (the inverse of its SRAM cost).
+        case FEAT_GIGASCREEN:    return butter ? VIDEO::gigascreenPrevFBBytes() : 0;
+#ifdef USE_GS
+        // GS sample RAM is carved from the top of butter/SPI in Buffer::initPools.
+        case FEAT_GENERAL_SOUND: return anyPsram ? GS::gs_ram_size : 0;
+#endif
+        // GM.DLS bank — only when it landed in PSRAM (else flash, reported as 0 here).
+        case FEAT_MIDI:          return MidiSynth::bankPsramBytes();
+        // esxDOS banks become direct butter-PSRAM pointers in use_psram mode.
+        case FEAT_DIVMMC:        return DivMMC::use_psram
+                                     ? (size_t)DIVMMC_NUM_BANKS * DIVMMC_BANK_SIZE : 0;
         default:                 return 0;
     }
 }
