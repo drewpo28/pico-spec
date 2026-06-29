@@ -1140,14 +1140,25 @@ void VIDEO::ulaPlusDisable() {
 // High byte = RIGHT pixel = (bit7 << 3) | (bits 5..3) = (I, GRB)
 // 512 bytes in SRAM, hot in cache. Reading one byte from a Pentagon plane
 // becomes a single LDRH from this table — no shift/mask in the inner loop.
-static uint16_t mode16col_decode_lut[256] __attribute__((aligned(4)));
+// 512 B heap LUT, allocated only while 16col is enabled (Config::mode16col_onoff)
+// and freed when off — so the feature costs ZERO SRAM when disabled.
+static uint16_t* mode16col_decode_lut = nullptr;
 
-static void init_mode16col_decode_lut() {
+void VIDEO::ensure16colLut() {
+    if (!mode16col_decode_lut) {
+        mode16col_decode_lut = (uint16_t*)malloc(256 * sizeof(uint16_t));
+        if (!mode16col_decode_lut) return;
+    }
     for (int x = 0; x < 256; x++) {
         uint8_t L = (uint8_t)((((x) >> 3) & 0x08) | ((x) & 0x07));
         uint8_t R = (uint8_t)((((x) >> 4) & 0x08) | (((x) >> 3) & 0x07));
         mode16col_decode_lut[x] = (uint16_t)L | ((uint16_t)R << 8);
     }
+}
+
+void VIDEO::free16colLut() {
+    free(mode16col_decode_lut);
+    mode16col_decode_lut = nullptr;
 }
 
 void VIDEO::mode16colUpdatePlanes() {
@@ -1337,10 +1348,19 @@ static bool ensurePrevFB(int lines, int stride) {
     // starves the rest of boot (WD1793/Z80/DivMMC/ZiFi) → OOM panic loop. Only take
     // it if enough heap remains afterwards; otherwise decline and the caller
     // (GsSubsys::apply) cleanly disables Gigascreen for the session.
+    // The bare malloc() below PANICS on failure (no NULL return). Two-part guard:
+    //  • the prevFB block itself must fit in the largest obtainable block (else panic).
+    //    getLargestAllocatable() probes the real allocator, so it sees a freed-then-
+    //    reusable prevFB block (Gigascreen off→on) that sbrk-only getContiguousHeap()
+    //    would miss (false decline).
+    //  • total free must still leave headroom AFTER the block — that headroom need not
+    //    be contiguous with the block, so it's a getFreeHeap() check, not a block check.
+    extern size_t getLargestAllocatable(void);
     extern size_t getFreeHeap(void);
-    if (getFreeHeap() < want + GIGASCREEN_PREVFB_HEADROOM) {
-        Debug::log("VIDEO: prevFB declined (freeHeap=%u < %u+%u) — Gigascreen off this session",
-                   (unsigned)getFreeHeap(), (unsigned)want, (unsigned)GIGASCREEN_PREVFB_HEADROOM);
+    if (getLargestAllocatable() < want || getFreeHeap() < want + GIGASCREEN_PREVFB_HEADROOM) {
+        Debug::log("VIDEO: prevFB declined (largest=%u free=%u want=%u+head=%u) — Gigascreen off this session",
+                   (unsigned)getLargestAllocatable(), (unsigned)getFreeHeap(),
+                   (unsigned)want, (unsigned)GIGASCREEN_PREVFB_HEADROOM);
         return false;
     }
     uint8_t *p = (uint8_t*)malloc(want);
@@ -1529,8 +1549,10 @@ void VIDEO::Init() {
     initAluBytes();
 
 #if !PICO_RP2040
-    // Precompute 16col byte->2-pixel LUT (used by 16col rasterizer hot loop)
-    init_mode16col_decode_lut();
+    // 16col byte->2-pixel LUT: build it only when the mode is enabled, release
+    // it otherwise so a disabled 16col reserves no SRAM.
+    if (Config::mode16col_onoff) VIDEO::ensure16colLut();
+    else VIDEO::free16colLut();
 #endif
 
     precalcULASWAP();   // precalculate ULA SWAP values
@@ -2083,7 +2105,8 @@ IRAM_ATTR void VIDEO::MainScreen_Blank(unsigned int statestoadd, bool contended)
 
 #if !PICO_RP2040
         // DMA per-scanline attr shadow: use snapshot if DMA wrote attrs for this scanline
-        if (Config::dma_mode && Z80DMA::dma_attr_valid[curline])
+        // (dma_attr_valid/shadow are null unless the DMA attr buffer is allocated)
+        if (Config::dma_mode && Z80DMA::dma_attr_valid && Z80DMA::dma_attr_valid[curline])
             dma_attr_override = &Z80DMA::dma_attr_shadow[curline * 32];
         else
             dma_attr_override = nullptr;
@@ -2341,7 +2364,7 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             *lineptr32++ = AluByte[combined >> 4][hires_att];
             *lineptr32++ = AluByte[combined & 0xF][hires_att];
         }
-    } else if (VIDEO::mode16col_enabled) {
+    } else if (VIDEO::mode16col_enabled && mode16col_decode_lut) {
         // 16col (Pentagon, Alone Coder, ZXPress Inferno #08).
         // Byte layout: %IiGRBgrb. mode16col_decode_lut[] precomputes
         // (left_pixel | right_pixel<<8) for every input byte.

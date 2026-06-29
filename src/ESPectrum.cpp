@@ -1099,8 +1099,10 @@ void ESPectrum::setup() {
   PitSubsys::request(Z80Ops::isByte);
   SaaSubsys::request(!Config::tape_player && Config::SAA1099);
   MidiSubsys::request(Config::midi != 0);
+  DmaSubsys::request(Config::dma_mode != 0);
   Mb02Subsys::syncFromState();
   DivMmcSubsys::syncFromState();
+  IdeSubsys::syncFromState();   // IDE::init() already ran above
 #endif
   Debug::log2SD("setup: Subsystems::applyPending begin, freeHeap=%u", (unsigned)getFreeHeap());
   Subsystems::applyPending();
@@ -1384,6 +1386,7 @@ void ESPectrum::reset(uint8_t romInUse) {
   PitSubsys::request(Z80Ops::isByte);
   SaaSubsys::request(!Config::tape_player && Config::SAA1099);
   MidiSubsys::request(Config::midi != 0);
+  DmaSubsys::request(Config::dma_mode != 0);
 #endif
   Subsystems::applyPending();
 

@@ -2318,6 +2318,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 
                 // ZIP archive — extract and replace fname/ext/mFile
                 if (ext == "zip") {
+                    // Lend the dormant Gigascreen prevFB to the extract's inflate
+                    // buffers on butter-less boards (no-op on butter — palloc routes
+                    // them to XIP PSRAM). Released right after the extract.
+                    NetArenaLease zipLease;
                     string zipFname = ZipExtract::extract(fname, DISK_ALLFILE);
                     if (zipFname.empty()) {
                         OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN);
@@ -3560,6 +3564,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 menu_saverect = false;
                                 continue;
                             }
+                            // Budget-gate when turning Z-Controller on (~0.5 KB sector buffer).
+                            if (newval && !OSD::featureBudgetGate(Subsystems::FEAT_ZCONTROLLER)) {
+                                menu_curopt = opt;
+                                menu_saverect = false;
+                                continue;   // declined to free → leave off
+                            }
                             Config::zcontroller = newval;
                             if (newval) {
                                 if (Config::esxdos) {
@@ -3717,6 +3727,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     if (sub) {
                                         uint8_t newval = sub - 1;
                                         if (newval != Config::ide_scheme) {
+                                            uint8_t prevScheme = Config::ide_scheme;
                                             // Mutually exclusive with esxDOS DivMMC/DivIDE
                                             // (shared ports 0xEB/0xE7/0xA3 etc.).
                                             if (newval && Config::esxdos) {
@@ -3725,8 +3736,19 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                                 OSD::osdCenteredMsg("esxDOS disabled", LEVEL_WARN, 2000);
                                             }
                                             Config::ide_scheme = newval;
-                                            IDE::init();
-                                            Config::save();
+                                            // Budget-gate when turning IDE on from off (~3.4 KB buffers).
+                                            // Set scheme first so the user's NEMO/PROFI choice survives
+                                            // a free-and-reboot inside the gate.
+                                            bool ok = true;
+                                            if (prevScheme == 0 && newval != 0)
+                                                ok = OSD::featureBudgetGate(Subsystems::FEAT_IDE);
+                                            if (!ok) {
+                                                Config::ide_scheme = prevScheme;   // declined → stay off
+                                            } else {
+                                                IDE::init();
+                                                IdeSubsys::syncFromState();
+                                                Config::save();
+                                            }
                                             menu_curopt = sub;
                                             menu_saverect = false;
                                         }
@@ -4111,8 +4133,15 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                                 uint8_t opt2 = menuRun(menu);
                                 if (opt2) {
+                                    bool wasOn = (prev != 0 || Config::soundriveEnabled());
                                     Config::covox = opt2 - 1;
-                                    if (Config::covox != prev) {
+                                    bool nowOn = (Config::covox != 0 || Config::soundriveEnabled());
+                                    // Budget-gate when the shared Covox/SounDrive buffer (~2 KB)
+                                    // transitions from not-needed to needed.
+                                    if (!wasOn && nowOn &&
+                                        !OSD::featureBudgetGate(Subsystems::FEAT_COVOX)) {
+                                        Config::covox = prev;   // declined → revert
+                                    } else if (Config::covox != prev) {
                                         Config::save();
                                         CovoxSubsys::request(Config::covox != 0 || Config::soundriveEnabled());
                                     }
@@ -4138,8 +4167,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 uint8_t opt2 = menuRun(menu);
                                 if (opt2) {
                                     static const uint8_t sd_map[3] = {2, 1, 0}; // menu row → mode
+                                    bool wasOn = (Config::covox != 0 || Config::soundriveEnabled());
                                     Config::soundrive = (opt2 <= 3) ? sd_map[opt2 - 1] : prev;
-                                    if (Config::soundrive != prev) {
+                                    bool nowOn = (Config::covox != 0 || Config::soundriveEnabled());
+                                    // Shared Covox/SounDrive buffer (~2 KB): gate on off→on.
+                                    if (!wasOn && nowOn &&
+                                        !OSD::featureBudgetGate(Subsystems::FEAT_COVOX)) {
+                                        Config::soundrive = prev;   // declined → revert
+                                    } else if (Config::soundrive != prev) {
                                         Config::save();
                                         CovoxSubsys::request(Config::covox != 0 || Config::soundriveEnabled());
                                     }
@@ -4170,22 +4205,25 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                                 uint8_t opt2 = menuRun(saa_menu);
                                 if (opt2) {
-                                    if (opt2 == 1)
-                                        Config::SAA1099 = true;
-                                    else
-                                        Config::SAA1099 = false;
-
-                                    if (Config::SAA1099 != prev_saa) {
-                                        ESPectrum::SAA_emu = Config::SAA1099;
-                                        if (Config::SAA1099 && Config::timex_video) {
-                                            Config::timex_video = false;
-                                            VIDEO::timex_port_ff = 0;
-                                            VIDEO::timex_mode = 0;
-                                            VIDEO::timex_hires_ink = 0;
-                                            OSD::osdCenteredMsg("Timex disabled", LEVEL_WARN, 2000);
+                                    bool want_saa = (opt2 == 1);
+                                    // Budget-gate when turning SAA1099 on from off (~2 KB).
+                                    if (want_saa && !prev_saa &&
+                                        !OSD::featureBudgetGate(Subsystems::FEAT_SAA)) {
+                                        // declined to free → leave SAA off
+                                    } else {
+                                        Config::SAA1099 = want_saa;
+                                        if (Config::SAA1099 != prev_saa) {
+                                            ESPectrum::SAA_emu = Config::SAA1099;
+                                            if (Config::SAA1099 && Config::timex_video) {
+                                                Config::timex_video = false;
+                                                VIDEO::timex_port_ff = 0;
+                                                VIDEO::timex_mode = 0;
+                                                VIDEO::timex_hires_ink = 0;
+                                                OSD::osdCenteredMsg("Timex disabled", LEVEL_WARN, 2000);
+                                            }
+                                            Config::save();
+                                            SaaSubsys::request(Config::SAA1099);
                                         }
-                                        Config::save();
-                                        SaaSubsys::request(Config::SAA1099);
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -4494,6 +4532,15 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     static const uint8_t driver_map_size = sizeof(driver_map);
                                     Config::audio_driver = (opt2 <= driver_map_size) ? driver_map[opt2 - 1] : prev;
                                     if (Config::audio_driver != prev) {
+#if !PICO_RP2040 && defined(VGA_HDMI)
+                                        // Budget-gate when switching to HDMI audio (~8.5 KB ring/queue).
+                                        // The gate reboots itself if the user frees features; otherwise
+                                        // fall through to the normal confirm+reboot.
+                                        if (Config::audio_driver == 4 &&
+                                            !OSD::featureBudgetGate(Subsystems::FEAT_HDMI_AUDIO)) {
+                                            Config::audio_driver = prev;   // declined → keep current driver
+                                        } else
+#endif
                                         if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
                                             Config::save();
                                             esp_hard_reset();
@@ -4874,16 +4921,20 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                                 uint8_t opt2 = menuRun(ula_menu);
                                 if (opt2) {
-                                    if (opt2 == 1)
-                                        Config::ulaplus = true;
-                                    else
-                                        Config::ulaplus = false;
-
-                                    if (Config::ulaplus != prev_ula) {
-                                        if (!Config::ulaplus && VIDEO::ulaplus_enabled) {
-                                            VIDEO::ulaPlusDisable();
+                                    bool want_ula = (opt2 == 1);
+                                    // Budget-gate for uniformity (ULA+ costs 0 SRAM — table in
+                                    // flash — so this always allows; keeps the toggle shape identical).
+                                    if (want_ula && !prev_ula &&
+                                        !OSD::featureBudgetGate(Subsystems::FEAT_ULAPLUS)) {
+                                        // declined → leave off
+                                    } else {
+                                        Config::ulaplus = want_ula;
+                                        if (Config::ulaplus != prev_ula) {
+                                            if (!Config::ulaplus && VIDEO::ulaplus_enabled) {
+                                                VIDEO::ulaPlusDisable();
+                                            }
+                                            Config::save();
                                         }
-                                        Config::save();
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -4912,21 +4963,28 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                                 uint8_t opt2 = menuRun(tmx_menu);
                                 if (opt2) {
-                                    if (opt2 == 1)
-                                        Config::timex_video = true;
-                                    else {
-                                        Config::timex_video = false;
-                                        VIDEO::timex_port_ff = 0;
-                                        VIDEO::timex_mode = 0;
-                                        VIDEO::timex_hires_ink = 0;
-                                    }
-                                    if (Config::timex_video != prev) {
-                                        if (Config::timex_video && Config::SAA1099) {
-                                            Config::SAA1099 = false;
-                                            ESPectrum::SAA_emu = false;
-                                            OSD::osdCenteredMsg("SAA1099 disabled", LEVEL_WARN, 2000);
+                                    bool want_tmx = (opt2 == 1);
+                                    // Budget-gate for uniformity (Timex costs 0 SRAM → always allows).
+                                    if (want_tmx && !prev &&
+                                        !OSD::featureBudgetGate(Subsystems::FEAT_TIMEX)) {
+                                        // declined → leave off
+                                    } else {
+                                        if (want_tmx)
+                                            Config::timex_video = true;
+                                        else {
+                                            Config::timex_video = false;
+                                            VIDEO::timex_port_ff = 0;
+                                            VIDEO::timex_mode = 0;
+                                            VIDEO::timex_hires_ink = 0;
                                         }
-                                        Config::save();
+                                        if (Config::timex_video != prev) {
+                                            if (Config::timex_video && Config::SAA1099) {
+                                                Config::SAA1099 = false;
+                                                ESPectrum::SAA_emu = false;
+                                                OSD::osdCenteredMsg("SAA1099 disabled", LEVEL_WARN, 2000);
+                                            }
+                                            Config::save();
+                                        }
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -4953,11 +5011,20 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::dma_mode = opt2 - 1;
                                     if (Config::dma_mode != prev) {
 #if !PICO_RP2040
-                                        // Attr shadow lives on heap only while DMA mode is on
-                                        if (Config::dma_mode) Z80DMA::ensureAttrShadow();
-                                        else Z80DMA::freeAttrShadow();
-#endif
+                                        // Budget-gate when turning DMA on from off (~7 KB attr shadow).
+                                        if (prev == 0 && Config::dma_mode != 0 &&
+                                            !OSD::featureBudgetGate(Subsystems::FEAT_DMA)) {
+                                            Config::dma_mode = prev;   // declined to free → stay off
+                                        } else {
+                                            // Apply now: emulation is paused in the OSD, so the attr
+                                            // shadow alloc/free is consistent for the renderer.
+                                            DmaSubsys::request(Config::dma_mode != 0);
+                                            DmaSubsys::apply();
+                                            Config::save();
+                                        }
+#else
                                         Config::save();
+#endif
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -5030,12 +5097,20 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     bool want = (opt2 == 1);
                                     if (want && !(Z80Ops::isPentagon || Z80Ops::isProfi)) {
                                         OSD::osdCenteredMsg(OSD_16COL_NEEDS_PENTAGON[Config::lang], LEVEL_WARN, 1500);
+                                    } else if (want && !prev &&
+                                               !OSD::featureBudgetGate(Subsystems::FEAT_16COL)) {
+                                        // declined to free → leave 16col off (~0.5 KB LUT)
                                     } else {
                                         Config::mode16col_onoff = want;
-                                        if (!Config::mode16col_onoff && VIDEO::mode16col_enabled) {
+                                        if (Config::mode16col_onoff) {
+                                            // Build the decode LUT now so the rasterizer is ready
+                                            // even before the next machine reset.
+                                            VIDEO::ensure16colLut();
+                                        } else if (VIDEO::mode16col_enabled) {
                                             // Disabling globally also drops the runtime latch.
                                             VIDEO::mode16col_enabled = false;
                                         }
+                                        if (!Config::mode16col_onoff) VIDEO::free16colLut();
                                         if (Config::mode16col_onoff != prev) Config::save();
                                     }
                                     menu_curopt = opt2;
@@ -9875,6 +9950,29 @@ size_t getContiguousHeap(void) {
     return (brk < &__HeapLimit) ? (size_t)(&__HeapLimit - brk) : 0;
 }
 
+// Largest single block that malloc() can actually satisfy RIGHT NOW, without
+// triggering the SDK's panic-on-OOM. getContiguousHeap() only measures the sbrk
+// top gap and is blind to freed blocks in the allocator's free-list (e.g. a 38 KB
+// prevFB freed when Gigascreen was turned off), so it badly under-reports after a
+// disable→re-enable. getFreeHeap() (total free) over-reports on a fragmented heap.
+// This probes the real (non-panicking) allocator by binary search: the only metric
+// that reflects what a single allocation can really get.
+extern "C" void* __real_malloc(size_t);
+extern "C" void  __real_free(void*);
+size_t getLargestAllocatable(void) {
+    extern size_t getFreeHeap(void);
+    size_t hi = getFreeHeap();          // a single block can't exceed total free
+    if (hi == 0) return 0;
+    size_t lo = 0;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo + 1) / 2;
+        void* p = __real_malloc(mid);
+        if (p) { __real_free(p); lo = mid; } // fits → search higher
+        else   { hi = mid - 1; }             // too big → search lower
+    }
+    return lo;
+}
+
 // Generic read-only text dialog with vertical scroll
 void OSD::showTextDialog(const char* title, const char* text, bool blocking, int* scroll_state) {
     if (blocking) {
@@ -10860,11 +10958,22 @@ bool OSD::loadAlfCart(const string& fname) {
     }
     Config::alfCartBanks = (uint8_t)AlfCart::bankCount();
 #if !PICO_RP2040
-    // Leaving Profi's forced-SRAM layout (no butter PSRAM) needs a reboot to re-lay out
-    // memory — an in-place reset() does not free the ~96 KB Profi pages and ALF would
-    // OOM. Same guard the Hardware→ALF menu entry uses. Boot re-mounts the cart from SD.
-    if (butter_psram_size() == 0 &&
-        MemESP::ram[56].memType() == mem_type_t::POINTER) {
+    // ALF uses neither General Sound nor Gigascreen — free their SRAM so the cart +
+    // machine have headroom. Gigascreen frees live (prevFB via GsSubsys); General
+    // Sound only frees across a reboot (no live deinit), so if it was on we reboot
+    // into ALF clean (the cart path is persisted → boot re-mounts it).
+    bool needGsReboot = (Config::gs_enabled != 0);
+    Config::gs_enabled = 0;
+    Config::gigascreen_enabled = false;
+    Config::gigascreen_onoff   = 0;
+    GsSubsys::request(false);     // release prevFB (applied at reset/reboot below)
+    Config::save();
+    // Reboot when GS was on (to actually reclaim it) OR when leaving Profi's forced-
+    // SRAM layout (no butter PSRAM) — an in-place reset() frees neither the ~96 KB
+    // Profi pages nor GS, and ALF would OOM. Boot re-mounts the cart from SD.
+    if (needGsReboot ||
+        (butter_psram_size() == 0 &&
+         MemESP::ram[56].memType() == mem_type_t::POINTER)) {
         OSD::esp_hard_reset();   // never returns
         return true;
     }

@@ -26,7 +26,16 @@ namespace Subsystems {
     // fit, OSD::featureBudgetGate() pops up the currently-enabled heavy features to
     // turn off (user picks → Config + reboot). Costs are a static table (board-aware);
     // getFreeHeap() is only the live baseline. Keep >=SRAM_MARGIN free.
-    enum FeatureId { FEAT_GIGASCREEN, FEAT_GENERAL_SOUND, FEAT_DIVMMC, FEAT_PROFI, FEAT_ZIFI, FEAT_MIDI, FEAT_COUNT };
+    enum FeatureId {
+        FEAT_GIGASCREEN, FEAT_GENERAL_SOUND, FEAT_DIVMMC, FEAT_PROFI, FEAT_ZIFI, FEAT_MIDI,
+        // Additional tracked features. Cost is the reclaimable heap reserved while
+        // enabled (heap-when-enabled basis); all are 0 SRAM when disabled. ULA+/Timex
+        // carry only a few bytes of static state (no heap) → cost 0, never offered as
+        // a free-candidate (see budgetCheck).
+        FEAT_ZCONTROLLER, FEAT_IDE, FEAT_SAA, FEAT_COVOX, FEAT_HDMI_AUDIO,
+        FEAT_ULAPLUS, FEAT_TIMEX, FEAT_DMA, FEAT_16COL,
+        FEAT_COUNT
+    };
 
     static constexpr size_t SRAM_MARGIN = 10 * 1024;  // keep this much SRAM free
 
@@ -60,6 +69,7 @@ SUBSYSTEM_DECL(PitSubsys);     // 640 B audioBufferPIT (Pentagon Byte 8253)
 #if !PICO_RP2040
 SUBSYSTEM_DECL(SaaSubsys);     // SAASound saaChip + sample buffers
 SUBSYSTEM_DECL(MidiSubsys);    // MIDI synth + 2x640 B L/R buffers
+SUBSYSTEM_DECL(DmaSubsys);     // Z80/zxnDMA per-scanline attr shadow (~7 KB heap)
 #ifdef VGA_HDMI
 SUBSYSTEM_DECL(HdmiAudioSubsys); // ~36.9 KB HDMI audio packet queue + sample rings
 #endif
@@ -92,6 +102,19 @@ struct GsSubsys {
     static bool dirty;
     static void request(bool on);
     static bool apply();
+};
+
+// IDE/HDD sector buffer + ATA identity + 2x FIL (~3.4 KB). IDE::init()/close() do
+// the real work; like Mb02Subsys/DivMmcSubsys, init() runs synchronously during
+// setup() and in the OSD (the menu reads geometry immediately), so syncFromState()
+// mirrors the resulting state and apply() handles the boot/teardown path.
+struct IdeSubsys {
+    static volatile bool enabled;
+    static bool wanted;
+    static bool dirty;
+    static void request(bool on);
+    static bool apply();
+    static void syncFromState();
 };
 #endif
 

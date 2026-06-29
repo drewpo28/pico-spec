@@ -14,6 +14,7 @@
 #include "AySound.h"
 
 extern size_t getFreeHeap(void);
+extern size_t getLargestAllocatable(void);  // largest block malloc() can really satisfy now
 
 #if !PICO_RP2040
 #include "SAASound.h"
@@ -21,6 +22,8 @@ extern size_t getFreeHeap(void);
 #include "MidiSynth.h"
 #include "MB02.h"
 #include "DivMMC.h"
+#include "IDE.h"
+#include "Z80DMA.h"
 #include "MemESP.h"   // butter_psram_size()
 #include "Video.h"    // VIDEO::gigascreenPrevFBBytes()
 #ifdef VGA_HDMI
@@ -386,6 +389,77 @@ bool HdmiAudioSubsys::apply() {
 #endif // VGA_HDMI
 
 // ----------------------------------------------------------------------------
+// DmaSubsys — Z80/zxnDMA per-scanline attr shadow (~7 KB heap). The buffer is
+// read only by the running video renderer, so the deferred frame-boundary apply
+// is safe (the OSD pauses emulation; applyPending() re-allocates before the next
+// DMA write). enabled tracks "buffer allocated", driven by Config::dma_mode != 0.
+// ----------------------------------------------------------------------------
+volatile bool DmaSubsys::enabled = false;
+bool DmaSubsys::wanted = false;
+bool DmaSubsys::dirty = false;
+
+void DmaSubsys::request(bool on) {
+    wanted = on;
+    if (wanted != enabled) dirty = true;
+}
+
+bool DmaSubsys::apply() {
+    dirty = false;
+    if (wanted == enabled) return true;
+
+    if (wanted) {
+        if (!Z80DMA::ensureAttrShadow()) {
+            Debug::log("DmaSubsys: OOM, free=%u", (unsigned)getFreeHeap());
+            wanted = false;
+            return false;
+        }
+        enabled = true;
+    } else {
+        enabled = false;
+        Z80DMA::freeAttrShadow();
+    }
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// IdeSubsys — IDE/HDD buffers (sector buf + identity + 2x FIL, ~3.4 KB). IDE::init()
+// runs synchronously during setup() and from the OSD (the menu reads geometry right
+// after), so this mirrors DivMmcSubsys/Mb02Subsys: syncFromState() reflects reality,
+// apply() covers the boot/teardown path through applyPending().
+// ----------------------------------------------------------------------------
+volatile bool IdeSubsys::enabled = false;
+bool IdeSubsys::wanted = false;
+bool IdeSubsys::dirty = false;
+
+void IdeSubsys::request(bool on) {
+    wanted = on;
+    if (wanted != enabled) dirty = true;
+}
+
+bool IdeSubsys::apply() {
+    dirty = false;
+    if (wanted == enabled) return true;
+
+    if (wanted) {
+        if (Config::ide_scheme == 0) Config::ide_scheme = 1;  // default NEMO
+        IDE::init();
+        enabled = (IDE::scheme != IDE::OFF);
+        if (!enabled) { wanted = false; return false; }
+    } else {
+        enabled = false;
+        Config::ide_scheme = 0;
+        IDE::close();   // frees sector buffer, identity and the 2 FILs
+    }
+    return true;
+}
+
+void IdeSubsys::syncFromState() {
+    enabled = (IDE::scheme != IDE::OFF);
+    wanted = enabled;
+    dirty = false;
+}
+
+// ----------------------------------------------------------------------------
 // SRAM budget manager (RP2350). See Subsystem.h. UI-free: the OSD popup lives in
 // OSDMain.cpp (OSD::featureBudgetGate) and calls these to decide what can fit and
 // what can be freed.
@@ -408,6 +482,18 @@ size_t featureCost(FeatureId f) {
         case FEAT_PROFI:         return spi ? 64 * 1024 : 0;
         case FEAT_ZIFI:          return 12 * 1024;   // in/out rings + rx_buf
         case FEAT_MIDI:          return 7 * 1024;    // GM.DLS: ~5K voice array + 2x ~640B L/R buffers
+        // ── Additional features (heap-when-enabled; all 0 SRAM when disabled) ──
+        case FEAT_ZCONTROLLER:   return 512;         // mmc_sector_buf (shared with DivMMC)
+        case FEAT_IDE:           return 4 * 1024;    // 2K sector buf + 212B identity + 2x FIL (~1.1K)
+        case FEAT_SAA:           return 2 * 1024;    // SAASound object (~1.5K: state + 2x640B buffers)
+        case FEAT_COVOX:         return 2 * 1024;    // 2x640B stereo sample buffer (~1.25K)
+#ifdef VGA_HDMI
+        case FEAT_HDMI_AUDIO:    return 9 * 1024;    // packet queue + sample rings (~8.5K; blobs shared w/ HDMI video)
+#endif
+        case FEAT_ULAPLUS:       return 0;           // AluBytes table lives in flash; only ~68B static state
+        case FEAT_TIMEX:         return 0;           // ~3B static state, no heap
+        case FEAT_DMA:           return 8 * 1024;    // DmaAttrBuf (6K shadow + valid/charrow/prev_attrs)
+        case FEAT_16COL:         return 512;         // decode LUT (256 x uint16_t)
         default:                 return 0;
     }
 }
@@ -420,6 +506,17 @@ bool featureEnabled(FeatureId f) {
         case FEAT_PROFI:         return Config::arch == "Profi";
         case FEAT_ZIFI:          return Config::zifi_enabled != 0;
         case FEAT_MIDI:          return Config::midi == 4;   // GM.DLS wavetable (the RAM-heavy mode)
+        case FEAT_ZCONTROLLER:   return Config::zcontroller;
+        case FEAT_IDE:           return Config::ide_scheme != 0;
+        case FEAT_SAA:           return Config::SAA1099;
+        case FEAT_COVOX:         return Config::covox != 0 || Config::soundrive != 0;
+#ifdef VGA_HDMI
+        case FEAT_HDMI_AUDIO:    return Config::audio_driver == 4;
+#endif
+        case FEAT_ULAPLUS:       return Config::ulaplus;
+        case FEAT_TIMEX:         return Config::timex_video;
+        case FEAT_DMA:           return Config::dma_mode != 0;
+        case FEAT_16COL:         return Config::mode16col_onoff;
         default:                 return false;
     }
 }
@@ -433,6 +530,17 @@ const char* featureName(FeatureId f) {
         case FEAT_PROFI:         return "Profi";
         case FEAT_ZIFI:          return "ZiFi";
         case FEAT_MIDI:          return "MIDI (GM.DLS)";
+        case FEAT_ZCONTROLLER:   return "Z-Controller";
+        case FEAT_IDE:           return "IDE/HDD";
+        case FEAT_SAA:           return "SAA1099";
+        case FEAT_COVOX:         return "Covox/SounDrive";
+#ifdef VGA_HDMI
+        case FEAT_HDMI_AUDIO:    return "HDMI Audio";
+#endif
+        case FEAT_ULAPLUS:       return "ULA+";
+        case FEAT_TIMEX:         return "Timex Gfx";
+        case FEAT_DMA:           return "DMA";
+        case FEAT_16COL:         return "16 colours";
         default:                 return "?";
     }
 }
@@ -471,6 +579,47 @@ void featureSetEnabled(FeatureId f, bool on) {
             if (!on) Config::midi = 0;
             else if (Config::midi != 4) Config::midi = 4;
             break;
+        case FEAT_ZCONTROLLER:
+            Config::zcontroller = on;
+            // Mutually exclusive with esxDOS DivMMC / MB-02+ (shared SD ports). The
+            // gate's reboot path bypasses the OSD toggle's disabling, so clear here.
+            if (on) { Config::esxdos = 0; Config::mb02 = 0; }
+            break;
+        case FEAT_IDE:
+            if (!on) Config::ide_scheme = 0;
+            else {
+                if (Config::ide_scheme == 0) Config::ide_scheme = 1;    // default NEMO
+                Config::esxdos = 0;   // mutually exclusive with esxDOS DivMMC/DivIDE
+            }
+            break;
+        case FEAT_SAA:
+            Config::SAA1099 = on;
+            break;
+        case FEAT_COVOX:
+            if (!on) { Config::covox = 0; Config::soundrive = 0; }
+            else if (Config::covox == 0 && Config::soundrive == 0) Config::covox = 1;
+            break;
+#ifdef VGA_HDMI
+        case FEAT_HDMI_AUDIO:
+            // Budget tradeoff: freeing HDMI audio means leaving the HDMI audio driver.
+            // Fall back to PWM (driver 1, available on every board) so the reboot
+            // doesn't re-pick HDMI via "auto". Enabling restores the HDMI driver.
+            Config::audio_driver = on ? 4 : 1;
+            break;
+#endif
+        case FEAT_ULAPLUS:
+            Config::ulaplus = on;
+            break;
+        case FEAT_TIMEX:
+            Config::timex_video = on;
+            break;
+        case FEAT_DMA:
+            if (!on) Config::dma_mode = 0;
+            else if (Config::dma_mode == 0) Config::dma_mode = 1;       // default Z80 DMA
+            break;
+        case FEAT_16COL:
+            Config::mode16col_onoff = on;
+            break;
         default: break;
     }
 }
@@ -483,6 +632,9 @@ static uint32_t autoDisabledMask(FeatureId f) {
     // on Profi entry on butter-less boards (g_voices + Profi SRAM don't fit).
     if (f == FEAT_PROFI) return (1u << FEAT_GIGASCREEN) | (1u << FEAT_ZIFI)
                               | (1u << FEAT_DIVMMC) | (1u << FEAT_MIDI);
+    // Z-Controller and IDE both displace esxDOS DivMMC (shared SD ports) — credit
+    // its freed SRAM and exclude it from the manual free-list.
+    if (f == FEAT_ZCONTROLLER || f == FEAT_IDE) return (1u << FEAT_DIVMMC);
     return 0;
 }
 
@@ -502,26 +654,46 @@ BudgetResult budgetCheck(FeatureId enabling, FeatureId* candidates, int* nCand, 
     *nCand = 0;
     *deficit = 0;
 
+    // Features that allocate no heap (e.g. ULA+/Timex — tables live in flash) can
+    // never reduce free SRAM, so enabling them always fits regardless of margin.
+    if (featureCost(enabling) == 0) return BUDGET_ALLOW;
+
     const uint32_t autoMask = autoDisabledMask(enabling);
-    size_t freeNow = getFreeHeap();
-    // Memory that enabling F will reclaim by auto-disabling other features.
+    // Two independent constraints, measured separately:
+    //  • blockFree  = largest single block obtainable now — the feature's biggest
+    //    allocation must fit here or the SDK allocator PANICS (cost is the proxy).
+    //  • totalFree  = total free heap — must still leave `margin` after `cost` so the
+    //    rest of the system has runtime headroom. The margin need NOT be contiguous
+    //    with the feature's block, so it's a total-free check, not a block check.
+    // Conflating the two (largest >= cost+margin) wrongly demands one giant block and
+    // falsely denies (e.g. 101 KB free, 54 KB largest block, Gigascreen needs 38.5 KB).
+    size_t blockFree = getLargestAllocatable();
+    size_t totalFree = getFreeHeap();
+    // Memory that enabling F reclaims by auto-disabling other features. Freeing them
+    // goes through a reboot (featureBudgetGate → esp_hard_reset), which defragments
+    // the heap — so post-free the largest block ≈ total free; credit both.
     for (int i = 0; i < FEAT_COUNT; i++)
-        if ((autoMask & (1u << i)) && featureEnabled((FeatureId)i))
-            freeNow += featureCost((FeatureId)i);
+        if ((autoMask & (1u << i)) && featureEnabled((FeatureId)i)) {
+            size_t c = featureCost((FeatureId)i);
+            blockFree += c; totalFree += c;
+        }
 
     // Switching to Profi also force-disables MB-02+ (mutually exclusive — see the
     // arch-switch code in OSDMain). MB-02 isn't a tracked FeatureId, but its 8 KB
     // EPROM composite is freed on disable, so credit it like the auto-disables.
-    if (enabling == FEAT_PROFI && Config::mb02)
-        freeNow += 8 * 1024;  // page0_composite (0x2000); 512 KB RAM is SPI-backed
+    if (enabling == FEAT_PROFI && Config::mb02) {
+        blockFree += 8 * 1024; totalFree += 8 * 1024;  // page0_composite; 512 KB RAM is SPI-backed
+    }
 
-    const size_t need = featureCost(enabling) + featureMargin(enabling);
-    Debug::log("budgetCheck(%s): freeNow=%u need=%u(cost=%u+margin=%u)",
-               featureName(enabling), (unsigned)freeNow, (unsigned)need,
-               (unsigned)featureCost(enabling), (unsigned)featureMargin(enabling));
-    if (freeNow >= need) return BUDGET_ALLOW;
-
-    *deficit = need - freeNow;
+    const size_t cost   = featureCost(enabling);
+    const size_t margin = featureMargin(enabling);
+    const size_t blockDef = (blockFree < cost)          ? (cost - blockFree)          : 0;
+    const size_t totalDef = (totalFree < cost + margin) ? (cost + margin - totalFree) : 0;
+    *deficit = blockDef > totalDef ? blockDef : totalDef;
+    Debug::log("budgetCheck(%s): block=%u total=%u cost=%u margin=%u → deficit=%u",
+               featureName(enabling), (unsigned)blockFree, (unsigned)totalFree,
+               (unsigned)cost, (unsigned)margin, (unsigned)*deficit);
+    if (*deficit == 0) return BUDGET_ALLOW;
 
     // Build the list of features the user could turn off to make room.
     size_t maxFree = 0;
@@ -534,6 +706,7 @@ BudgetResult budgetCheck(FeatureId enabling, FeatureId* candidates, int* nCand, 
         // for enabling itself — the c==enabling check above already handles that.)
         if (autoMask & (1u << i)) continue;      // already auto-freed above
         if (!featureEnabled(c)) continue;
+        if (featureCost(c) == 0) continue;       // nothing to reclaim (e.g. ULA+/Timex)
         candidates[(*nCand)++] = c;
         maxFree += featureCost(c);
     }
@@ -583,6 +756,14 @@ void Subsystems::applyPending() {
     if (GsSubsys::dirty)    {
         Debug::log2SD("Subsys: Gs wanted=%d freeHeap=%u", (int)GsSubsys::wanted, (unsigned)getFreeHeap());
         GsSubsys::apply();
+    }
+    if (DmaSubsys::dirty)   {
+        Debug::log2SD("Subsys: Dma wanted=%d freeHeap=%u", (int)DmaSubsys::wanted, (unsigned)getFreeHeap());
+        DmaSubsys::apply();
+    }
+    if (IdeSubsys::dirty)   {
+        Debug::log2SD("Subsys: Ide wanted=%d freeHeap=%u", (int)IdeSubsys::wanted, (unsigned)getFreeHeap());
+        IdeSubsys::apply();
     }
 #ifdef VGA_HDMI
     if (HdmiAudioSubsys::dirty) {

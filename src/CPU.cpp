@@ -211,6 +211,7 @@ void CPU::reset() {
             Config::save();
         }
         VIDEO::mode16col_enabled = false;
+        VIDEO::free16colLut();   // release the LUT — 16col now off (0 SRAM)
     }
 #endif
 

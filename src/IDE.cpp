@@ -17,7 +17,7 @@
 
 uint8_t IDE::scheme = IDE::OFF;
 
-FIL  IDE::file[2];
+FIL* IDE::file = nullptr;
 bool IDE::file_open[2] = { false, false };
 bool IDE::is_atapi[2]  = { false, false };
 bool IDE::sig_valid[2] = { false, false };
@@ -279,7 +279,8 @@ void IDE::init() {
     // logical block, so the shared buffer is sized for the larger case.
     if (!buffer)   buffer   = (uint8_t*)calloc(ATAPI_BLOCK, 1);
     if (!identity) identity = (uint8_t(*)[106])calloc(2 * 106, 1);
-    if (!buffer || !identity) {
+    if (!file)     file     = (FIL*)calloc(2, sizeof(FIL));
+    if (!buffer || !identity || !file) {
         Debug::log("IDE: OOM allocating buffers");
         close();
         scheme = OFF;
@@ -354,6 +355,9 @@ bool IDE::createImage(const char* path, uint32_t megabytes,
         if (progress) progress(sec + 1, totalSec);
     }
     f_close(&f);
+    // If IDE is not active, the scratch buffer was allocated solely for this
+    // one-shot create — release it so a disabled IDE keeps its ZERO-SRAM contract.
+    if (scheme == OFF) { free(buffer); buffer = nullptr; }
     if (!ok) { f_unlink(path); Debug::log("IDE: createImage write failed"); return false; }
     Debug::log("IDE: created %s (%u MB)", path, (unsigned)megabytes);
     return true;
@@ -411,7 +415,7 @@ void IDE::reset() {
 
 void IDE::close() {
     for (int d = 0; d < 2; d++) {
-        if (file_open[d]) {
+        if (file && file_open[d]) {
             f_close(&file[d]);
             file_open[d] = false;
         }
@@ -422,6 +426,11 @@ void IDE::close() {
     }
     data_index = -1;
     atapi_phase = 0;
+    // Release all heap so IDE costs ZERO SRAM when disabled. init() re-allocates
+    // these when a scheme is (re-)activated; it calls close() before re-allocating.
+    free(buffer);   buffer   = nullptr;
+    free(identity); identity = nullptr;
+    free(file);     file     = nullptr;
 }
 
 bool IDE::present() {

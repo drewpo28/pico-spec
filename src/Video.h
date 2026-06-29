@@ -351,6 +351,8 @@ public:
   static bool mode16col_enabled;
   static const uint8_t* mode16col_planes[4]; // base ptrs to 4 6144-byte planes
   static void mode16colUpdatePlanes();
+  static void ensure16colLut();  // alloc+build the 512 B decode LUT (no-op if present)
+  static void free16colLut();    // release the decode LUT — 16col costs 0 SRAM when off
 #endif
 
   // Palette transform (Default, Grayscale, etc.)

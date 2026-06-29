@@ -274,7 +274,10 @@ bool ZipExtract::extractStored(FIL* zipFile, uint32_t size) {
 // what was OOM-ing on a big extract (e.g. SATISFAC.SCL, 204 KB) when Gigascreen's
 // prevFB had already eaten the heap.
 static void* zip_zalloc(void* /*opaque*/, size_t items, size_t size) {
-    return Buffer::palloc(items * size, Buffer::USE_NET_ARENA);
+    // PREFER_PSRAM: on butter boards route the inflate state to the huge XIP-PSRAM
+    // arena instead of the scarce SRAM heap (else a big extract OOMs when GS/
+    // Gigascreen hold SRAM). USE_NET_ARENA still wins first when a lease is active.
+    return Buffer::palloc(items * size, Buffer::USE_NET_ARENA | Buffer::PREFER_PSRAM);
 }
 static void zip_zfree(void* /*opaque*/, void* p) { Buffer::pfree(p); }
 
@@ -305,15 +308,15 @@ bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize) {
     uint32_t infile_remaining = compressedSize;
     bool in_eof = false;
 
-    // Inflate dictionary (32KB LZ window). Draw it from the Buffer pool — the lent
-    // Gigascreen prevFB arena (active during net downloads) → heap → butter PSRAM — so
-    // we do NOT clobber ZX RAM. Borrowing screen pages 5+7 corrupted those banks when
-    // the extracted file was then run in place: an ALF cart from a ZIP showed a
-    // half-built catalog (blank game slots) until a manual reboot rebuilt RAM. Only when
-    // memory is too tight to allocate 32KB do we fall back to the page 5+7 borrow
-    // (saved/restored) — that path keeps working on the tightest boards.
+    // Inflate dictionary (32KB LZ window). Draw it from the Buffer pool — lent
+    // Gigascreen prevFB arena → butter PSRAM (PREFER_PSRAM) → heap — so we do NOT
+    // clobber ZX RAM and do NOT starve the SRAM heap on butter boards. Borrowing
+    // screen pages 5+7 corrupted those banks when the extracted file was then run in
+    // place: an ALF cart from a ZIP showed a half-built catalog (blank game slots)
+    // until a manual reboot rebuilt RAM. Only when memory is too tight to allocate
+    // 32KB do we fall back to the page 5+7 borrow (saved/restored) — tightest boards.
     uint8_t *dict = (uint8_t*)Buffer::palloc(TINFL_LZ_DICT_SIZE,
-                                             Buffer::NEED_POINTER | Buffer::USE_NET_ARENA);
+                                             Buffer::NEED_POINTER | Buffer::USE_NET_ARENA | Buffer::PREFER_PSRAM);
     bool dictBorrowedRam = false;
     if (!dict) {
         dict = MemESP::ram[5].direct();          // ram[5]=pages57, ram[7]=pages57+16KB (32KB static)
