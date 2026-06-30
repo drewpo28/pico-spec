@@ -5670,6 +5670,22 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         Config::arch = arch;
                                     }
                                 }
+                                // The per-arch romset slot above is only written when the
+                                // romset itself changed. Switching arch while the same romset
+                                // stays active (e.g. P512+Gluk → P1024 — Config::romSet is
+                                // already "128Kpg") leaves the destination arch's slot at its
+                                // default, so a cold boot reloads the wrong ROM: Gluk works
+                                // while running (romSet carries over across the switch) but
+                                // reverts to the 128 menu after a restart. Sync the active
+                                // arch's slot to the running romSet so it survives reboot
+                                // (mirrors the pref=="Last" gating of the romset block above;
+                                // when a pref is pinned, cold boot loads from that pref instead).
+                                if (Config::arch == "Pentagon" && Config::pref_romSetPent == "Last") Config::romSetPent = Config::romSet;
+                                else if (Config::arch == "P512" && Config::pref_romSetP512 == "Last") Config::romSetP512 = Config::romSet;
+                                else if (Config::arch == "P1024" && Config::pref_romSetP1M == "Last") Config::romSetP1M = Config::romSet;
+                                else if (Config::arch == "128K" && Config::pref_romSet_128 == "Last") Config::romSet128 = Config::romSet;
+                                else if (Config::arch == "48K" && Config::pref_romSet_48 == "Last") Config::romSet48 = Config::romSet;
+                                else if (Config::arch == "Profi" && Config::pref_romSetProfi == "Last") Config::romSetProfi = Config::romSet;
                                 // Mutual exclusivity
 #if !PICO_RP2040
                                 bool isByte = (romset == "48Kby" || romset == "128Kby");
