@@ -1420,14 +1420,6 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         if (rn < 1) rn = 1;
         int l = (sndriveLatch[0] + sndriveLatch[1] + sndriveLatch[2] + sndriveLatch[5]) / ln;
         int r = (sndriveLatch[3] + sndriveLatch[4] + sndriveLatch[5]) / rn;
-        // Makeup gain (x1.5): rail averaging halves a two-DACs/side mix relative
-        // to a full-scale mono Covox, so SounDrive music plays noticeably
-        // quieter. x1.5 brings perceived loudness closer without reintroducing
-        // the rest-level clipping that raw summation caused (silence stays well
-        // below 255). Same DC convention as the rest of the Covox path; the
-        // residual DC is removed downstream in pwm_audio. Clamped to 255.
-        l = (l * 3) / 2;
-        r = (r * 3) / 2;
         if (l > 255) l = 255;
         if (r > 255) r = 255;
         LED::touchW(LED::COVOX);
