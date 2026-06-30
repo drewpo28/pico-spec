@@ -2030,19 +2030,23 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
         // the file type). For a real filename, use F5 Save instead.
         rfd_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
         OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
-        // Extension straight from the display name when it looks like a real file
-        // extension (short, alphanumeric) — avoids an extra request. Catalog titles can
-        // contain dots mid-name (e.g. "...3; Demo (SL+SSROM)"), so fall back to
-        // downloadBasename() (the real name from the locator) when the suffix isn't ext-like.
+        // Extension straight from the display name only when the suffix is a *known*
+        // launchable extension — avoids an extra request. Catalog titles routinely
+        // carry dots mid-name (version tags like "Z-Player v3.4", or "...3; Demo
+        // (SL+SSROM)"), and a bare "short alphanumeric suffix" test wrongly takes ".4"
+        // as the type. Anything unrecognised falls back to downloadBasename() (the real
+        // name from the locator), which is the authoritative source of the extension.
+        auto isLaunchExt = [](const string& lc) {
+            return lc == "tap" || lc == "tzx" || lc == "pzx" || lc == "wav" || lc == "mp3"
+                || lc == "sna" || lc == "z80" || lc == "p"   || lc == "zip"
+                || lc == "rom" || lc == "bin"
+                || FileUtils::ifaceForExt(lc) != IFACE_NONE; // trd/scl/fdi/udi/td0/pro/mbd/mmc/hdf
+        };
         string ext;
         size_t slash = nm.find_last_of('/'), dot = nm.find_last_of('.');
-        if (dot != string::npos && (slash == string::npos || dot > slash)) {
-            string e = nm.substr(dot);                 // includes the '.'
-            bool extLike = (e.size() >= 2 && e.size() <= 5);
-            for (size_t i = 1; extLike && i < e.size(); i++)
-                if (!isalnum((unsigned char)e[i])) extLike = false;
-            if (extLike) ext = e;
-        }
+        if (dot != string::npos && (slash == string::npos || dot > slash) &&
+            isLaunchExt(FileUtils::getLCaseExt(nm)))
+            ext = nm.substr(dot);                          // includes the '.'
         if (ext.empty()) {
             string base = fs->downloadBasename(nm);
             size_t d2 = base.find_last_of('.');

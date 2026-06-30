@@ -1783,7 +1783,15 @@ static void trdMaybeInjectBoot(rvmwdDisk *disk) {
     uint8_t fileCount = buf[0xE4];
     if (fileCount >= 128) return;           // catalog full
 
-    // Scan the active catalog entries (dir sectors 0-7) for an existing "boot    B".
+    // Scan the active catalog entries (dir sectors 0-7) for an existing "boot    B",
+    // and verify the boot's target — logical sector 9 of track 0 (linear sector 9) —
+    // is not occupied by a file. The reserved-tail assumption only holds for the
+    // standard layout (first-free pointer = track 1 / sector 0, whole of track 0
+    // system-reserved). Some archived TRDs are formatted with track 0's tail
+    // (logical sectors 9-15) reclaimed for data, so a file starts at linear sector 9;
+    // injecting there would silently clobber that file's data. Skip injection on
+    // those disks (drop to the TR-DOS prompt, same as without the feature) rather
+    // than corrupt them. A file occupies linear sectors [start, start+seccnt).
     int loadedSec = -1;
     for (int i = 0; i < fileCount; i++) {
         int sec = i >> 4;
@@ -1794,6 +1802,14 @@ static void trdMaybeInjectBoot(rvmwdDisk *disk) {
         }
         const uint8_t *ent = buf + ((i & 0x0F) << 4);
         if (memcmp(ent, "boot    ", 8) == 0 && ent[8] == 'B') return; // already present
+        if (ent[0] == 0x00) continue;                  // empty terminator entry
+        int fileStart = ent[15] * 16 + ent[14];        // linear sector (track*16 + sector)
+        int fileEnd   = fileStart + ent[13];           // ent[13] = length in sectors
+        if (fileStart <= 9 && 9 < fileEnd) {           // covers track 0's tail sector 9
+            Debug::log("TRD: skip boot inject — track 0 tail in use (file @lin%d len%d)",
+                       fileStart, (int)ent[13]);
+            return;
+        }
     }
 
     // No boot file — append the catalog entry at slot = fileCount.

@@ -195,18 +195,34 @@ bool Ftp::get(const std::string& remote, const std::string& localSdPath, XferPro
     auto g_ftp_buf = std::make_unique<uint8_t[]>(FTP_BUF_SZ);
     uint32_t done = 0;
     bool ok = true;
+    int idle = 0;                 // consecutive transient (no-data) timeouts
     for (;;) {
         int n = ZiFiSock::sock_recv(DATA, g_ftp_buf.get(), FTP_BUF_SZ, 10000);
         if (n < 0) { ok = false; break; }
-        if (n == 0) break; // EOF
+        if (n == 0) {
+            // sock_recv() returns 0 for BOTH a real peer-close AND a transient
+            // no-data timeout. Only a real close is end-of-file; a timeout while
+            // the server still owes us bytes (slow link / WiFi sag / ESP RX stall)
+            // must NOT be mistaken for EOF, or the file is silently truncated —
+            // which shows up as "nonsense in BASIC" when a half TRD is mounted.
+            if (ZiFiSock::isClosed(DATA)) break;          // genuine EOF
+            if (total && done >= total) break;            // got it all; close imminent
+            if (++idle >= 6) { ok = false; break; }       // ~60 s dead → give up
+            continue;
+        }
+        idle = 0;
         UINT bw;
         if (f_write(f, g_ftp_buf.get(), n, &bw) != FR_OK || (int)bw != n) { ok = false; break; }
         done += n;
         if (cb && !cb(done, total)) { ok = false; break; } // user abort
+        if (total && done >= total) break;                 // complete — don't wait for close
     }
+    // Truncation guard: a known size we never reached means a corrupt/partial file.
+    if (ok && total && done < total) ok = false;
     fclose2(f);
     ZiFiSock::sock_close(DATA);
     readReply(reply); // 226
+    if (!ok) f_unlink(localSdPath.c_str());   // never leave a truncated image on SD
     return ok;
 }
 
