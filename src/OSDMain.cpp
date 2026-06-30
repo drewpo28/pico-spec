@@ -2320,8 +2320,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 if (ext == "zip") {
                     // Lend the dormant Gigascreen prevFB to the extract's inflate
                     // buffers on butter-less boards (no-op on butter — palloc routes
-                    // them to XIP PSRAM). Released right after the extract.
+                    // them to XIP PSRAM). Released right after the extract. The lease
+                    // helper only exists where Gigascreen + the net arena do (RP2350).
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
                     NetArenaLease zipLease;
+#endif
                     string zipFname = ZipExtract::extract(fname, DISK_ALLFILE);
                     if (zipFname.empty()) {
                         OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN);
@@ -4137,11 +4140,15 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::covox = opt2 - 1;
                                     bool nowOn = (Config::covox != 0 || Config::soundriveEnabled());
                                     // Budget-gate when the shared Covox/SounDrive buffer (~2 KB)
-                                    // transitions from not-needed to needed.
+                                    // transitions from not-needed to needed. No budget
+                                    // manager on RP2040 — enable directly.
+#if !PICO_RP2040
                                     if (!wasOn && nowOn &&
                                         !OSD::featureBudgetGate(Subsystems::FEAT_COVOX)) {
                                         Config::covox = prev;   // declined → revert
-                                    } else if (Config::covox != prev) {
+                                    } else
+#endif
+                                    if (Config::covox != prev) {
                                         Config::save();
                                         CovoxSubsys::request(Config::covox != 0 || Config::soundriveEnabled());
                                     }
@@ -4171,10 +4178,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::soundrive = (opt2 <= 3) ? sd_map[opt2 - 1] : prev;
                                     bool nowOn = (Config::covox != 0 || Config::soundriveEnabled());
                                     // Shared Covox/SounDrive buffer (~2 KB): gate on off→on.
+                                    // No budget manager on RP2040 — enable directly.
+#if !PICO_RP2040
                                     if (!wasOn && nowOn &&
                                         !OSD::featureBudgetGate(Subsystems::FEAT_COVOX)) {
                                         Config::soundrive = prev;   // declined → revert
-                                    } else if (Config::soundrive != prev) {
+                                    } else
+#endif
+                                    if (Config::soundrive != prev) {
                                         Config::save();
                                         CovoxSubsys::request(Config::covox != 0 || Config::soundriveEnabled());
                                     }
