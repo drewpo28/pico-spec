@@ -1852,7 +1852,12 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   bool eff7_decode = (Config::arch == "Profi") ? ((address & 0xF008) == 0xE000)
                                                : ((address & 0x1008) == 0);
   if ((Z80Ops::isPentagon || Z80Ops::isProfi) && eff7_decode) { // EFF7
-    if (!MemESP::pagingLock) {
+    // The #EFF7 page0-overlay / lock-disable (bits 2,3) is a Pentagon-1024SL (and
+    // Profi) feature; a plain Pentagon 512/128 has no #EFF7 and must NOT respond to
+    // it. Gating to is1024/isProfi keeps real hardware semantics and lets guest
+    // software tell a 512 from a 1024SL by probing #EFF7 (a 512 leaves page0 = ROM)
+    // before ever touching #7FFD bit5 (which would permanently lock a 512).
+    if (!MemESP::pagingLock && (Z80Ops::is1024 || Z80Ops::isProfi)) {
       uint8_t prevPage0 = MemESP::page0ram;
       uint8_t prevNotMore = MemESP::notMore128;
       MemESP::notMore128 = bitRead(data, 2);
