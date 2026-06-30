@@ -121,6 +121,7 @@ uint8_t Ports::port[128];
 uint8_t Ports::extPort[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 uint8_t Ports::port254 = 0;
 uint8_t Ports::sndriveLatch[6] = {0, 0, 0, 0, 0, 0};
+uint8_t Ports::sndriveUsed = 0;
 uint8_t Ports::portAFF7 = 0;
 uint8_t Ports::portDFFD = 0;
 uint8_t Ports::portEFF7 = 0;
@@ -1403,8 +1404,30 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       }
       if (slot >= 0) {
         sndriveLatch[slot] = data;
-        int l = sndriveLatch[0] + sndriveLatch[1] + sndriveLatch[2] + sndriveLatch[5];
-        int r = sndriveLatch[3] + sndriveLatch[4] + sndriveLatch[5];
+        sndriveUsed |= (1 << slot);
+        // Model the analog summing amplifier: each rail is the average of the
+        // DACs actually driven on it, not their raw sum. Summing alone clips at
+        // 255 even at rest (two idle DACs sit at ~128 each → ~256), which is the
+        // harsh distortion 4-channel SounDrive music exhibits. Averaging over
+        // the *used* DAC count keeps one-DAC-per-side programs at full scale
+        // (no regression for Single Warrior: #3F left + #5F right) while two
+        // DACs/side mix cleanly. The result can never exceed 255, so no clip.
+        const uint8_t leftMask = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 5);
+        const uint8_t rightMask = (1 << 3) | (1 << 4) | (1 << 5);
+        int ln = __builtin_popcount(sndriveUsed & leftMask);
+        int rn = __builtin_popcount(sndriveUsed & rightMask);
+        if (ln < 1) ln = 1;
+        if (rn < 1) rn = 1;
+        int l = (sndriveLatch[0] + sndriveLatch[1] + sndriveLatch[2] + sndriveLatch[5]) / ln;
+        int r = (sndriveLatch[3] + sndriveLatch[4] + sndriveLatch[5]) / rn;
+        // Makeup gain (x1.5): rail averaging halves a two-DACs/side mix relative
+        // to a full-scale mono Covox, so SounDrive music plays noticeably
+        // quieter. x1.5 brings perceived loudness closer without reintroducing
+        // the rest-level clipping that raw summation caused (silence stays well
+        // below 255). Same DC convention as the rest of the Covox path; the
+        // residual DC is removed downstream in pwm_audio. Clamped to 255.
+        l = (l * 3) / 2;
+        r = (r * 3) / 2;
         if (l > 255) l = 255;
         if (r > 255) r = 255;
         LED::touchW(LED::COVOX);

@@ -1329,6 +1329,7 @@ void ESPectrum::reset(uint8_t romInUse) {
 #endif
   lastCovoxVal = lastCovoxValR = lastaudioBit = 0;
   memset(Ports::sndriveLatch, 0, sizeof(Ports::sndriveLatch));
+  Ports::sndriveUsed = 0;
 
   AY_emu = Config::AY48;
 #if !PICO_RP2040

@@ -63,6 +63,11 @@ public:
     // (right), #FB (both). Mixed in stereo into the covox L/R buffers.
     // Cleared on reset.
     static uint8_t sndriveLatch[6];
+    // Bitmask of latches ever written since reset (slot -> bit). Used as the
+    // analog summing-amp divisor: each rail is averaged over the DACs actually
+    // driven, so one DAC/side stays full-scale (Single Warrior) while two
+    // DACs/side average instead of summing-and-clipping (4-ch SounDrive music).
+    static uint8_t sndriveUsed;
 
     static uint8_t portAFF7;
     static uint8_t portDFFD;
