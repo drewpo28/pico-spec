@@ -508,7 +508,6 @@ static int brdlin_cnt = 0;
 static unsigned int lin_end, lin_end2 /*, lin_end3*/;
 
 static unsigned int coldraw_cnt;
-static unsigned int col_end;
 static unsigned int video_rest;
 static unsigned int video_opcode_rest;
 static unsigned int curline;

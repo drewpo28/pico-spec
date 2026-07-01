@@ -64,8 +64,6 @@ struct semaphore graphics_init_done_semaphore;
 #endif
 #include "Video.h"
 
-static FATFS fs;
-
 struct input_bits_t {
     bool a: true;
     bool b: true;

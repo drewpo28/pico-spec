@@ -235,8 +235,6 @@ unsigned char ESPectrum::audioSampleDivider;
 unsigned char ESPectrum::audioAYDivider;
 unsigned char ESPectrum::audioCOVOXDivider;
 unsigned char ESPectrum::audioOverSampleDivider;
-static int audioBitBuf = 0;
-static unsigned char audioBitbufCount = 0;
 /// QueueHandle_t audioTaskQueue;
 /// TaskHandle_t ESPectrum::audioTaskHandle;
 uint8_t *param;
