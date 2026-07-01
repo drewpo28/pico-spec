@@ -61,6 +61,7 @@ char     last_line[96];    // last completed status line
 bool     flag_prompt = false; // saw the CIPSEND '>' prompt
 bool     flag_send_ok= false;
 bool     flag_error  = false;
+bool     flag_send_fail = false; // saw "SEND FAIL" — TCP buffer full, bytes NOT queued (retry-safe)
 int      pending_close = -1;  // link id seen as CLOSED on the last status line, else -1
 int      pending_connect = -1; // link id seen as "<id>,CONNECT" (server accept), else -1
 
@@ -69,6 +70,7 @@ void reset_parser() {
     ipd_field = 0; ipd_nfld = 0; ipd_tmp_id = 0;
     last_line[0] = '\0';
     flag_prompt = flag_send_ok = flag_error = false;
+    flag_send_fail = false;
     pending_close = -1;
     pending_connect = -1;
 }
@@ -95,7 +97,11 @@ static void process_status_line(const char* L) {
     last_line[sizeof(last_line) - 1] = '\0';
     if (strstr(L, "SEND OK"))      flag_send_ok = true;
     if (strstr(L, "ERROR"))        flag_error   = true;
-    if (strstr(L, "SEND FAIL"))    flag_error   = true;
+    // "SEND FAIL" = the ESP's TCP send buffer was full and it dropped this CIPSEND
+    // payload (it was NOT queued). Kept distinct from flag_error so sock_send can
+    // safely retry the same chunk under backpressure instead of aborting the whole
+    // upload — large STOR/put transfers over the slow ESP link hit this routinely.
+    if (strstr(L, "SEND FAIL"))    flag_send_fail = true;
     // "<id>,CLOSED" (mux) or "CLOSED" (single). pump() applies it to closed[].
     if (strstr(L, "CLOSED")) {
         int id = 0;
@@ -306,35 +312,55 @@ int ZiFiSock::sock_send(int id, const uint8_t* buf, size_t len, uint32_t timeout
         size_t chunk = len - sent;
         if (chunk > 2048) chunk = 2048; // ESP-AT default CIPSEND cap
 
-        char cmd[32];
-        if (mux_mode) snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%d,%u", id, (unsigned)chunk);
-        else          snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%u", (unsigned)chunk);
+        // Retry the SAME chunk while the ESP reports it could not queue the bytes
+        // (no '>' prompt → busy; "SEND FAIL" → TCP buffer full). Both mean nothing
+        // was transmitted, so resending is safe and never duplicates data. Without
+        // this, a single backpressure stall mid-stream aborted the whole transfer —
+        // why large uploads (2.5 MB firmware over the slow ESP link) "failed" and
+        // left a short file on the server. A real ERROR or an ambiguous missing
+        // SEND OK (bytes maybe queued) still aborts: retrying those could duplicate.
+        const int MAX_RETRY = 8;
+        int attempt = 0;
+        for (;;) {
+            char cmd[32];
+            if (mux_mode) snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%d,%u", id, (unsigned)chunk);
+            else          snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%u", (unsigned)chunk);
 
-        flag_prompt = flag_send_ok = flag_error = false; last_line[0] = '\0';
-        ZiFi::sendRaw((const uint8_t*)cmd, strlen(cmd));
-        const uint8_t crlf[2] = {'\r', '\n'};
-        ZiFi::sendRaw(crlf, 2);
+            flag_prompt = flag_send_ok = flag_error = flag_send_fail = false; last_line[0] = '\0';
+            ZiFi::sendRaw((const uint8_t*)cmd, strlen(cmd));
+            const uint8_t crlf[2] = {'\r', '\n'};
+            ZiFi::sendRaw(crlf, 2);
 
-        // Wait for the '>' prompt.
-        absolute_time_t pdl = make_timeout_time_ms(timeout_ms);
-        while (!flag_prompt && !flag_error && !time_reached(pdl)) pump(20);
-        if (!flag_prompt) {
+            // Wait for the '>' prompt.
+            absolute_time_t pdl = make_timeout_time_ms(timeout_ms);
+            while (!flag_prompt && !flag_error && !time_reached(pdl)) pump(20);
+            if (!flag_prompt) {
+                if (!flag_error && ++attempt < MAX_RETRY) { // busy → let it drain, retry chunk
+                    absolute_time_t bk = make_timeout_time_ms(200);
+                    while (!time_reached(bk)) pump(20);
+                    continue;
+                }
 #if ZIFI_TRACE
-            Debug::log("sock_send: NO '>' prompt (id=%d chunk=%u err=%d last=%s)",
-                       id, (unsigned)chunk, flag_error, last_line);
+                Debug::log("sock_send: NO '>' prompt (id=%d chunk=%u err=%d try=%d last=%s)",
+                           id, (unsigned)chunk, flag_error, attempt, last_line);
 #endif
-            return sent ? (int)sent : -1;
-        }
+                return sent ? (int)sent : -1;
+            }
 
-        // Send the payload bytes verbatim, then wait for SEND OK.
-        ZiFi::sendRaw(buf + sent, chunk);
-        flag_send_ok = flag_error = false;
-        absolute_time_t sdl = make_timeout_time_ms(timeout_ms);
-        while (!flag_send_ok && !flag_error && !time_reached(sdl)) pump(20);
-        if (!flag_send_ok) {
+            // Send the payload bytes verbatim, then wait for SEND OK / SEND FAIL.
+            ZiFi::sendRaw(buf + sent, chunk);
+            flag_send_ok = flag_error = flag_send_fail = false;
+            absolute_time_t sdl = make_timeout_time_ms(timeout_ms);
+            while (!flag_send_ok && !flag_error && !flag_send_fail && !time_reached(sdl)) pump(20);
+            if (flag_send_ok) break;                 // chunk accepted
+            if (flag_send_fail && ++attempt < MAX_RETRY) { // TCP buffer full → retry whole chunk
+                absolute_time_t bk = make_timeout_time_ms(200);
+                while (!time_reached(bk)) pump(20);
+                continue;
+            }
 #if ZIFI_TRACE
-            Debug::log("sock_send: NO 'SEND OK' (id=%d chunk=%u err=%d last=%s)",
-                       id, (unsigned)chunk, flag_error, last_line);
+            Debug::log("sock_send: NO 'SEND OK' (id=%d chunk=%u err=%d fail=%d try=%d last=%s)",
+                       id, (unsigned)chunk, flag_error, flag_send_fail, attempt, last_line);
 #endif
             return sent ? (int)sent : -1;
         }
