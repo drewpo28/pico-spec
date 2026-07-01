@@ -741,7 +741,16 @@ BudgetResult budgetCheck(FeatureId enabling, FeatureId* candidates, int* nCand, 
 
     const size_t cost   = featureCost(enabling);
     const size_t margin = featureMargin(enabling);
-    const size_t blockDef = (blockFree < cost)          ? (cost - blockFree)          : 0;
+    // The block check demands `cost` in one contiguous allocation. That's right for
+    // features that malloc a single big buffer (GS 38 KB, DivMMC 33 KB, Gigascreen's
+    // prev-FB ~52 KB). Profi is different: its `cost` (64 KB) is a *marginal*, multi-
+    // page figure — setup() re-lays out 6×16 KB SRAM pages one page at a time, and the
+    // switch REBOOTS, so those pages come from a fresh (defragmented) heap. Its biggest
+    // single allocation is therefore one 16 KB page, not 64 KB. Using the full cost as
+    // the block proxy falsely DENIES on a fragmented-but-roomy heap (e.g. m1p2: 76 KB
+    // free total, largest block < 64 KB → phantom deficit). Total-free still gates it.
+    const size_t blockNeed = (enabling == FEAT_PROFI) ? (size_t)MEM_PG_SZ : cost;
+    const size_t blockDef = (blockFree < blockNeed)     ? (blockNeed - blockFree)     : 0;
     const size_t totalDef = (totalFree < cost + margin) ? (cost + margin - totalFree) : 0;
     *deficit = blockDef > totalDef ? blockDef : totalDef;
     Debug::log("budgetCheck(%s): block=%u total=%u cost=%u margin=%u → deficit=%u",
