@@ -3,6 +3,7 @@
 #if !PICO_RP2040 && ZIFI_NET_CLIENT
 
 #include "ZiFiSock.h"
+#include "ZiFi.h"
 #include "Debug.h"
 #include "ff.h"
 #include <string.h>
@@ -192,13 +193,34 @@ bool Ftp::get(const std::string& remote, const std::string& localSdPath, XferPro
     FIL* f = fopen2(localSdPath.c_str(), FA_WRITE | FA_CREATE_ALWAYS);
     if (!f) { ZiFiSock::sock_close(DATA); return false; }
 
+    // Network reads land in a small per-chunk buffer (matches the ZiFiSock per-link
+    // rx_buf), but SD writes are batched into a much larger accumulator. Every
+    // f_write() call blocks the core for the physical write, and nothing drains the
+    // ESP UART's small IRQ ring while blocked (ZiFi::rxSpill() only runs from
+    // sock_recv()) — at high baud (921600) that 8 KB ring can overflow inside a
+    // single write's stall. Fewer, larger writes means fewer stall windows, which
+    // cuts the total time the ring goes undrained (confirmed by hw log: baud 921600,
+    // 1 KB-per-write get() lost ~0.45% of a 640 KB TRD — see FTP_BUF_SZ history above).
+    static const size_t WRITE_CHUNK_SZ = 16 * 1024;
     auto g_ftp_buf = std::make_unique<uint8_t[]>(FTP_BUF_SZ);
+    auto g_wr_buf  = std::make_unique<uint8_t[]>(WRITE_CHUNK_SZ);
+    size_t wrFill = 0;
+    auto flushWrite = [&]() -> bool {
+        if (!wrFill) return true;
+        UINT bw;
+        bool wok = f_write(f, g_wr_buf.get(), wrFill, &bw) == FR_OK && bw == wrFill;
+        wrFill = 0;
+        return wok;
+    };
+
     uint32_t done = 0;
     bool ok = true;
-    int idle = 0;                 // consecutive transient (no-data) timeouts
+    int idle = 0;                  // consecutive transient (no-data) timeouts
+    const char* failReason = nullptr; // diagnostic only — which branch gave up
+    uint32_t dropBefore = ZiFi::rxDropped();
     for (;;) {
         int n = ZiFiSock::sock_recv(DATA, g_ftp_buf.get(), FTP_BUF_SZ, 10000);
-        if (n < 0) { ok = false; break; }
+        if (n < 0) { ok = false; failReason = "recv error"; break; }
         if (n == 0) {
             // sock_recv() returns 0 for BOTH a real peer-close AND a transient
             // no-data timeout. Only a real close is end-of-file; a timeout while
@@ -207,22 +229,36 @@ bool Ftp::get(const std::string& remote, const std::string& localSdPath, XferPro
             // which shows up as "nonsense in BASIC" when a half TRD is mounted.
             if (ZiFiSock::isClosed(DATA)) break;          // genuine EOF
             if (total && done >= total) break;            // got it all; close imminent
-            if (++idle >= 6) { ok = false; break; }       // ~60 s dead → give up
+            if (++idle >= 6) { ok = false; failReason = "idle timeout"; break; } // ~60 s dead → give up
             continue;
         }
         idle = 0;
-        UINT bw;
-        if (f_write(f, g_ftp_buf.get(), n, &bw) != FR_OK || (int)bw != n) { ok = false; break; }
+        size_t off = 0;
+        while (off < (size_t)n) {
+            size_t room  = WRITE_CHUNK_SZ - wrFill;
+            size_t chunk = (size_t)n - off < room ? (size_t)n - off : room;
+            memcpy(g_wr_buf.get() + wrFill, g_ftp_buf.get() + off, chunk);
+            wrFill += chunk; off += chunk;
+            if (wrFill == WRITE_CHUNK_SZ && !flushWrite()) { ok = false; failReason = "SD write error"; break; }
+        }
+        if (!ok) break;
         done += n;
-        if (cb && !cb(done, total)) { ok = false; break; } // user abort
+        if (cb && !cb(done, total)) { ok = false; failReason = "user abort"; break; }
         if (total && done >= total) break;                 // complete — don't wait for close
     }
+    if (ok && !flushWrite()) { ok = false; failReason = "SD write error"; }
+    else if (!ok) flushWrite();    // best-effort — file is unlinked below anyway
     // Truncation guard: a known size we never reached means a corrupt/partial file.
-    if (ok && total && done < total) ok = false;
+    if (ok && total && done < total) { ok = false; failReason = "short xfer"; }
     fclose2(f);
     ZiFiSock::sock_close(DATA);
-    readReply(reply); // 226
-    if (!ok) f_unlink(localSdPath.c_str());   // never leave a truncated image on SD
+    int code = readReply(reply); // 226
+    if (!ok) {
+        Debug::log("FTP get %s: FAIL (%s) done=%u total=%u finalReply=%d '%s' rxDrop=%u",
+                   remote.c_str(), failReason ? failReason : "?", done, total, code, reply.c_str(),
+                   (unsigned)(ZiFi::rxDropped() - dropBefore));
+        f_unlink(localSdPath.c_str());   // never leave a truncated image on SD
+    }
     return ok;
 }
 
