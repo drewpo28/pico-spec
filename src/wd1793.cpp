@@ -49,12 +49,36 @@ static bool sclConvertToTRD(rvmWD1793 *wd);
 static void mbdFlushTrack(rvmWD1793 *wd); // defined below; also re-declared near its callers
 #endif
 
-// Shared SCL-translated track-0 buffer (was per-fdd Track0[2304], 2 copies).
-// SCL conversion happens lazily once per SCL disk; only one fdd can own the
-// buffer at a time. When a different fdd asks for its track 0, the previous
-// owner's sclConverted flag is cleared so the buffer is regenerated.
-static unsigned char s_scl_track0[2304];
+// Shared 8 KB track scratch for raw-format loads: FDI whole-track bulk read and
+// TD0 streaming decode fetch a track in ONE SD multi-block read instead of one
+// SPI transaction per sector (~1.4 ms each on plain SPI cards). RP2350-only —
+// the FDI/TD0 raw paths are all under #if !PICO_RP2040.
+#if !PICO_RP2040
+static uint8_t g_rawTrkDataBuf[8192];
+#endif
+
+// SCL-translated track-0 cache (was per-fdd Track0[2304], 2 copies). Only one fdd
+// owns it at a time; a different fdd clears the previous owner's sclConverted flag
+// so the buffer is regenerated. On RP2350 it ALIASES the first 2304 B of
+// g_rawTrkDataBuf to save SRAM: SCL never uses g_rawTrkDataBuf, and FDI/TD0 never
+// use this cache, for the SAME disk — they can only collide ACROSS drives (SCL in
+// one + FDI/TD0 in another). invalidateSclCacheForScratch() handles that: it drops
+// the SCL cache at every g_rawTrkDataBuf (re)fill, so track-0 is reconverted on the
+// next SCL read (a few ms, only in that rare mix). RP2040 has no FDI/TD0 raw path,
+// so it keeps a dedicated buffer.
 static rvmWD1793 *s_scl_track0_owner = nullptr;
+#if !PICO_RP2040
+static unsigned char* const s_scl_track0 = (unsigned char*)g_rawTrkDataBuf;
+static inline void invalidateSclCacheForScratch() {
+    if (s_scl_track0_owner) {
+        s_scl_track0_owner->sclConverted = false;
+        s_scl_track0_owner = nullptr;
+    }
+}
+#else
+static unsigned char s_scl_track0[2304];
+static inline void invalidateSclCacheForScratch() {}
+#endif
 
 static unsigned char* claim_scl_track0(rvmWD1793 *wd) {
     if (s_scl_track0_owner && s_scl_track0_owner != wd) {
@@ -2389,10 +2413,8 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
 }
 
 #if !PICO_RP2040
-// Shared staging buffer for raw-format track loads (FDI/TD0): the whole
-// track's sector data is fetched in ONE SD multi-block read instead of one
-// SPI transaction per sector (~1.4 ms each on plain SPI cards).
-static uint8_t g_rawTrkDataBuf[8192];
+// g_rawTrkDataBuf (raw-format track staging) is defined near the top of the file
+// so the SCL track-0 cache can alias it — see s_scl_track0.
 
 static void udiFlushTrack(rvmWD1793 *wd) {
     // Flush targets the unit whose track is in the buffer, not the currently
@@ -2581,6 +2603,7 @@ void fdiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
     if (dataMaxEnd > dataMinOff && (dataMaxEnd - dataMinOff) <= sizeof(g_rawTrkDataBuf)) {
         f_lseek(disk->Diskfile, disk->fdiDataOffset + trkDataOffset + dataMinOff);
         f_read(disk->Diskfile, g_rawTrkDataBuf, dataMaxEnd - dataMinOff, &br);
+        invalidateSclCacheForScratch();  // scratch shares SRAM with the SCL track-0 cache
         bulkOK = true;
     }
 
@@ -2767,6 +2790,7 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
         UINT want = (rem > (FSIZE_t)sizeof(g_rawTrkDataBuf))
                     ? (UINT)sizeof(g_rawTrkDataBuf) : (UINT)rem;
         f_read(disk->td0Stream, g_rawTrkDataBuf, want, &bulkLen);
+        invalidateSclCacheForScratch();  // scratch shares SRAM with the SCL track-0 cache
     }
 
     // First pass: parse sector headers (from the staging buffer when covered),
