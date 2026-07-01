@@ -3450,6 +3450,11 @@ static inline size_t saveRectShift() {
 // Reserve up to this much SaveRect space; abort save if offset exceeds it.
 #define SAVE_RECT_PSRAM_MAX (256ul << 10)
 
+// Shared by save()/restore_last()/store_ram()/restore_ram(): each opens, uses
+// and closes it within a single synchronous call, on the same file, never
+// overlapping — so one static FIL (~600 B) replaces four (was one per method).
+static FIL s_saveRectFile;
+
 void SaveRectT::save(int16_t x, int16_t y, int16_t w, int16_t h) {
     if (offsets.empty()) {
         offsets.push_back(0);
@@ -3493,7 +3498,7 @@ void SaveRectT::save(int16_t x, int16_t y, int16_t w, int16_t h) {
         // overflows it and corrupts neighbouring memory (timer callbacks etc),
         // crashing later in alarm_pool_irq_handler. save() is synchronous
         // (open/write/close within one call) so a static FIL is safe even nested.
-        static FIL f;
+        FIL &f = s_saveRectFile;
         if (f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) {
             offsets.push_back(off); // open failed — dummy
             return;
@@ -3586,7 +3591,7 @@ void SaveRectT::restore_last() {
         // Static FIL: sizeof(FIL) ~= 580 B would overflow the tight ~2 KB OSD
         // stack from deep call chains (same fix as save()). restore is
         // synchronous (open/read/close in one call) so a static FIL is safe.
-        static FIL f;
+        FIL &f = s_saveRectFile;
         if (f_open(&f, "/tmp/save_rect.tmp", FA_READ) != FR_OK) {
             if (offsets.empty()) offsets.push_back(0);
             return;
@@ -3638,7 +3643,7 @@ void SaveRectT::store_ram(const void* p, size_t sz) {
         return;
     }
     // Static FIL: same 580-byte stack-overflow guard as save() / restore_last().
-    static FIL f;
+    FIL &f = s_saveRectFile;
     if (f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) {
         offsets.push_back((size_t)-1);
         return;
@@ -3660,7 +3665,7 @@ void SaveRectT::restore_ram(void* p, size_t sz) {
     if (top == (size_t)-1) return; // store_ram skipped the write — nothing to restore
     size_t off = offsets.back();   // position where store_ram wrote the data
     if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) return;
-    static FIL f;
+    FIL &f = s_saveRectFile;
     if (f_open(&f, "/tmp/save_rect.tmp", FA_READ) != FR_OK) return;
     f_lseek(&f, off);
     UINT br;
