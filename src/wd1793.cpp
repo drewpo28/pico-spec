@@ -1441,9 +1441,12 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
 #endif
 #if !PICO_RP2040 && FDD_PORT_TRACE
         // FDD command trace — every accepted WD1793 command with key registers.
-        // Enable via -DFDD_PORT_TRACE=ON. Decodes the (ROM14,CPM) port scheme bug
-        // class: watch `side` vs the command side bit (bit3) on RDSEC/WRSEC.
-        if (Config::arch == "Profi") {
+        // Enable via -DFDD_PORT_TRACE=ON. Originally Profi-only (decodes the
+        // (ROM14,CPM) port scheme bug class: watch `side` vs the command side bit
+        // on RDSEC/WRSEC), but the command dispatch itself is architecture-generic,
+        // so gating it to Profi left every other machine (Pentagon included) with
+        // no command-level trace at all — only the noisier per-register [FDC SYS].
+        {
             const char *cn;
             uint8_t c = wd->command;
             if (!(c & 0x80))                cn = (c & 0x10) ? "SEEK" : ((c & 0x60) ? "STEP" : "RESTORE");
@@ -1811,20 +1814,29 @@ static void trdMaybeInjectBoot(rvmwdDisk *disk) {
     if (f_lseek(disk->Diskfile, 2048) != FR_OK) return;
     if (f_read(disk->Diskfile, buf, 256, &br) != FR_OK || br < 256) return;
     if (buf[0xE7] != 0x10) return;          // not a TR-DOS disk
-    uint8_t fileCount = buf[0xE4];
-    if (fileCount >= 128) return;           // catalog full
 
-    // Scan the active catalog entries (dir sectors 0-7) for an existing "boot    B",
-    // and verify the boot's target — logical sector 9 of track 0 (linear sector 9) —
-    // is not occupied by a file. The reserved-tail assumption only holds for the
-    // standard layout (first-free pointer = track 1 / sector 0, whole of track 0
-    // system-reserved). Some archived TRDs are formatted with track 0's tail
-    // (logical sectors 9-15) reclaimed for data, so a file starts at linear sector 9;
-    // injecting there would silently clobber that file's data. Skip injection on
-    // those disks (drop to the TR-DOS prompt, same as without the feature) rather
-    // than corrupt them. A file occupies linear sectors [start, start+seccnt).
+    // Scan the catalog directly (up to the 128 max slots across dir sectors 0-7),
+    // rather than trusting the disk-info file-count byte (buf[0xE4]): some archived
+    // TRDs (seen on vtrd.in) ship with a zeroed disk-info sector — file count, free
+    // sectors, first-free pointer all 0 — despite having real catalog entries, as
+    // a copy-protection artifact. Trusting buf[0xE4]==0 made this whole scan a
+    // no-op, so neither the "boot already present" nor the track-0-tail check ever
+    // ran, and injection overwrote the disk's real first catalog entry — TR-DOS
+    // then reported "No disk" on that image. Stop at the first genuinely-empty
+    // entry (ent[0]==0): TR-DOS always appends sequentially, so that slot and
+    // everything after it is real, reliable end-of-catalog regardless of what the
+    // disk-info sector claims.
+    // Also verify the boot's target — logical sector 9 of track 0 (linear sector
+    // 9) — is not occupied by a file. The reserved-tail assumption only holds for
+    // the standard layout (first-free pointer = track 1 / sector 0, whole of track
+    // 0 system-reserved). Some archived TRDs are formatted with track 0's tail
+    // (logical sectors 9-15) reclaimed for data, so a file starts at linear sector
+    // 9; injecting there would silently clobber that file's data. Skip injection
+    // on those disks (drop to the TR-DOS prompt, same as without the feature)
+    // rather than corrupt them. A file occupies linear sectors [start, start+seccnt).
+    int fileCount = -1;
     int loadedSec = -1;
-    for (int i = 0; i < fileCount; i++) {
+    for (int i = 0; i < 128; i++) {
         int sec = i >> 4;
         if (sec != loadedSec) {
             if (f_lseek(disk->Diskfile, sec * 256) != FR_OK) return;
@@ -1832,8 +1844,8 @@ static void trdMaybeInjectBoot(rvmwdDisk *disk) {
             loadedSec = sec;
         }
         const uint8_t *ent = buf + ((i & 0x0F) << 4);
+        if (ent[0] == 0x00) { fileCount = i; break; }  // real end of catalog
         if (memcmp(ent, "boot    ", 8) == 0 && ent[8] == 'B') return; // already present
-        if (ent[0] == 0x00) continue;                  // empty terminator entry
         int fileStart = ent[15] * 16 + ent[14];        // linear sector (track*16 + sector)
         int fileEnd   = fileStart + ent[13];           // ent[13] = length in sectors
         if (fileStart <= 9 && 9 < fileEnd) {           // covers track 0's tail sector 9
@@ -1842,6 +1854,7 @@ static void trdMaybeInjectBoot(rvmwdDisk *disk) {
             return;
         }
     }
+    if (fileCount < 0) return;              // catalog full (128 real entries)
 
     // No boot file — append the catalog entry at slot = fileCount.
     int slotSec = fileCount >> 4;
@@ -2371,9 +2384,21 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
             wd->disk[UnitNum]->sides = 1;
             break;
         default:
-            wdDiskEject(wd,UnitNum);
-            Debug::led_blink();
-            return false;
+            // Some archived/protected TRDs (seen on vtrd.in) ship with this byte
+            // zeroed along with the rest of the disk-info sector (file count, free
+            // sectors, first-free pointer — see trdMaybeInjectBoot's catalog-scan
+            // fix) as a copy-protection artifact, even though the disk itself is a
+            // perfectly normal image. Rejecting the disk outright here meant it
+            // never got as far as the catalog scan at all — "No disk", every time,
+            // deterministically. Fall back to the most permissive standard geometry
+            // (80 tracks / 2 sides, same as case 0x16) instead of refusing to mount;
+            // the file-size-based track check right below still trims/expands it to
+            // match the actual file, and a real 40-track or single-sided disk just
+            // reads harmless zero/empty sectors past its real content.
+            Debug::log("TRD: disk-info type byte 0x%02X unrecognized — assuming 80T/2S", diskType);
+            wd->disk[UnitNum]->tracks = 79;
+            wd->disk[UnitNum]->sides = 2;
+            break;
     }
 
     // Check if we have more tracks than on a standard disk

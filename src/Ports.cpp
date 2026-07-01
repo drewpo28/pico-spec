@@ -891,10 +891,19 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
 // rejected the catalog on track0/side0 → "FDD Read Error".
 static inline void profiFdcSysWrite(uint8_t data) {
 #if FDD_PORT_TRACE
-  Debug::log("[FDC SYS] data=%02X drv=%d reset=%d side(bit4)=%d dden=%d pc=%04X",
-             data, data & 3, (int)((data & 0x04) == 0),
-             (int)((data & 0x10) != 0), (int)((data & 0x20) == 0),
-             Z80::getRegPC());
+  // Some ROMs pulse just the HLT bit (bit3) in a tight software-timed wait loop —
+  // logging every single write there floods/garbles the UART (thousands of lines
+  // that only ever alternate bit3) and drowns out the far rarer, more useful
+  // [FDC CMD] trace. Dedupe on everything EXCEPT bit3, so a genuine drive/reset/
+  // side/density change still logs even while HLT happens to be mid-pulse.
+  static uint8_t lastData = 0xFF; // no register write is 0xFF at reset, forces first log
+  if ((data & ~0x08) != (lastData & ~0x08)) {
+    lastData = data;
+    Debug::log("[FDC SYS] data=%02X drv=%d reset=%d hlt(bit3)=%d side(bit4)=%d dden=%d pc=%04X",
+               data, data & 3, (int)((data & 0x04) == 0), (int)((data & 0x08) != 0),
+               (int)((data & 0x10) != 0), (int)((data & 0x20) == 0),
+               Z80::getRegPC());
+  }
 #endif
   // Change active disk unit. Profi 5.06 has 2 physical drives, so drive bits
   // wrap modulo 2 (ZXMAK2 WD1793.cs:227).
