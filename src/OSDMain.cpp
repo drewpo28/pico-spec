@@ -1357,6 +1357,32 @@ void OSD::clearStats() {
     }
 }
 
+void OSD::drawVolumeBox() {
+
+    unsigned short x, y;
+    if (Config::aspect_16_9) {
+        x = 156;
+        y = 180;
+    } else if (VIDEO::isFullBorder288()) {
+        x = 188;
+        y = 272;
+    } else if (VIDEO::isFullBorder240()) {
+        x = 188;
+        y = 224;
+    } else {
+        x = 168;
+        y = 224;
+    }
+    VIDEO::vga.fillRect(x, y - 4, 24 * 6, 16, zxColor(1, 0));
+    VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
+    VIDEO::vga.setFont(Font6x8);
+    VIDEO::vga.setCursor(x + 4, y + 1);
+    VIDEO::vga.print(Config::tape_player ? "TAP" : "VOL");
+    for (int i = 0; i < ESPectrum::aud_volume + 16; i++) {
+        VIDEO::vga.fillRect(x + 26 + (i * 7), y + 1, 6, 7, zxColor(7, 0));
+    }
+}
+
 // Forward-declare the local f_gets wrapper (defined further below)
 static void f_gets(char* b, size_t sz, FIL& f);
 // Forward-declare slotInlineEdit (defined further below)
@@ -2557,28 +2583,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 Config::aud_volume = ESPectrum::aud_volume;
                 ESPectrum::vol_changed = true;
             }
-            unsigned short x, y;
-            if (Config::aspect_16_9) {
-                x = 156;
-                y = 180;
-            } else if (VIDEO::isFullBorder288()) {
-                x = 188;
-                y = 272;
-            } else if (VIDEO::isFullBorder240()) {
-                x = 188;
-                y = 224;
-            } else {
-                x = 168;
-                y = 224;
-            }
-            VIDEO::vga.fillRect(x ,y - 4, 24 * 6, 16, zxColor(1, 0));
-            VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
-            VIDEO::vga.setFont(Font6x8);
-            VIDEO::vga.setCursor(x + 4,y + 1);
-            VIDEO::vga.print(Config::tape_player ? "TAP" : "VOL");
-            for (int i = 0; i < ESPectrum::aud_volume + 16; i++) {
-                VIDEO::vga.fillRect(x + 26 + (i * 7) , y + 1, 6, 7, zxColor( 7, 0));
-            }
+            OSD::drawVolumeBox();
         } else if (hkIdx == Config::HK_VOL_UP) {
             if (VIDEO::OSD == 0) {
                 if (Config::aspect_16_9)
@@ -2597,28 +2602,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 Config::aud_volume = ESPectrum::aud_volume;
                 ESPectrum::vol_changed = true;
             }
-            unsigned short x, y;
-            if (Config::aspect_16_9) {
-                x = 156;
-                y = 180;
-            } else if (VIDEO::isFullBorder288()) {
-                x = 188;
-                y = 272;
-            } else if (VIDEO::isFullBorder240()) {
-                x = 188;
-                y = 224;
-            } else {
-                x = 168;
-                y = 224;
-            }
-            VIDEO::vga.fillRect(x ,y - 4, 24 * 6, 16, zxColor(1, 0));
-            VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
-            VIDEO::vga.setFont(Font6x8);
-            VIDEO::vga.setCursor(x + 4,y + 1);
-            VIDEO::vga.print(Config::tape_player ? "TAP" : "VOL");
-            for (int i = 0; i < ESPectrum::aud_volume + 16; i++) {
-                VIDEO::vga.fillRect(x + 26 + (i * 7) , y + 1, 6, 7, zxColor( 7, 0));
-            }
+            OSD::drawVolumeBox();
         } else if (hkIdx == Config::HK_HARD_RESET) { // Hard reset
             if (Config::ram_file != NO_RAM_FILE) {
                 Config::ram_file = NO_RAM_FILE;
@@ -2660,22 +2644,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 ESPectrum::totalseconds = 0;
                 ESPectrum::totalsecondsnodelay = 0;
                 VIDEO::framecnt = 0;
-                unsigned short x, y;
-                if (Config::aspect_16_9) {
-                    x = 156;
-                    y = 180;
-                } else {
-                    x = 168;
-                    y = 224;
-                }
-                VIDEO::vga.fillRect(x ,y - 4, 24 * 6, 16, zxColor(1, 0));
-                VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
-                VIDEO::vga.setFont(Font6x8);
-                VIDEO::vga.setCursor(x + 4,y + 1);
-                VIDEO::vga.print(Config::tape_player ? "TAP" : "VOL");
-                for (int i = 0; i < ESPectrum::aud_volume + 16; i++) {
-                    VIDEO::vga.fillRect(x + 26 + (i * 7) , y + 1, 6, 7, zxColor( 7, 0));
-                }
+                OSD::drawVolumeBox();
                 click();
                 return;
             }

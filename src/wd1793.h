@@ -45,6 +45,10 @@ THE SOFTWARE.
 #define kRVMwdDiskOutTrack0 0x80
 #define kRVMwdDiskOutIndex 0x20
 
+// Matches LED::DECAY_FRAMES (LEDIndicators.h) so the FDD lamp/glyph/hum decay at
+// the same rate as every other on-screen activity indicator.
+#define FDD_ACTIVE_DECAY_FRAMES 12
+
 #define TRACKHEADER 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, \
                     0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, \
                     0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, \
@@ -342,6 +346,16 @@ typedef struct
     int wtrackmark, wtracksector;
 
     uint8_t fdd_clicks;  // Pending step clicks count
+    // Frames remaining since the last genuine head-load/header-search/data-transfer
+    // event (real disk-rotation activity — see the state-machine sites in wd1793.cpp
+    // that set it to FDD_ACTIVE_DECAY_FRAMES). Decremented once per frame by
+    // LED::decay() (LEDIndicators.cpp), so it self-clears like the other LED activity
+    // counters. Deliberately NOT set by raw command-register writes (see Ports.cpp'
+    // LED::touchW on reg 0), so bus-probing software that issues WD1793 commands
+    // without ever moving a real byte doesn't keep the motor-hum/lamp alive. Drives
+    // the audio motor-hum, the corner FDD lamp, and the FDD glyph in the LED
+    // indicator strip — all three read this instead of LED::readActive/writeActive.
+    uint8_t fdd_active_decay;
 
 #if !PICO_RP2040
     uint8_t* diskTrackBuf;        // MFM track buffer (DISK_TRACK_BUF_SZ); heap-allocated

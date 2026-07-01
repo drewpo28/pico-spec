@@ -40,24 +40,22 @@ namespace LED {
 
     bool isVisible(Id i);
 
-    // Always record activity (not gated on Config::ledIndicators): the rdec/wdec
-    // state also feeds the corner FDD lamp and the FDD motor-hum sound, which are
-    // independent settings (Config::trdosSoundLed). Cost is a single byte store on
-    // the port path. Whether the border glyph ROW is drawn is gated in draw().
+    // Always record activity (not gated on Config::ledIndicators). Cost is a single
+    // byte store on the port path. Whether the border glyph ROW is drawn is gated
+    // in draw().
     //
-    // For FDD, callers count only real data-register transfers: data reads
-    // (touchR → green) and data writes (touchW → red). Commands (seek/read/write/
-    // force-int), track/sector setup, status polling and SYS register (drive/side/
-    // motor) housekeeping are NOT counted. TR-DOS issues a seek + read-sector
-    // command for every read, so counting commands as writes turned every read
-    // yellow (red+green) and pinned the lamp on. Now: read=green, write=red.
+    // NOTE: FDD is the one exception — it does NOT use rdec/wdec at all. Raw port
+    // I/O direction is the wrong signal for a floppy: TR-DOS issues a seek + a
+    // command-register *write* for every read, and bus-probing software can poke
+    // the command/data registers with no real disk access at all. The FDD lamp,
+    // LED indicator glyph, and motor-hum sound instead read
+    // rvmWD1793::fdd_active_decay, set by the WD1793 state machine only on genuine
+    // head-load/header-search/data-transfer activity (see wd1793.h/.cpp) and
+    // decayed once per frame in decay(). No caller should touchR/touchW(FDD).
     static inline void touchR(Id i) { rdec[i] = DECAY_FRAMES; }
     static inline void touchW(Id i) { wdec[i] = DECAY_FRAMES; }
 
-    // Recent-activity queries (true within DECAY_FRAMES of the last touch). Used by
-    // the corner FDD indicator so it tracks actual port access (and auto-clears)
-    // instead of the raw rvmWD1793::led flag, which can stay set if a command never
-    // reaches _end() (stuck BUSY) — leaving the LED lit with no disk access.
+    // Recent-activity queries (true within DECAY_FRAMES of the last touch).
     static inline bool readActive(Id i)  { return rdec[i] != 0; }
     static inline bool writeActive(Id i) { return wdec[i] != 0; }
 

@@ -520,9 +520,9 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         FDDStep_MB02(true); // force step — WD2797 needs step advancement for Seek/Restore
         ioContentionLate(MemESP::ramContended[rambank]);
         uint8_t r = (lo >> 5) & 3;
-        // Only count a real data-register read as access (reg 3); status polling
-        // (reg 0) happens continuously at idle and would keep the LED lit.
-        if (r == 3) LED::touchR(LED::FDD);
+        // FDD lamp/glyph/hum now come from rvmWD1793::fdd_active_decay (set by the
+        // WD1793 state machine on genuine activity — see wd1793.h/.cpp), not from
+        // port-access direction, so no LED::touchR here.
         uint8_t val = rvmWD1793Read(&ESPectrum::mb02_fdd, r);
         return val;
       }
@@ -683,8 +683,6 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         // IN A,(0x83) is polled in tight busy-wait loops at 0x8625/0x862B with no
         // other code advancing the FDC, so we must force each step here.
         FDDStep(true);
-        // Only the data register (reg 3) is real access; reg 0 is status polling.
-        if (((address >> 5) & 0x3) == 3) LED::touchR(LED::FDD);
         return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
       }
 
@@ -721,9 +719,6 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       case 0x43:
       case 0x63:
         FDDStep(false);
-        // Only count data-register reads (reg 3); reg 0 status polling runs
-        // continuously while TR-DOS is paged in and would pin the LED on.
-        if (((address >> 5) & 0x3) == 3) LED::touchR(LED::FDD);
         return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
 
       case 0xa3:
@@ -1523,10 +1518,6 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       if ((lo & 0x9F) == 0x0F) { // WD2797 registers
         FDDStep_MB02(false);
         uint8_t reg = (lo >> 5) & 3;
-        // Red = real data written to disk: only the data register (reg 3).
-        // Command (reg 0 = seek/read/write/force-int) and track/sector setup
-        // (reg 1/2) are not transfers — counting them turned every read yellow.
-        if (reg == 3) LED::touchW(LED::FDD);
         rvmWD1793Write(&ESPectrum::mb02_fdd, reg, data);
         // If command register written and DMA transfer is pending, execute it now.
         // On real hardware DMA waits for DRQ from FDC; here we run the whole
@@ -1710,8 +1701,6 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
           ((address & 0x9F) == 0x83)) {
         FDDStep(false);
         uint8_t fr = (address >> 5) & 0x3;
-        // Count command (reg 0) and data (reg 3) writes; reg 1/2 are setup.
-        if (fr == 0 || fr == 3) LED::touchW(LED::FDD);
         // CMD write via shifted 0x83 → activate shifted-scheme status for IN(0x3F)
         if (fr == 0) profi_shifted_fdc = true;
         rvmWD1793Write(&ESPectrum::fdd, fr, data);
@@ -1733,9 +1722,6 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       case 0x43:
       case 0x63:
         FDDStep(false);
-        // Count command (reg 0) and data (reg 3) writes; reg 1/2 (track/sector)
-        // are setup writes that recur during idle seeks.
-        if (((address >> 5) & 0x3) == 0 || ((address >> 5) & 0x3) == 3) LED::touchW(LED::FDD);
         // CMD write via normal path → deactivate shifted-scheme status
         if (((address >> 5) & 0x3) == 0) profi_shifted_fdc = false;
 #if !PICO_RP2040

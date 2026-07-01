@@ -145,6 +145,7 @@ IRAM_ATTR void _do(rvmWD1793 *wd) {
       }
 
       // RVM plays motor audio sample here
+      wd->fdd_active_decay = FDD_ACTIVE_DECAY_FRAMES; // head load engage — real motor/head activity
 
       wd->control|=kRVMWD177XHLD;
       // wd->c=kRVMWD177XSettingHeaderTime * ((wd->control&kRVMWD177XTest)?1:0);
@@ -362,6 +363,7 @@ IRAM_ATTR void _do(rvmWD1793 *wd) {
         return;
       }
 
+      wd->fdd_active_decay = FDD_ACTIVE_DECAY_FRAMES; // header search — real head/disk activity
 
       if(wd->headerI==0xff) {
         if(wd->a!=0xfe) {
@@ -689,6 +691,7 @@ case kRVMWD177XWriteData: {
         return;
       }
 
+      wd->fdd_active_decay = FDD_ACTIVE_DECAY_FRAMES; // real byte written to the disk image
 
       wd->a=wd->data;
       // wd->crc=crc(wd->crc,wd->a);
@@ -838,6 +841,7 @@ case kRVMWD177XWriteData: {
 
     case kRVMWD177XReadData: {
 
+      wd->fdd_active_decay = FDD_ACTIVE_DECAY_FRAMES; // real byte read from the disk image
 
       wd->data = wd->a;
 
@@ -958,6 +962,7 @@ case kRVMWD177XWriteTrack: {
         return;
       }
 
+      wd->fdd_active_decay = FDD_ACTIVE_DECAY_FRAMES; // formatting — real byte written to the disk image
 
         switch(wd->data) {
 
@@ -1059,6 +1064,7 @@ case kRVMWD177XWriteTrack: {
         return;
       }
 
+      wd->fdd_active_decay = FDD_ACTIVE_DECAY_FRAMES; // real byte read from the disk image
 
       if(wd->control & kRVMWD177XDRQ) wd->status|=kRVMWD177XStatusLostData;
 
@@ -1721,6 +1727,7 @@ void rvmWD1793Reset(rvmWD1793 *wd) {
   wd->status = kRVMWD177XStatusSetIndex | kRVMWD177XStatusSetTrack0 | kRVMWD177XStatusSetWP;
   wd->track = 0xff;
   wd->fdd_clicks = 0;
+  wd->fdd_active_decay = 0;
   wd->wtrackmark = 0;
   wd->headerI = 0;
   wd->retry = 0;

@@ -88,6 +88,7 @@ public:
     static void drawOSD(bool bottom_info);
     static void drawStats();
     static void clearStats();
+    static void drawVolumeBox();
     static void do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL);
     static void HWInfo();
     static void ChipInfo();

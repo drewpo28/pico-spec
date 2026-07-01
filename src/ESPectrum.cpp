@@ -2077,8 +2077,15 @@ void ESPectrum::FDDGenSound() {
         for (int c = 0; c < clicks; c++) {
             fddSound.click_pos[c] = spacing * (c + 1);
         }
-    } else if (LED::readActive(LED::FDD) || LED::writeActive(LED::FDD)) {
-        // Motor hum while the drive is being accessed (recent FDC port activity).
+    } else if (ctrl->fdd_active_decay) {
+        // Motor hum while the drive is genuinely spinning/transferring (head-load,
+        // header search, real sector/track data movement — see wd1793.cpp). NOT
+        // driven by LED::readActive/writeActive(FDD): those also fire on bare
+        // WD1793 *command* writes (Ports.cpp counts reg 0 on write for LED colour
+        // purposes), so bus-probing software that issues commands without ever
+        // moving a real byte would otherwise keep the hum going with no disk
+        // rotation/transfer actually happening. Decays once per frame in
+        // LED::decay() — shared with the corner lamp and LED indicator glyph.
         fddSound.click_count = 0;
         fddSound.motor_noise = true;
     } else {
@@ -2572,6 +2579,11 @@ void ESPectrum::loop() {
     // they persist.  (Normal modes draw into the static border area, no flicker.)
     if (profi_ds80_active && (VIDEO::OSD & 0x03) && (VIDEO::OSD & 0x04) == 0 && !CPU::paused)
       OSD::drawStats();
+    // Same flicker as above, but for the F9/F10 volume box (OSD bit 0x04):
+    // it's only (re)drawn on key-press/timeout, so DS80's per-frame repaint
+    // erases it after a single frame. Keep it pinned while it's showing.
+    if (profi_ds80_active && (VIDEO::OSD & 0x04))
+      OSD::drawVolumeBox();
 #endif
     // Flashing flag change (disabled when ULA+ palette is active)
 #if !PICO_RP2040
@@ -2597,16 +2609,17 @@ void ESPectrum::loop() {
 #if !PICO_RP2040
     if (profi_ds80_active) led_off_col = (uint8_t)(~VIDEO::borderColor) & 0x07;
 #endif
-    // Corner FDD lamp. ON/OFF follows LEDIndicators' decaying FDC-access state (it
-    // auto-clears, unlike the old rvmWD1793::led which could stick on with no disk
-    // access). COLOUR by the actual WD1793 command — write-sector/track → red, else
-    // (read/seek) → blue — because touchR/touchW track port I/O *direction* (a read
-    // command is issued by an OUT, so it would otherwise show red during loading).
+    // Corner FDD lamp. ON/OFF follows rvmWD1793::fdd_active_decay — genuine
+    // head-load/header-search/data-transfer activity, decremented once per frame by
+    // LED::decay() (auto-clears; unlike the old rvmWD1793::led it can't stick on, and
+    // unlike LED::readActive/writeActive(FDD) it isn't fooled by a bare command write
+    // with no real disk access — see wd1793.h). COLOUR by the actual WD1793 command —
+    // write-sector/track → red, else (read/seek) → blue.
     rvmWD1793 *fctrl = &fdd;
 #if !PICO_RP2040
     if (MB02::enabled) fctrl = &mb02_fdd;
 #endif
-    bool fdd_active = LED::readActive(LED::FDD) || LED::writeActive(LED::FDD);
+    bool fdd_active = fctrl->fdd_active_decay != 0;
     bool fdd_write  = ((fctrl->command & 0xE0) == 0xA0) ||   // Write Sector (0xA_/0xB_)
                       ((fctrl->command & 0xF0) == 0xF0);     // Write Track  (0xF_)
     // Foreground = lamp colour when active, else the border colour so the diskette
