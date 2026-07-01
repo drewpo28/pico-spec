@@ -399,8 +399,16 @@ void* Buffer::palloc(size_t bytes, uint32_t flags) {
     if (void* p = tryHeap()) return p;
     if (void* p = tryFlash()) return p;
 #endif
-    // Last resort: heap regardless of the safety margin (caller handles nullptr).
-    return malloc(bytes);
+    // Last resort: heap below the safety margin — but NEVER blind-call malloc here.
+    // pico_malloc PANICs on OOM ("*** PANIC *** Out of memory"); it does not return
+    // NULL. Blindly calling it defeats the whole "caller handles nullptr" contract —
+    // e.g. ZipExtract's 32 KB inflate dict has a page-5/7 borrow fallback that never
+    // runs if palloc panics first (m1p2+Profi boots with ~21 KB free, no butter PSRAM,
+    // SPI PSRAM not pointer-addressable, NET arena off). Pre-check the largest block
+    // the allocator can really satisfy so the caller gets nullptr instead of a hard OOM.
+    extern size_t getLargestAllocatable(void);
+    if (getLargestAllocatable() >= bytes) return malloc(bytes);
+    return nullptr;
 }
 
 void Buffer::pfree(void* p) {
