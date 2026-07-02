@@ -1338,7 +1338,11 @@ void ESPectrum::reset(uint8_t romInUse) {
 #endif
 
   // Set samples per frame and AY_emu flag depending on arch
-  if (Config::arch == "48K") {
+  // Profi shares the 48K frame timing (69888 T / 624 samples) — it MUST take the
+  // 48K branch here, exactly like setup() does. Otherwise it falls through to the
+  // Pentagon branch (640 samples/frame) and over-feeds the 31250 Hz DAC by ~2.6%
+  // (640*50.08fps = 32051 > 31250), causing ring overrun → periodic clicks/buzz.
+  if (Config::arch == "48K" || Config::arch == "Profi") {
     samplesPerFrame = ESP_AUDIO_SAMPLES_48;
     audioOverSampleDivider = ESP_AUDIO_OVERSAMPLES_DIV_48;
     audioAYDivider = ESP_AUDIO_AY_DIV_48;
