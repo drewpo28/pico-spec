@@ -62,6 +62,12 @@ extern volatile uint32_t mem_spi_evict_page;  // last evicted page index
 extern volatile uint32_t mem_spi_read_skip;   // first-touch loads with the read skipped
 extern volatile uint32_t mem_spi_wb_skip;     // clean-victim evictions, write-back skipped
 extern volatile uint32_t mem_spi_swap_us;     // total µs spent in _sync page swaps
+#if MEM_ACCESS_TRACE
+// Access counts of evicted pages, split clean/dirty — see [ACC] log in Video.cpp.
+extern volatile uint32_t mem_acc_clean_cnt, mem_acc_clean_sum, mem_acc_clean_max;
+extern volatile uint32_t mem_acc_lo128, mem_acc_lo512;   // clean victims with <128 / <512 accesses
+extern volatile uint32_t mem_acc_dirty_cnt, mem_acc_dirty_sum;
+#endif
 uint32_t butter_psram_size();
 extern uint8_t rx[4];
 #if !PICO_RP2040
@@ -86,6 +92,12 @@ public:
     static bool* bank_dirty[4];
     static bool  dirty_sink;
     static inline void mark_bank_dirty(uint8_t bank) { if (bank < 4) *bank_dirty[bank] = true; }
+#if MEM_ACCESS_TRACE
+    // Same pointer-per-slot scheme for the access counters (feasibility study
+    // for the accessor-mode bank window — see [ACC] log in Video.cpp).
+    static uint32_t* bank_access[4];
+    static uint32_t  access_sink;
+#endif
 private:
     struct mem_desc_int_t {
         uint8_t* p;
@@ -95,6 +107,9 @@ private:
         bool pinned;  // if true, _sync skips this entry (never evicted while pinned)
         bool dirty;   // frame modified since last load/write-back; clean victims
                       // are evicted WITHOUT the 16KB write-back (see _sync)
+#if MEM_ACCESS_TRACE
+        uint32_t acc; // Z80 accesses (fetch/read/write) since last load — see [ACC] log
+#endif
         mem_desc_int_t() : p(0), vram_off(0), mem_type(POINTER), is_rom(false), pinned(false), dirty(true) {}
     };
     mem_desc_int_t* _int;
@@ -134,6 +149,9 @@ public:
         if (bank < 4) {
             plugged_in[bank] = res;
             bank_dirty[bank] = _int->is_rom ? &dirty_sink : &_int->dirty;
+#if MEM_ACCESS_TRACE
+            bank_access[bank] = _int->is_rom ? &access_sink : &_int->acc;
+#endif
         }
         return res;
     }
@@ -297,6 +315,11 @@ inline uint8_t MemESP::readbyte(uint16_t addr) {
         return (addr < 0x2000) ? page0_lo[addr] : page0_hi[addr & 0x1FFF];
     }
 #endif
+#if MEM_ACCESS_TRACE
+    // Count only RAM accesses (flash ROM at 0x10xxxxxx is plugged via direct()
+    // without sync(), so its slot pointer would be stale — the guard filters it).
+    if (ramCurrent[page] >= (uint8_t*)0x11000000) *mem_desc_t::bank_access[page] += 1;
+#endif
     return romPeek(page, ramCurrent[page], addr & 0x3fff);
 }
 
@@ -335,6 +358,9 @@ inline void MemESP::writebyte(uint16_t addr, uint8_t data)
     uint8_t* p = ramCurrent[page];
     if (p < (uint8_t*)0x11000000) return;
     *mem_desc_t::bank_dirty[page] = true;
+#if MEM_ACCESS_TRACE
+    *mem_desc_t::bank_access[page] += 1;
+#endif
     // NOTE: the Profi CP/M BOOTFDD has 0x801A = 0xC9, which the BIOS reads via
     // `LD A,(0x801A); AND A; JR NZ` to select the floppy boot path (A≠0).
     // An earlier experiment patched this byte to 0x00 to force the HDD boot path,

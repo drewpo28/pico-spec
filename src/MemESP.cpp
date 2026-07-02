@@ -47,6 +47,16 @@ bool* mem_desc_t::bank_dirty[4] = {
     &mem_desc_t::dirty_sink, &mem_desc_t::dirty_sink,
     &mem_desc_t::dirty_sink, &mem_desc_t::dirty_sink,
 };
+#if MEM_ACCESS_TRACE
+uint32_t  mem_desc_t::access_sink = 0;
+uint32_t* mem_desc_t::bank_access[4] = {
+    &mem_desc_t::access_sink, &mem_desc_t::access_sink,
+    &mem_desc_t::access_sink, &mem_desc_t::access_sink,
+};
+volatile uint32_t mem_acc_clean_cnt = 0, mem_acc_clean_sum = 0, mem_acc_clean_max = 0;
+volatile uint32_t mem_acc_lo128 = 0, mem_acc_lo512 = 0;
+volatile uint32_t mem_acc_dirty_cnt = 0, mem_acc_dirty_sum = 0;
+#endif
 uint32_t MEM_PG_CNT = 64;
 
 // Per-frame SPI PSRAM swap counters — reset each EndFrame, read in Debug::log.
@@ -114,6 +124,9 @@ extern "C" void mem_swap_reopen(void) {
 void mem_desc_t::reset(void) {
     memset(vram_pg_valid, 0, sizeof(vram_pg_valid));
     for (int i = 0; i < 4; ++i) bank_dirty[i] = &dirty_sink;
+#if MEM_ACCESS_TRACE
+    for (int i = 0; i < 4; ++i) bank_access[i] = &access_sink;
+#endif
     pages.clear();
     f_close(&f);
     f_unlink(PAGEFILE); // ensure it is new file
@@ -150,6 +163,9 @@ void mem_desc_t::from_vram(uint8_t* p) {
     uint32_t ba = _int->vram_off;
     _int->mem_type = POINTER;
     _int->dirty = false;   // frame == backing store (or both garbage on skip)
+#if MEM_ACCESS_TRACE
+    _int->acc = 0;         // start counting accesses served by this load
+#endif
     if (!vram_pg_is_valid(ba)) {
         // First touch: the backing store was never written, its content is
         // power-on garbage — the reused frame's stale bytes are just as good.
@@ -219,6 +235,22 @@ void mem_desc_t::_sync(uint8_t bank) {
             {
                 uint32_t vba = page._int->vram_off;
                 bool vspi = psram_size() >= vba + MEM_PG_SZ;
+#if MEM_ACCESS_TRACE
+                // How many Z80 accesses did this page's 16KB load actually
+                // serve?  Clean victims with a low count are the accessor-mode
+                // win candidates (the load was mostly wasted).
+                {
+                    uint32_t a = page._int->acc;
+                    if (page._int->dirty) {
+                        mem_acc_dirty_cnt++; mem_acc_dirty_sum += a;
+                    } else {
+                        mem_acc_clean_cnt++; mem_acc_clean_sum += a;
+                        if (a > mem_acc_clean_max) mem_acc_clean_max = a;
+                        if (a < 128) mem_acc_lo128++;
+                        if (a < 512) mem_acc_lo512++;
+                    }
+                }
+#endif
                 if (!page._int->dirty) {
                     // Clean victim: the backing store already matches the frame
                     // (or both hold garbage — never materialized).  Detach with

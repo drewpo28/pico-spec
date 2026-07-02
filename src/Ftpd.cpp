@@ -3,6 +3,7 @@
 #if !PICO_RP2040 && ZIFI_NET_CLIENT
 
 #include "ZiFiSock.h"
+#include "ZiFi.h"
 #include "Debug.h"
 #include "ff.h"
 #include "pico/time.h"   // sleep_ms
@@ -12,6 +13,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <memory>
 
 // All FTP-server scratch lives in ONE heap struct allocated in begin() and freed
 // in stop() — the server never runs in the background, so it costs 0 SRAM when
@@ -50,6 +52,7 @@ static void ftplog(const char* fmt, ...) {
     vsnprintf(buf, sizeof(g_b->log), fmt, ap);
     va_end(ap);
     if (g_log) g_log(buf);         // on-screen FTP terminal
+    Debug::log("[FTPD] %s", buf);  // serial log too — the terminal scrolls away
 }
 
 // ── Control replies ──────────────────────────────────────────────────────────
@@ -228,15 +231,45 @@ static void doStor(const char* arg, bool append) {
     int data = openData();
     if (data < 0) { fclose2(f); return; } // openData() already sent 425
 
+    // Same UART-overrun hardening as the client's Ftp::get(): a blocking f_write
+    // stalls the core with nothing draining the ESP UART IRQ ring, so spill the
+    // ring right before every physical write (full 8 KB of headroom per stall) and
+    // batch writes into a larger accumulator — fewer stall windows and fewer
+    // mid-file FAT updates (f_expand is no help here: STOR doesn't know the size
+    // up front). Heap-transient like g_b; on a tight heap fall back to direct
+    // 2 KB writes from xfer.
+    static const size_t WR_CHUNK_SZ = 16 * 1024;
+    std::unique_ptr<uint8_t[]> wrBuf(new (std::nothrow) uint8_t[WR_CHUNK_SZ]);
+    size_t wrFill = 0;
+
     bool ok = true;
     uint32_t got = 0;
     uint32_t drops0 = ZiFiSock::rxBufDropped();
+    uint32_t irqDrops0 = ZiFi::rxDropped();
     int empties = 0;
+    auto flushWrite = [&](const uint8_t* p, size_t len) -> bool {
+        if (!len) return true;
+        ZiFi::rxSpill();          // empty the IRQ ring → full headroom for this write
+        UINT bw;
+        return f_write(f, p, len, &bw) == FR_OK && bw == len;
+    };
     for (;;) {
         int n = ZiFiSock::sock_recv(data, g_b->xfer, sizeof(g_b->xfer), 10000);
         if (n > 0) {
-            UINT bw;
-            if (f_write(f, g_b->xfer, n, &bw) != FR_OK || (int)bw != n) { ok = false; break; }
+            if (wrBuf) {
+                size_t off = 0;
+                while (off < (size_t)n) {
+                    size_t room  = WR_CHUNK_SZ - wrFill;
+                    size_t chunk = (size_t)n - off < room ? (size_t)n - off : room;
+                    memcpy(wrBuf.get() + wrFill, g_b->xfer + off, chunk);
+                    wrFill += chunk; off += chunk;
+                    if (wrFill == WR_CHUNK_SZ) {
+                        if (!flushWrite(wrBuf.get(), wrFill)) { ok = false; break; }
+                        wrFill = 0;
+                    }
+                }
+                if (!ok) break;
+            } else if (!flushWrite(g_b->xfer, n)) { ok = false; break; }
             got += n;
             empties = 0;
             continue;
@@ -245,15 +278,23 @@ static void doStor(const char* arg, bool append) {
         // n == 0: no data this round. End only on a real close (FTP EOF); a transient
         // empty read (brief gap, e.g. an SD-write stall) is NOT EOF — keep waiting.
         if (ZiFiSock::sock_closed(data)) break;
-        if (++empties >= 3) break;                   // ~30 s of silence on an open link → give up
+        if (++empties >= 3) { ok = false; break; }   // ~30 s of silence on an open link → dead
     }
+    if (ok && !flushWrite(wrBuf.get(), wrFill)) ok = false;
     fclose2(f);
+    bool wasClosed = ZiFiSock::sock_closed(data);
     ZiFiSock::sock_close(data);
-    uint32_t drops = ZiFiSock::rxBufDropped() - drops0;
-    // Diagnostic: if the upload truncates, this shows whether it was an early close
-    // (closed=1) or dropped RX bytes (drops>0, ring overflow during SD writes).
-    ftplog("  STOR %s: %lu bytes (closed=%d drops=%lu)", baseName(path),
-           (unsigned long)got, ZiFiSock::sock_closed(data) ? 1 : 0, (unsigned long)drops);
+    uint32_t drops    = ZiFiSock::rxBufDropped() - drops0;
+    uint32_t irqDrops = ZiFi::rxDropped() - irqDrops0;
+    // Dropped bytes never reached the file — the stored image is silently corrupt.
+    // STOR has no expected size to cross-check (unlike the client's get()), so the
+    // drop counters are the only truncation signal: fail loudly instead of 226.
+    if (ok && (drops || irqDrops)) ok = false;
+    // Diagnostic: if the upload fails, this shows whether it was an early close
+    // (closed=0), dropped RX bytes (ring overflow during SD writes), or a dead link.
+    ftplog("  STOR %s: %lu bytes ok=%d (closed=%d drops=%lu irqDrops=%lu)", baseName(path),
+           (unsigned long)got, ok ? 1 : 0, wasClosed ? 1 : 0,
+           (unsigned long)drops, (unsigned long)irqDrops);
     reply(ok ? 226 : 426, ok ? "Transfer complete" : "Transfer aborted");
 }
 

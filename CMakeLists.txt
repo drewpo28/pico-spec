@@ -37,6 +37,7 @@ option(RTC_PORT_TRACE "Enable MC146818 Mr Gluk RTC port access tracing" OFF)
 option(PROFI_PORT_TRACE "Enable 0x7FFD/0xDFFD paging-port write tracing" OFF)
 option(SND_PORT_TRACE "Enable per-port I/O histogram (sound-DAC port hunting)" OFF)
 option(PERF_TRACE "Enable per-60-frame CPU/HDMI/FPS performance logging" ON)
+option(MEM_ACCESS_TRACE "Count Z80 accesses per RAM page between load and eviction (accessor-mode feasibility study; slows readbyte/writebyte)" OFF)
 option(GS_PERF_TRACE "Enable General Sound per-second perf counters (GS.cpp)" OFF)
 option(GS_DEBUG_TRACE "Enable General Sound port-IO trace ring + auto-dumps (~50 KB SRAM)" OFF)
 option(ZIFI_TRACE "Enable ZiFi (ESP-01S WiFi NIC) port/UART tracing" ON)
@@ -348,6 +349,16 @@ if (PERF_TRACE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE PERF_TRACE=1)
 else ()
     target_compile_definitions(${PROJECT_NAME} PRIVATE PERF_TRACE=0)
+endif ()
+
+# Per-page Z80 access counting between page load and eviction (see MemESP.h/.cpp
+# `#if MEM_ACCESS_TRACE`, [ACC] log in Video.cpp). Feasibility study for the
+# accessor-mode bank window idea: if evicted trampoline pages show only a few
+# hundred accesses, serving them per-byte over SPI beats the 16KB page load.
+if (MEM_ACCESS_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE MEM_ACCESS_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE MEM_ACCESS_TRACE=0)
 endif ()
 
 # General Sound perf counters toggle (see GS.cpp `GS_PERF()` / `#if GS_PERF_TRACE`).

@@ -3329,6 +3329,22 @@ IRAM_ATTR void VIDEO::EndFrame() {
             wbskip_accum = 0;
             swap_us_accum = 0;
             evict_accum = 0;
+#if MEM_ACCESS_TRACE
+            // Accesses served per evicted-page load (accessor-mode feasibility):
+            // clean victims with <512 accesses would have been cheaper served
+            // per-byte over SPI than via the 16KB page load (~600 = breakeven).
+            if (mem_acc_clean_cnt || mem_acc_dirty_cnt) {
+                Debug::log("[ACC] clean n=%u avg=%u max=%u <128=%u <512=%u | dirty n=%u avg=%u",
+                           mem_acc_clean_cnt,
+                           mem_acc_clean_cnt ? mem_acc_clean_sum / mem_acc_clean_cnt : 0,
+                           mem_acc_clean_max, mem_acc_lo128, mem_acc_lo512,
+                           mem_acc_dirty_cnt,
+                           mem_acc_dirty_cnt ? mem_acc_dirty_sum / mem_acc_dirty_cnt : 0);
+                mem_acc_clean_cnt = mem_acc_clean_sum = mem_acc_clean_max = 0;
+                mem_acc_lo128 = mem_acc_lo512 = 0;
+                mem_acc_dirty_cnt = mem_acc_dirty_sum = 0;
+            }
+#endif
         }
     }
 
