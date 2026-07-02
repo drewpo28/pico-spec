@@ -619,15 +619,24 @@ uint8_t read8psram(uint32_t addr32);
 uint16_t read16psram(uint32_t addr32);
 uint32_t read32psram(uint32_t addr32);
 void psram_id(uint8_t rx[8]);
+// Block transfer aliases for readability at call sites (same as the range functions).
 void writepsram(uint32_t addr32, uint8_t* b, size_t sz);
 void readpsram(uint8_t* b, uint32_t addr32, size_t sz);
-// Burst-read/write: 31/27 bytes per SPI transaction — ~7× less overhead vs per-4-byte loop
+// Burst-read/write any length. Transfers ≥32 bytes use the 32-bit-counter PIO
+// program: ONE SPI CS assertion + ONE DMA setup per up-to-16KB chunk. Smaller
+// transfers use 31/27-byte chunks on the 8-bit program.
 void psram_read_range(uint32_t addr, uint8_t* dst, size_t total);
 void psram_write_range(uint32_t addr, const uint8_t* src, size_t total);
-// Single-transaction page transfer (32-bit PIO counter, ONE SPI CS assertion per 16KB).
-// ~3.5× faster than psram_read/write_range for full-page operations.
+// Single-transaction 16KB page transfer (thin wrappers over the same burst core).
 void psram_read_page(uint32_t addr, uint8_t* dst);
 void psram_write_page(uint32_t addr, const uint8_t* src);
+// Background 16KB page write: starts the transfer and returns while PIO+DMA
+// clock it out; the bus lock stays held until psram_async_join() completes the
+// write (every PSRAM entry point joins first, so callers never see a busy bus).
+// `src` must stay untouched until the next PSRAM access. Single producer only
+// (core0 MemESP page eviction).
+void psram_write_page_async(uint32_t addr, const uint8_t* src);
+void psram_async_join(void);
 
 #ifdef __cplusplus
 }

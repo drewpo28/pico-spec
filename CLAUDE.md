@@ -60,6 +60,41 @@ Flattened from CSAAFreq, CSAANoise, CSAAEnv, CSAAAmp, CSAADevice into a single c
 - `cmake --build build` from project root
 - SAASound.cpp compiled with `-O3 -ffast-math -funroll-loops`
 
+## SPI PSRAM driver (drivers/psram/psram_spi.*)
+
+- **Two PSRAM back-ends, not abstracted**: PIO SPI PSRAM (accessor API, active
+  **only on MURM1**) vs "butter" QSPI on RP2350 XIP CS1 (memory-mapped
+  `PSRAM_DATA @0x11000000`, hardware QMI, quad 0xEB/0x38, XIP cache —
+  `src/main.cpp psram_init/psram_retiming`). Higher layers branch on
+  `psram_size()` vs `butter_psram_size()`.
+- **PIO-QSPI (`qspi_psram` program) is intentionally unused**: no board routes 4
+  SIO lines to the SPI PSRAM (MURM1 wires only MOSI/MISO); RP2350 quad goes via
+  QMI. Kept with a "what enabling takes" note in psram_spi.pio.
+- **Burst API**: `psram_read_range`/`psram_write_range` (any length; ≥32 bytes →
+  single-CS transfer per up-to-16KB chunk via the 32-bit-counter PIO program,
+  ONE DMA setup, no per-31-byte command overhead; smaller → 8-bit program
+  31/27-byte chunks). `readpsram`/`writepsram` are aliases of the range calls
+  (were per-byte loops — never reintroduce per-byte PSRAM loops: one SPI byte
+  transaction costs ~57 SCK cycles + 2 DMA setups). `psram_read_page`/`write_page`
+  = 16KB wrappers over the same burst core (used by MemESP from_vram/to_vram).
+- **SCK (MURM1)**: target `PSRAM_MAX_SCK_MHZ=94` → clkdiv 2.0 at sys 378 → SCK
+  94.5 MHz (integer divider, clean waveform; fractional divider = jitter =
+  corruption on APS6404 — never allow one; `psram_update_clkdiv()` rounds to
+  int). `init_psram()` runs an at-speed write/verify memtest and drops to
+  `PSRAM_FALLBACK_SCK_MHZ=63` automatically if the chip fails. At >83 MHz the
+  fudge PIO program (falling-edge sampling) is auto-selected.
+- **Locking**: all transfers take the `PSRAM_SPINLOCK` (cross-core, GS on
+  core1). Long single-CS bursts use the IRQ-PRESERVING lock — never hold IRQs
+  off during a 16KB transfer (VGA DMA IRQ starves → monitor loses signal).
+- **tCEM caveat**: single-CS 16KB transfers hold CS low far beyond the APS6404
+  8µs tCEM spec; verified working on the shipped hardware (pre-dates the burst
+  generalization — pages always did this).
+- **MemESP snapshot paths** (`from_file/to_file/from_mem/cleanup`) transfer via
+  a malloc'd 1KB bounce (gated on `getLargestAllocatable()`, per-byte fallback
+  on tight heap — pico malloc panics on OOM).
+- On-hardware benchmark: OSD → Memory Info measures SPI PSRAM MB/s via the
+  range functions (`OSDMain.cpp`).
+
 ## RP2040 Memory Constraints (ZERO target)
 
 ### Key facts

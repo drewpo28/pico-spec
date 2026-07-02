@@ -36,17 +36,17 @@ option(FDD_PORT_TRACE "Enable WD1793 (ВГ93) FDD command/port tracing" OFF)
 option(RTC_PORT_TRACE "Enable MC146818 Mr Gluk RTC port access tracing" OFF)
 option(PROFI_PORT_TRACE "Enable 0x7FFD/0xDFFD paging-port write tracing" OFF)
 option(SND_PORT_TRACE "Enable per-port I/O histogram (sound-DAC port hunting)" OFF)
-option(PERF_TRACE "Enable per-60-frame CPU/HDMI/FPS performance logging" OFF)
+option(PERF_TRACE "Enable per-60-frame CPU/HDMI/FPS performance logging" ON)
 option(GS_PERF_TRACE "Enable General Sound per-second perf counters (GS.cpp)" OFF)
 option(GS_DEBUG_TRACE "Enable General Sound port-IO trace ring + auto-dumps (~50 KB SRAM)" OFF)
-option(ZIFI_TRACE "Enable ZiFi (ESP-01S WiFi NIC) port/UART tracing" OFF)
+option(ZIFI_TRACE "Enable ZiFi (ESP-01S WiFi NIC) port/UART tracing" ON)
 option(ZIFI_NET_VERBOSE "Per-packet trace of the ZiFi net client (+IPD/chanSend); floods logs" OFF)
 
 # Per-board Debug-Probe UART toggles (logging over UART). Declared here together;
 # the board-specific `if(<board>_DBG_UART)` blocks below consume them (they call
 # pico_enable_stdio_uart() + remap pins, which needs the target to exist first).
 # Each enables stdio over the board's Debug-Probe header — see the block for pins.
-set(MURM1_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1) — moves KBD to GP16/GP17, disables NESPAD")
+set(MURM1_DBG_UART   ON CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1) — moves KBD to GP16/GP17, disables NESPAD")
 set(PICO_PC_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on DBG1 header GP0/GP1 (PICO_PC)")
 set(PICO_DV_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
 set(ZERO_DBG_UART    OFF CACHE BOOL "Enable Debug Probe UART0 on GP16/GP13 (ZERO)")
@@ -341,6 +341,13 @@ if (RTC_PORT_TRACE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE RTC_PORT_TRACE=1)
 else ()
     target_compile_definitions(${PROJECT_NAME} PRIVATE RTC_PORT_TRACE=0)
+endif ()
+
+# Per-60-frame CPU/HDMI/FPS performance logging (see Video.cpp `#if PERF_TRACE`).
+if (PERF_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PERF_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PERF_TRACE=0)
 endif ()
 
 # General Sound perf counters toggle (see GS.cpp `GS_PERF()` / `#if GS_PERF_TRACE`).
@@ -887,9 +894,13 @@ ELSE()
         # SPI clock ceiling. At 126 MHz (default) sys_clk=378 gives clkdiv=1.5 —
         # a fractional divider that makes SCK jitter and corrupts this board's
         # APS6404 8 MB chip (~930 KB/1 MB bad at boot, size probe flaps 8M↔1M).
-        # 63 MHz forces clkdiv=3.0 (integer, clean waveform) — zero corruption.
-        # psram_update_clkdiv() keeps it at 63 MHz after CPU overclock too.
-        PSRAM_MAX_SCK_MHZ=63
+        # 94 MHz targets clkdiv=2.0 at 378 MHz (round(378/188)=2 → SCK=94.5 MHz,
+        # still an integer divider with a clean waveform — same reason 63 MHz /
+        # clkdiv=3.0 was safe, one step faster: +50% bandwidth). init_psram()
+        # runs an at-speed write/verify memtest and drops the target back to
+        # PSRAM_FALLBACK_SCK_MHZ (63) if this chip fails at 94.5 MHz;
+        # psram_update_clkdiv() keeps the chosen target after CPU overclock too.
+        PSRAM_MAX_SCK_MHZ=94
 
         PSRAM_PIN_CS=18
         PSRAM_PIN_SCK=19

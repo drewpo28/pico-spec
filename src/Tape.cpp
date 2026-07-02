@@ -1858,6 +1858,7 @@ bool Tape::FlashLoad() {
             if ( p < (uint8_t*)0x11000000 || (page == 0 && !MemESP::page0ram) ) {
                 f_lseek(tape, f_tell(tape) + nBytes);
             } else {
+                mem_desc_t::mark_bank_dirty(page); // direct write past writebyte
                 f_read(tape, &p[addr2], nBytes, &br);
             }
             while ((count < nBytes) && (count < blockLen - 1)) {
@@ -1871,6 +1872,7 @@ bool Tape::FlashLoad() {
             do {
                 if ((page > 0) && (page < 4)) {
                     UINT br;
+                    mem_desc_t::mark_bank_dirty(page); // direct write past writebyte
                     f_read(tape, &MemESP::ramCurrent[page][addr2], chunk1, &br);
                     for (int i=0; i < chunk1; i++) {
                         Z80::Xor(MemESP::readbyte(addr));
@@ -1998,6 +2000,7 @@ bool Tape::FlashLoad() {
             if ( p < (uint8_t*)0x11000000 || (page == 0 && !MemESP::page0ram) ) {
                 f_lseek(tape, f_tell(tape) + readLen);
             } else {
+                mem_desc_t::mark_bank_dirty(page); // direct write past writebyte
                 f_read(tape, &p[addr2], readLen, &br);
             }
             while (count < readLen) {
@@ -2012,6 +2015,7 @@ bool Tape::FlashLoad() {
                 if (chunk1 > chunkrest) chunk1 = chunkrest;
                 if ((page > 0) && (page < 4)) {
                     UINT br;
+                    mem_desc_t::mark_bank_dirty(page); // direct write past writebyte
                     f_read(tape, &MemESP::ramCurrent[page][addr2], chunk1, &br);
                     for (int i=0; i < chunk1; i++) {
                         Z80::Xor(MemESP::readbyte(addr));
@@ -2134,6 +2138,7 @@ bool Tape::FlashLoad() {
         if ( p < (uint8_t*)0x11000000 || (page == 0 && !MemESP::page0ram) ) {
             f_lseek(tape, f_tell(tape) + nBytes);
         } else {
+            mem_desc_t::mark_bank_dirty(page); // direct write past writebyte
             f_read(tape, &p[addr2], nBytes, &br);
         }
 
@@ -2154,6 +2159,7 @@ bool Tape::FlashLoad() {
 
             if ((page > 0) && (page < 4)) {
                 UINT br;
+                mem_desc_t::mark_bank_dirty(page); // direct write past writebyte
                 f_read(tape, &MemESP::ramCurrent[page][addr2], chunk1, &br);
 
                 for (int i=0; i < chunk1; i++) {

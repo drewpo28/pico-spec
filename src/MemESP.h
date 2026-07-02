@@ -59,6 +59,9 @@ extern uint8_t* PSRAM_DATA;
 extern uint8_t psram_pin;
 extern volatile uint32_t mem_spi_evict_count; // SPI PSRAM loads per frame
 extern volatile uint32_t mem_spi_evict_page;  // last evicted page index
+extern volatile uint32_t mem_spi_read_skip;   // first-touch loads with the read skipped
+extern volatile uint32_t mem_spi_wb_skip;     // clean-victim evictions, write-back skipped
+extern volatile uint32_t mem_spi_swap_us;     // total µs spent in _sync page swaps
 uint32_t butter_psram_size();
 extern uint8_t rx[4];
 #if !PICO_RP2040
@@ -74,13 +77,25 @@ enum mem_type_t {
 class mem_desc_t {
     static std::list<mem_desc_t> pages; // a pool of assigned pages
     static uint8_t* plugged_in[4]; // pointers are plugged to 64k space (do not revoke 'em)
+public:
+    // Per-CPU-bank dirty hooks: writebyte() does `*bank_dirty[page] = true` on
+    // every RAM write; sync(bank) re-points the slot at the plugged page's
+    // dirty flag (ROM slots point at dirty_sink).  A false positive (stale
+    // pointer marking an unrelated page) only costs a redundant write-back;
+    // pool pages are only ever plugged via sync(), so no dirty write is missed.
+    static bool* bank_dirty[4];
+    static bool  dirty_sink;
+    static inline void mark_bank_dirty(uint8_t bank) { if (bank < 4) *bank_dirty[bank] = true; }
+private:
     struct mem_desc_int_t {
         uint8_t* p;
         uint32_t vram_off;
         mem_type_t mem_type;
         bool is_rom;
         bool pinned;  // if true, _sync skips this entry (never evicted while pinned)
-        mem_desc_int_t() : p(0), vram_off(0), mem_type(POINTER), is_rom(false), pinned(false) {}
+        bool dirty;   // frame modified since last load/write-back; clean victims
+                      // are evicted WITHOUT the 16KB write-back (see _sync)
+        mem_desc_int_t() : p(0), vram_off(0), mem_type(POINTER), is_rom(false), pinned(false), dirty(true) {}
     };
     mem_desc_int_t* _int;
     uint8_t* to_vram(void);
@@ -116,7 +131,10 @@ public:
             _sync(bank);
         }
         uint8_t* res = _int->p;
-        if (bank < 4) plugged_in[bank] = res;
+        if (bank < 4) {
+            plugged_in[bank] = res;
+            bank_dirty[bank] = _int->is_rom ? &dirty_sink : &_int->dirty;
+        }
         return res;
     }
     inline uint8_t read(uint16_t addr) {
@@ -129,6 +147,7 @@ public:
         if (_int->mem_type != POINTER) {
             return _write(addr, v);
         }
+        _int->dirty = true;
         _int->p[addr] = v;
     }
      // virtual RAM - PSRAM or swap
@@ -315,6 +334,7 @@ inline void MemESP::writebyte(uint16_t addr, uint8_t data)
 #endif
     uint8_t* p = ramCurrent[page];
     if (p < (uint8_t*)0x11000000) return;
+    *mem_desc_t::bank_dirty[page] = true;
     // NOTE: the Profi CP/M BOOTFDD has 0x801A = 0xC9, which the BIOS reads via
     // `LD A,(0x801A); AND A; JR NZ` to select the floppy boot path (A≠0).
     // An earlier experiment patched this byte to 0x00 to force the HDD boot path,

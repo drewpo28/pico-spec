@@ -35,16 +35,56 @@ visit https://zxespectrum.speccy.org/contacto
 
 #include "MemESP.h"
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 #include "psram_spi.h"
 #include "ff.h"
 
 std::list<mem_desc_t> mem_desc_t::pages;
 uint8_t* mem_desc_t::plugged_in[4] = { 0, 0, 0, 0 };
+bool  mem_desc_t::dirty_sink = false;
+bool* mem_desc_t::bank_dirty[4] = {
+    &mem_desc_t::dirty_sink, &mem_desc_t::dirty_sink,
+    &mem_desc_t::dirty_sink, &mem_desc_t::dirty_sink,
+};
 uint32_t MEM_PG_CNT = 64;
 
 // Per-frame SPI PSRAM swap counters — reset each EndFrame, read in Debug::log.
 volatile uint32_t mem_spi_evict_count = 0;  // from_vram calls (SPI DMA loads)
 volatile uint32_t mem_spi_evict_page  = 0;  // last evicted page index
+volatile uint32_t mem_spi_read_skip   = 0;  // first-touch loads with the read skipped
+volatile uint32_t mem_spi_wb_skip     = 0;  // clean-victim evictions with the write-back skipped
+volatile uint32_t mem_spi_swap_us     = 0;  // total µs spent in _sync page swaps
+
+// Backing-store validity bitmap: bit set = this vram/swap page has been
+// materialized (written to PSRAM or the swap file) at least once.  A page that
+// was never materialized holds power-on garbage, so from_vram() skips the 16KB
+// load entirely — the stale content of the reused SRAM frame is just as good.
+// This halves the fault cost of the Profi boot RAM-clear and the 1024K memtest
+// first pass, where every fault touches a page for the first time.
+#define VRAM_PG_MAX 512  // 8MB of backing store; out-of-range = always "valid"
+static uint32_t vram_pg_valid[VRAM_PG_MAX / 32];
+static inline bool vram_pg_is_valid(uint32_t ba) {
+    uint32_t pg = ba / MEM_PG_SZ;
+    return pg >= VRAM_PG_MAX || ((vram_pg_valid[pg >> 5] >> (pg & 31)) & 1u);
+}
+static inline void vram_pg_set_valid(uint32_t ba) {
+    uint32_t pg = ba / MEM_PG_SZ;
+    if (pg < VRAM_PG_MAX) vram_pg_valid[pg >> 5] |= 1u << (pg & 31);
+}
+
+// Spare 16KB SRAM frame for asynchronous page swaps: a fault loads the incoming
+// page into the spare and pushes the victim's write-back to the background
+// (psram_write_page_async), so the Z80 resumes after just the read half of the
+// swap.  The victim's old frame becomes the next spare — it must stay untouched
+// until the background write is joined, which the driver guarantees (every
+// PSRAM entry point joins first).  Allocated lazily from the heap (NOT stolen
+// from the pool — the Profi pool is sized exactly to its CP/M working set and
+// losing a slot reignites the bank-trampoline thrash); skipped when the heap
+// is tight (ZiFi TLS needs ~50KB headroom for HTTPS).
+static uint8_t* g_swap_spare = nullptr;
+static bool     g_spare_tried = false;
+extern size_t getLargestAllocatable(void);  // also used by mem_bounce_acquire below
 
 // Cold paths for memory breakpoints — see declaration in MemESP.h.
 __attribute__((noinline)) void MemESP::checkMemReadBP(uint16_t addr) {
@@ -72,6 +112,8 @@ extern "C" void mem_swap_reopen(void) {
 }
 
 void mem_desc_t::reset(void) {
+    memset(vram_pg_valid, 0, sizeof(vram_pg_valid));
+    for (int i = 0; i < 4; ++i) bank_dirty[i] = &dirty_sink;
     pages.clear();
     f_close(&f);
     f_unlink(PAGEFILE); // ensure it is new file
@@ -99,12 +141,21 @@ uint8_t* mem_desc_t::to_vram(void) {
         #endif
         _int->mem_type = SWAP;
     }
+    vram_pg_set_valid(ba);
     _int->p = 0;
     return res;
 }
 void mem_desc_t::from_vram(uint8_t* p) {
     this->_int->p = p;
     uint32_t ba = _int->vram_off;
+    _int->mem_type = POINTER;
+    _int->dirty = false;   // frame == backing store (or both garbage on skip)
+    if (!vram_pg_is_valid(ba)) {
+        // First touch: the backing store was never written, its content is
+        // power-on garbage — the reused frame's stale bytes are just as good.
+        mem_spi_read_skip++;
+        return;
+    }
     if (psram_size() >= ba + MEM_PG_SZ) {
         mem_spi_evict_count++;
         mem_spi_evict_page = ba / MEM_PG_SZ;
@@ -115,7 +166,6 @@ void mem_desc_t::from_vram(uint8_t* p) {
         f_lseek(&f, lba);
         f_read(&f, p, 0x4000, &br);
     }
-    _int->mem_type = POINTER;
 }
 uint8_t mem_desc_t::_read(uint16_t addr) {
     uint32_t ba = _int->vram_off;
@@ -131,6 +181,9 @@ uint8_t mem_desc_t::_read(uint16_t addr) {
 }
 void mem_desc_t::_write(uint16_t addr, uint8_t v) {
     uint32_t ba = _int->vram_off;
+    // The byte lands in the backing store — a later from_vram must not skip
+    // the load anymore (the rest of the page stays garbage, like real RAM).
+    vram_pg_set_valid(ba);
     if (psram_size() >= ba + MEM_PG_SZ) {
         write8psram(ba + addr, v);
         return;
@@ -147,6 +200,14 @@ void mem_desc_t::_write(uint16_t addr, uint8_t v) {
     #endif
 }
 void mem_desc_t::_sync(uint8_t bank) {
+    uint32_t t0 = time_us_32();
+    // One-time: allocate the swap spare from the heap (~100KB free at runtime
+    // on m1p2; keep ≥48KB headroom for ZiFi TLS / OSD).  No pool stealing.
+    if (!g_spare_tried && psram_size()) {
+        g_spare_tried = true;
+        if (getLargestAllocatable() >= MEM_PG_SZ + 49152)
+            g_swap_spare = (uint8_t*)malloc(MEM_PG_SZ);
+    }
     for (auto it = pages.begin(); it != pages.end(); ++it) {
         mem_desc_t& page = *it;
         if (page._int->mem_type == POINTER && !page._int->pinned) {
@@ -155,41 +216,100 @@ void mem_desc_t::_sync(uint8_t bank) {
                     if (page._int->p == plugged_in[i]) goto skip;
                 }
             }
-            from_vram( page.to_vram() );
+            {
+                uint32_t vba = page._int->vram_off;
+                bool vspi = psram_size() >= vba + MEM_PG_SZ;
+                if (!page._int->dirty) {
+                    // Clean victim: the backing store already matches the frame
+                    // (or both hold garbage — never materialized).  Detach with
+                    // NO write-back and reuse the frame for the incoming page:
+                    // the fault costs only the read half.  Read-heavy storms
+                    // (memtest verify passes, the CP/M bank trampoline over
+                    // read-only code banks) skip the 16KB write entirely.
+                    uint8_t* vf = page._int->p;
+                    page._int->p = 0;
+                    page._int->mem_type = vspi ? PSRAM_SPI : SWAP;
+                    mem_spi_wb_skip++;
+                    from_vram(vf);
+                } else if (g_swap_spare && vspi) {
+                    // Async swap: load the incoming page into the spare frame,
+                    // then push the victim's write-back to the background —
+                    // the Z80 resumes while PIO+DMA clock out the 16KB.  The
+                    // victim's frame becomes the next spare; it stays untouched
+                    // until the driver joins the write on the next PSRAM access.
+                    uint8_t* vf = page._int->p;
+                    page._int->p = 0;
+                    page._int->mem_type = PSRAM_SPI;
+                    from_vram(g_swap_spare);          // may skip read on first touch
+                    psram_write_page_async(vba, vf);
+                    vram_pg_set_valid(vba);
+                    g_swap_spare = vf;
+                } else {
+                    from_vram( page.to_vram() );
+                }
+            }
             pages.erase(it);
             pages.push_back(*this);
             break;
         }
         skip:;
     }
+    mem_spi_swap_us += time_us_32() - t0;
 }
-/// TODO: packet mode
+// Transient bounce buffer for chunked page<->file transfers (snapshot load/save
+// into evicted pages). malloc'd per call — pico_malloc PANICS on OOM instead of
+// returning NULL, so gate on getLargestAllocatable() (see Buffer::palloc) and
+// fall back to the per-byte path when the heap is too tight (e.g. RP2040 after
+// VIDEO::Init with ~5KB free).
+extern size_t getLargestAllocatable(void);
+static uint8_t* mem_bounce_acquire(size_t* sz) {
+    const size_t WANT = 1024;
+    if (getLargestAllocatable() < WANT + 2048) return nullptr;
+    uint8_t* p = (uint8_t*)malloc(WANT);
+    if (p) *sz = WANT;
+    return p;
+}
+
 void mem_desc_t::from_file(FIL* f_in, size_t sz) {
     UINT br;
     if (_int->mem_type == POINTER) {
+        _int->dirty = true;   // frame modified behind writebyte's back
         f_read(f_in, direct(), sz, &br);
         return;
     }
-    uint8_t v;
     uint32_t ba = _int->vram_off;
-    if (psram_size() >= ba + MEM_PG_SZ) {
+    bool spi = psram_size() >= ba + MEM_PG_SZ;
+    if (!spi) {
+        #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
+        gpio_put(PICO_DEFAULT_LED_PIN, true);
+        #endif
+        f_lseek(&f, ba);
+    }
+    size_t bsz = 0;
+    uint8_t* buf = mem_bounce_acquire(&bsz);
+    if (buf) {
+        for (size_t off = 0; off < sz; off += bsz) {
+            size_t n = (sz - off > bsz) ? bsz : sz - off;
+            f_read(f_in, buf, n, &br);
+            if (spi) {
+                psram_write_range(ba + off, buf, n);
+            } else {
+                UINT bw;
+                f_write(&f, buf, n, &bw);
+            }
+        }
+        free(buf);
+    } else {
+        uint8_t v;
         for (size_t addr = 0; addr < sz; ++addr) {
             f_read(f_in, &v, 1, &br);
-            write8psram(ba + addr, v);
+            if (spi) write8psram(ba + addr, v);
+            else     f_write(&f, &v, 1, &br);
         }
-        return;
     }
+    vram_pg_set_valid(ba);
     #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
-    gpio_put(PICO_DEFAULT_LED_PIN, true);
-    #endif
-    FSIZE_t lba = ba;
-    f_lseek(&f, lba);
-    for (size_t addr = 0; addr < sz; ++addr) {
-        f_read(f_in, &v, 1, &br);
-        f_write(&f, &v, 1, &br);
-    }
-    #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
-    gpio_put(PICO_DEFAULT_LED_PIN, false);
+    if (!spi) gpio_put(PICO_DEFAULT_LED_PIN, false);
     #endif
 }
 void mem_desc_t::to_file(FIL* f_out, size_t sz) {
@@ -204,56 +324,98 @@ void mem_desc_t::to_file(FIL* f_out, size_t sz) {
         #endif
         return;
     }
-    uint8_t v;
     uint32_t ba = _int->vram_off;
-    if (psram_size()) {
+    // Same page-fits-in-PSRAM test as to_vram/_read/_write — a bare psram_size()
+    // check would read a high page (evicted to SD swap) from wrapped PSRAM addresses.
+    bool spi = psram_size() >= ba + MEM_PG_SZ;
+    if (!spi) f_lseek(&f, ba);
+    size_t bsz = 0;
+    uint8_t* buf = mem_bounce_acquire(&bsz);
+    if (buf) {
+        for (size_t off = 0; off < sz; off += bsz) {
+            size_t n = (sz - off > bsz) ? bsz : sz - off;
+            if (spi) psram_read_range(ba + off, buf, n);
+            else     f_read(&f, buf, n, &br);
+            f_write(f_out, buf, n, &br);
+        }
+        free(buf);
+    } else {
+        uint8_t v;
         for (size_t addr = 0; addr < sz; ++addr) {
-            v = read8psram(ba + addr);
+            if (spi) v = read8psram(ba + addr);
+            else     f_read(&f, &v, 1, &br);
             f_write(f_out, &v, 1, &br);
         }
-        #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
-        gpio_put(PICO_DEFAULT_LED_PIN, false);
-        #endif
-        return;
-    }
-    FSIZE_t lba = ba;
-    f_lseek(&f, lba);
-    for (size_t addr = 0; addr < sz; ++addr) {
-        f_read(&f, &v, 1, &br);
-        f_write(f_out, &v, 1, &br);
     }
     #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
     gpio_put(PICO_DEFAULT_LED_PIN, false);
     #endif
 }
 void mem_desc_t::from_mem(mem_desc_t& ram, size_t sz) {
-    if (_int->mem_type == POINTER) {
-        if (ram._int->mem_type == POINTER) {
-            memcpy(direct(), ram.direct(), sz);
-        } else {
-            uint8_t* p = direct();
-            for (size_t addr = 0; addr < sz; ++addr) {
-                p[addr] = ram._read(addr);
-            }
+    bool dstPtr = _int->mem_type == POINTER;
+    bool srcPtr = ram._int->mem_type == POINTER;
+    if (dstPtr && srcPtr) {
+        _int->dirty = true;
+        memcpy(direct(), ram.direct(), sz);
+        return;
+    }
+    uint32_t sba = ram._int->vram_off;
+    uint32_t dba = _int->vram_off;
+    bool sspi = psram_size() >= sba + MEM_PG_SZ;
+    bool dspi = psram_size() >= dba + MEM_PG_SZ;
+    UINT brw;
+    if (dstPtr) {          // vram/swap → SRAM: one block transfer, no bounce
+        _int->dirty = true;
+        if (sspi) psram_read_range(sba, direct(), sz);
+        else { f_lseek(&f, sba); f_read(&f, direct(), sz, &brw); }
+        return;
+    }
+    if (srcPtr) {          // SRAM → vram/swap: one block transfer, no bounce
+        if (dspi) psram_write_range(dba, ram.direct(), sz);
+        else { f_lseek(&f, dba); f_write(&f, ram.direct(), sz, &brw); }
+        vram_pg_set_valid(dba);
+        return;
+    }
+    // vram/swap → vram/swap — bounce chunks; per-byte fallback on tight heap.
+    size_t bsz = 0;
+    uint8_t* buf = mem_bounce_acquire(&bsz);
+    if (buf) {
+        for (size_t off = 0; off < sz; off += bsz) {
+            size_t n = (sz - off > bsz) ? bsz : sz - off;
+            if (sspi) psram_read_range(sba + off, buf, n);
+            else { f_lseek(&f, sba + off); f_read(&f, buf, n, &brw); }
+            if (dspi) psram_write_range(dba + off, buf, n);
+            else { f_lseek(&f, dba + off); f_write(&f, buf, n, &brw); }
         }
+        free(buf);
+        vram_pg_set_valid(dba);
     } else {
-        if (ram._int->mem_type == POINTER) {
-            uint8_t* p = ram.direct();
-            for (size_t addr = 0; addr < sz; ++addr) {
-                _write(addr, p[addr]);
-            }
-        } else {
-            for (size_t addr = 0; addr < sz; ++addr) {
-                _write(addr, ram._read(addr));
-            }
+        for (size_t addr = 0; addr < sz; ++addr) {
+            _write(addr, ram._read(addr));
         }
     }
-
 }
 void mem_desc_t::cleanup() {
     if (_int->mem_type == POINTER) {
-        for (size_t addr = 0; addr < MEM_PG_SZ; ++addr) {
-            _write(addr, 0);
+        // Zero the vram backing store (same effect as the old per-byte _write
+        // loop — 16384 SPI transactions — but chunked).
+        uint32_t ba = _int->vram_off;
+        bool spi = psram_size() >= ba + MEM_PG_SZ;
+        size_t bsz = 0;
+        uint8_t* buf = mem_bounce_acquire(&bsz);
+        if (buf) {
+            memset(buf, 0, bsz);
+            if (!spi) f_lseek(&f, ba);
+            for (size_t off = 0; off < MEM_PG_SZ; off += bsz) {
+                if (spi) psram_write_range(ba + off, buf, bsz);
+                else { UINT bw; f_write(&f, buf, bsz, &bw); }
+            }
+            free(buf);
+            vram_pg_set_valid(ba);
+        } else {
+            for (size_t addr = 0; addr < MEM_PG_SZ; ++addr) {
+                _write(addr, 0);
+            }
         }
     } else {
         if (!_int->p) return;
