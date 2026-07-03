@@ -63,6 +63,7 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - TR-DOS auto-boot: optionally inject a boot loader into TRD/SCL images that lack one, so downloaded disks auto-start (Storage → Betadisk → Auto-boot) (RP2350 only).
 - IDE/HDD emulation: NEMO and Profi schemes, HDF / raw .hdd / Fixed VHD images, create-empty-image helper, mounted from the Storage → IDE/HDD menu (RP2350 only).
 - MB-02+ disk interface emulation: WD2797 FDC, Z80-DMA, 512KB SRAM paging, BS-DOS 308, MBD disk images, 4 drives, NMI menu (RP2350 only).
+- USB flash drive support: browse and load images from a USB mass-storage stick (mounted as a FatFs `USB:` volume); appears as a location in the F5 file browser and, when no SD card is present at boot, becomes the default storage (RP2350 only).
 - esxDOS support (DivMMC, DivIDE, DivSD) — [esxdos.org](https://esxdos.org/index.html).
 - Z-Controller emulation: raw SD card access via ports #57/#77, mutually exclusive with esxDOS and MB-02+ (RP2350 only).
 - FDD activity LED indicator and mechanical head click/seek sound emulation (optional, toggled via Betadisk menu).
@@ -80,8 +81,8 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - ZIP archive support: browse, extract, load and delete files inside ZIP archives.
 - Configurable keyboard hotkeys with hint display in menus.
 - Enhanced debugger: multi-breakpoint (up to 20), memory editor, port read/write breakpoints.
-- Hardware info menu: Chip Info (model, cores, frequency, VREG voltage), Board Info (flash, PSRAM, SDK version) and Emulator Info (machine, video, sound, input and storage configuration).
-- Speed Test menu: benchmark CPU MIPS, SRAM read/write, PSRAM, and SD card throughput (individual or all at once).
+- Hardware info menu: Chip Info (model, cores, frequency, VREG voltage), Board Info (flash, PSRAM, SDK version), Memory Info (live SRAM/PSRAM/flash occupancy and Buffer tier pools) and Emulator Info (machine, video, sound, input and storage configuration).
+- Speed Test menu: benchmark CPU MIPS, SRAM read/write, PSRAM, SD card and USB drive throughput (individual or all at once).
 - ZX Keyboard overlay (main menu → ZX Keyboard): full-screen bitmap of the Spectrum keyboard for quick reference. Thanks to @const_bill and @tecnocat.
 - Overclock menu: CPU frequency (RP2350: 252/378/504 MHz; RP2040: 252/378 MHz), Flash frequency (33–166 MHz), PSRAM frequency (66–166 MHz), VReg voltage (RP2350: 1.15–1.80 V).
 - Complete file navigation system with autoindexing, folder support and search functions.
@@ -231,7 +232,7 @@ File access (FTP/SFTP and the online archives) lives in the **F5 file browser** 
 
 In any of these, **Enter** quick-starts a file (download to RAM and run/mount) and **F5** saves it to a chosen SD folder; `..`/Backspace go up, Esc closes.
 
-Wiring is just **4 wires** (TX, RX, GND, 3V3 — TX/RX crossover; EN/RST/GPIO0/GPIO2 left unconnected). Per-board default pins and full details: **[Network wiki page](https://github.com/drewpo28/pico-spec/wiki/EN-Network)** ([RU](https://github.com/drewpo28/pico-spec/wiki/Network)).
+Wiring is just **4 wires** (TX, RX, GND, 3V3 — TX/RX crossover; EN/RST/GPIO0/GPIO2 left unconnected). Alternatively, the ESP-01S can be connected over USB through a **CH340 / CP210x / FTDI USB-serial dongle** instead of the GPIO UART. Per-board default pins and full details: **[Network wiki page](https://github.com/drewpo28/pico-spec/wiki/EN-Network)** ([RU](https://github.com/drewpo28/pico-spec/wiki/Network)).
 
 ## How to build
 ### Windows 10+
