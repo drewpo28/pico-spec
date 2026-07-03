@@ -828,9 +828,11 @@ static void splitTabs(const string& s, std::vector<string>& out) {
 // Esc or any network action (caller closes the OSD).
 
 // The chooser is reachable when there's any location besides the SD card: a WiFi
-// link (or saved SSID) or a USB stick.
+// link (or saved SSID) or a USB stick. With the stick AS the root volume (no SD
+// at boot) "Local" already browses it, so it adds no extra location.
 static inline bool f5HasChooser() {
-    return ZiFiAT::connected || !Config::wifi_ssid.empty() || UsbMsc::ready();
+    return ZiFiAT::connected || !Config::wifi_ssid.empty() ||
+           (UsbMsc::ready() && !FileUtils::usbRoot);
 }
 
 // Last browse dir per local source, so switching SD⇄USB in the chooser returns to
@@ -878,9 +880,12 @@ static bool f5Locations() {
     int lf = 2, lb = 2;                               // keep the cursor on the chosen location
     while (1) {
         if (OSD::net_launch_close) return false;      // a quick-start launched → close OSD
-        const bool usb = UsbMsc::ready();
+        // Hide the USB row when the stick is the root volume — "Local" IS the stick.
+        const bool usb = UsbMsc::ready() && !FileUtils::usbRoot;
         std::vector<string> rows = {
-            string(1, (char)DIR_MARKER) + MSG_F5_LOCAL[Config::lang],
+            // USB-as-root: "Local" is the stick, not the (absent) SD card.
+            string(1, (char)DIR_MARKER) + (FileUtils::usbRoot ? MSG_F5_USB[Config::lang]
+                                                              : MSG_F5_LOCAL[Config::lang]),
             string(1, (char)DIR_MARKER) + MSG_F5_REMOTE[Config::lang],
             string(1, (char)DIR_MARKER) + MSG_F5_WEB[Config::lang],
             MSG_F5_ADD_REMOTE[Config::lang],
@@ -11463,6 +11468,61 @@ progressDialog(OSD_FIRMW[Config::lang],OSD_FIRMW_END[Config::lang],100,1);
 // ---------------------------------------------------------------------------
 // Speed Test
 // ---------------------------------------------------------------------------
+
+// Sequential file R/W benchmark on one FatFs volume — measures the same
+// FatFs+diskio path the emulator's own file I/O uses. benchPath selects the
+// volume ("/bench.tmp" = SD, "USB:/..." = stick).
+//
+// NOTE on USB: block size does NOT change USB throughput. The RP2350 native
+// USB host transfers bulk data at ~1 packet (64 B) per 1 ms SOF frame, so USB
+// MSC is hard-capped near ~64 KB/s regardless of transfer size — measured a
+// single 32 KB (64-sector) read10 at 558 ms, identical to 64 single-sector
+// reads. It's a host-controller limit, not this code. See CLAUDE.md.
+static bool benchFsSpeed(const char* benchPath, const char* volName,
+                         const char* title, float& rd, float& wr) {
+    static uint8_t io_buf[512];
+    static FIL f;    // 2KB core stack — never put a FIL on it
+    UINT bw, br;
+    bool ok = false;
+    char msg[24];
+
+    snprintf(msg, sizeof(msg), "%s write...", volName);
+    OSD::progressDialog(title, msg, 0, 0);
+    memset(io_buf, 0x55, sizeof(io_buf));
+    if (f_open(&f, benchPath, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+        uint64_t t0 = time_us_64();
+        uint32_t total = 0;
+        while (time_us_64() - t0 < 2000000ULL && total < 512u * 1024u) {
+            if (f_write(&f, io_buf, sizeof(io_buf), &bw) != FR_OK) break;
+            total += bw;
+        }
+        uint64_t elapsed = time_us_64() - t0;
+        f_close(&f);
+        if (elapsed > 0 && total > 0) {
+            wr = (float)total / (float)elapsed;
+            ok = true;
+        }
+    }
+
+    snprintf(msg, sizeof(msg), "%s read...", volName);
+    OSD::progressDialog(title, msg, 50, 1);
+    if (f_open(&f, benchPath, FA_READ) == FR_OK) {
+        uint64_t t0 = time_us_64();
+        uint32_t total = 0;
+        while (f_read(&f, io_buf, sizeof(io_buf), &br) == FR_OK && br > 0)
+            total += br;
+        uint64_t elapsed = time_us_64() - t0;
+        f_close(&f);
+        if (elapsed > 0 && total > 0)
+            rd = (float)total / (float)elapsed;
+    }
+    f_unlink(benchPath);
+
+    OSD::progressDialog(title, "", 100, 1);
+    OSD::progressDialog("", "", 0, 2);
+    return ok;
+}
+
 void OSD::SpeedTest() {
     menu_level = 2;
     menu_curopt = 1;
@@ -11472,10 +11532,11 @@ void OSD::SpeedTest() {
         uint8_t st_opt = menuRun(MENU_SPEEDTEST[Config::lang]);
         if (st_opt == 0) break;
 
-        const bool do_cpu   = (st_opt == 1 || st_opt == 5);
-        const bool do_sram  = (st_opt == 2 || st_opt == 5);
-        const bool do_psram = (st_opt == 3 || st_opt == 5);
-        const bool do_sd    = (st_opt == 4 || st_opt == 5);
+        const bool do_cpu   = (st_opt == 1 || st_opt == 6);
+        const bool do_sram  = (st_opt == 2 || st_opt == 6);
+        const bool do_psram = (st_opt == 3 || st_opt == 6);
+        const bool do_sd    = (st_opt == 4 || st_opt == 6);
+        const bool do_usb   = (st_opt == 5 || st_opt == 6);
 
         const char* title = Config::lang ? "Test velocidad" : "Speed Test";
 
@@ -11484,7 +11545,12 @@ void OSD::SpeedTest() {
         float spi_rd = 0.0f, spi_wr = 0.0f;
         float qspi_rd = 0.0f, qspi_wr = 0.0f;
         float sd_rd = 0.0f, sd_wr = 0.0f;
-        bool sd_ok = false;
+        float usb_rd = 0.0f, usb_wr = 0.0f;
+        bool sd_ok = false, usb_ok = false;
+        // usbRoot: there is no SD — the unprefixed volume IS the stick, so the
+        // SD test would silently benchmark USB; report "No card" instead.
+        const bool sd_present  = FileUtils::fsMount && !FileUtils::usbRoot;
+        const bool usb_present = UsbMsc::ready();
 
         const bool has_spi  = psram_size() > 0;
         const bool has_qspi = butter_psram_size() > 0;
@@ -11618,47 +11684,12 @@ void OSD::SpeedTest() {
         }
 
         // --- SD Card ---
-        if (do_sd) {
-            if (FileUtils::fsMount) {
-                static uint8_t sd_buf[512];
-                const char* BENCH_FILE = "/bench.tmp";
-                FIL f;
-                UINT bw, br;
+        if (do_sd && sd_present)
+            sd_ok = benchFsSpeed("/bench.tmp", "SD", title, sd_rd, sd_wr);
 
-                progressDialog(title, "SD write...", 0, 0);
-                memset(sd_buf, 0x55, sizeof(sd_buf));
-                if (f_open(&f, BENCH_FILE, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
-                    uint64_t t0 = time_us_64();
-                    uint32_t total = 0;
-                    while (time_us_64() - t0 < 2000000ULL && total < 512u * 1024u) {
-                        if (f_write(&f, sd_buf, sizeof(sd_buf), &bw) != FR_OK) break;
-                        total += bw;
-                    }
-                    uint64_t elapsed = time_us_64() - t0;
-                    f_close(&f);
-                    if (elapsed > 0 && total > 0) {
-                        sd_wr = (float)total / (float)elapsed;
-                        sd_ok = true;
-                    }
-                }
-
-                progressDialog(title, "SD read...", 50, 1);
-                if (f_open(&f, BENCH_FILE, FA_READ) == FR_OK) {
-                    uint64_t t0 = time_us_64();
-                    uint32_t total = 0;
-                    while (f_read(&f, sd_buf, sizeof(sd_buf), &br) == FR_OK && br > 0)
-                        total += br;
-                    uint64_t elapsed = time_us_64() - t0;
-                    f_close(&f);
-                    if (elapsed > 0 && total > 0)
-                        sd_rd = (float)total / (float)elapsed;
-                }
-                f_unlink(BENCH_FILE);
-
-                progressDialog(title, "", 100, 1);
-                progressDialog("", "", 0, 2);
-            }
-        }
+        // --- USB flash stick ---
+        if (do_usb && usb_present)
+            usb_ok = benchFsSpeed("USB:/bench.tmp", "USB", title, usb_rd, usb_wr);
 
         // --- Build result text ---
         char (&buf)[OSD_INFO_BUF_SZ] = osd_info_buf;
@@ -11696,7 +11727,7 @@ void OSD::SpeedTest() {
             }
         }
         if (do_sd) {
-            if (!FileUtils::fsMount) {
+            if (!sd_present) {
                 pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
                     " SD      : No card\n\n");
             } else if (sd_ok) {
@@ -11707,6 +11738,20 @@ void OSD::SpeedTest() {
             } else {
                 pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
                     " SD      : Error\n\n");
+            }
+        }
+        if (do_usb) {
+            if (!usb_present) {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " USB     : No stick\n\n");
+            } else if (usb_ok) {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " USB rd  : %.2f MB/s\n"
+                    " USB wr  : %.2f MB/s\n\n",
+                    usb_rd, usb_wr);
+            } else {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " USB     : Error\n\n");
             }
         }
 

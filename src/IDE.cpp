@@ -6,6 +6,7 @@
 #include <cstring>
 #include "Config.h"
 #include "Debug.h"
+#include "FileUtils.h"
 
 // IDE_PORT_TRACE (every ATA register/command access + sector read/write) is
 // defined by CMake (default 0). One-time init/geometry logs stay unconditional.
@@ -131,6 +132,8 @@ static void synth_chs(uint32_t total_lba, uint16_t& c, uint16_t& h, uint16_t& s)
 
 bool IDE::open_image(int slot, const char* path) {
     if (!path || !path[0]) return false;
+    // "USB:/..." image at boot: wait for the stick to enumerate first.
+    if (!FileUtils::waitVolumeReady(path)) return false;
 
     FRESULT fr = f_open(&file[slot], path, FA_READ | FA_WRITE);
     if (fr != FR_OK) {

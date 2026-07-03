@@ -116,12 +116,6 @@ DSTATUS usb_disk_initialize(void) {
 DRESULT usb_disk_read(BYTE* buff, LBA_t sector, UINT count) {
     if (usb_disk_status()) return RES_NOTRDY;
     if (!count || sector + count > g_blkcnt) return RES_PARERR;
-    // One-shot bring-up confirmation that the SCSI data path works at all.
-    static bool first_logged = false;
-    if (!first_logged) {
-        first_logged = true;
-        Debug::log("UsbMsc: first read lba=%u n=%u buf=%p\n", (unsigned)sector, count, buff);
-    }
     if (((uintptr_t)buff & 3) == 0)
         return mscRead(buff, (uint32_t)sector, count) ? RES_OK : RES_ERROR;
     // Odd-aligned caller buffer (FatFs passes large f_read targets straight
@@ -188,6 +182,9 @@ void tuh_msc_mount_cb(uint8_t dev_addr) {
         }
     }
     f_mount(&g_mem->fs, "USB:", 0);          // deferred — registers the volume only
+    // USB-as-root (booted without an SD card): a re-plugged stick brings the
+    // default volume back to life, so re-enable the filesystem flag.
+    if (FileUtils::usbRoot) FileUtils::fsMount = true;
 }
 
 void tuh_msc_umount_cb(uint8_t dev_addr) {
@@ -198,6 +195,9 @@ void tuh_msc_umount_cb(uint8_t dev_addr) {
     // to the SD root instead of a dead "USB:/..." path.
     if (FileUtils::ALL_Path.compare(0, 4, "USB:") == 0)
         FileUtils::ALL_Path = "/";
+    // USB-as-root: the stick WAS the whole filesystem — flag storage as gone
+    // so menus degrade the same way as a missing SD card.
+    if (FileUtils::usbRoot) FileUtils::fsMount = false;
     Debug::log("UsbMsc: stick removed\n");
 }
 
@@ -206,6 +206,16 @@ void tuh_msc_umount_cb(uint8_t dev_addr) {
 // ── Public state accessors ───────────────────────────────────────────────────
 bool UsbMsc::ready() {
     return g_daddr != 0 && g_mem != nullptr && g_blksz == FF_MAX_SS;
+}
+
+bool UsbMsc::waitReady(uint32_t timeout_ms) {
+    if (!tuh_inited()) return false;   // non-KBDUSB build: host stack never started
+    absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+    while (!ready()) {
+        if (absolute_time_diff_us(get_absolute_time(), deadline) < 0) return false;
+        mscService();
+    }
+    return true;
 }
 
 uint64_t UsbMsc::sizeBytes() {

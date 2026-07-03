@@ -153,13 +153,30 @@
 /  on character encoding. When LFN is not enabled, these options have no effect. */
 
 
-#define FF_FS_RPATH		0
+// 1: f_chdrive() support — when no SD card is present at boot, FileUtils
+// switches the default volume to a USB flash stick, so every unprefixed path
+// (configs, /tmp, /spec) transparently lands on the stick. CAUTION: with
+// RPATH enabled an unprefixed path resolves on the CURRENT volume (not
+// volume 0), so volume-level calls must always spell the volume out with a
+// colon ("SD:", "USB:") — a bare "SD" parses as "no prefix".
+#define FF_FS_RPATH		1
 /* This option configures support for relative path.
 /
 /   0: Disable relative path and remove related functions.
 /   1: Enable relative path. f_chdir() and f_chdrive() are available.
 /   2: f_getcwd() function is available in addition to 1.
 */
+
+// Max directory nesting FatFs can follow on an exFAT volume when RPATH is on.
+// NOT just for f_chdir: on exFAT (which has no ".." entries) follow_path()
+// records every descended sub-directory into a tbl[FF_PATH_DEPTH + 1] chain and
+// returns FR_NOT_ENOUGH_CORE the moment the path is deeper — so this caps EVERY
+// absolute path on an exFAT volume, not the cwd. 1 was far too small: the config
+// dir alone (/.config/pico-spec/<ver>/<board>) is 4 deep, so f_mkdir/f_open on a
+// 60 GB exFAT USB stick failed (SD is usually FAT32, where this code never runs
+// — that's why the bug looked "USB only"). 16 covers the config tree plus deep
+// user browsing; costs ~12 B per level in each FATFS (static SD + heap USB).
+#define FF_PATH_DEPTH	16
 
 
 /*---------------------------------------------------------------------------/

@@ -334,9 +334,45 @@ RP2350-only (`CFG_TUH_MSC` gated on `PICO_RP2350` in tusb_config.h; RP2040 keeps
 MSC off + `CFG_TUH_DEVICE_MAX 5`). NOT hw-confirmed yet.
 
 - **FatFs two volumes**: `FF_VOLUMES=2`, `FF_STR_VOLUME_ID=1`, `VolumeStr {"SD","USB"}`
-  (ffconf.h). Unprefixed paths → volume 0 (SD) — zero changes for existing code;
-  `"USB:/..."` paths flow through `fopen2`/`f_open` everywhere (TAP/TRD/SNA/ROM/ZIP
-  loaders work from the stick untouched).
+  (ffconf.h). Unprefixed paths → current volume (normally SD) — zero changes for
+  existing code; `"USB:/..."` paths flow through `fopen2`/`f_open` everywhere
+  (TAP/TRD/SNA/ROM/ZIP loaders work from the stick untouched).
+- **USB-as-root fallback**: no SD card at boot → `FileUtils::initFileSystem` waits
+  up to 3 s for a stick (`UsbMsc::waitReady` pumps tuh_task — nothing else pumps
+  that early) then `f_chdrive("USB:")` + `FileUtils::usbRoot=true` — all unprefixed
+  paths (CONFIG_DIR, /tmp, /spec, storage.nvs) transparently land on the stick.
+  SD always wins when a card is present. Requires `FF_FS_RPATH=1` +
+  `FF_PATH_DEPTH=16`. **exFAT depth trap** (hw-confirmed, was "video-mode switch
+  fails only on USB"): with RPATH on, FatFs's follow_path() on an **exFAT** volume
+  records every descended sub-dir into a `tbl[FF_PATH_DEPTH+1]` chain and returns
+  `FR_NOT_ENOUGH_CORE` once the path is deeper — so FF_PATH_DEPTH caps EVERY
+  absolute path on exFAT, not just f_chdir. `FF_PATH_DEPTH=1` broke every write to
+  a big (exFAT) USB stick: the 4-deep config dir couldn't be created, so
+  `Config::save()` silently fell back to a RAM buffer and nothing persisted (SD is
+  usually FAT32, where this code never runs — hence "USB only"). Keep it ≥ the
+  deepest path (config tree is 4; 16 also covers deep browsing).
+  **CAUTION**: with RPATH a volume name without a colon parses as "no prefix" =
+  current volume — always spell `"SD:"`/`"USB:"` in f_mount/f_unmount. In usbRoot
+  mode the F5 chooser hides the USB row and relabels Local→"USB Drive"; stick
+  unplug/replug toggles `fsMount` (menus degrade like no-SD); `remountSD()` skips
+  the SD reinit and just re-verifies `UsbMsc::ready()`.
+- **Boot-race guard for remembered "USB:/..." paths**: boot-time reopeners
+  (`Config::loadDiskMounts`, `Tape::LoadRemembered`, DivMMC/IDE image opens) run
+  in `ESPectrum::setup` BEFORE anything pumps tuh_task — the stick hasn't
+  enumerated, the open fails, and the next `Config::save()` would persist the
+  empty live state (paths "not saved"). Every such site calls
+  `FileUtils::waitVolumeReady(path)` first (pumps up to 3 s for "USB:" paths,
+  no-op otherwise). Stick truly absent → reopen skipped, like a deleted SD file.
+- **Throughput ceiling ~64 KB/s — DON'T re-investigate** (hw-measured on m1p2):
+  the RP2350 native USB host transfers bulk data at ~1 packet (64 B) per 1 ms SOF
+  frame, so USB MSC is hard-capped near 0.05–0.06 MB/s **regardless of block
+  size**. Proven: one 32 KB (64-sector) `read10` took 558 ms — identical to 64
+  single-sector reads (639 ms). It is NOT the block size, NOT the FatFs path, NOT
+  the stick, NOT the Speed Test — it's the host controller (E15-style frame
+  pacing; the batching lever does nothing). Only a vendor `hcd_rp2040` rewrite
+  (burst multiple packets/frame) could raise it. USB stick = fine for browsing /
+  small files, slow for big loads; use SD for speed. Speed Test's 0.06 MB/s is
+  the honest number.
 - **diskio dispatch**: `drivers/sdcard/sdcard.c` routes `pdrv==1` to `usb_disk_*`
   in `src/UsbMsc.cpp` (TinyUSB `tuh_msc_read10/write10` made synchronous by pumping
   a guarded `tuh_task()` — same re-entrancy rules as ZiFi's `usbService()`; NEVER

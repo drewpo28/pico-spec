@@ -77,6 +77,10 @@ class FileUtils
 {
 public:
     static bool fsMount;
+    // No SD card at boot and a USB stick took over as the default FatFs volume
+    // (f_chdrive "USB:") — all unprefixed paths (configs, /tmp, /spec) resolve
+    // on the stick. SD always wins when a card is present.
+    static bool usbRoot;
 
     static string getLCaseExt(const string& filename);
 
@@ -87,6 +91,12 @@ public:
     static void initFileSystem();
     static bool mountSDCard();
     static void unmountSDCard();
+    // Boot-time guard for remembered "USB:/..." paths (disk mounts, tape):
+    // they are reopened before the main loop ever pumps tuh_task, so the stick
+    // has not enumerated yet and the open would fail — and the failed mount
+    // would then be persisted as empty. Waits for the stick when the path
+    // needs it; true = volume is (now) available, false = skip the reopen.
+    static bool waitVolumeReady(const string& path);
     static bool mkdirParents(const char* path);
     static bool checkSDCard();
     static bool remountSD();

@@ -1034,6 +1034,7 @@ static const char *MENU_HARDWARE[2] = { MENU_HARDWARE_EN, MENU_HARDWARE_ES };
     "SRAM R/W\n"\
     "PSRAM\n"\
     "SD Card\n"\
+    "USB Drive\n"\
     "All tests\n"
 #define MENU_SPEEDTEST_ES \
     "Test velocidad\n"\
@@ -1041,6 +1042,7 @@ static const char *MENU_HARDWARE[2] = { MENU_HARDWARE_EN, MENU_HARDWARE_ES };
     "SRAM L/E\n"\
     "PSRAM\n"\
     "Tarjeta SD\n"\
+    "Unidad USB\n"\
     "Todos\n"
 static const char *MENU_SPEEDTEST[2] = { MENU_SPEEDTEST_EN, MENU_SPEEDTEST_ES };
 

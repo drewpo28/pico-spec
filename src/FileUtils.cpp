@@ -52,6 +52,8 @@ visit https://zxespectrum.speccy.org/contacto
 #include "wd1793.h"
 #include "sdcard.h"
 #include "diskio.h"
+#include "Debug.h"
+#include "UsbMsc.h"   // RP2040-safe: header provides inline stubs there
 #if !PICO_RP2040
 #include "DivMMC.h"
 #include "IDE.h"
@@ -178,6 +180,23 @@ bool FileUtils::mkdirParents(const char* path) {
 
 void FileUtils::initFileSystem() {
     SDReady = mountSDCard();
+#if !PICO_RP2040
+    if (!SDReady) {
+        // No SD card — fall back to a USB flash stick as the default volume.
+        // SD is always the primary storage when a card is present; the stick
+        // becomes the root only when the SD probe failed. f_chdrive() makes
+        // every unprefixed path (CONFIG_DIR, /tmp, /spec, storage.nvs, ...)
+        // resolve on the stick, so no caller changes. The wait covers USB
+        // enumeration time: tuh_init already ran (main.cpp) but nothing has
+        // pumped tuh_task yet.
+        if (UsbMsc::waitReady(3000)) {
+            usbRoot = true;
+            f_chdrive("USB:");
+            fsMount = SDReady = true;
+            Debug::log("FileUtils: no SD card, USB stick is the root volume\n");
+        }
+    }
+#endif
     if (SDReady) {
         f_mkdir("/tmp");
         mkdirParents(CONFIG_DIR);
@@ -191,17 +210,26 @@ void FileUtils::initFileSystem() {
 
 static FATFS fs;
 bool FileUtils::fsMount = false;
+bool FileUtils::usbRoot = false;
 bool FileUtils::mountSDCard() {
     // f_mount with opt=1 is delayed mount — always succeeds without touching the card.
     // Probe the physical drive up front so absence of a card is detected here instead of
     // blocking the first FatFS call later (e.g. OSD SaveRect.clear → f_unlink → 500 ms SPI stall per op).
     if (disk_initialize(0) & STA_NOINIT) { fsMount = false; return false; }
-    fsMount = f_mount(&fs, "SD", 1) == FR_OK;
+    // "SD:" with the colon — with FF_FS_RPATH a bare "SD" parses as "no volume
+    // prefix" and would target the CURRENT volume instead.
+    fsMount = f_mount(&fs, "SD:", 1) == FR_OK;
     return fsMount;
 }
 
 void FileUtils::unmountSDCard() {
-    f_unmount("SD");
+    f_unmount(usbRoot ? "USB:" : "SD:");
+}
+
+bool FileUtils::waitVolumeReady(const string& path) {
+    if (path.compare(0, 4, "USB:") != 0) return true;   // SD — always there by now
+    if (UsbMsc::ready()) return true;
+    return UsbMsc::waitReady(3000);
 }
 
 bool FileUtils::checkSDCard() {
@@ -211,10 +239,21 @@ bool FileUtils::checkSDCard() {
 }
 
 bool FileUtils::remountSD() {
-    // Unmount FatFS and force full SD card reinit
-    f_mount(NULL, "SD", 0);
-    disk_invalidate();
-    if (!mountSDCard()) return false;
+#if !PICO_RP2040
+    if (usbRoot) {
+        // USB-as-root: there is no SD card to remount. The volume itself
+        // recovers via the re-plug callback (deferred f_mount); just verify
+        // the stick is back and fall through to reopening the files.
+        if (!UsbMsc::ready()) return false;
+        fsMount = true;
+    } else
+#endif
+    {
+        // Unmount FatFS and force full SD card reinit
+        f_mount(NULL, "SD:", 0);
+        disk_invalidate();
+        if (!mountSDCard()) return false;
+    }
 
     // Reopen WD1793 disk image files
     rvmWD1793 &wd = ESPectrum::fdd;

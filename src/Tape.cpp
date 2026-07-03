@@ -421,6 +421,9 @@ void Tape::LoadRemembered() {
         !FileUtils::hasPZXextension(full)) return;
     size_t slash = full.rfind('/');
     if (slash == string::npos) return;
+    // A remembered "USB:/..." tape must wait for the stick to enumerate (boot
+    // runs this before the first tuh_task pump) or the probe fails early.
+    if (!FileUtils::waitVolumeReady(full)) return;
     // Verify the file still exists before handing it to LoadTape, which would
     // otherwise pop an OSD error during a silent boot/reset re-mount. Use the
     // heap-backed fopen2 (not a stack FIL — the core stack is only 2 KB).

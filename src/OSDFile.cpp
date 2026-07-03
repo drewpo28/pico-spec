@@ -439,6 +439,14 @@ void fgets(char* b, size_t sz, FIL& f) {
 #define ftell(x) f_tell(&x)
 #define feof(x) f_eof(&x)
 
+// Display-only volume prefix for the dialog's path row: unprefixed paths live
+// on the default volume — "SD:" normally, "USB:" when the stick is the root
+// (booted without an SD card). "USB:/..." paths already carry their volume.
+static string fdDisplayPath(const string& fdir) {
+    if (fdir.find(':') != string::npos) return fdir;
+    return (FileUtils::usbRoot ? "USB:" : "SD:") + fdir;
+}
+
 // Run a new file menu
 string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t mfcols, uint8_t mfrows) {
     if (Config::audio_driver == 3) send_to_595(LOW(AY_Enable));
@@ -491,7 +499,7 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
         f_closedir(&f_dir);
     }
 
-    menu = title + "\n" + fdir + "\n";
+    menu = title + "\n" + fdDisplayPath(fdir) + "\n";
     WindowDraw(); // Draw menu outline
     if (ftype == DISK_ALLFILE)
         fd_DrawSidebar(x, y, mf_rows);
@@ -1151,7 +1159,7 @@ void OSD::fd_Redraw(const string& title, const string& fdir, uint8_t ftype, cons
     if ((FileUtils::fileTypes[ftype].focus != last_focus) || (FileUtils::fileTypes[ftype].begin_row != last_begin_row)) {
         // printf("fd_Redraw\n");
         // Read bunch of rows
-        menu = title + "\n" + ( fdir.length() == 1 ? fdir : fdir.substr(0,fdir.length()-1)) + "\n";
+        menu = title + "\n" + fdDisplayPath(fdir.length() == 1 ? fdir : fdir.substr(0,fdir.length()-1)) + "\n";
         char buf[128];
         if (FileUtils::fileTypes[ftype].fdMode == 0 || FileUtils::fileTypes[ftype].fileSearch == "") {
             int pos = FileUtils::fileTypes[ftype].begin_row - 2;

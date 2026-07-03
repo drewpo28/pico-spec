@@ -463,7 +463,10 @@ void Config::loadDiskMounts() {
                 size_t plen = strlen(prefix);
                 if (s.length() >= plen && s.compare(0, plen, prefix) == 0) {
                     std::string fn = s.substr(plen);
-                    if (!fn.empty()) {
+                    // A "USB:/..." disk must wait for the stick to enumerate
+                    // (we run before the first tuh_task pump) — inserting too
+                    // early fails and the next save() would erase the path.
+                    if (!fn.empty() && FileUtils::waitVolumeReady(fn)) {
                         rvmWD1793InsertDisk(&ESPectrum::fdd, i, fn);
                         if (ESPectrum::fdd.disk[i])
                             ESPectrum::fdd.disk[i]->writeprotect = driveWP[i];
@@ -487,7 +490,7 @@ void Config::loadDiskMounts() {
                     // boot (Profi never starts). Skipping the insert when !mb02 is
                     // safe: the path stays remembered and the disk reappears once
                     // MB-02+ is re-enabled (loadMb02DiskMounts) or on next boot.
-                    if (!fn.empty() && Config::mb02) {
+                    if (!fn.empty() && Config::mb02 && FileUtils::waitVolumeReady(fn)) {
                         rvmWD1793InsertDisk(&ESPectrum::mb02_fdd, i, fn);
                         if (ESPectrum::mb02_fdd.disk[i])
                             ESPectrum::mb02_fdd.disk[i]->writeprotect = mb02WP[i];
