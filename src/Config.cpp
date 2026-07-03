@@ -216,8 +216,32 @@ void Config::initHotkeys() {
         hotkeys[i] = defaults[i];
 }
 
+extern std::string g_snapshot_loading_path;  // Snapshot.cpp — snapshot mid-load
+
 void Config::requestMachine(const string& newArch, const string& newRomSet)
 {
+#if !PICO_RP2040
+    // Profi boundary on SPI-PSRAM boards (no butter): setup() lays out ~96KB
+    // of forced-SRAM pages (DS80 colour 56/58 + CP/M pool) once at boot and
+    // nothing frees or creates them at runtime, so ANY arch change crossing
+    // the Profi boundary must reboot so setup() re-lays out memory.  The OSD
+    // Machine menu checks this itself, but snapshot loaders call
+    // requestMachine directly: a Pentagon snapshot loaded on Profi left the
+    // ~96KB allocated; a Profi snapshot loaded elsewhere got no DS80 colour
+    // pages.  Persist the target arch and the in-flight snapshot — setup()
+    // resumes the load via Config::ram_file after the reboot (same pattern as
+    // savePendingVideoMode).  If the config write fails, nothing is persisted
+    // (NvsWriter is atomic) and the next boot comes up unchanged — no loop.
+    bool profiSramLayout = (MemESP::ram[56].memType() == mem_type_t::POINTER);
+    if (butter_psram_size() == 0 && (newArch == "Profi") != profiSramLayout) {
+        arch = newArch;
+        if (!newRomSet.empty()) romSet = newRomSet;
+        if (!g_snapshot_loading_path.empty())
+            ram_file = g_snapshot_loading_path;
+        save();
+        OSD::esp_hard_reset();   // never returns; setup() re-lays out memory
+    }
+#endif
     arch = newArch;
     // Re-bind ROM overlays from scratch for this machine (RomOverlay.h). Each romset
     // below registers the overlays it needs; clearing first avoids stale entries.
