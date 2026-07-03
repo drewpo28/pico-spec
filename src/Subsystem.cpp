@@ -733,10 +733,14 @@ BudgetResult budgetCheck(FeatureId enabling, FeatureId* candidates, int* nCand, 
         }
 
     // Switching to Profi also force-disables MB-02+ (mutually exclusive — see the
-    // arch-switch code in OSDMain). MB-02 isn't a tracked FeatureId, but its 8 KB
-    // EPROM composite is freed on disable, so credit it like the auto-disables.
+    // arch-switch code in OSDMain). MB-02 isn't a tracked FeatureId, but its heap
+    // blocks are freed on disable, so credit them like the auto-disables: the 8 KB
+    // EPROM composite plus the 12.5 KB WD1793 MFM track buffer (both heap; the
+    // 512 KB SRAM pages are SPI-backed pool pages, no extra heap).
     if (enabling == FEAT_PROFI && Config::mb02) {
-        blockFree += 8 * 1024; totalFree += 8 * 1024;  // page0_composite; 512 KB RAM is SPI-backed
+        size_t c = 8 * 1024;                                   // page0_composite
+        if (ESPectrum::mb02_fdd.diskTrackBuf) c += DISK_TRACK_BUF_SZ;
+        blockFree += c; totalFree += c;
     }
 
     const size_t cost   = featureCost(enabling);
