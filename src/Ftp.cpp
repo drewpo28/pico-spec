@@ -217,6 +217,16 @@ bool Ftp::get(const std::string& remote, const std::string& localSdPath, XferPro
     std::string reply;
     for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         if (!openPasvData()) return false;
+        // Snapshot the demux diagnostics BEFORE RETR: in active (+IPD push) mode
+        // the first data frames arrive while readReply is still fetching the
+        // "150" line, so a later snapshot excludes them and the FAIL log shows
+        // done > ipdData by one frame (a measurement artifact, seen on hw).
+        uint32_t dropBefore     = ZiFi::rxDropped();
+        uint32_t bufDropBefore  = ZiFiSock::rxBufDropped();
+        uint32_t malfBefore     = ZiFiSock::ipdMalformed();
+        uint32_t ipdDataBefore  = ZiFiSock::ipdBytes(DATA);
+        uint32_t ipdCtrlBefore  = ZiFiSock::ipdBytes(CTRL);
+        uint32_t ipdFrmBefore   = ZiFiSock::ipdFrames(DATA);
         if (command("RETR", remote.c_str(), reply) / 100 != 1) { ZiFiSock::sock_close(DATA); return false; }
 
         FIL* f = fopen2(localSdPath.c_str(), FA_WRITE | FA_CREATE_ALWAYS);
@@ -229,9 +239,22 @@ bool Ftp::get(const std::string& remote, const std::string& localSdPath, XferPro
         size_t wrFill = 0;
         auto flushWrite = [&]() -> bool {
             if (!wrFill) return true;
-            ZiFi::rxSpill();          // empty the IRQ ring → full headroom for this write
-            UINT bw;
-            bool wok = f_write(f, g_wr_buf.get(), wrFill, &bw) == FR_OK && bw == wrFill;
+            // Write in 4 KB slices with a drain between each: rxSpill() empties the
+            // IRQ ring (UART) or pumps tuh_task + drains TinyUSB's rx FIFO (USB-CDC,
+            // which has NO IRQ-context drain — its only cushion during a blocking
+            // f_write is FIFO + CH340 internals, ~2.3 KB ≈ 50 ms at 460800). Slicing
+            // shrinks the no-drain window from the whole 16 KB write to one slice's
+            // SD latency; a rare longer internal-GC stall still loses bytes and is
+            // caught by the short-xfer/rx-drop guards → retry.
+            size_t off = 0;
+            bool wok = true;
+            while (off < wrFill) {
+                ZiFi::rxSpill();
+                size_t sl = wrFill - off > 4096 ? 4096 : wrFill - off;
+                UINT bw;
+                if (f_write(f, g_wr_buf.get() + off, sl, &bw) != FR_OK || bw != sl) { wok = false; break; }
+                off += sl;
+            }
             wrFill = 0;
             return wok;
         };
@@ -240,7 +263,6 @@ bool Ftp::get(const std::string& remote, const std::string& localSdPath, XferPro
         bool ok = true;
         int idle = 0;                  // consecutive transient (no-data) timeouts
         const char* failReason = nullptr; // diagnostic only — which branch gave up
-        uint32_t dropBefore = ZiFi::rxDropped();
         for (;;) {
             int n = ZiFiSock::sock_recv(DATA, g_ftp_buf.get(), FTP_BUF_SZ, 10000);
             if (n < 0) { ok = false; failReason = "recv error"; break; }
@@ -266,6 +288,12 @@ bool Ftp::get(const std::string& remote, const std::string& localSdPath, XferPro
             if (!ok) break;
             done += n;
             if (cb && !cb(done, total)) { ok = false; failReason = "user abort"; break; }
+            // The progress redraw above can block for tens of ms (OSD rendering) —
+            // on USB-CDC that's longer than the CH340's ~300 B of internal cushion
+            // (nothing re-arms the IN endpoint while tuh_task isn't pumped). Drain
+            // immediately after so the loss window is the redraw alone, not
+            // redraw + the next f_write.
+            ZiFi::rxSpill();
             if (total && done >= total) break;                 // complete — don't wait for close
         }
         if (ok && !flushWrite()) { ok = false; failReason = "SD write error"; }
@@ -274,9 +302,12 @@ bool Ftp::get(const std::string& remote, const std::string& localSdPath, XferPro
         if (ok && total && done < total) { ok = false; failReason = "short xfer"; }
         // Dropped UART bytes never reach `done`, so they normally surface as a short
         // transfer; flag it explicitly too, so a size-unknown (total==0) transfer that
-        // lost bytes isn't trusted as complete.
-        uint32_t dropped = ZiFi::rxDropped() - dropBefore;
-        if (ok && dropped) { ok = false; failReason = "rx drop"; }
+        // lost bytes isn't trusted as complete. rxBufDropped covers the per-link
+        // demux ring; on USB-CDC rxDropped also counts suspected TinyUSB-FIFO
+        // overflows (invisible CH340-side loss).
+        uint32_t dropped    = ZiFi::rxDropped() - dropBefore;
+        uint32_t bufDropped = ZiFiSock::rxBufDropped() - bufDropBefore;
+        if (ok && (dropped || bufDropped)) { ok = false; failReason = "rx drop"; }
 
         fclose2(f);
         // On success we broke early (done>=total) without waiting for the peer close,
@@ -295,9 +326,15 @@ bool Ftp::get(const std::string& remote, const std::string& localSdPath, XferPro
 
         if (ok) return true;
 
-        Debug::log("FTP get %s: attempt %d/%d FAIL (%s) done=%u total=%u finalReply=%d '%s' rxDrop=%u",
+        Debug::log("FTP get %s: attempt %d/%d FAIL (%s) done=%u total=%u finalReply=%d '%s' rxDrop=%u"
+                   " bufDrop=%u ipdData=%u/%uf ipdCtrl=%u malformed=%u",
                    remote.c_str(), attempt, MAX_ATTEMPTS, failReason ? failReason : "?",
-                   done, total, code, reply.c_str(), (unsigned)dropped);
+                   done, total, code, reply.c_str(), (unsigned)dropped,
+                   (unsigned)bufDropped,
+                   (unsigned)(ZiFiSock::ipdBytes(DATA) - ipdDataBefore),
+                   (unsigned)(ZiFiSock::ipdFrames(DATA) - ipdFrmBefore),
+                   (unsigned)(ZiFiSock::ipdBytes(CTRL) - ipdCtrlBefore),
+                   (unsigned)(ZiFiSock::ipdMalformed() - malfBefore));
         f_unlink(localSdPath.c_str());   // never leave a truncated image on SD
 
         // Only data-loss cases are worth retrying: a user abort or a hard control

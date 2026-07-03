@@ -328,6 +328,35 @@ Port low byte `0xEF`; high address byte = register. Gated by `Config::zifi_enabl
 - **Picker**: Network → first row `GPIO x/y` (or `GPIO Off`, `(def)` suffix when unset) → submenu listing `Off` + each board pair with a note (what it displaces, e.g. "off: NESPAD"). On select: save + `ZiFi::deinit()/init()` if NIC on. `BoardPins` is the reusable home for board pin-maps (extend for MIDI etc.).
 - **Yield-at-boot**: when a chosen pair shares pins with a peripheral (non-empty note), ZiFi has priority — at boot each conflicting peripheral calls `BoardPins::zifiOwnsPin(pin)` and **skips its own init** if ZiFi owns it: NESPAD (`main.cpp`, moved after `Config::load`, gated by `nespad_active`), MIDI (`ESPectrum.cpp` `Midi::enabled=0`), WAV (`pwm_audio.cpp` skip `inInit`), PCM5122 (`pwm_audio.cpp` skip I2S), AY-clock (`PinSerialData_595.c` via `extern "C" board_zifi_owns_pin`). The displaced peripheral only releases pins at boot, so selecting a conflicting pair **or** enabling the NIC with a conflicting default prompts `OSD_DLG_APPLYREBOOT` (`BoardPins::zifiActiveNote()` non-empty). Defaults that conflict by design: MURM2/PICO_PC 20/21 = NESPAD, MURM1_P2 16/17 = NESPAD.
 
+## USB flash stick (MSC host → FatFs volume "USB:")
+
+RP2350-only (`CFG_TUH_MSC` gated on `PICO_RP2350` in tusb_config.h; RP2040 keeps
+MSC off + `CFG_TUH_DEVICE_MAX 5`). NOT hw-confirmed yet.
+
+- **FatFs two volumes**: `FF_VOLUMES=2`, `FF_STR_VOLUME_ID=1`, `VolumeStr {"SD","USB"}`
+  (ffconf.h). Unprefixed paths → volume 0 (SD) — zero changes for existing code;
+  `"USB:/..."` paths flow through `fopen2`/`f_open` everywhere (TAP/TRD/SNA/ROM/ZIP
+  loaders work from the stick untouched).
+- **diskio dispatch**: `drivers/sdcard/sdcard.c` routes `pdrv==1` to `usb_disk_*`
+  in `src/UsbMsc.cpp` (TinyUSB `tuh_msc_read10/write10` made synchronous by pumping
+  a guarded `tuh_task()` — same re-entrancy rules as ZiFi's `usbService()`; NEVER
+  pump from a tuh callback). Odd-aligned FatFs buffers bounce per-sector.
+- **Mount flow**: `tuh_msc_mount_cb` does NO bus traffic — capacity is cached by
+  the host stack at enumeration; it lazily heap-allocs `UsbFsMem` (FATFS + 512B
+  bounce, ~1.1KB, `getLargestAllocatable()` gated, never freed) and registers a
+  deferred `f_mount("USB:", 0)`. First real FS access initializes from main-loop
+  context. Sticks with sector size ≠512 are ignored. `umount_cb` resets a stale
+  `ALL_Path` to `/`.
+- **UI**: F5 locations chooser gains a "USB Drive" row while a stick is enumerated
+  (`f5HasChooser()` = WiFi OR `UsbMsc::ready()`, so it works without a saved SSID);
+  SD⇄USB each remember their last dir (`s_f5_sd_dir`/`s_f5_usb_dir`, ALL_Path holds
+  the active one and is the one persisted). Per-type paths (TAP_Path etc.) inherit
+  USB paths naturally; in their dialogs ".." at `USB:/` exits to the SD root, in F5
+  it returns to the chooser. `sorted_files::init` replaces ':' in .idx names (the
+  index always lives on SD `/tmp`, so a read-only/removed stick can't break it).
+- Stale `"USB:/..."` in NVS self-heals: fileDialog's entry `f_opendir` check resets
+  fdir to `/`.
+
 ## Internet archive downloader (WIP — TR-DOS/tape images over HTTPS to SD)
 
 Goal: browse/download disk & tape images (vtrd.in, then zxart.ee, worldofspectrum)

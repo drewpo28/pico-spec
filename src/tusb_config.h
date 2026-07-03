@@ -97,13 +97,57 @@
 
 #define CFG_TUH_XINPUT                 1 //
 #define CFG_TUH_HUB                 1 // number of supported hubs
+// CDC host: one serial adapter at a time (the ESP-01 bridge). The vendor serial
+// sub-drivers let a CH340/CP2102/FTDI USB-UART dongle carry the ESP-01 over the USB
+// host port (through the hub, alongside the keyboard) instead of GPIO. RP2350 only —
+// the RP2040 boards (ZERO/MURM) don't run ZiFi and are SRAM-tight, so keep CDC off.
+// IMPORTANT: gate on PICO_RP2350 (an SDK -D on the build), NOT CFG_TUSB_MCU — TinyUSB
+// reports OPT_MCU_RP2040 for BOTH RP2040 and RP2350, so it can't distinguish them.
+#if PICO_RP2350
+#define CFG_TUH_CDC                 1
+// Non-standard USB-serial chips. CH340C = CH34x (the documented dongle); CP210x/FTDI
+// come free and cover other common adapters. Stock CDC-ACM is always on.
+#define CFG_TUH_CDC_CH34X           1
+#define CFG_TUH_CDC_CP210X          1
+#define CFG_TUH_CDC_FTDI            1
+// Per-interface FIFOs. NOTE: TinyUSB's cdc_host sizes BOTH the rx and tx FIFOs from
+// CFG_TUH_CDC_TX_BUFSIZE (rx_ff_buf[CFG_TUH_CDC_TX_BUFSIZE]). This FIFO is the only
+// cushion for bytes the ESP keeps sending while tuh_task() is stalled (SD write /
+// mbedTLS work) — unlike the UART path there's no IRQ-context drain upstream of it:
+// once it fills, the IN endpoint stops being re-armed and the CH340's ~256 B
+// internals overflow SILENTLY (tu_edpt_stream_read_xfer requires ≥64 B of FIFO room
+// to re-arm). Size for the MAX menu rate 921600 (~92 KB/s, applied via AT+UART_CUR +
+// tuh_cdc_set_baudrate): 8 KB tolerates ~89 ms of stall — enough for the TLS
+// handshake compute gaps and (with Ftp.cpp's 4 KB write slicing) SD writes; 4 KB
+// (~44 ms) still lost bytes on both at ≥460800. MURM1_P2 (the board-define fallback)
+// is SRAM-tight — Profi leaves ~10 KB heap and this BSS is spent even with ZiFi
+// off — so it keeps 2 KB (~22 ms): practical ceiling there is 230400-460800.
+#if defined(MURM2) || defined(PICO_PC) || defined(PICO_DV) || defined(ZERO2)
+#define CFG_TUH_CDC_RX_BUFSIZE      8192
+#define CFG_TUH_CDC_TX_BUFSIZE      8192
+#else
+#define CFG_TUH_CDC_RX_BUFSIZE      2048
+#define CFG_TUH_CDC_TX_BUFSIZE      2048
+#endif
+#else
 #define CFG_TUH_CDC                 0
+#endif
 #define CFG_TUH_HID                 8 // composite devices (kbd + pad + extra ifs) can need many slots
+// USB mass-storage host (flash sticks in the file manager, FatFs volume "USB:").
+// RP2350 only — same SRAM reasoning as CDC above; RP2040 boards stay MSC-free.
+#if PICO_RP2350
+#define CFG_TUH_MSC                 1
+#else
 #define CFG_TUH_MSC                 0
+#endif
 #define CFG_TUH_VENDOR              0
 
 // max device support (excluding hub device)
+#if PICO_RP2350
+#define CFG_TUH_DEVICE_MAX          6 // hub + keyboard + mouse + 2 gamepads + MSC stick
+#else
 #define CFG_TUH_DEVICE_MAX          5 // hub + keyboard + mouse + 2 gamepads
+#endif
 
 //------------- HID -------------//
 #define CFG_TUH_HID_EPIN_BUFSIZE    64

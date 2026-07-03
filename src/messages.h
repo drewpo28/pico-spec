@@ -2362,6 +2362,8 @@ static const char *MSG_WIFI_DISCONNECT_Q[2]  = { "Disconnect?",       "\xA8" "De
 static const char *MENU_WIFI_LIST_TITLE[2]   = { "Wi-Fi networks",    "Redes Wi-Fi"        };
 static const char *MENU_TZ_TITLE[2]          = { "Time zone (UTC)",   "Zona horaria (UTC)" };
 static const char *MENU_ZIFI_GPIO_TITLE[2]   = { "ZiFi UART GPIO",    "ZiFi UART GPIO"     };
+static const char *MENU_ZIFI_TRANSPORT_TITLE[2] = { "ESP-01 transport", "ESP-01 transporte" };
+static const char *MENU_ZIFI_USB_LABEL[2]    = { "USB (CH340)",       "USB (CH340)"        };
 static const char *MENU_ESP01_TITLE[2]       = { "ESP-01(S)",         "ESP-01(S)"          };
 static const char *MENU_BAUD_TITLE[2]        = { "UART baud rate",    "Velocidad UART"     };
 
@@ -2408,6 +2410,7 @@ static const char *MSG_NET_REFRESHING[2]     = { "Refreshing...",    "Actualizan
 // ─── F5 location picker + saved-remotes manager ─────────────────────────────
 static const char *MENU_F5_LOCATION[2]       = { "Open from",        "Abrir desde"        };
 static const char *MSG_F5_LOCAL[2]           = { "Local (SD)",       "Local (SD)"         };
+static const char *MSG_F5_USB[2]             = { "USB Drive",        "Unidad USB"         };
 static const char *MSG_F5_REMOTE[2]          = { "Remote (FTP/SFTP)","Remoto (FTP/SFTP)"  };
 static const char *MSG_F5_WEB[2]             = { "Web Archives",     "Archivos web"       };
 static const char *MSG_F5_ADD_REMOTE[2]      = { "Add Remote",       "Anadir remoto"      };

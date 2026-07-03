@@ -166,13 +166,15 @@
 / Drive/Volume Configurations
 /---------------------------------------------------------------------------*/
 
-// TODO: calulate really required volumes
-#define FF_VOLUMES		1
+// Volume 0 = SD card (default drive: paths without a prefix), volume 1 = USB
+// mass-storage stick ("USB:/..." paths, RP2350 only). Physical drive mapping
+// lives in drivers/sdcard/sdcard.c (drv 0 = SD SPI, drv 1 = TinyUSB MSC).
+#define FF_VOLUMES		2
 /* Number of volumes (logical drives) to be used. (1-10) */
 
 
-#define FF_STR_VOLUME_ID	0
-#define FF_VOLUME_STRS		"RAM","NAND","CF","SD","SD2","USB","USB2","USB3"
+#define FF_STR_VOLUME_ID	1
+#define FF_VOLUME_STRS		"SD","USB"
 /* FF_STR_VOLUME_ID switches support for volume ID in arbitrary strings.
 /  When FF_STR_VOLUME_ID is set to 1 or 2, arbitrary strings can be used as drive
 /  number in the path name. FF_VOLUME_STRS defines the volume ID strings for each
@@ -204,7 +206,9 @@
 /  GET_SECTOR_SIZE command. */
 
 
-#define FF_LBA64		0
+// 1: USB sticks partitioned with GPT (common on big/exFAT sticks) fail to mount
+// without 64-bit LBA support (find_volume can't parse the GPT header).
+#define FF_LBA64		1
 /* This option switches support for 64-bit LBA. (0:Disable or 1:Enable)
 /  To enable the 64-bit LBA, also exFAT needs to be enabled. (FF_FS_EXFAT == 1) */
 

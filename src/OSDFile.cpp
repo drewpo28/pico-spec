@@ -119,6 +119,7 @@ public:
         const char* prefix;
         std::string s = folder;
         std::replace( s.begin(), s.end(), '/', '_');
+        std::replace( s.begin(), s.end(), ':', '_');  // "USB:/..." — ':' is invalid in FAT names
         idx_file = "/tmp/." + s + ".idx";
         calc_sz();
     }
@@ -481,8 +482,10 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
     if (y + h > scrH) y = scrH - h;
 
     DIR f_dir;
-    bool res = f_opendir(&f_dir, fdir.c_str()) == FR_OK;
+    FRESULT fr = f_opendir(&f_dir, fdir.c_str());
+    bool res = fr == FR_OK;
     if (!res) {
+        Debug::log("fileDialog: f_opendir('%s') err=%d — falling back to /\n", fdir.c_str(), fr);
         fdir = "/";
     } else {
         f_closedir(&f_dir);
@@ -524,7 +527,8 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
                 ++ndirs;
                 crc += ::crc(string(2, DIR_MARKER) + "..");
             }
-            while (f_readdir(&f_dir, &fileInfo) == FR_OK && fileInfo.fname[0] != '\0') {
+            FRESULT frd;
+            while ((frd = f_readdir(&f_dir, &fileInfo)) == FR_OK && fileInfo.fname[0] != '\0') {
                 if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
                    fabgl::VirtualKey lkp = get_last_key_pressed();
                    if (lkp == fabgl::VirtualKey::VK_F1) break;
@@ -541,6 +545,9 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
                         }
                 }
             }
+            if (frd != FR_OK)
+                Debug::log("fileDialog: f_readdir('%s') err=%d after %u items\n",
+                           fdir.c_str(), frd, (unsigned)(elements + ndirs));
 
             f_closedir(&f_dir);
             uint32_t rcrc = filenames.crc();
@@ -942,7 +949,16 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
                                 click();
                             }
                         } else {
-                            if (fdir != "/") {
+                            if (fdir == "USB:/") {
+                                // Backspace at the USB root → out to the SD root (a plain
+                                // ascend would truncate the volume prefix into "").
+                                fdir = "/";
+                                if (!fd_pos_pop(FileUtils::fileTypes[ftype].begin_row,
+                                                FileUtils::fileTypes[ftype].focus))
+                                    FileUtils::fileTypes[ftype].begin_row = FileUtils::fileTypes[ftype].focus = 2;
+                                click();
+                                break;
+                            } else if (fdir != "/") {
                                 fdir.pop_back();
                                 fdir = fdir.substr(0,fdir.find_last_of("/") + 1);
                                 if (!fd_pos_pop(FileUtils::fileTypes[ftype].begin_row,
@@ -984,20 +1000,29 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
                         string filedir = rowGet(menu, FileUtils::fileTypes[ftype].focus);
                         if (filedir[0] == DIR_MARKER) {
                             if (filedir[1] == DIR_MARKER) {
-                                // ".." at the SD root → back to the locations chooser
+                                // ".." at the SD/USB root → back to the locations chooser
                                 // (distinct from Esc, which closes the OSD). "\x02UP".
-                                if (fd_root_parent && fdir == "/") {
+                                if (fd_root_parent && (fdir == "/" || fdir == "USB:/")) {
                                     if (menu_saverect) { VIDEO::SaveRect.restore_last(); menu_saverect = false; }
                                     click(); filenames.close(); string().swap(menu);
                                     if (Config::audio_driver == 3) send_to_595(HIGH(AY_Enable));
                                     return "\x02UP";
                                 }
+                                if (fdir == "USB:/") {
+                                    // ".." at the USB root without the chooser (a per-type
+                                    // dialog that landed on the stick) → out to the SD root.
+                                    fdir = "/";
+                                    if (!fd_pos_pop(FileUtils::fileTypes[ftype].begin_row,
+                                                    FileUtils::fileTypes[ftype].focus))
+                                        FileUtils::fileTypes[ftype].begin_row = FileUtils::fileTypes[ftype].focus = 2;
+                                } else {
                                 // Going up to parent dir — restore saved position
                                 fdir.pop_back();
                                 fdir = fdir.substr(0,fdir.find_last_of("/") + 1);
                                 if (!fd_pos_pop(FileUtils::fileTypes[ftype].begin_row,
                                                 FileUtils::fileTypes[ftype].focus))
                                     FileUtils::fileTypes[ftype].begin_row = FileUtils::fileTypes[ftype].focus = 2;
+                                }
                             } else {
                                 // Entering subdirectory — save current position
                                 fd_pos_push(FileUtils::fileTypes[ftype].begin_row,

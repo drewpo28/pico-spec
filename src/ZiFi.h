@@ -49,11 +49,24 @@ public:
 
     // Current UART rate the Pico+ESP are (supposedly) on.
     static uint32_t currentBaud();
+
+    // USB-CDC transport hooks (Config::zifi_transport==1). The TinyUSB weak
+    // callbacks tuh_cdc_mount_cb/umount_cb/rx_cb in ZiFi.cpp forward here; these
+    // touch the private RX ring so they're members. No-ops on the UART path / when
+    // CDC is compiled out. Called from main-loop (tuh_task) context.
+    static void usbCdcMount(int idx);
+    static void usbCdcUnmount(int idx);
+    static void usbCdcRx(int idx);
     // Diagnostic: temporarily switch the UART to `baud`, send "AT", and report
     // whether the ESP answers "OK". Restores the prior baud + RX IRQ. Used to
     // detect a baud desync (ESP power-sagged back to its 115200 default while we
     // stayed at the raised rate → every AT fails until a manual reboot).
     static bool probeBaud(uint32_t baud);
+
+    // Any RX byte ready in the pipe (IRQ ring | spill | staging)? Public so
+    // ZiFiSock::sock_open can verify the pipe is fully drained before flushing
+    // a link's ring (stale +IPD frames of a previous connection).
+    static bool rxAvailable();
 
 private:
     // RX ring: IRQ landing zone. 8 KB so it absorbs SD-write/decrypt latency spikes
@@ -86,7 +99,6 @@ private:
     // traffic so the handshake isn't slowed. rxSpillTick() (per frame) drives
     // spill/mode; rxPop() is the single byte source for all read paths.
     static int  rxPop();              // next RX byte, or -1 if none available
-    static bool rxAvailable();        // any RX byte ready (ring | SD | out_buf)?
     static void rxSpillTick();        // per-frame: spill ring → SD, manage SD mode
     static void rxReset();            // CLRFIFO / deinit: drop everything, close swap
 

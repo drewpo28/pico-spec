@@ -50,6 +50,14 @@ public:
     // consumer couldn't drain fast enough, e.g. during an SD-write stall). Diagnostic.
     static uint32_t rxBufDropped();
 
+    // Demux diagnostics: cumulative +IPD payload bytes / frames the parser
+    // attributed to link `id`, and how many +IPD headers parsed as malformed
+    // (a malformed header silently swallows its payload as status-line garbage
+    // — the "exactly one frame missing" failure signature).
+    static uint32_t ipdBytes(int id);
+    static uint32_t ipdFrames(int id);
+    static uint32_t ipdMalformed();
+
     // End the session: optionally reset CIPMUX back to 0 and drop buffers.
     static void end();
 

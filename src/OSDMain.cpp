@@ -72,6 +72,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "SoftSynth.h"
 #include "ZiFi.h"
 #include "ZiFiAT.h"
+#include "UsbMsc.h"
 #include "BoardPins.h"
 #if ZIFI_NET_CLIENT
 #include "ZiFiSock.h"
@@ -820,9 +821,24 @@ static void splitTabs(const string& s, std::vector<string>& out) {
 }
 
 // F5 location level — rendered IN the file-browser window (Open File + sidebar) as
-// 4 rows: Local (SD) / Remote (FTP/SFTP) / Web Archives / Add Remote. Returns true
-// only when the user chose Local (caller then opens the SD browser); false for Esc
-// or any network action (caller closes the OSD).
+// rows: Local (SD) / [USB Drive] / Remote (FTP/SFTP) / Web Archives / Add Remote.
+// The USB row appears only while a mass-storage stick is enumerated. Returns true
+// when the user chose a LOCAL source — SD or USB (caller then opens the browser at
+// FileUtils::ALL_Path, which this function points at the chosen volume); false for
+// Esc or any network action (caller closes the OSD).
+
+// The chooser is reachable when there's any location besides the SD card: a WiFi
+// link (or saved SSID) or a USB stick.
+static inline bool f5HasChooser() {
+    return ZiFiAT::connected || !Config::wifi_ssid.empty() || UsbMsc::ready();
+}
+
+// Last browse dir per local source, so switching SD⇄USB in the chooser returns to
+// where you were on each side. ALL_Path holds whichever is active (and is the one
+// persisted to NVS; a stale "USB:/..." with no stick self-heals in fileDialog).
+static string s_f5_sd_dir  = "/";
+static string s_f5_usb_dir = "USB:/";
+
 static bool f5Locations() {
     // One-time restore of the last browse location (across all sources), so F5 reopens
     // where you left off — Local stays at ALL_Path, Web/Remote reopen their last folder.
@@ -862,19 +878,36 @@ static bool f5Locations() {
     int lf = 2, lb = 2;                               // keep the cursor on the chosen location
     while (1) {
         if (OSD::net_launch_close) return false;      // a quick-start launched → close OSD
+        const bool usb = UsbMsc::ready();
         std::vector<string> rows = {
             string(1, (char)DIR_MARKER) + MSG_F5_LOCAL[Config::lang],
             string(1, (char)DIR_MARKER) + MSG_F5_REMOTE[Config::lang],
             string(1, (char)DIR_MARKER) + MSG_F5_WEB[Config::lang],
             MSG_F5_ADD_REMOTE[Config::lang],
         };
+        if (usb)
+            rows.insert(rows.begin() + 1, string(1, (char)DIR_MARKER) + MSG_F5_USB[Config::lang]);
         OSD::menu_level = 0;
         int key;
         int loc = OSD::fdChromeList(rows, MENU_ALL_TITLE[Config::lang],
                                     MENU_F5_LOCATION[Config::lang],
                                     OSD::FD_SIDE_LOCATIONS, false, &key, &lf, &lb);
         if (loc < 0) return false;                    // Esc → close OSD
-        if (loc == 0) return true;                    // Local (SD) → caller opens SD browser
+        if (usb && loc == 1) {                        // USB Drive → browse the stick
+            if (FileUtils::ALL_Path.compare(0, 4, "USB:") != 0) {
+                s_f5_sd_dir = FileUtils::ALL_Path;
+                FileUtils::ALL_Path = s_f5_usb_dir;
+            }
+            return true;
+        }
+        if (usb && loc > 1) loc--;                    // fold the USB row out of the indices
+        if (loc == 0) {                               // Local (SD) → caller opens SD browser
+            if (FileUtils::ALL_Path.compare(0, 4, "USB:") == 0) {
+                s_f5_usb_dir = FileUtils::ALL_Path;
+                FileUtils::ALL_Path = s_f5_sd_dir;
+            }
+            return true;
+        }
         else if (loc == 1) remoteHostsBrowse();
         else if (loc == 2) netDownloadArchive();      // Web Archives (built-in catalog)
         else if (loc == 3) addRemoteForm();
@@ -2287,9 +2320,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             // rather than closing the OSD, so the locations chooser is always reachable.
             // On a fresh F5 press, restore the last browse location across all sources
             // (g_f5_restore); the goto re-entry skips it so back-out lands on the chooser.
-            if (ZiFiAT::connected || !Config::wifi_ssid.empty()) g_f5_restore = true;
+            if (f5HasChooser()) g_f5_restore = true;
             f5_locations:
-            if (ZiFiAT::connected || !Config::wifi_ssid.empty()) {
+            if (f5HasChooser()) {
                 if (!f5Locations()) {                // chose a non-Local action or cancelled
                     if (OSD::net_launch_close) OSD::net_launch_close = false;
                     OSD::net_close_all = false;      // Esc-close consumed → reset
@@ -2312,7 +2345,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             f5_retry:
 #if !PICO_RP2040 && ZIFI_NET_CLIENT
             // From locations: show a ".." even at the SD root → returns "" → locations.
-            OSD::fd_root_parent = (ZiFiAT::connected || !Config::wifi_ssid.empty());
+            OSD::fd_root_parent = f5HasChooser();
 #endif
             mFile = fileDialog(FileUtils::ALL_Path, MENU_ALL_TITLE[Config::lang], DISK_ALLFILE, 52, 22);
 #if !PICO_RP2040 && ZIFI_NET_CLIENT
@@ -7092,43 +7125,63 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 };
 
                 // ── ESP-01S hardware/config pickers (level 3, under the ESP01 submenu) ──
-                auto pickGpio = [&]() {
+                // ESP-01 transport picker: Off / USB (CH340) / per-board GPIO pairs.
+                // Merges the old GPIO picker with the USB-CDC choice. The USB row only
+                // exists in host-stack builds (#ifdef KBDUSB) — without it the host
+                // never enumerates a dongle, so USB transport can't work. usbRow shifts
+                // the dense GPIO-pair indices (zifiPair()/zifiPairCount() are already a
+                // contiguous, package-filtered view) by one when the USB row is present.
+                auto pickTransport = [&]() {
                     menu_level = 3; menu_saverect = true;
-                    string m = string(MENU_ZIFI_GPIO_TITLE[Config::lang]) + "\n";
+                    int usbRow = 0;
+#if defined(KBDUSB)
+                    usbRow = 1;
+#endif
+                    string m = string(MENU_ZIFI_TRANSPORT_TITLE[Config::lang]) + "\n";
                     m += "Off\n";
+                    if (usbRow) m += string(MENU_ZIFI_USB_LABEL[Config::lang]) + "\n";
                     int nopt = BoardPins::zifiPairCount();
                     for (int i = 0; i < nopt; i++) {
                         const BoardPins::UartPair* p = BoardPins::zifiPair(i);
                         char b[48];
-                        snprintf(b, sizeof(b), "%u/%u%s%s\n", p->tx, p->rx, p->note[0] ? "  " : "", p->note);
+                        snprintf(b, sizeof(b), "GPIO %u/%u%s%s\n", p->tx, p->rx, p->note[0] ? "  " : "", p->note);
                         m += b;
                     }
-                    if (Config::zifi_tx_pin == BoardPins::PIN_OFF) menu_curopt = 1;
+                    bool usbT = usbRow && (Config::zifi_transport == 1);
+                    if (usbT) menu_curopt = 2;
+                    else if (Config::zifi_tx_pin == BoardPins::PIN_OFF) menu_curopt = 1;
                     else {
                         uint8_t rtx, rrx;
                         BoardPins::resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, rtx, rrx);
-                        menu_curopt = 2;
+                        menu_curopt = 2 + usbRow;
                         for (int i = 0; i < nopt; i++)
-                            if (BoardPins::zifiPair(i)->tx == rtx) { menu_curopt = i + 2; break; }
+                            if (BoardPins::zifiPair(i)->tx == rtx) { menu_curopt = i + 2 + usbRow; break; }
                     }
                     uint8_t sel = menuRun(m);
                     if (sel > 0) {
                         VIDEO::SaveRect.restore_last();
                         bool conflict = false;
-                        if (sel == 1) Config::zifi_tx_pin = Config::zifi_rx_pin = BoardPins::PIN_OFF;
-                        else {
-                            const BoardPins::UartPair* p = BoardPins::zifiPair(sel - 2);
-                            if (p) { Config::zifi_tx_pin = p->tx; Config::zifi_rx_pin = p->rx; conflict = p->note[0] != 0; }
+                        bool wasUsb = (Config::zifi_transport == 1);
+                        if (sel == 1) {                       // Off
+                            Config::zifi_transport = 0;
+                            Config::zifi_tx_pin = Config::zifi_rx_pin = BoardPins::PIN_OFF;
+                        } else if (usbRow && sel == 2) {      // USB (CH340)
+                            Config::zifi_transport = 1;
+                        } else {                              // a GPIO pair
+                            const BoardPins::UartPair* p = BoardPins::zifiPair(sel - 2 - usbRow);
+                            if (p) { Config::zifi_transport = 0; Config::zifi_tx_pin = p->tx; Config::zifi_rx_pin = p->rx; conflict = p->note[0] != 0; }
                         }
                         Config::save();
-                        // Re-apply the pins now whenever the link is up — for the NIC
-                        // *or* for WiFi (they're independent users of the shared UART).
-                        // Was gated on zifi_enabled, so with the NIC off a pin change
-                        // only took effect after a reboot.
+                        // Re-apply now whenever the link is up — for the NIC *or* WiFi
+                        // (independent users of the shared transport).
                         if (ZiFi::linkUp()) { ZiFi::deinit(); ZiFi::init(); }
                         refreshNetStatus();
-                        if (conflict && OSD::msgDialog(MENU_ZIFI_GPIO_TITLE[Config::lang],
-                                                       OSD_DLG_APPLYREBOOT[Config::lang]) == DLG_YES)
+                        // A conflicting GPIO pair, or any switch into/out of USB, wants
+                        // a reboot so displaced peripherals release/grab their pins.
+                        bool nowUsb = (Config::zifi_transport == 1);
+                        if ((conflict || wasUsb != nowUsb) &&
+                            OSD::msgDialog(MENU_ZIFI_TRANSPORT_TITLE[Config::lang],
+                                           OSD_DLG_APPLYREBOOT[Config::lang]) == DLG_YES)
                             OSD::esp_hard_reset();
                     }
                 };
@@ -7174,18 +7227,25 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     else
                         OSD::osdCenteredMsg(MSG_RTC_SYNC_ERR[Config::lang], LEVEL_WARN, 3000);
                 };
-                // ── ESP01 submenu (level 2): GPIO / Baud / Time zone / Sync time ──
+                // ── ESP01 submenu (level 2): Transport / Baud / Time zone / Sync time ──
                 auto esp01Menu = [&]() {
                     menu_saverect = true; menu_curopt = 1;
                     while (1) {
                         menu_level = 2;
-                        char gpio[40];
-                        if (Config::zifi_tx_pin == BoardPins::PIN_OFF)
-                            snprintf(gpio, sizeof(gpio), "GPIO Off\t>");
+                        // First row shows the current transport: USB, Off, or GPIO pins.
+                        char gpio[44];
+                        bool usbT = false;
+#if defined(KBDUSB)
+                        usbT = (Config::zifi_transport == 1);
+#endif
+                        if (usbT)
+                            snprintf(gpio, sizeof(gpio), "Transport: %s\t>", MENU_ZIFI_USB_LABEL[Config::lang]);
+                        else if (Config::zifi_tx_pin == BoardPins::PIN_OFF)
+                            snprintf(gpio, sizeof(gpio), "Transport: Off\t>");
                         else {
                             uint8_t dtx, drx;
                             BoardPins::resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, dtx, drx);
-                            snprintf(gpio, sizeof(gpio), "GPIO %u/%u%s\t>", dtx, drx,
+                            snprintf(gpio, sizeof(gpio), "Transport: %u/%u%s\t>", dtx, drx,
                                      Config::zifi_tx_pin == BoardPins::PIN_DEFAULT ? " (def)" : "");
                         }
                         char baud[32]; snprintf(baud, sizeof(baud), "Baud %u\t>", (unsigned)Config::zifi_baud);
@@ -7195,7 +7255,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                  + (Config::lang ? "Sincronizar hora\n" : "Sync time (SNTP)\n");
                         uint8_t e = menuRun(m);
                         if (e == 0) break; // Esc → back to Network (menuRun popped our rect)
-                        if      (e == 1) pickGpio();
+                        if      (e == 1) pickTransport();
                         else if (e == 2) pickBaud();
                         else if (e == 3) pickTz();
                         else if (e == 4) doSync();

@@ -250,6 +250,9 @@ public:
     // (resolved via BoardPins). See BoardPins.h / Network → GPIO picker.
     static uint8_t zifi_tx_pin;
     static uint8_t zifi_rx_pin;
+    // ESP-01 transport: 0=GPIO UART (zifi_tx_pin/rx_pin), 1=USB-CDC (CH340/CP210x/
+    // FTDI dongle on the USB host port). RP2350 + KBDUSB only. See Network→ESP01.
+    static uint8_t zifi_transport;
     static uint32_t zifi_baud;  // ESP-01S UART rate (115200 default; raised via AT+UART_CUR)
     static string wifi_ssid;
     static string wifi_pass;

@@ -136,6 +136,7 @@ uint16_t Config::ide_chs[2][3] = {{0,0,0},{0,0,0}};
 uint8_t  Config::zifi_enabled = 0;
 uint8_t  Config::zifi_tx_pin = 0xFE; // 0xFE = board default (BoardPins)
 uint8_t  Config::zifi_rx_pin = 0xFE;
+uint8_t  Config::zifi_transport = 0; // 0=GPIO UART, 1=USB-CDC
 uint32_t Config::zifi_baud = 115200;
 string   Config::wifi_ssid;
 string   Config::wifi_pass;
@@ -879,6 +880,7 @@ void Config::load() {
         nvs_get_u8("zifi_enabled", zifi_enabled, sts);
         nvs_get_u8("zifi_tx_pin", zifi_tx_pin, sts);
         nvs_get_u8("zifi_rx_pin", zifi_rx_pin, sts);
+        nvs_get_u8("zifi_transport", zifi_transport, sts);
 #endif
         nvs_get_str("SNA_Path", FileUtils::SNA_Path, sts);
         nvs_get_str("TAP_Path", FileUtils::TAP_Path, sts);
@@ -1115,6 +1117,7 @@ void Config::save() {
     nvs_set_u8(buf,"zifi_enabled", zifi_enabled);
     nvs_set_u8(buf,"zifi_tx_pin", zifi_tx_pin);
     nvs_set_u8(buf,"zifi_rx_pin", zifi_rx_pin);
+    nvs_set_u8(buf,"zifi_transport", zifi_transport);
 #endif
     nvs_set_u8(buf,"ayConfig", Config::ayConfig);
     nvs_set_u8(buf,"turbosound", Config::turbosound);

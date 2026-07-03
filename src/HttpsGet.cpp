@@ -179,10 +179,14 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
         if (total && total - res.received < want) want = total - res.received;
         int n = c.rd(hb, want);
         if (n < 0) {  // read error (TLS alert, deadline, or dropped link)
-            Debug::log("HttpsGet: read err @%lu/%lu tlsErr=-0x%04x rxDrop=%lu",
+            // rxDrop = ZiFi 8 KB ring overflow; bufDrop = per-link rx_buf overflow.
+            // Both 0 on a USB-CDC MAC failure ⇒ loss is upstream (CDC FIFO / CH340
+            // overrun while tuh_task() was stalled), not in our pipeline.
+            Debug::log("HttpsGet: read err @%lu/%lu tlsErr=-0x%04x rxDrop=%lu bufDrop=%lu",
                        (unsigned long)res.received, (unsigned long)total,
                        c.tls ? -c.ts->lastError() : 0,
-                       (unsigned long)(ZiFi::rxDropped() - drop0));
+                       (unsigned long)(ZiFi::rxDropped() - drop0),
+                       (unsigned long)ZiFiSock::rxBufDropped());
             res.status = -1; goto done;
         }
         if (n == 0) { // EOF
