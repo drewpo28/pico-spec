@@ -24,6 +24,7 @@ bool MB02::disk_changed = false;
 void MB02::init() {
     enabled = false;
     MemESP::mb02_write_gate = true;
+    MemESP::mb02_page_dirty = nullptr;
     Z80DMA::mb02_deferred = false;
 
     // Unmap SRAM/EPROM when disabling
@@ -67,7 +68,12 @@ void MB02::init() {
     // Clear SRAM pages
     for (int i = 0; i < MB02_NUM_PAGES; i++) {
         uint8_t* p = MemESP::ram[ram_base_idx + i].materialize(0); // need real frame (accessor sync may return nullptr)
-        if (p) memset(p, 0, MB02_PAGE_SIZE);
+        if (p) {
+            memset(p, 0, MB02_PAGE_SIZE);
+            // Raw memset bypasses writebyte's dirty hook — mark the page dirty
+            // or the eviction write-back is skipped and the zeroing is lost.
+            *MemESP::ram[ram_base_idx + i].dirty_ptr() = true;
+        }
     }
 
     // Set up the MB-02 FDD instance (preserve existing disks on re-init)
@@ -124,6 +130,8 @@ void MB02::applyMapping() {
     write_enabled = (paging_reg & MB02_WRITE_ENABLE) != 0;
     MemESP::mb02_write_gate = write_enabled || !enabled;
 
+    MemESP::mb02_page_dirty = nullptr;  // set below only when an SRAM page is mapped
+
     if (sram_en && eprom_en) {
         MemESP::divmmc_mapped = false;
         MemESP::recoverPage0();
@@ -165,6 +173,10 @@ void MB02::applyMapping() {
         MemESP::divmmc_mapped = true;
         MemESP::divmmc_lo_dirty = nullptr;
         MemESP::divmmc_hi_dirty = nullptr;
+        // The window is a POOL frame: writes through page0 must mark the page
+        // dirty (writebyte's MB-02 branches) or its eviction write-back is
+        // skipped → BS-DOS system/RAM-disk data loss.
+        MemESP::mb02_page_dirty = MemESP::ram[ram_base_idx + page].dirty_ptr();
         return;
     }
 

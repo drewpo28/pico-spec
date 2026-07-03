@@ -235,6 +235,10 @@ public:
     // other banks can still find enough evictable slots.  Nop for non-pool pages.
     inline void pin()   { _int->pinned = true;  }
     inline void unpin() { _int->pinned = false; }
+    // Direct handle to the dirty flag — for writers that modify the frame
+    // behind writebyte's back through a raw pointer (MB-02 page0 window).
+    // An unmarked write means the eviction write-back is skipped → data loss.
+    inline bool* dirty_ptr() { return &_int->dirty; }
     inline void assign_rom(const uint8_t* p) { // TODO: prev?
         this->_int->p = (uint8_t*)p;
         this->_int->vram_off = 0;
@@ -318,6 +322,10 @@ public:
     static bool* divmmc_hi_dirty;  // swap mode: points to slot_dirty[] for page0_hi slot
     static bool* divmmc_lo_dirty;  // swap mode: points to slot_dirty[] for page0_lo slot
     static bool mb02_write_gate;   // MB-02: true = SRAM writable, false = read-only
+    static bool* mb02_page_dirty;  // MB-02: dirty flag of the SRAM page mapped at
+                                   // page0 (pool frame!) — writes through the
+                                   // page0 window must mark it or the eviction
+                                   // write-back is skipped (BS-DOS data loss)
 #endif
 
     static uint8_t readbyte(uint16_t addr);
@@ -395,12 +403,14 @@ inline void MemESP::writebyte(uint16_t addr, uint8_t data)
             } else if (page0_lo >= (uint8_t*)0x11000000) {
                 if (!mb02_write_gate) return; // MB-02 write protect
                 page0_lo[addr] = data;
+                if (mb02_page_dirty) *mb02_page_dirty = true; // pool frame → mark for write-back
             }
         } else {
             // 0x2000-0x3FFF: always RAM bank, writable
             if (page0_hi >= (uint8_t*)0x11000000 && !mb02_write_gate) return;
             page0_hi[addr & 0x1FFF] = data;
             if (divmmc_hi_dirty) *divmmc_hi_dirty = true;
+            else if (mb02_page_dirty) *mb02_page_dirty = true; // pool frame → mark for write-back
         }
         return;
     }
