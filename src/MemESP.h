@@ -62,6 +62,8 @@ extern volatile uint32_t mem_spi_evict_page;  // last evicted page index
 extern volatile uint32_t mem_spi_read_skip;   // first-touch loads with the read skipped
 extern volatile uint32_t mem_spi_wb_skip;     // clean-victim evictions, write-back skipped
 extern volatile uint32_t mem_spi_swap_us;     // total µs spent in _sync page swaps
+extern volatile uint32_t mem_spi_accb;        // accessor-mode per-byte SPI accesses
+extern volatile uint32_t mem_spi_promo;       // accessor→pool promotions
 #if MEM_ACCESS_TRACE
 // Access counts of evicted pages, split clean/dirty — see [ACC] log in Video.cpp.
 extern volatile uint32_t mem_acc_clean_cnt, mem_acc_clean_sum, mem_acc_clean_max;
@@ -73,6 +75,7 @@ extern uint8_t rx[4];
 #if !PICO_RP2040
 extern uint8_t* g_alfWindow;   // AlfCart's 16K SD-faulted window (nullptr = unmounted)
 #endif
+extern "C" uint32_t psram_size();   // SPI PSRAM size (0 on butter/QSPI boards)
 
 enum mem_type_t {
     POINTER = 0,
@@ -98,6 +101,18 @@ public:
     static uint32_t* bank_access[4];
     static uint32_t  access_sink;
 #endif
+    // Accessor-mode bank window: sync() of an SPI-backed non-resident page
+    // does NOT load 16KB — it marks the slot (ramCurrent[bank] = nullptr) and
+    // records the desc here; readbyte/writebyte serve the bank per-byte over
+    // SPI and promote it into the pool after MEM_ACC_PROMOTE_AT accesses.
+    // hw data (Death World / Valley / Single War): 85-100% of trampoline bank
+    // visits touch <128 bytes, so most visits never pay the 1.45ms page load.
+    static mem_desc_t acc_bank[4];   // desc accessor-mapped per CPU slot
+    // Count an accessor access; true = promotion threshold reached.  The
+    // counter lives in the page desc and accumulates ACROSS visits (hw showed
+    // pages trampolined often-but-lightly racking up 27k per-byte ops with a
+    // per-visit counter); it resets only when the page is loaded into the pool.
+    inline bool acc_tick() { return ++_int->acc_hits >= 128; }
 private:
     struct mem_desc_int_t {
         uint8_t* p;
@@ -107,10 +122,14 @@ private:
         bool pinned;  // if true, _sync skips this entry (never evicted while pinned)
         bool dirty;   // frame modified since last load/write-back; clean victims
                       // are evicted WITHOUT the 16KB write-back (see _sync)
+        uint16_t acc_hits; // accessor-mode accesses, CUMULATIVE across bank visits
+                      // (reset only when the page is loaded into the pool) — a
+                      // page trampolined often-but-lightly still accumulates to
+                      // the promotion threshold instead of staying per-byte forever
 #if MEM_ACCESS_TRACE
         uint32_t acc; // Z80 accesses (fetch/read/write) since last load — see [ACC] log
 #endif
-        mem_desc_int_t() : p(0), vram_off(0), mem_type(POINTER), is_rom(false), pinned(false), dirty(true) {}
+        mem_desc_int_t() : p(0), vram_off(0), mem_type(POINTER), is_rom(false), pinned(false), dirty(true), acc_hits(0) {}
     };
     mem_desc_int_t* _int;
     uint8_t* to_vram(void);
@@ -141,7 +160,10 @@ public:
     inline void preload() { if (_int->mem_type != POINTER) _sync(255); }
     inline mem_type_t memType(void) { return _int->mem_type; }
     inline uint32_t   spiBase(void) { return _int->vram_off; }
-    inline uint8_t* sync(uint8_t bank) {
+    // Load into an SRAM pool frame (evicting a victim if needed) and plug the
+    // slot bookkeeping.  Use when the caller NEEDS a real pointer (MB-02 page
+    // memset/getPage, accessor promotion); CPU bank-switch sites use sync().
+    inline uint8_t* materialize(uint8_t bank) {
         if (_int->mem_type != POINTER) {
             _sync(bank);
         }
@@ -154,6 +176,21 @@ public:
 #endif
         }
         return res;
+    }
+    // Accessor-aware plug for CPU bank switches: an SPI-backed non-resident
+    // page is NOT loaded — the slot goes to accessor mode (returns nullptr,
+    // which the callers store into ramCurrent[bank]; readbyte/writebyte and
+    // romPeek detect it).  SD-swap pages and banks ≥4 keep the eager load
+    // (per-byte SD access would be catastrophically slow).
+    inline uint8_t* sync(uint8_t bank) {
+        if (bank < 4 && _int->mem_type != POINTER &&
+            psram_size() >= _int->vram_off + MEM_PG_SZ) {
+            acc_bank[bank] = *this;
+            plugged_in[bank] = 0;
+            bank_dirty[bank] = &dirty_sink;   // accessor writes go straight to backing
+            return nullptr;
+        }
+        return materialize(bank);
     }
     inline uint8_t read(uint16_t addr) {
         if (_int->mem_type != POINTER) {
@@ -258,7 +295,20 @@ public:
             const uint8_t* ov = overlayFor(p);
             if (ov) return rom_overlay_byte(ov, p, off);
         }
+        // Accessor-mode bank (sync() deferred the 16KB load): serve per-byte.
+        if (__builtin_expect(p == nullptr, 0)) return accessorRead(page, off);
         return p[off];
+    }
+
+    // Accessor-mode bank window (cold paths, MemESP.cpp): per-byte SPI access
+    // + promotion into the pool after MEM_ACC_PROMOTE_AT accesses.
+    static uint8_t accessorRead(uint8_t bank, uint16_t off);
+    static void    accessorWrite(uint8_t bank, uint16_t off, uint8_t v);
+    static void    promoteBank(uint8_t bank);
+    // For code that needs a raw ramCurrent[page] pointer (tape flashload,
+    // debugger poke): force an accessor-mode bank into a real SRAM frame.
+    static inline void ensureResident(uint8_t page) {
+        if (page < 4 && ramCurrent[page] == nullptr) promoteBank(page);
     }
 
 #if !PICO_RP2040
@@ -356,6 +406,12 @@ inline void MemESP::writebyte(uint16_t addr, uint8_t data)
     }
 #endif
     uint8_t* p = ramCurrent[page];
+    // Accessor-mode bank: write goes straight to the SPI backing store
+    // (must be checked before the ROM filter — nullptr < 0x11000000).
+    if (__builtin_expect(p == nullptr, 0)) {
+        accessorWrite(page, addr & 0x3fff, data);
+        return;
+    }
     if (p < (uint8_t*)0x11000000) return;
     *mem_desc_t::bank_dirty[page] = true;
 #if MEM_ACCESS_TRACE

@@ -578,16 +578,17 @@ static void assign_ram(int i) {
   // IDL gain (the bottleneck is the whole Z80 working set in XIP, not the color
   // pages), so don't waste 48KB SRAM.
   //
-  // +2 extra LRU pool buffers (60, 40 = 32KB): during DS80 only one slot is
-  // otherwise evictable (56/58 pinned, 61 free), so HC's CP/M bank-switch
-  // trampoline (OUT 0x7FFD/0xDFFD) ping-pongs read-only code banks through it
-  // → ~70 SPI reloads/frame.  These two unpinned SRAM buffers join the pool as
-  // extra LRU lines (sync/_sync reuse them across pages, every page's data is
-  // preserved in PSRAM on evict → no loss of the 1024K capacity).  Drops the
-  // thrash to ~1.4/frame.  Page indices must be MID-range: forcing the TOP
-  // pages (62/63) corrupts Profi-1024K boot (system data lives there); 40/60
-  // are safe.  The initial index is otherwise irrelevant — the LRU repurposes
-  // the buffer for whatever working set is hot.
+  // +1 extra LRU pool buffer (60 = 16KB): HC's CP/M bank-switch trampoline
+  // (OUT 0x7FFD/0xDFFD) ping-pongs read-only code banks; historically that
+  // needed +2..3 forced SRAM buffers here (40/41, ~70 SPI reloads/frame with
+  // fewer).  The ACCESSOR-MODE bank window (mem_desc_t::sync/MemESP::accessor*)
+  // now serves those short bank visits per-byte over SPI without any 16KB
+  // load — hw showed 85-100% of trampoline visits touch <128 bytes — so pages
+  // 40/41 went back to the heap (+32KB).  Every page's data is preserved in
+  // PSRAM on evict → no loss of the 1024K capacity.  Page indices must be
+  // MID-range: forcing the TOP pages (62/63) corrupts Profi-1024K boot
+  // (system data lives there); 60 is safe.  The initial index is otherwise
+  // irrelevant — the LRU repurposes the buffer for whatever working set is hot.
   //
   // Pages 56 and 58 are the DS80 color-attribute pages (videoLatch=0 → 56,
   // videoLatch=1 → 58).  They must be permanently SRAM-resident (locked=true,
@@ -600,9 +601,9 @@ static void assign_ram(int i) {
   // HDMI/VGA renderer never stalls on SPI DMA → no sync loss.
   //
   // Profi CP/M pool layout (RP2350, SPI-PSRAM only):
-  //   Locked SRAM (pinned, never evicted): pages 58, 59 — DS80 colour/pixel data
-  //   LRU pool (3 evictable slots):        pages 40, 60, 61 — CP/M working set
-  //   All other pages:                     SPI PSRAM (loaded on demand)
+  //   Locked SRAM (never evicted): pages 56, 58 — DS80 colour-attribute data
+  //   LRU pool (evictable):        pages 1, 2, 3, 60, 61 — CP/M working set
+  //   All other pages:             SPI PSRAM, on demand via accessor window
   //
   // RP2040 (ZERO/MURM): DS80 not available; heap budget ~181KB with MEM_REMAIN=96KB
   // reserved for framebuffer. Use 3-page set {56,58,61} on RP2040.
@@ -616,7 +617,7 @@ static void assign_ram(int i) {
                            && (i == 56 || i == 58)
                            && (butter_psram_size() == 0);
   bool force_sram = (Config::arch == "Profi")
-                    && (i == 61 || i == 60 || i == 40 || i == 41)
+                    && (i == 61 || i == 60)
                     && (butter_psram_size() == 0);
 #endif
   if (force_sram_locked) {
@@ -2282,7 +2283,7 @@ void ESPectrum::loop() {
           VIDEO::profi_ds80_osd_active = true;
           VIDEO::applyProfiOSDPalette();
         }
-        OSD::osdCenteredMsg(OSD_PROFI_LOADING[Config::lang], LEVEL_WARN, 2500);
+        //OSD::osdCenteredMsg(OSD_PROFI_LOADING[Config::lang], LEVEL_WARN, 2500);
         if (ds80) {
           VIDEO::profi_ds80_osd_active = false;
           if (profi_ds80_active) {

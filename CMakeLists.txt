@@ -911,7 +911,7 @@ ELSE()
         # runs an at-speed write/verify memtest and drops the target back to
         # PSRAM_FALLBACK_SCK_MHZ (63) if this chip fails at 94.5 MHz;
         # psram_update_clkdiv() keeps the chosen target after CPU overclock too.
-        PSRAM_MAX_SCK_MHZ=94
+        PSRAM_MAX_SCK_MHZ=63
 
         PSRAM_PIN_CS=18
         PSRAM_PIN_SCK=19

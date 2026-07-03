@@ -1188,6 +1188,7 @@ bool FileP::load(const string& p_fn) {
 
     uint16_t address = 16393;
     uint8_t page = address >> 14;
+    MemESP::ensureResident(page); // accessor bank → real frame before raw fread
     fread(&MemESP::ramCurrent[page][address & 0x3fff], p_size, 1, *file);
 
     fclose2(file);

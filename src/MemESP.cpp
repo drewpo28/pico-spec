@@ -47,6 +47,7 @@ bool* mem_desc_t::bank_dirty[4] = {
     &mem_desc_t::dirty_sink, &mem_desc_t::dirty_sink,
     &mem_desc_t::dirty_sink, &mem_desc_t::dirty_sink,
 };
+mem_desc_t mem_desc_t::acc_bank[4];
 #if MEM_ACCESS_TRACE
 uint32_t  mem_desc_t::access_sink = 0;
 uint32_t* mem_desc_t::bank_access[4] = {
@@ -65,6 +66,33 @@ volatile uint32_t mem_spi_evict_page  = 0;  // last evicted page index
 volatile uint32_t mem_spi_read_skip   = 0;  // first-touch loads with the read skipped
 volatile uint32_t mem_spi_wb_skip     = 0;  // clean-victim evictions with the write-back skipped
 volatile uint32_t mem_spi_swap_us     = 0;  // total µs spent in _sync page swaps
+volatile uint32_t mem_spi_accb       = 0;   // accessor-mode per-byte SPI accesses
+volatile uint32_t mem_spi_promo      = 0;   // accessor→pool promotions (16KB loads)
+
+// Accessor-mode bank window.  hw measurements (3 games) put the trampoline
+// bank-visit access counts at 0-128 in 85-100% of cases, with the real working
+// set in the thousands — the distribution is bimodal, so the low threshold in
+// mem_desc_t::acc_tick() (128, cumulative per page) both captures the wins and
+// promotes genuinely hot pages quickly (a promoted page pays ≤128 per-byte
+// accesses ≈ 0.3ms on top of the 1.45ms load).
+
+uint8_t MemESP::accessorRead(uint8_t bank, uint16_t off) {
+    mem_spi_accb++;
+    uint8_t v = mem_desc_t::acc_bank[bank].read(off);
+    if (mem_desc_t::acc_bank[bank].acc_tick()) promoteBank(bank);
+    return v;
+}
+
+void MemESP::accessorWrite(uint8_t bank, uint16_t off, uint8_t v) {
+    mem_spi_accb++;
+    mem_desc_t::acc_bank[bank].write(off, v);   // _write → backing store + valid bit
+    if (mem_desc_t::acc_bank[bank].acc_tick()) promoteBank(bank);
+}
+
+void MemESP::promoteBank(uint8_t bank) {
+    mem_spi_promo++;
+    ramCurrent[bank] = mem_desc_t::acc_bank[bank].materialize(bank);
+}
 
 // Backing-store validity bitmap: bit set = this vram/swap page has been
 // materialized (written to PSRAM or the swap file) at least once.  A page that
@@ -163,6 +191,7 @@ void mem_desc_t::from_vram(uint8_t* p) {
     uint32_t ba = _int->vram_off;
     _int->mem_type = POINTER;
     _int->dirty = false;   // frame == backing store (or both garbage on skip)
+    _int->acc_hits = 0;    // page is pool-resident now; accessor counting restarts
 #if MEM_ACCESS_TRACE
     _int->acc = 0;         // start counting accesses served by this load
 #endif

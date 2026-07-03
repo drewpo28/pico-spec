@@ -66,7 +66,7 @@ void MB02::init() {
 
     // Clear SRAM pages
     for (int i = 0; i < MB02_NUM_PAGES; i++) {
-        uint8_t* p = MemESP::ram[ram_base_idx + i].sync(0);
+        uint8_t* p = MemESP::ram[ram_base_idx + i].materialize(0); // need real frame (accessor sync may return nullptr)
         if (p) memset(p, 0, MB02_PAGE_SIZE);
     }
 
@@ -114,7 +114,7 @@ void MB02::reset() {
 
 uint8_t* MB02::getPage(uint8_t page_idx) {
     if (page_idx >= MB02_NUM_PAGES || ram_base_idx < 0) return nullptr;
-    return MemESP::ram[ram_base_idx + page_idx].sync(0);
+    return MemESP::ram[ram_base_idx + page_idx].materialize(0); // callers deref the pointer
 }
 
 void MB02::applyMapping() {

@@ -3310,24 +3310,32 @@ IRAM_ATTR void VIDEO::EndFrame() {
         static uint32_t skip_accum = 0;
         static uint32_t wbskip_accum = 0;
         static uint32_t swap_us_accum = 0;
+        static uint32_t accb_accum = 0;
+        static uint32_t promo_accum = 0;
         evict_accum  += mem_spi_evict_count;
         skip_accum   += mem_spi_read_skip;
         wbskip_accum += mem_spi_wb_skip;
         swap_us_accum += mem_spi_swap_us;
+        accb_accum   += mem_spi_accb;
+        promo_accum  += mem_spi_promo;
         evict_last_page = mem_spi_evict_page;
         mem_spi_evict_count = 0;
         mem_spi_read_skip = 0;
         mem_spi_wb_skip = 0;
         mem_spi_swap_us = 0;
+        mem_spi_accb = 0;
+        mem_spi_promo = 0;
         if (++evict_log_frame >= 60) {
             evict_log_frame = 0;
-            if (evict_accum || skip_accum)
-                Debug::log("[SPI] evict/60f=%u skip=%u wbskip=%u swap=%ums last_pg=%u (%.1f/frame)",
-                           evict_accum, skip_accum, wbskip_accum, swap_us_accum / 1000u,
-                           evict_last_page, evict_accum / 60.0f);
+            if (evict_accum || skip_accum || accb_accum)
+                Debug::log("[SPI] evict/60f=%u skip=%u wbskip=%u accb=%u promo=%u swap=%ums last_pg=%u (%.1f/frame)",
+                           evict_accum, skip_accum, wbskip_accum, accb_accum, promo_accum,
+                           swap_us_accum / 1000u, evict_last_page, evict_accum / 60.0f);
             skip_accum = 0;
             wbskip_accum = 0;
             swap_us_accum = 0;
+            accb_accum = 0;
+            promo_accum = 0;
             evict_accum = 0;
 #if MEM_ACCESS_TRACE
             // Accesses served per evicted-page load (accessor-mode feasibility):

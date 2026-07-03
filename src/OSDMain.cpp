@@ -9356,7 +9356,7 @@ c:
     VIDEO::vga.print("-Pages-----------");
     {
         char pb0[20], pb1[20], pb2[20], pb3[20];
-        if (MemESP::ramCurrent[0] < (uint8_t*)0x11000000)
+        if (MemESP::ramCurrent[0] && MemESP::ramCurrent[0] < (uint8_t*)0x11000000)
             snprintf(pb0, 20, "PAGE0 -> ROM#%d", MemESP::romInUse);
         else if (MemESP::newSRAM)
             snprintf(pb0, 20, "PAGE0 -> SRAM#%d", MemESP::romLatch);
@@ -13446,6 +13446,7 @@ void OSD::pokeDialog() {
                     if (dlgValues[0] == "   -   ") {
                         // Poke address between 16384 and 65535
                         uint8_t page = address >> 14;
+                        MemESP::ensureResident(page); // accessor bank → real frame
                         MemESP::ramCurrent[page][address & 0x3fff] = value;
                     } else {
                         // Poke address in bank
