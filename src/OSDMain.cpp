@@ -145,6 +145,7 @@ extern "C" const uint32_t profi_default_palette16[16];
 #include "DivMMC.h"
 #include "IDE.h"
 #include "MB02.h"
+#include "GS/GS.h"
 #endif
 
 #include <malloc.h>
@@ -4471,13 +4472,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         if (opt2) {
                                             uint8_t newclock = opt2 - 1;
                                             if (newclock != prev_clock) {
+                                                // Clock only feeds pump()/step() timing constants
+                                                // (no allocation) — apply live, no reboot needed.
                                                 Config::gs_clock = newclock;
-                                                if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
-                                                    Config::save();
-                                                    esp_hard_reset();
-                                                } else {
-                                                    Config::gs_clock = prev_clock;
-                                                }
+                                                GS::setClock();
+                                                Config::save();
                                             }
                                             ci = Config::gs_clock < 5 ? Config::gs_clock : 1;
                                             menu_curopt = ci + 1;

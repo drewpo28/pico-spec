@@ -14,6 +14,12 @@ public:
     static void deinit();
     static void reset();
 
+    // Re-derive the GS-Z80 clock/IRQ timing from Config::gs_clock at runtime.
+    // The clock feeds only the pump()/step() timing constants (no allocation),
+    // so a clock change applies live without a reboot. Safe to call any time;
+    // init() calls it too.
+    static void setClock();
+
     // Sample-RAM size (bytes) GS will reserve at the top of PSRAM, derived purely
     // from Config (no side effects). Single source of truth shared by init() and
     // Buffer::initPools() — initPools must reserve this region BEFORE GS::init runs.

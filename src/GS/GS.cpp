@@ -682,13 +682,15 @@ uint32_t GS::configuredRamBytes() {
     return rounded;
 }
 
+void GS::setClock() {
+    uint8_t ci = Config::gs_clock < 5 ? Config::gs_clock : 1;
+    GS_CLOCK_HZ   = GS_CLOCK_TABLE[ci];
+    GS_INT_PERIOD = GS_CLOCK_HZ / GS_INT_HZ;
+}
+
 bool GS::init(uint32_t ram_size_bytes) {
     if (enabled) return true;
-    {
-        uint8_t ci = Config::gs_clock < 5 ? Config::gs_clock : 1;
-        GS_CLOCK_HZ  = GS_CLOCK_TABLE[ci];
-        GS_INT_PERIOD = GS_CLOCK_HZ / GS_INT_HZ;
-    }
+    setClock();
 
     uint32_t rounded = 0x20000;
     while (rounded < ram_size_bytes && rounded < (2u << 20)) rounded <<= 1;
