@@ -213,6 +213,11 @@ static const char *MSG_FACTORY_RESET_Q[2] = {
     "Reset all settings to defaults?",
     "Restablecer todos los ajustes?"
 };
+// Guided boot prompt shown while the "hold R" reset window is open.
+static const char *MSG_FACTORY_RESET_HOLD[2] = {
+    "Hold  R  for Factory Reset",
+    "Manten  R  para Reset de fabrica"
+};
 
 #define OSD_FIRMW_EN "Updating firmware"
 #define OSD_FIRMW_ES "Actualizando firmware"

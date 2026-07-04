@@ -116,6 +116,18 @@ static inline void hid_snap_set_decoded(uint8_t instance, uint8_t h, uint16_t bi
   }
 }
 
+// True once the USB host has enumerated a keyboard-class HID. Lets the boot-time
+// factory-reset probe end its wait as soon as a keyboard is actually available
+// (a fixed blind timeout used to close before slow sticks/hubs finished enumerating).
+extern "C" bool usb_keyboard_mounted(void) {
+  for (uint8_t i = 0; i < CFG_TUH_HID; i++) {
+    if (!hid_snap[i].mounted) continue;
+    if (hid_snap[i].itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) return true;
+    if (hid_snap[i].last_handler == HID_HANDLER_KBD) return true;
+  }
+  return false;
+}
+
 // Sony DualShock 4 (PS4 wired): VID=054C, PID=05C4 (v1) / 09CC (v2).
 // 507-byte report descriptor with vendor-page reports overflows TinyUSB's
 // parser, so we bypass the rpt_info table for these and decode the 64-byte

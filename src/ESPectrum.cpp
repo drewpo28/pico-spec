@@ -2184,17 +2184,52 @@ void ESPectrum::loop() {
   // defaults. Pump the keyboard at FULL SPEED here, BEFORE the emulation for(;;)
   // starts: once it runs, a thrashing machine (Profi DS80 on SPI-PSRAM, ~4 FPS)
   // pumps tuh_task too rarely for USB to even enumerate, so a per-frame check inside
-  // the loop never saw the key. ~1.5 s gives USB time to enumerate; we break as soon
-  // as R is seen (held). R reads as VK_R or VK_r depending on CAPSLOCK — test both.
+  // the loop never saw the key. R reads as VK_R or VK_r depending on CAPSLOCK.
+  //
+  // Reliability (was ~50/50): the window is now guided and keyboard-aware.
+  //  - We poll until the keyboard is actually READY (PS/2: instant; USB: mounted),
+  //    then a short grace, instead of a blind fixed timeout that closed before a
+  //    slow USB keyboard finished enumerating. Hard cap FR_MAX_US if none appears.
+  //  - After FR_PROMPT_DELAY_US we draw a centered "Hold R for Factory Reset" hint
+  //    so the user knows the window is open and holds long enough. A fast PS/2 hold
+  //    is caught before the delay, so a normal reset never flashes the prompt.
   {
       extern void repeat_me_for_input();
+#ifdef KBDUSB
+      extern "C" bool usb_keyboard_mounted(void);
+#endif
       auto Kbd = PS2Controller.keyboard();
+
+      const uint32_t FR_PROMPT_DELAY_US = 400000;   // fast R-hold skips the prompt
+      const uint32_t FR_GRACE_US        = 800000;    // poll this long once kbd is ready
+      const uint32_t FR_MAX_US          = 3500000;   // hard cap if no keyboard appears
+
       uint32_t fr_t0 = time_us_32();
+      uint32_t fr_ready_at = 0;        // elapsed us when the keyboard became available
       bool rHeld = false;
-      Debug::log("factory-reset: probing for held R (~1.5s)");
-      while ((uint32_t)(time_us_32() - fr_t0) < 1500000) {
-          repeat_me_for_input();   // pump USB (tuh_task) + PS/2 at full speed
+      bool promptShown = false;
+      Debug::log("factory-reset: probing for held R (guided window)");
+      for (;;) {
+          uint32_t el = (uint32_t)(time_us_32() - fr_t0);
+          repeat_me_for_input();       // pump USB (tuh_task) + PS/2 at full speed
           if (Kbd && (Kbd->isVKDown(fabgl::VK_R) || Kbd->isVKDown(fabgl::VK_r))) { rHeld = true; break; }
+
+          if (!fr_ready_at) {
+#ifdef KBDUSB
+              bool ready = usb_keyboard_mounted();
+#else
+              bool ready = true;       // PS/2 keyboard state is available immediately
+#endif
+              if (ready) fr_ready_at = el ? el : 1;
+          }
+
+          if (!promptShown && el >= FR_PROMPT_DELAY_US) {
+              OSD::osdCenteredMsg(MSG_FACTORY_RESET_HOLD[Config::lang], LEVEL_INFO, 0);
+              promptShown = true;      // persistent draw; emulation repaint erases it
+          }
+
+          if (el >= FR_MAX_US) break;                             // no keyboard ever seen
+          if (fr_ready_at && (el - fr_ready_at) >= FR_GRACE_US) break;  // ready + grace, no R
           sleep_ms(2);
       }
       if (rHeld) {
