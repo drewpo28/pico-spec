@@ -313,6 +313,9 @@ bool ZiFiSock::begin(bool mux) {
     // Wait out any residual flood from a prior (possibly aborted) session before
     // issuing the mode command, so its "OK" isn't buried in stale +IPD bytes.
     drainQuiet(80, 2000);
+    // Host session with the Z80 paused → drive the full configured rate (the NIC's
+    // live-emulation baud ceiling doesn't apply here). Restored in end().
+    ZiFi::boostBaud();
 
     const char* cmd = mux ? "AT+CIPMUX=1" : "AT+CIPMUX=0";
     is_ready = atCmd(cmd, "OK", 2000);
@@ -328,6 +331,9 @@ bool ZiFiSock::begin(bool mux) {
         for (int i = 0; i < N_LINKS; i++) g_drained[i] = false;
         Debug::log("ZiFiSock: receive mode = %s", g_passive ? "passive (CIPRECVMODE=1)" : "active (+IPD push)");
     }
+    // Failed begin() → callers return without end(); undo the boost so the link
+    // doesn't idle above the NIC-safe ceiling.
+    if (!is_ready) ZiFi::restoreBaud();
     return is_ready;
 }
 
@@ -556,15 +562,26 @@ bool ZiFiSock::server_listen(uint16_t port) {
     accepted_link = -1;
     uint8_t junk[64];
     while (ZiFi::recvRaw(junk, sizeof(junk)) > 0) {}
+    // FTP server runs with the Z80 paused → drive the full configured rate. Restored
+    // in server_stop().
+    ZiFi::boostBaud();
 
-    // The FTP server stays on the hw-proven active (+IPD push) path; make sure a
-    // leftover passive mode from an aborted client session can't linger.
-    if (g_passive) { atCmd("AT+CIPRECVMODE=0", "OK", 1000); g_passive = false; }
-
-    if (!atCmd("AT+CIPMUX=1", "OK", 2000)) { is_ready = false; return false; }
+    if (!atCmd("AT+CIPMUX=1", "OK", 2000)) { is_ready = false; ZiFi::restoreBaud(); return false; }
+    // Passive receive (CIPRECVMODE=1) for STOR: a client upload is bulk data flowing
+    // client→server, and while a blocking f_write stalls the core the active-mode
+    // +IPD firehose overflows the rings → dropped bytes → the transfer fails (large
+    // uploads died where small ones squeaked through). In passive mode the ESP holds
+    // the data and its TCP window closes → end-to-end backpressure, we pull at our
+    // own pace with CIPRECVDATA. Old AT firmware without CIPRECVMODE answers ERROR →
+    // transparently stay on the active path. RETR (send) is unaffected either way.
+    g_passive = atCmd("AT+CIPRECVMODE=1", "OK", 2000);
+    for (int i = 0; i < N_LINKS; i++) g_drained[i] = false;
+    Debug::log("ZiFiSock: FTP server receive mode = %s",
+               g_passive ? "passive (CIPRECVMODE=1)" : "active (+IPD push)");
     char cmd[40];
     snprintf(cmd, sizeof(cmd), "AT+CIPSERVER=1,%u", (unsigned)port);
     is_ready = atCmd(cmd, "OK", 3000);
+    if (!is_ready) ZiFi::restoreBaud();   // failed listen → callers skip server_stop()
     return is_ready;
 }
 
@@ -590,10 +607,12 @@ void ZiFiSock::server_stop() {
     for (int i = 0; i < N_LINKS; i++)
         if (opened[i]) sock_close(i);
     atCmd("AT+CIPSERVER=0", "OK", 2000);          // these still pump() → need rx_buf
+    if (g_passive) { atCmd("AT+CIPRECVMODE=0", "OK", 1000); g_passive = false; }
     if (mux_mode) atCmd("AT+CIPMUX=0", "OK", 1000);
     reset_parser();
     accepted_link = -1;
     is_ready = false;
+    ZiFi::restoreBaud();                          // back to the NIC-safe idle rate
     // Symmetric with server_listen()'s alloc (and end() on the client paths): return
     // the 4 KB demux ring to its tier so it isn't leaked after the FTP server closes.
     // The emulated ZiFi NIC uses its own buffers, so this is safe; ZiFi UART stays up.
@@ -608,6 +627,7 @@ void ZiFiSock::end() {
     reset_parser();
     is_ready = false;
     freeRxBuf();                      // return the 4 KB to its tier
+    ZiFi::restoreBaud();              // back to the NIC-safe idle rate
 }
 
 #endif // !PICO_RP2040 && ZIFI_NET_CLIENT

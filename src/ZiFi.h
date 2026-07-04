@@ -50,6 +50,15 @@ public:
     // Current UART rate the Pico+ESP are (supposedly) on.
     static uint32_t currentBaud();
 
+    // Baud split between the emulated NIC (live emulation) and paused host sessions.
+    // The NIC bridges bytes while the Z80 is RUNNING — core0 can't drain the RX IRQ
+    // fast enough above ~230 kbaud, so the link idles at the NIC-safe ceiling. A
+    // host session (FTP/HTTPS/SSH) runs with the Z80 PAUSED and can push the full
+    // configured rate: boostBaud() lifts the link for the session, restoreBaud()
+    // drops it back. No-ops when the configured rate is already NIC-safe.
+    static void boostBaud();
+    static void restoreBaud();
+
     // USB-CDC transport hooks (Config::zifi_transport==1). The TinyUSB weak
     // callbacks tuh_cdc_mount_cb/umount_cb/rx_cb in ZiFi.cpp forward here; these
     // touch the private RX ring so they're members. No-ops on the UART path / when

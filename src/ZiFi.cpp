@@ -38,6 +38,21 @@ extern size_t getFreeHeap(void);
 
 #define ZIFI_BAUD 115200   // ESP-01S AT firmware power-on default; our base rate
 
+// Live-emulation drain ceiling. The emulated NIC bridges ESP bytes while the Z80
+// is RUNNING, so core0 shares its time with CPU+video and can't service the RX IRQ
+// fast enough above this — the guest's AT handshake loses bytes ("wifi chip init
+// failed"). The link idles here; paused host sessions boostBaud() past it. HW-found:
+// NIC OK at 230400, breaks above.
+#define ZIFI_NIC_MAX_BAUD 230400
+
+// The rate the link idles at (for the NIC): the configured rate, clamped to the
+// live-emulation ceiling. Equals the configured rate when it's already NIC-safe,
+// so boost/restore become no-ops and nothing changes for ≤230400 setups.
+static uint32_t nicSafeBaud() {
+    uint32_t want = Config::zifi_baud ? Config::zifi_baud : ZIFI_BAUD;
+    return want < ZIFI_NIC_MAX_BAUD ? want : ZIFI_NIC_MAX_BAUD;
+}
+
 // Runtime UART selection — pins come from Config (resolved via BoardPins), not a
 // compile-time #define. g_uart == nullptr means no physical UART (OFF/invalid):
 // the FIFO/port emulation still works, there's just no link to the ESP.
@@ -139,10 +154,41 @@ static void usbApplyPendingBaud() {
     if (!g_usb_baud_pending || busy || g_in_tuh) return;
     if (g_cdc_idx < 0 || !tuh_cdc_mounted(g_cdc_idx)) return;
     busy = true;
-    if (zifi_usb_set_baud(Config::zifi_baud)) g_usb_baud_pending = false;
+    if (zifi_usb_set_baud(nicSafeBaud())) g_usb_baud_pending = false;
     busy = false;
 }
 #endif
+
+// Change the link rate at RUNTIME (RX IRQ already armed). The init-time
+// zifi_set_baud() poll-drains the transition garbage itself and so must run with
+// the IRQ off; mask it around the switch here. USB-CDC has no IRQ to mask.
+static void zifi_set_baud_live(uint32_t target) {
+    if (target == 0 || target == g_cur_baud) return;
+#if CFG_TUH_CDC
+    if (g_usb_mode) { zifi_usb_set_baud(target); return; }
+#endif
+    if (!g_uart) return;
+    irq_set_enabled(g_uart_irq, false);
+    zifi_set_baud(target);
+    irq_set_enabled(g_uart_irq, true);
+}
+
+// Paused host sessions (FTP/HTTPS/SSH — Z80 stopped) can drive the full configured
+// rate; boost for the session and restore the NIC-safe idle rate afterwards.
+void ZiFi::boostBaud() {
+    if (!linkActive()) return;
+    uint32_t t = Config::zifi_baud ? Config::zifi_baud : ZIFI_BAUD;
+    if (t == g_cur_baud) return;                 // already at full rate (config ≤ NIC-safe)
+    zifi_set_baud_live(t);
+    Debug::log("ZiFi: baud boost %u (host session)", (unsigned)g_cur_baud);
+}
+void ZiFi::restoreBaud() {
+    if (!linkActive()) return;
+    uint32_t t = nicSafeBaud();
+    if (t == g_cur_baud) return;
+    zifi_set_baud_live(t);
+    Debug::log("ZiFi: baud restore %u (NIC idle)", (unsigned)g_cur_baud);
+}
 
 uint8_t ZiFi::enabled = 0;
 
@@ -424,7 +470,7 @@ void ZiFi::init() {
         // Raise to the configured rate — immediately if the dongle is already
         // enumerated (init runs in main-loop context), else the pending flag is
         // applied from tick()/sendRaw()/recvRaw() once it mounts.
-        g_usb_baud_pending = (Config::zifi_baud != 0 && Config::zifi_baud != ZIFI_BAUD);
+        g_usb_baud_pending = (nicSafeBaud() != ZIFI_BAUD);
         usbApplyPendingBaud();
         return;
     }
@@ -453,10 +499,11 @@ void ZiFi::init() {
     // Fire the RX IRQ at 1/8 full (4 of 32 bytes) instead of 1/2, so at high baud
     // there's more headroom before the FIFO overflows if the handler is delayed.
     uart_get_hw(g_uart)->ifls &= ~(0x7u << 3); // RXIFLSEL = 000 (1/8)
-    // Optionally raise the link speed for faster transfers. Negotiate BEFORE
-    // arming the RX IRQ so zifi_set_baud can poll-drain the transition bytes.
-    if (Config::zifi_baud && Config::zifi_baud != ZIFI_BAUD)
-        zifi_set_baud(Config::zifi_baud);
+    // Optionally raise the link speed for faster transfers. Idle at the NIC-safe
+    // rate (paused host sessions boostBaud() past it); negotiate BEFORE arming the
+    // RX IRQ so zifi_set_baud can poll-drain the transition bytes.
+    if (nicSafeBaud() != ZIFI_BAUD)
+        zifi_set_baud(nicSafeBaud());
     irq_set_exclusive_handler(g_uart_irq, uart_rx_irq_handler);
     // High baud (460800/921600) leaves only ~350 us of RX-FIFO headroom (32 bytes);
     // if video/audio IRQs delay this handler the FIFO overflows and bytes are lost,
@@ -743,7 +790,7 @@ void ZiFi::usbCdcMount(int idx) {
     // Callback context: the blocking baud raise can't run here (it would re-enter
     // the host stack), so flag it for the next main-loop entry point.
     g_cur_baud = ZIFI_BAUD;
-    if (hw_initialized && Config::zifi_baud && Config::zifi_baud != ZIFI_BAUD)
+    if (hw_initialized && nicSafeBaud() != ZIFI_BAUD)
         g_usb_baud_pending = true;
     Debug::log("ZiFi: USB-CDC adapter mounted (idx=%d) freeHeap=%u", idx, (unsigned)getFreeHeap());
 #else

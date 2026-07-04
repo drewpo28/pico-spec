@@ -1936,6 +1936,10 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
 
     while (1) {
         OSD::net_last_path = fs->cwdPath();   // remembered as the global last F5 location
+        // Path shown in the header: prefix the remote cwd with the scheme label
+        // ("FTP:"/"SSH:"/"WEB:") so fdDisplayPath() doesn't stamp it "SD:". Display
+        // only — cache key / net_last_path / cursor memory still use the raw cwdPath.
+        const string dispPath = fs->schemeLabel() + fs->cwdPath();
         // ── Open (or build) the per-folder listing index into the shared `filenames`
         // (so the SD render path can draw it). Reuse cache when known-fresh. ──
         uint32_t key = netHash(fs->cacheId() + "|" + fs->cwdPath());
@@ -1951,7 +1955,7 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
             reuse = (fs->revalidate("", stored, fresh) == RemoteFs::CACHE_FRESH);
         }
         if (!reuse) {
-            OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], fs->cwdPath(), 0, 0, fs->utf8Names());
+            OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], dispPath, 0, 0, fs->utf8Names());
             filenames.unlink();          // truncate to empty (also (re)creates the file)
             // ".." row (double DIR_MARKER → sorts/renders first), like the SD browser:
             // select it to go up a level, and from the top it exits toward the root.
@@ -1965,7 +1969,7 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
         netSessAdd(key);
 
         int outKey = FDK_ESC;
-        int sel = fdChromeNav(title, fs->cwdPath(), side, fs->utf8Names(), &outKey, &curFocus, &curBegin);
+        int sel = fdChromeNav(title, dispPath, side, fs->utf8Names(), &outKey, &curFocus, &curBegin);
         // Remember this folder's cursor for the session (so F5 reopen restores it).
         g_net_cur_path = fs->cwdPath(); g_net_cur_focus = curFocus; g_net_cur_begin = curBegin;
 
