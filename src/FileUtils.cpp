@@ -198,14 +198,38 @@ void FileUtils::initFileSystem() {
     }
 #endif
     if (SDReady) {
-        f_mkdir("/tmp");
-        mkdirParents(CONFIG_DIR);
-        // User data (snapshots/screenshots) lives under visible /spec root.
-        f_mkdir(SPEC_DIR_ROOT);
-        f_mkdir(DISK_SCR_DIR);
-        f_mkdir(DISK_PSNA_DIR);
-        mkdirParents(CONFIG_DIR_BOARD);
+        ensureBootDirs();
     }
+}
+
+// Create the directory tree pico-spec expects on the default volume. Split out
+// of initFileSystem so runtime automount (a card inserted after a card-less
+// boot) can bring the same structure online without a reboot.
+void FileUtils::ensureBootDirs() {
+    f_mkdir("/tmp");
+    mkdirParents(CONFIG_DIR);
+    // User data (snapshots/screenshots) lives under visible /spec root.
+    f_mkdir(SPEC_DIR_ROOT);
+    f_mkdir(DISK_SCR_DIR);
+    f_mkdir(DISK_PSNA_DIR);
+    mkdirParents(CONFIG_DIR_BOARD);
+}
+
+// Runtime SD automount: probe for a card only while the filesystem is offline
+// (booted with no card, and no USB stick took over as root). On the first
+// successful probe it mounts "SD:", creates the boot dir tree, and flips
+// fsMount/SDReady true so the OSD menus and file dialogs (which gate on fsMount
+// live) light up without a reboot. Returns true only on the tick the card
+// comes online, so the caller can run the one-shot follow-up (disk mounts,
+// notice). The physical probe is a few ms with no card (a single failed CMD0),
+// so callers must still throttle it — never call this every frame.
+bool FileUtils::automountSD() {
+    if (fsMount || usbRoot) return false;   // already online (SD or USB-as-root)
+    if (!mountSDCard()) return false;       // still no card
+    ensureBootDirs();
+    SDReady = true;                         // fsMount set by mountSDCard()
+    Debug::log("FileUtils: SD card detected at runtime, automounted\n");
+    return true;
 }
 
 static FATFS fs;

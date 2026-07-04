@@ -89,7 +89,12 @@ public:
     static DiskIface ifaceForExt(const string& lcExt);
 
     static void initFileSystem();
+    static void ensureBootDirs();
     static bool mountSDCard();
+    // Runtime automount: while the FS is offline (card-less boot, no USB root),
+    // probe for an inserted SD card; on the tick it comes online mount it,
+    // create the dir tree, set fsMount/SDReady and return true. Throttle calls.
+    static bool automountSD();
     static void unmountSDCard();
     // Boot-time guard for remembered "USB:/..." paths (disk mounts, tape):
     // they are reopened before the main loop ever pumps tuh_task, so the stick

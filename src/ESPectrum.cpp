@@ -90,6 +90,11 @@ extern size_t getFreeHeap(void);
 #if !PICO_RP2040
 extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
 extern "C" volatile bool profi_ds80_active;
+#ifdef KBDUSB
+// C-linkage query from hid_app.cpp; declared at file scope because a linkage
+// specification ("C") is not permitted at block scope.
+extern "C" bool usb_keyboard_mounted(void);
+#endif
 #endif
 
 //=======================================================================================
@@ -2195,9 +2200,6 @@ void ESPectrum::loop() {
   //    is caught before the delay, so a normal reset never flashes the prompt.
   {
       extern void repeat_me_for_input();
-#ifdef KBDUSB
-      extern "C" bool usb_keyboard_mounted(void);
-#endif
       auto Kbd = PS2Controller.keyboard();
 
       const uint32_t FR_PROMPT_DELAY_US = 400000;   // fast R-hold skips the prompt
@@ -2360,6 +2362,26 @@ void ESPectrum::loop() {
         }
     }
 #endif
+
+    // SD automount: when the machine booted with no card (fsMount==false, and no
+    // USB stick took over as root), probe periodically for one being inserted.
+    // On the tick it comes online we mount it live — the OSD menus and file
+    // dialogs gate on fsMount at render time, so they light up without a reboot.
+    // We deliberately DON'T reload Config here: video-mode / arch settings from
+    // the card can only be applied by a reboot, so live use keeps the RAM
+    // defaults and only enables file access + the remembered disk mounts.
+    if (!FileUtils::fsMount && !FileUtils::usbRoot) {
+        static uint64_t sd_probe_at = 0;   // next allowed probe (throttle)
+        uint64_t now = time_us_64();
+        if (now >= sd_probe_at) {
+            sd_probe_at = now + 2000000ull; // ~2 s between probes (each is a few ms)
+            if (FileUtils::automountSD()) {
+                Config::loadDiskMounts();   // restore remembered disk images
+                Tape::LoadRemembered();     // and the remembered tape
+                OSD::osdCenteredMsg(MSG_SD_AUTOMOUNT[Config::lang], LEVEL_INFO, 1500);
+            }
+        }
+    }
 
     // GS-Z80 runs on core1 alongside pcm_call(); core0 only reads the ring.
 
