@@ -140,7 +140,7 @@ uint8_t  Config::zifi_transport = 0; // 0=GPIO UART, 1=USB-CDC
 uint32_t Config::zifi_baud = 115200;
 string   Config::wifi_ssid;
 string   Config::wifi_pass;
-bool     Config::wifi_autoconnect = false;
+bool     Config::wifi_enabled = false;
 signed char Config::wifi_tz = 0;
 string   Config::net_host;
 string   Config::net_user;
@@ -537,7 +537,7 @@ void Config::loadMb02DiskMounts() {
 void Config::loadWifiConfig() {
     wifi_ssid.clear();
     wifi_pass.clear();
-    wifi_autoconnect = false;
+    wifi_enabled = false;
     wifi_tz = 0;
     FIL* f = fopen2(WIFI_CFG_PATH, FA_READ);
     if (!f) f = fopen2(WIFI_CFG_PATH_OLD, FA_READ); // legacy location
@@ -554,7 +554,7 @@ void Config::loadWifiConfig() {
                 string val = line.substr(eq + 1);
                 if (key == "ssid")        wifi_ssid = val;
                 else if (key == "pass")   wifi_pass = val;
-                else if (key == "autoconnect") wifi_autoconnect = (val == "1" || val == "true");
+                else if (key == "autoconnect") wifi_enabled = (val == "1" || val == "true");
                 else if (key == "tz")     wifi_tz = (signed char)atoi(val.c_str());
                 else if (key == "net_host")  net_host = val;
                 else if (key == "net_user")  net_user = val;
@@ -587,7 +587,7 @@ void Config::saveWifiConfig() {
                      "net_host=%s\nnet_user=%s\nnet_port=%u\nnet_proto=%u\nbaud=%u\n"
                      "net_dl=%s\nnet_ul=%s\ncatalog_host=%s\ncatalog_port=%u\nlast_loc=%s\n",
                      wifi_ssid.c_str(), wifi_pass.c_str(),
-                     (int)wifi_tz, wifi_autoconnect ? 1 : 0,
+                     (int)wifi_tz, wifi_enabled ? 1 : 0,
                      net_host.c_str(), net_user.c_str(),
                      (unsigned)net_port, (unsigned)net_proto, (unsigned)zifi_baud,
                      net_dl_dir.c_str(), net_ul_dir.c_str(),

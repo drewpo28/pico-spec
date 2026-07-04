@@ -7121,12 +7121,23 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 string st_ssid, st_ip;
                 auto refreshNetStatus = [&]() {
                     st_ssid.clear(); st_ip.clear();
-                    // Query when the ESP is in use — NIC on, or already connected (e.g.
-                    // the boot SNTP auto-connect, or a connect from the WiFi menu while
-                    // the NIC toggle is off). Avoids powering up the ESP just by opening
-                    // the menu when networking was never started.
-                    st_conn = (Config::zifi_enabled || ZiFiAT::connected)
+                    // Query when WiFi is in use — WiFi enabled, or already connected (e.g.
+                    // the boot SNTP auto-connect still settling). Keyed on WiFi, not the
+                    // NIC: the NIC is a layer on top and never the reason networking is up.
+                    // Avoids powering up the ESP just by opening the menu when WiFi is off.
+                    st_conn = (Config::wifi_enabled || ZiFiAT::connected)
                               && ZiFiAT::getStatus(st_ssid, st_ip);
+                };
+                // After a transport/baud change re-established the UART link, make sure WiFi
+                // is associated again. Normally the ESP keeps its association across a host
+                // UART reconfigure and getStatus() above confirms it — but if the change
+                // dropped the link, re-associate from the saved credentials. We're in menu
+                // context with the Z80 paused, so a blocking connect is safe.
+                auto reconnectWifiIfNeeded = [&]() {
+                    if (Config::wifi_enabled && !ZiFiAT::connected && !Config::wifi_ssid.empty()) {
+                        ZiFiAT::connect(Config::wifi_ssid, Config::wifi_pass);
+                        refreshNetStatus();
+                    }
                 };
 
                 // ── ESP-01S hardware/config pickers (level 3, under the ESP01 submenu) ──
@@ -7187,7 +7198,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         if ((conflict || wasUsb != nowUsb) &&
                             OSD::msgDialog(MENU_ZIFI_TRANSPORT_TITLE[Config::lang],
                                            OSD_DLG_APPLYREBOOT[Config::lang]) == DLG_YES)
-                            OSD::esp_hard_reset();
+                            OSD::esp_hard_reset();  // never returns
+                        // No reboot (or declined) → recover the WiFi link on the new transport.
+                        reconnectWifiIfNeeded();
                     }
                 };
                 auto pickBaud = [&]() {
@@ -7209,6 +7222,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             // Apply now whenever the link is up (NIC or WiFi), not just for the NIC.
                             if (ZiFi::linkUp()) { ZiFi::deinit(); ZiFi::init(); }
                             refreshNetStatus();
+                            reconnectWifiIfNeeded();  // recover the link if the baud switch dropped it
                         }
                     }
                 };
@@ -7270,10 +7284,26 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 };
                 // ── WiFi connect/disconnect (level 2 list) ──
                 auto doWifi = [&]() {
-                    if (st_conn) {
-                        string msg = st_ip + "  " + string(MSG_WIFI_DISCONNECT_Q[Config::lang]);
-                        if (OSD::msgDialog(st_ssid, msg) == DLG_YES) {
+                    if (Config::wifi_enabled) {
+                        // WiFi is on → this row turns it off. Show the live IP when the ESP
+                        // is associated; otherwise just confirm the switch-off (enabled but
+                        // offline — e.g. autoconnect hasn't finished / AP out of range).
+                        string title = st_conn ? st_ssid : string("WiFi");
+                        string msg   = (st_conn ? st_ip + "  " : string())
+                                     + string(MSG_WIFI_DISCONNECT_Q[Config::lang]);
+                        if (OSD::msgDialog(title, msg) == DLG_YES) {
                             ZiFiAT::disconnect();
+                            Config::wifi_enabled = false;
+                            // The NIC is purely a layer on top of WiFi — it cannot stay on
+                            // once WiFi is off. Drop it too (NVS-persisted separately).
+                            if (Config::zifi_enabled) {
+                                Config::zifi_enabled = 0;
+                                ZiFi::enabled = 0;
+                                Config::save();
+                            }
+                            // Nobody left using the shared UART link → tear it down.
+                            if (!ZiFiAT::connected) ZiFi::deinit();
+                            Config::saveWifiConfig();
                             OSD::osdCenteredMsg(MSG_WIFI_DISCONNECTED[Config::lang], LEVEL_INFO, 1500);
                         }
                     } else {
@@ -7329,7 +7359,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             ZiFiAT::syncTime(Config::wifi_tz, when); // streamed too
                         ZiFiAT::log_cb = nullptr;
                         if (cst == ZiFiAT::OK) {
-                            Config::wifi_ssid = chosen; Config::wifi_pass = pass; Config::wifi_autoconnect = true;
+                            Config::wifi_ssid = chosen; Config::wifi_pass = pass; Config::wifi_enabled = true;
                             Config::saveWifiConfig();
                             wifiLogLine(MSG_WIFI_CONNECTED[Config::lang]);
                             sleep_ms(900);                   // brief, then auto-close on success
@@ -7345,6 +7375,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 };
                 // ── ZiFi NIC on/off (level 2) ──
                 auto doNic = [&]() {
+                    // The NIC is only the guest-port (0xEF/16550) emulation layered on top
+                    // of WiFi — it can't be enabled while WiFi is off (and WiFi-off already
+                    // forces it off), so there's nothing to toggle. Point the user at WiFi.
+                    if (!Config::wifi_enabled) {
+                        OSD::osdCenteredMsg(Config::lang ? "Active WiFi primero"
+                                                         : "Enable WiFi first", LEVEL_WARN, 2500);
+                        return;
+                    }
                     menu_level = 2; menu_saverect = true; menu_curopt = Config::zifi_enabled + 1;
                     uint8_t zn = menuRun(MENU_ZIFI_NIC[Config::lang]);
                     if (zn > 0) {
@@ -7393,6 +7431,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     } else if (ZiFiAT::autoSyncBusy()) {
                         // Boot auto-connect (CWJAP→SNTP) still running — don't claim "Off".
                         st = "WiFi connecting...";
+                    } else if (Config::wifi_enabled) {
+                        // Enabled by the user but not currently associated (out of range /
+                        // autoconnect not run yet). Still "on" — selecting the row turns it off.
+                        st = "WiFi On (offline)";
                     } else st = "WiFi Off";
                     if (st.size() < 32) st.append(32 - st.size(), ' '); else st.resize(32);
 

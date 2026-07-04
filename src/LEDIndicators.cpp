@@ -227,7 +227,7 @@ bool isVisible(Id i) {
 #endif
         case ULAPLUS:    return Config::ulaplus;
         case GIGASCREEN: return Config::gigascreen_enabled;
-        case NET:        return Config::zifi_enabled != 0;
+        case NET:        return Config::wifi_enabled != 0; // networking is WiFi-driven (NIC requires it)
 #else
         case SD: case ZCTRL: case IDE: case MIDI:
         case SAA: case TIMEX: case DMA: case GS:

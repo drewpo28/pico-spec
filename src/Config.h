@@ -256,7 +256,11 @@ public:
     static uint32_t zifi_baud;  // ESP-01S UART rate (115200 default; raised via AT+UART_CUR)
     static string wifi_ssid;
     static string wifi_pass;
-    static bool wifi_autoconnect;
+    // WiFi master switch: owns host networking (FTP/SSH/WEB), is the prerequisite for
+    // the ZiFi NIC, and (with a saved SSID) triggers the boot auto-connect. Fully
+    // independent of the NIC — the NIC never brings WiFi up. Persisted in wifi.cfg
+    // under the legacy key "autoconnect" so pre-existing configs migrate for free.
+    static bool wifi_enabled;
     static signed char wifi_tz; // SNTP timezone offset in hours (wifi.cfg key "tz")
     // Network file-transfer client (Network → File transfer). Stored in wifi.cfg.
     // Passwords are NOT persisted (re-prompted each session).

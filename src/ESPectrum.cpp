@@ -1023,7 +1023,9 @@ void ESPectrum::setup() {
     // Profi forces ~80 KB of SRAM pages and OOMs at VIDEO::Init if the NIC's heap
     // rings (~12 KB) are also up — so never bring ZiFi up on Profi, regardless of a
     // stale zifi_enabled. (The menu also turns the NIC off when switching to Profi.)
-    ZiFi::enabled = Config::zifi_enabled && Config::arch != "Profi";
+    // The NIC also requires WiFi to be enabled — it is purely the guest-port
+    // emulation layer on top of WiFi, never a standalone networking switch.
+    ZiFi::enabled = Config::zifi_enabled && Config::wifi_enabled && Config::arch != "Profi";
     if (ZiFi::enabled)
         ZiFi::init();
 #endif
@@ -2305,12 +2307,12 @@ void ESPectrum::loop() {
     // the run so the ESP has time to auto-reconnect; then stepped each loop tick.
     static bool     rtc_autosync_begun = false;
     static uint32_t rtc_autosync_at    = 0;
-    // Reconnect WiFi at boot whenever the user left it connected (wifi_autoconnect),
-    // independent of the RTC — otherwise the only reconnect path was the SNTP sync,
-    // so with RTC off the link stayed down and the menu always showed "WiFi Off".
-    // The background state machine also runs SNTP, which is harmless when RTC is off.
-    if (!Config::wifi_ssid.empty() && Config::arch != "Profi" &&
-        (Config::wifi_autoconnect || (ZiFi::enabled && Config::rtc_enabled))) {
+    // Reconnect WiFi at boot whenever WiFi is enabled and an SSID is saved. This is
+    // driven ONLY by the WiFi switch — the NIC is no longer a trigger (it used to
+    // pull WiFi up as a side effect via `ZiFi::enabled && rtc_enabled`, which is
+    // exactly the leak that made FTP/SSH work only with the NIC on). The background
+    // state machine also runs SNTP, harmless when RTC is off.
+    if (!Config::wifi_ssid.empty() && Config::arch != "Profi" && Config::wifi_enabled) {
         if (!rtc_autosync_begun) {
             uint32_t now = to_ms_since_boot(get_absolute_time());
             if (rtc_autosync_at == 0) rtc_autosync_at = now + 4000;
