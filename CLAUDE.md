@@ -347,6 +347,22 @@ Port low byte `0xEF`; high address byte = register. Gated by `Config::zifi_enabl
 - **Picker**: Network → first row `GPIO x/y` (or `GPIO Off`, `(def)` suffix when unset) → submenu listing `Off` + each board pair with a note (what it displaces, e.g. "off: NESPAD"). On select: save + `ZiFi::deinit()/init()` if NIC on. `BoardPins` is the reusable home for board pin-maps (extend for MIDI etc.).
 - **Yield-at-boot**: when a chosen pair shares pins with a peripheral (non-empty note), ZiFi has priority — at boot each conflicting peripheral calls `BoardPins::zifiOwnsPin(pin)` and **skips its own init** if ZiFi owns it: NESPAD (`main.cpp`, moved after `Config::load`, gated by `nespad_active`), MIDI (`ESPectrum.cpp` `Midi::enabled=0`), WAV (`pwm_audio.cpp` skip `inInit`), PCM5122 (`pwm_audio.cpp` skip I2S), AY-clock (`PinSerialData_595.c` via `extern "C" board_zifi_owns_pin`). The displaced peripheral only releases pins at boot, so selecting a conflicting pair **or** enabling the NIC with a conflicting default prompts `OSD_DLG_APPLYREBOOT` (`BoardPins::zifiActiveNote()` non-empty). Defaults that conflict by design: MURM2/PICO_PC 20/21 = NESPAD, MURM1_P2 16/17 = NESPAD.
 
+### Baud ceilings (transport-dependent, `src/ZiFi.cpp`)
+
+- Menu (Network → Baud) offers 115200/230400/460800/921600; the link idles at
+  `nicSafeBaud()` and paused host sessions (FTP/HTTPS/SSH) `boostBaud()` to the
+  configured rate.
+- **GPIO UART**: NIC (live Z80) ceiling `ZIFI_NIC_MAX_BAUD=230400` (hw-found: RX-IRQ
+  starvation above). Boost unclamped — 921600 (~92 KB/s) hw-verified.
+- **USB-CDC** (`Config::zifi_transport==1`): everything clamped to
+  `ZIFI_CDC_MAX_BAUD=460800` — the RP2350 host drains bulk IN at ~64 KB/s (1 packet
+  per 1 ms frame, same pacing that caps USB MSC), so 921600 out of the ESP overruns
+  the CH340's ~256 B internals mid-chunk regardless of FIFO sizes. NIC ceiling on CDC
+  is also 460800 (`ZIFI_NIC_MAX_BAUD_USB` — no RX IRQ to starve; 8 KB TinyUSB FIFO
+  ≈ 180 ms cushion; not hw-confirmed yet, revert to 230400 if guest AT flakes).
+- Net effect: **for max download speed prefer GPIO UART at 921600; USB-CDC tops out
+  at 460800 (~46 KB/s)** — the dongle is a pin-saver, not a speed-up.
+
 ## USB flash stick (MSC host → FatFs volume "USB:")
 
 RP2350-only (`CFG_TUH_MSC` gated on `PICO_RP2350` in tusb_config.h; RP2040 keeps

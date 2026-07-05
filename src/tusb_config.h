@@ -116,12 +116,16 @@
 // mbedTLS work) — unlike the UART path there's no IRQ-context drain upstream of it:
 // once it fills, the IN endpoint stops being re-armed and the CH340's ~256 B
 // internals overflow SILENTLY (tu_edpt_stream_read_xfer requires ≥64 B of FIFO room
-// to re-arm). Size for the MAX menu rate 921600 (~92 KB/s, applied via AT+UART_CUR +
-// tuh_cdc_set_baudrate): 8 KB tolerates ~89 ms of stall — enough for the TLS
-// handshake compute gaps and (with Ftp.cpp's 4 KB write slicing) SD writes; 4 KB
-// (~44 ms) still lost bytes on both at ≥460800. MURM1_P2 (the board-define fallback)
-// is SRAM-tight — Profi leaves ~10 KB heap and this BSS is spent even with ZiFi
-// off — so it keeps 2 KB (~22 ms): practical ceiling there is 230400-460800.
+// to re-arm). The FIFO only cushions tuh_task() STALLS — it cannot fix a wire-rate
+// deficit: the RP2350 host drains bulk IN at ~64 KB/s (1 packet/frame, same pacing
+// that caps USB MSC), so 921600 (~92 KB/s) overruns the CH340 no matter the size and
+// every CDC rate is clamped to 460800 (ZIFI_CDC_MAX_BAUD in ZiFi.cpp). Sized for
+// that max rate 460800 (~46 KB/s, applied via AT+UART_CUR + tuh_cdc_set_baudrate):
+// 8 KB tolerates ~178 ms of stall — enough for the TLS handshake compute gaps and
+// (with Ftp.cpp's 4 KB write slicing) SD writes; 4 KB (~89 ms) still lost bytes on
+// both at 460800 in hw testing. MURM1_P2 (the board-define fallback) is SRAM-tight —
+// Profi leaves ~10 KB heap and this BSS is spent even with ZiFi off — so it keeps
+// 2 KB (~44 ms): practical ceiling there is 230400.
 #if defined(MURM2) || defined(PICO_PC) || defined(PICO_DV) || defined(ZERO2)
 #define CFG_TUH_CDC_RX_BUFSIZE      8192
 #define CFG_TUH_CDC_TX_BUFSIZE      8192

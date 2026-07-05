@@ -45,13 +45,21 @@ extern size_t getFreeHeap(void);
 // NIC OK at 230400, breaks above.
 #define ZIFI_NIC_MAX_BAUD 230400
 
-// The rate the link idles at (for the NIC): the configured rate, clamped to the
-// live-emulation ceiling. Equals the configured rate when it's already NIC-safe,
-// so boost/restore become no-ops and nothing changes for ≤230400 setups.
-static uint32_t nicSafeBaud() {
-    uint32_t want = Config::zifi_baud ? Config::zifi_baud : ZIFI_BAUD;
-    return want < ZIFI_NIC_MAX_BAUD ? want : ZIFI_NIC_MAX_BAUD;
-}
+// USB-CDC transport ceiling — for EVERY rate on that path, boosted host sessions
+// included. The RP2350 native USB host drains bulk IN at ~64 KB/s (~1 × 64 B packet
+// per 1 ms SOF frame — the same hw-measured pacing that caps USB MSC, see
+// benchFsSpeed in OSDMain.cpp). 460800 (~46 KB/s) fits under that drain rate;
+// 921600 (~92 KB/s) exceeds it, so the dongle's UART side outruns USB and the
+// CH340's ~256 B internals overflow SILENTLY mid-burst (one 2 KB CIPRECVDATA chunk
+// builds ~600 B of backlog) — a wire-rate deficit no FIFO size can absorb.
+#define ZIFI_CDC_MAX_BAUD 460800
+
+// Live-NIC ceiling for the CDC path. The 230400 UART ceiling above came from RX-IRQ
+// starvation, which CDC doesn't have: RX is pumped from the main loop into the
+// TinyUSB rx FIFO (8 KB ≈ 180 ms of cushion at 460800, vs ~350 µs of UART FIFO), so
+// the NIC can idle at the full CDC-safe rate. NOT hw-confirmed yet — if the guest AT
+// handshake proves flaky over USB, drop this back to ZIFI_NIC_MAX_BAUD.
+#define ZIFI_NIC_MAX_BAUD_USB ZIFI_CDC_MAX_BAUD
 
 // Runtime UART selection — pins come from Config (resolved via BoardPins), not a
 // compile-time #define. g_uart == nullptr means no physical UART (OFF/invalid):
@@ -90,6 +98,15 @@ static const int    g_cdc_idx  = -1;
 #endif
 // The physical ESP link is up if either transport is active.
 static inline bool linkActive() { return g_uart != nullptr || g_usb_mode; }
+
+// The rate the link idles at (for the NIC): the configured rate, clamped to the
+// live-emulation ceiling of the active transport. Equals the configured rate when
+// it's already NIC-safe, so boost/restore become no-ops for ≤ceiling setups.
+static uint32_t nicSafeBaud() {
+    uint32_t want = Config::zifi_baud ? Config::zifi_baud : ZIFI_BAUD;
+    uint32_t cap  = g_usb_mode ? ZIFI_NIC_MAX_BAUD_USB : ZIFI_NIC_MAX_BAUD;
+    return want < cap ? want : cap;
+}
 
 // Switch the ESP-01S (and our UART) to `target` baud. Uses the volatile
 // AT+UART_CUR so it never persists in ESP flash — every fresh boot the ESP is
@@ -178,6 +195,13 @@ static void zifi_set_baud_live(uint32_t target) {
 void ZiFi::boostBaud() {
     if (!linkActive()) return;
     uint32_t t = Config::zifi_baud ? Config::zifi_baud : ZIFI_BAUD;
+    if (g_usb_mode && t > ZIFI_CDC_MAX_BAUD) {
+        // 921600 over CDC can only lose bytes (see ZIFI_CDC_MAX_BAUD) — cap the
+        // boost instead of honoring the menu value; the GPIO UART path is unclamped.
+        Debug::log("ZiFi: baud %u clamped to %u (USB host bulk drain ~64 KB/s)",
+                   (unsigned)t, (unsigned)ZIFI_CDC_MAX_BAUD);
+        t = ZIFI_CDC_MAX_BAUD;
+    }
     if (t == g_cur_baud) return;                 // already at full rate (config ≤ NIC-safe)
     zifi_set_baud_live(t);
     Debug::log("ZiFi: baud boost %u (host session)", (unsigned)g_cur_baud);
