@@ -408,6 +408,15 @@ MSC off + `CFG_TUH_DEVICE_MAX 5`). NOT hw-confirmed yet.
   (burst multiple packets/frame) could raise it. USB stick = fine for browsing /
   small files, slow for big loads; use SD for speed. Speed Test's 0.06 MB/s is
   the honest number.
+  **That rewrite now exists upstream**: TinyUSB 0.21.0 (June 2026) reworked the
+  RP2 HCD — "EPX for non-interrupt endpoints + ping-pong double buffering". Try
+  it via `-DPICO_TINYUSB_PATH=<tinyusb-0.21 checkout>` (see the CMakeLists block
+  before `pico_sdk_init`; our sources are 0.21-compatible — only
+  `usbh_class_driver_t::open` changed signature, shimmed in `xinput_host.h`).
+  NOT hw-tested yet — measure with Speed Test, regression keyboard+pad+CDC (the
+  `usbService` pumping model was tuned against the old driver). FS bulk absolute
+  ceiling ≈ 1.2 MB/s (19 × 64 B/frame). If it holds, it also lifts the USB-CDC
+  ~64 KB/s drain cap (→ `ZIFI_CDC_MAX_BAUD` could go back up).
 - **diskio dispatch**: `drivers/sdcard/sdcard.c` routes `pdrv==1` to `usb_disk_*`
   in `src/UsbMsc.cpp` (TinyUSB `tuh_msc_read10/write10` made synchronous by pumping
   a guarded `tuh_task()` — same re-entrancy rules as ZiFi's `usbService()`; NEVER
