@@ -114,11 +114,29 @@ void __tusb_irq_path_func(rp2usb_reset_transfer)(hw_endpoint_t *ep) {
 #endif
 }
 
+// PICO-SPEC PATCH (upstream hathach/tinyusb#3533 / #3602): count of stale-AVAILABLE
+// disarms in host mode — readable from the app for diagnostics.
+volatile uint32_t rp2usb_stale_avail_fixups = 0;
+
 void __tusb_irq_path_func(bufctrl_write32)(io_rw_32 *buf_reg, uint32_t value) {
   const uint32_t current    = *buf_reg;
   const uint32_t avail_mask = USB_BUF_CTRL_AVAIL | (USB_BUF_CTRL_AVAIL << 16);
   if (current & value & avail_mask) {
-    panic("buf_ctrl @ 0x%lX already available", (uintptr_t)buf_reg);
+    // PICO-SPEC PATCH (upstream #3533/#3602): host-mode error completions
+    // (RX_TIMEOUT/STALL paths in hcd_rp2040_irq) finish the EPX transfer via
+    // xfer_complete_isr() WITHOUT disarming the buffer — STOP_TRANS aborted the
+    // transaction, so the controller never consumed it and AVAILABLE stays set.
+    // The next transfer submitted on EPX (hw-hit: a control stage right after a
+    // failed bulk, tuh_cdc_set_baudrate vs streaming CDC IN) then tripped this
+    // guard and panicked the whole firmware. The stale bit is a leftover, not a
+    // live transaction (the SIE is stopped) — disarm and continue. Device mode
+    // keeps the panic: there a double-arm is a genuine logic error.
+    if (rp2usb_is_host_mode()) {
+      rp2usb_stale_avail_fixups++;
+      *buf_reg = 0;
+    } else {
+      panic("buf_ctrl @ 0x%lX already available", (uintptr_t)buf_reg);
+    }
   }
   *buf_reg = value & ~(USB_BUF_CTRL_AVAIL | (USB_BUF_CTRL_AVAIL << 16)); // write other bits first
 
@@ -136,7 +154,14 @@ void __tusb_irq_path_func(bufctrl_write32)(io_rw_32 *buf_reg, uint32_t value) {
 void __tusb_irq_path_func(bufctrl_write16)(io_rw_16 *buf_reg16, uint16_t value) {
   const uint16_t current = *buf_reg16;
   if (current & value & USB_BUF_CTRL_AVAIL) {
-    panic("buf_ctrl @ 0x%lX already available", (uintptr_t)buf_reg16);
+    // PICO-SPEC PATCH: see bufctrl_write32 above — same stale-AVAILABLE leftover
+    // after host-mode error completions; disarm and continue in host mode.
+    if (rp2usb_is_host_mode()) {
+      rp2usb_stale_avail_fixups++;
+      *buf_reg16 = 0;
+    } else {
+      panic("buf_ctrl @ 0x%lX already available", (uintptr_t)buf_reg16);
+    }
   }
   *buf_reg16 = value & (uint16_t)~USB_BUF_CTRL_AVAIL; // write other bits first
 

@@ -421,8 +421,15 @@ MSC off + `CFG_TUH_DEVICE_MAX 5`). NOT hw-confirmed yet.
   Speed Test jumped to **0.89 MB/s rd / 0.75 MB/s wr** (~15×, near the FS-bulk
   theoretical ≈1.2 MB/s). TinyUSB 0.21 is **vendored at `external/tinyusb`**
   (subset: LICENSE, src/, hw/bsp/rp2040 + family_support) and is the default via
-  `PICO_TINYUSB_PATH` set before `pico_sdk_init` — every build gets the fast HCD;
-  `-DPICO_TINYUSB_PATH=...` on the cmake line still overrides for experiments.
+  `PICO_TINYUSB_PATH` set before `pico_sdk_init` — every build gets the fast HCD.
+  **The vendored copy carries LOCAL PATCHES — grep `PICO-SPEC PATCH` before
+  re-vendoring/upgrading!** Patch 1 (rp2040_usb.c, hw-hit 2026-07-06): host-mode
+  error completions (RX_TIMEOUT/STALL in hcd_rp2040_irq) finish the EPX transfer
+  without disarming its buffer → the next EPX submit hit `panic("buf_ctrl ...
+  already available")` (upstream #3533/#3602; hit as control-vs-bulk collision:
+  tuh_cdc_set_baudrate while CDC IN streamed after a machine reset). Patched to
+  disarm-and-continue in host mode (`rp2usb_stale_avail_fixups` counts) — device
+  mode keeps the panic.
   Source compat: `usbh_class_driver_t::open` returns consumed length on 0.21+
   (version-gated shim in `xinput_host.h`) and `ps2kbd_mrmltr.cpp` needs its own
   `<cstdio>` (printf leaked transitively from ≤0.18 tusb headers). Still pending:
