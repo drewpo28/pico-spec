@@ -90,11 +90,12 @@ extern size_t getFreeHeap(void);
 #if !PICO_RP2040
 extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
 extern "C" volatile bool profi_ds80_active;
+#endif
 #ifdef KBDUSB
 // C-linkage query from hid_app.cpp; declared at file scope because a linkage
-// specification ("C") is not permitted at block scope.
+// specification ("C") is not permitted at block scope. ALL platforms — the
+// factory-reset probe uses it on RP2040 (MURM/ZERO) KBDUSB builds too.
 extern "C" bool usb_keyboard_mounted(void);
-#endif
 #endif
 
 //=======================================================================================

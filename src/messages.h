@@ -2328,6 +2328,10 @@ const uint8_t ESPectrum_logo[] = {
 };
 
 
+// Runtime SD automount toast — ALL platforms (the probe runs on RP2040 too, so
+// this must live OUTSIDE the RP2350-only network block below).
+static const char *MSG_SD_AUTOMOUNT[2]       = { "SD card mounted",  "Tarjeta SD montada" };
+
 // ─── ZiFi / Network menu strings ─────────────────────────────────────────────
 #if !PICO_RP2040
 
@@ -2416,7 +2420,6 @@ static const char *MSG_NET_REFRESHING[2]     = { "Refreshing...",    "Actualizan
 
 // ─── F5 location picker + saved-remotes manager ─────────────────────────────
 static const char *MENU_F5_LOCATION[2]       = { "Open from",        "Abrir desde"        };
-static const char *MSG_SD_AUTOMOUNT[2]       = { "SD card mounted",  "Tarjeta SD montada" };
 static const char *MSG_F5_LOCAL[2]           = { "Local (SD)",       "Local (SD)"         };
 static const char *MSG_F5_USB[2]             = { "USB Drive",        "Unidad USB"         };
 static const char *MSG_F5_REMOTE[2]          = { "Remote (FTP/SFTP)","Remoto (FTP/SFTP)"  };
