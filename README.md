@@ -63,7 +63,8 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - TR-DOS auto-boot: optionally inject a boot loader into TRD/SCL images that lack one, so downloaded disks auto-start (Storage → Betadisk → Auto-boot) (RP2350 only).
 - IDE/HDD emulation: NEMO and Profi schemes, HDF / raw .hdd / Fixed VHD images, create-empty-image helper, mounted from the Storage → IDE/HDD menu (RP2350 only).
 - MB-02+ disk interface emulation: WD2797 FDC, Z80-DMA, 512KB SRAM paging, BS-DOS 308, MBD disk images, 4 drives, NMI menu (RP2350 only).
-- USB flash drive support: browse and load images from a USB mass-storage stick (mounted as a FatFs `USB:` volume); appears as a location in the F5 file browser and, when no SD card is present at boot, becomes the default storage (RP2350 only).
+- USB flash drive support: browse and load images from a USB mass-storage stick (mounted as a FatFs `USB:` volume) at ~0.9 MB/s; appears as a location in the F5 file browser and, when no SD card is present at boot, becomes the default storage (RP2350 only).
+- SD card hot-insert: a card inserted after boot is mounted automatically, no reboot needed.
 - esxDOS support (DivMMC, DivIDE, DivSD) — [esxdos.org](https://esxdos.org/index.html).
 - Z-Controller emulation: raw SD card access via ports #57/#77, mutually exclusive with esxDOS and MB-02+ (RP2350 only).
 - FDD activity LED indicator and mechanical head click/seek sound emulation (optional, toggled via Betadisk menu).
@@ -89,7 +90,7 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - Complete OSD menu in two languages: English & Spanish.
 - On-screen LED indicators: real-time overlay showing FDD activity, SD card, IDE/HDD, MIDI TX, tape, network (ZiFi TX/RX), and other port-driven hardware states.
 - Volume boost: configurable audio amplification (0–64) in the Audio menu.
-- Factory reset: hold R at boot to wipe all settings and restore defaults (with confirmation prompt).
+- Factory reset: hold R at boot to wipe all settings and restore defaults — an on-screen prompt guides the hold window, works with PS/2 and USB keyboards (with confirmation prompt).
 - BMP screen capture to SD Card (thanks David Crespo 😉).
 
 ## Byte Emulation Details (https://zxbyte.org/)

@@ -95,6 +95,12 @@
 // Size of buffer to hold descriptors and other data used for enumeration
 #define CFG_TUH_ENUMERATION_BUFSIZE 1024
 
+// A failed TU_ASSERT executes a bkpt instruction whenever a debug probe is
+// attached, freezing the session on every RECOVERABLE assert (e.g. cdc_host's
+// get_itf(TUSB_INDEX_INVALID) while a dongle re-enumerates). Route TinyUSB's
+// breakpoint to a counting no-op instead — g_tusb_assert_count in main.cpp.
+#define CFG_TUSB_DEBUG_BREAKPOINT picospec_tusb_assert_hook
+
 #define CFG_TUH_XINPUT                 1 //
 #define CFG_TUH_HUB                 1 // number of supported hubs
 // CDC host: one serial adapter at a time (the ESP-01 bridge). The vendor serial
@@ -133,6 +139,13 @@
 #define CFG_TUH_CDC_RX_BUFSIZE      2048
 #define CFG_TUH_CDC_TX_BUFSIZE      2048
 #endif
+// CFG_TUH_CDC_RX_EPSIZE stays at the default 64 (one packet per armed transfer).
+// 512 was tried to let bursts chain through the double-buffered EPX without
+// tuh_task — it did move data, but the CH340's constant SHORT packets through the
+// ping-pong buffers delivered CORRUPTED bytes (hw 2026-07-06: MRF page rendered
+// as garbage, rx counters clean). Multi-packet RX is only safe for full-packet
+// sources (MSC); serial dongles must stay single-packet. Burst survival is
+// handled by cdcPump()'s three call sites instead (see ZiFi.cpp).
 #else
 #define CFG_TUH_CDC                 0
 #endif

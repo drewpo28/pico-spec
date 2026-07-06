@@ -30,7 +30,7 @@
 #if CFG_TUSB_MCU == OPT_MCU_RP2040 && (CFG_TUD_ENABLED || CFG_TUH_ENABLED)
 
   #include <stdlib.h>
-  #include "rp2040_usb.h"
+  #include "portable/raspberrypi/rp2040/rp2040_usb.h"
 
   #include "device/dcd.h"
   #include "host/hcd.h"
@@ -114,23 +114,16 @@ void __tusb_irq_path_func(rp2usb_reset_transfer)(hw_endpoint_t *ep) {
 #endif
 }
 
-// PICO-SPEC PATCH (upstream hathach/tinyusb#3533 / #3602): count of stale-AVAILABLE
-// disarms in host mode — readable from the app for diagnostics.
+// PICO-SPEC PATCH: count of host-mode stale-AVAILABLE disarms (see below).
 volatile uint32_t rp2usb_stale_avail_fixups = 0;
 
 void __tusb_irq_path_func(bufctrl_write32)(io_rw_32 *buf_reg, uint32_t value) {
   const uint32_t current    = *buf_reg;
   const uint32_t avail_mask = USB_BUF_CTRL_AVAIL | (USB_BUF_CTRL_AVAIL << 16);
   if (current & value & avail_mask) {
-    // PICO-SPEC PATCH (upstream #3533/#3602): host-mode error completions
-    // (RX_TIMEOUT/STALL paths in hcd_rp2040_irq) finish the EPX transfer via
-    // xfer_complete_isr() WITHOUT disarming the buffer — STOP_TRANS aborted the
-    // transaction, so the controller never consumed it and AVAILABLE stays set.
-    // The next transfer submitted on EPX (hw-hit: a control stage right after a
-    // failed bulk, tuh_cdc_set_baudrate vs streaming CDC IN) then tripped this
-    // guard and panicked the whole firmware. The stale bit is a leftover, not a
-    // live transaction (the SIE is stopped) — disarm and continue. Device mode
-    // keeps the panic: there a double-arm is a genuine logic error.
+    // PICO-SPEC PATCH: in host mode a leftover AVAILABLE (aborted/errored EPX
+    // transfer) must not brick the firmware — disarm and continue, counted in
+    // rp2usb_stale_avail_fixups. Device mode keeps the panic (genuine bug there).
     if (rp2usb_is_host_mode()) {
       rp2usb_stale_avail_fixups++;
       *buf_reg = 0;
@@ -145,7 +138,7 @@ void __tusb_irq_path_func(bufctrl_write32)(io_rw_32 *buf_reg, uint32_t value) {
   // Don't need delay in host mode as host is in charge of when to start the transaction.
   if (value & (USB_BUF_CTRL_AVAIL | (USB_BUF_CTRL_AVAIL << 16))) {
     if (!rp2usb_is_host_mode()) {
-      busy_wait_at_least_cycles(12);
+      busy_wait_at_least_cycles(24);
     }
     *buf_reg = value; // then set AVAILABLE bit last
   }
@@ -154,8 +147,7 @@ void __tusb_irq_path_func(bufctrl_write32)(io_rw_32 *buf_reg, uint32_t value) {
 void __tusb_irq_path_func(bufctrl_write16)(io_rw_16 *buf_reg16, uint16_t value) {
   const uint16_t current = *buf_reg16;
   if (current & value & USB_BUF_CTRL_AVAIL) {
-    // PICO-SPEC PATCH: see bufctrl_write32 above — same stale-AVAILABLE leftover
-    // after host-mode error completions; disarm and continue in host mode.
+    // PICO-SPEC PATCH: see bufctrl_write32 above.
     if (rp2usb_is_host_mode()) {
       rp2usb_stale_avail_fixups++;
       *buf_reg16 = 0;
@@ -168,7 +160,7 @@ void __tusb_irq_path_func(bufctrl_write16)(io_rw_16 *buf_reg16, uint16_t value) 
   // Section 4.1.2.7.1 (rp2040) / 12.7.3.7.1 (rp2350) Concurrent access
   if (value & USB_BUF_CTRL_AVAIL) {
     if (!rp2usb_is_host_mode()) {
-      busy_wait_at_least_cycles(12);
+      busy_wait_at_least_cycles(24);
     }
     *buf_reg16 = value; // then set AVAILABLE bit last
   }

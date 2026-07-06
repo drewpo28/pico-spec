@@ -1254,6 +1254,12 @@ extern "C" uint8_t linkVGA01;
 #endif
 extern "C" int testPins(uint32_t pin0, uint32_t pin1);
 
+// TinyUSB routes failed TU_ASSERTs here instead of a bkpt instruction (see
+// CFG_TUSB_DEBUG_BREAKPOINT in tusb_config.h) — a bkpt freezes every debug
+// session on recoverable asserts (dongle re-enumeration). Count and move on.
+volatile uint32_t g_tusb_assert_count = 0;
+extern "C" void picospec_tusb_assert_hook(void) { g_tusb_assert_count++; }
+
 int main() {
     flash_info();
 #ifdef PICO_RP2040

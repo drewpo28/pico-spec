@@ -601,11 +601,16 @@ void ZiFi::deinit() {
 // guest drivers miss their short post-command poll windows (MRF's AT handshake
 // never completed), and mid-frame +IPD bursts get truncated while the guest is
 // busy rendering (hw 2026-07-06: MRF's 1412-byte gopher page lost ~800 bytes).
-// cdcPump() closes both gaps — it is driven, rate-limited to ~1 kHz, from every
-// otherwise-unpumped stretch of the frame:
-//   - CPU::loop, every ~3500 guest T-states (active emulation, via cdcNicActive);
+// cdcPump() closes the gaps — it is driven, rate-limited to ~1 kHz, from every
+// otherwise-unpumped stretch of the frame; ALL THREE call sites are load-bearing
+// (removing any one re-broke MRF on hw, 2026-07-06):
+//   - the guest's ZiFi port reads (ZiFi::read / uart16550Read) — the ONLY pump
+//     inside Z80::exec_nocheck(), which runs most of the frame with no
+//     per-instruction checks;
+//   - CPU::loop, every ~3500 guest T-states — covers the INT window and frame
+//     tail (the checked while-loops), where exec_nocheck doesn't run;
 //   - ESPectrum::loop frame-pacing waits (v-sync spin / idle delay — the longest
-//     gaps, up to ~13 ms, and where the CH340 actually overflowed).
+//     gaps, up to ~13 ms).
 volatile bool ZiFi::cdcNicActive = false;
 
 void __not_in_flash("zifi") ZiFi::cdcPump() {
@@ -620,6 +625,12 @@ void __not_in_flash("zifi") ZiFi::cdcPump() {
 }
 
 uint8_t __not_in_flash("zifi") ZiFi::read(uint8_t hi) {
+    // NOT redundant with the CPU::loop hook (learned the hard way, 2026-07-06):
+    // most of each frame executes inside Z80::exec_nocheck() — the fast path with
+    // no per-instruction checks — where the CPU::loop pump never runs. The guest's
+    // own port polls (this function) are the ONLY pump there; removing this call
+    // reintroduced ~15 ms unpumped gaps and CH340 overflows mid +IPD burst.
+    cdcPump();
     if (hi <= 0xBF) {
         // DR read: pop from RX FIFO (ring + SD swap). 0xFF if nothing available.
         int b = rxPop();
@@ -690,6 +701,27 @@ void __not_in_flash("zifi") ZiFi::tick() {
             if (tx) tuh_cdc_write_flush(g_cdc_idx);
         }
         if (tx) LED::touchW(LED::NET);
+        // 1 Hz counter snapshot while traffic moves or queues back up — cheap and
+        // proven invaluable for CDC-link debugging (shows which direction died);
+        // the harmful part of the old diag was the per-byte trace, not this.
+        {
+            static uint32_t next_us = 0, ptx = 0, prx = 0;
+            uint32_t now = time_us_32();
+            if ((int32_t)(now - next_us) >= 0) {
+                next_us = now + 1000000;
+                uint8_t outq = fifo_fill(zifi_out_head, zifi_out_tail);
+                if (tx_bytes != ptx || rx_bytes != prx || outq || in_fill()) {
+                    extern volatile uint32_t rp2usb_stale_avail_fixups;
+                    extern volatile uint32_t g_tusb_assert_count;
+                    Debug::log("ZiFi CDC: tx=%u rx=%u drop=%u outq=%u inq=%u stale=%u assert=%u",
+                               (unsigned)tx_bytes, (unsigned)rx_bytes, (unsigned)rx_dropped,
+                               (unsigned)outq, (unsigned)in_fill(),
+                               (unsigned)rp2usb_stale_avail_fixups,
+                               (unsigned)g_tusb_assert_count);
+                    ptx = tx_bytes; prx = rx_bytes;
+                }
+            }
+        }
         return;
     }
 #endif
@@ -780,6 +812,7 @@ size_t ZiFi::recvRaw(uint8_t* buf, size_t maxlen) {
 //   1 IER     (DLAB=0) or DLM (DLAB=1)
 //   2 IIR(r)/FCR(w)   3 LCR   4 MCR   5 LSR   6 MSR   7 SCR
 uint8_t __not_in_flash("zifi") ZiFi::uart16550Read(uint8_t reg_hi) {
+    cdcPump();   // load-bearing — see the comment in ZiFi::read
     switch (reg_hi & 0x07) {
         case 0: { // RBR / DLL
             if (u16550_lcr & 0x80) return u16550_dll;

@@ -364,14 +364,25 @@ Port low byte `0xEF`; high address byte = register. Gated by `Config::zifi_enabl
   hw-proven value; higher untested since cdcPump landed (possible follow-up).
 - **Live NIC over CDC requires `ZiFi::cdcPump()` (hw-confirmed 2026-07-06, fixed
   "MRF hangs on USB")**: CDC has no RX IRQ — every 64 B IN transfer needs a
-  tuh_task() pass to re-arm the endpoint (bigger EP buffers don't help: CH340
-  answers with short packets), and the CH340 holds only ~256 B ≈ 11 ms at 230400.
-  With only the per-frame ZiFi::tick (20 ms) MRF's AT handshake missed every
-  poll window and +IPD bursts were truncated (~800 of 1412 bytes lost while MRF
-  rendered). cdcPump (~1 kHz, self-rate-limited) is driven from CPU::loop
-  (`cdcNicActive`, every ~3500 T-states) AND from ESPectrum::loop's frame-pacing
-  waits (v-sync spin / idle delay — the longest unpumped gaps, where the CH340
-  actually overflowed). No-op on GPIO UART and RP2040.
+  tuh_task() pass to re-arm the endpoint, and the CH340 holds only ~256 B ≈ 11 ms
+  at 230400. With only the per-frame ZiFi::tick (20 ms) MRF's AT handshake missed
+  every poll window and +IPD bursts were truncated. cdcPump (~1 kHz,
+  self-rate-limited) has THREE call sites and **ALL THREE are load-bearing**
+  (removing any one re-broke MRF on hw):
+  (1) guest ZiFi port reads (`ZiFi::read`/`uart16550Read`) — the ONLY pump inside
+  `Z80::exec_nocheck()`, which runs MOST of each frame with no per-instruction
+  checks (removing this as "redundant with the CPU::loop hook" was exactly the
+  regression);
+  (2) CPU::loop every ~3500 T-states (`cdcNicActive`) — covers the checked
+  while-loops (INT window + frame tail) where exec_nocheck doesn't run;
+  (3) ESPectrum::loop frame-pacing waits (v-sync spin / idle delay, up to ~13 ms).
+  No-op on GPIO UART and RP2040.
+- **Do NOT raise `CFG_TUH_CDC_RX_EPSIZE` above 64 for serial dongles**
+  (hw 2026-07-06): 512 made multi-packet IN transfers chain through the
+  double-buffered EPX, but the CH340's constant SHORT packets through the
+  ping-pong buffers delivered CORRUPTED data (MRF page = garbage, counters
+  clean — no drops, wrong bytes). Multi-packet RX is for full-packet sources
+  (MSC) only.
 - FTP **upload** over CDC is much slower than download at the same baud — that's
   not the link rate: `sock_send`/chanSend pays an AT+CIPSEND `>`-prompt +
   "SEND OK" round-trip per ~2 KB chunk, so upload is handshake-bound. Raising
@@ -422,14 +433,27 @@ MSC off + `CFG_TUH_DEVICE_MAX 5`). NOT hw-confirmed yet.
   theoretical ≈1.2 MB/s). TinyUSB 0.21 is **vendored at `external/tinyusb`**
   (subset: LICENSE, src/, hw/bsp/rp2040 + family_support) and is the default via
   `PICO_TINYUSB_PATH` set before `pico_sdk_init` — every build gets the fast HCD.
-  **The vendored copy carries LOCAL PATCHES — grep `PICO-SPEC PATCH` before
-  re-vendoring/upgrading!** Patch 1 (rp2040_usb.c, hw-hit 2026-07-06): host-mode
-  error completions (RX_TIMEOUT/STALL in hcd_rp2040_irq) finish the EPX transfer
-  without disarming its buffer → the next EPX submit hit `panic("buf_ctrl ...
-  already available")` (upstream #3533/#3602; hit as control-vs-bulk collision:
-  tuh_cdc_set_baudrate while CDC IN streamed after a machine reset). Patched to
-  disarm-and-continue in host mode (`rp2usb_stale_avail_fixups` counts) — device
-  mode keeps the panic.
+  **The vendored copy DIVERGES from the 0.21.0 tag — grep `PICO-SPEC PATCH` and
+  read this before re-vendoring/upgrading!**
+  (a) `hcd_rp2040.c` + `rp2040_usb.c` are REPLACED with Rumbledethumps' rewritten
+  host driver from picocomputer/rp6502 (`vendor/tinyusb_rp6502`, the author of
+  upstream issue #3533) — fixes the silicon quirk family the stock 0.21 driver
+  panics on: shared EPX/interrupt-EP handshake latches (false RX_TIMEOUT /
+  DATA_SEQ_ERROR while a keyboard poll is in flight → `panic("Data Seq Error")`
+  and dongle re-enumeration loops), interrupt-poll suppression around EPX
+  transactions, DATA_SEQ-before-BUFF_STATUS ordering, working abort/close, EP0
+  MPS tracking per device. Both hw-hit here as whole-firmware panics with ZiFi
+  CDC streaming + machine reset + keyboard.
+  (b) On top, `rp2040_usb.c` `bufctrl_write32/16` are patched to
+  disarm-and-continue in HOST mode on a stale AVAILABLE (leftover of an
+  errored/aborted EPX transfer, upstream #3533/#3602 — was
+  `panic("buf_ctrl ... already available")`, whole firmware down);
+  `rp2usb_stale_avail_fixups` counts, device mode keeps the panic.
+  (c) TU_ASSERT's bkpt is routed to a counting no-op (`CFG_TUSB_DEBUG_BREAKPOINT`
+  in tusb_config.h → `g_tusb_assert_count` in main.cpp) — otherwise every
+  recoverable assert freezes attached-debugger sessions.
+  Diagnostics: the ZiFi 1 Hz `ZiFi CDC:` console line reports tx/rx/drop/queues +
+  the stale/assert counters.
   Source compat: `usbh_class_driver_t::open` returns consumed length on 0.21+
   (version-gated shim in `xinput_host.h`) and `ps2kbd_mrmltr.cpp` needs its own
   `<cstdio>` (printf leaked transitively from ≤0.18 tusb headers). Still pending:
