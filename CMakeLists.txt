@@ -188,19 +188,12 @@ if (ZIFI_NET_CLIENT AND NOT PICO_PLATFORM STREQUAL "rp2040")
     set(PICO_MBEDTLS_CONFIG_FILE "${CMAKE_CURRENT_LIST_DIR}/src/mbedtls_config_picospec.h")
 endif ()
 
-# USB host throughput experiment: the SDK-bundled TinyUSB (≤0.20) paces host bulk
-# transfers at ~1 × 64 B packet per 1 ms frame → USB MSC (and CDC) cap out near
-# ~64 KB/s. TinyUSB 0.21.0 reworked the RP2 HCD (EPX for non-interrupt endpoints +
-# ping-pong double buffering), which may lift that ceiling. To try it, build
-# against an external checkout — the SDK honors this natively:
-#   git clone --branch 0.21.0 --depth 1 https://github.com/hathach/tinyusb
-#   cmake ... -DPICO_TINYUSB_PATH=/abs/path/to/tinyusb
-# Our sources are 0.21-compatible (see xinput_host.h open() shim). Measure with
-# OSD → Speed Test (USB rd/wr) and regression-test keyboard+pad+CDC together —
-# the pumping model (usbService guards) was tuned against the old driver.
-if (PICO_TINYUSB_PATH)
-    message(STATUS "pico-spec: building against external TinyUSB at ${PICO_TINYUSB_PATH}")
-endif ()
+# TinyUSB 0.21.0 vendored at external/tinyusb (subset: LICENSE, src/, hw/bsp/
+# rp2040 + family_support — what the SDK's tinyusb glue consumes). Must be set
+# BEFORE pico_sdk_init(): the SDK-bundled TinyUSB (0.18 in SDK 2.2.0) paces host
+# bulk at ~1 × 64 B packet per 1 ms frame, capping USB MSC/CDC near ~64 KB/s;
+# the 0.21 RP2 HCD rework lifts Speed Test to 0.89/0.75 MB/s (hw-confirmed).
+set(PICO_TINYUSB_PATH ${CMAKE_CURRENT_LIST_DIR}/external/tinyusb)
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()

@@ -355,10 +355,13 @@ Port low byte `0xEF`; high address byte = register. Gated by `Config::zifi_enabl
 - **GPIO UART**: NIC (live Z80) ceiling `ZIFI_NIC_MAX_BAUD=230400` (hw-found: RX-IRQ
   starvation above). Boost unclamped — 921600 (~92 KB/s) hw-verified.
 - **USB-CDC** (`Config::zifi_transport==1`): everything clamped to
-  `ZIFI_CDC_MAX_BAUD=460800` — the RP2350 host drains bulk IN at ~64 KB/s (1 packet
-  per 1 ms frame, same pacing that caps USB MSC), so 921600 out of the ESP overruns
-  the CH340's ~256 B internals mid-chunk regardless of FIFO sizes. NIC ceiling on CDC
-  is also 460800 (`ZIFI_NIC_MAX_BAUD_USB` — no RX IRQ to starve; 8 KB TinyUSB FIFO
+  `ZIFI_CDC_MAX_BAUD=460800`. Original reason: TinyUSB ≤0.20 host drains bulk IN at
+  ~64 KB/s (1 packet/frame), so 921600 out of the ESP overruns the CH340's ~256 B
+  internals mid-chunk regardless of FIFO sizes. On a TinyUSB-0.21 build that
+  host-side limit is GONE (hw: MSC 0.89 MB/s) — but keep the clamp until re-tested:
+  the CH340 chip itself silently drops sustained RX well below 921600 (see
+  esp01_usb_cdc_transport memory), a separate constraint. NIC ceiling on CDC is
+  also 460800 (`ZIFI_NIC_MAX_BAUD_USB` — no RX IRQ to starve; 8 KB TinyUSB FIFO
   ≈ 180 ms cushion; not hw-confirmed yet, revert to 230400 if guest AT flakes).
 - Net effect: **for max download speed prefer GPIO UART at 921600; USB-CDC tops out
   at 460800 (~46 KB/s)** — the dongle is a pin-saver, not a speed-up.
@@ -398,25 +401,24 @@ MSC off + `CFG_TUH_DEVICE_MAX 5`). NOT hw-confirmed yet.
   empty live state (paths "not saved"). Every such site calls
   `FileUtils::waitVolumeReady(path)` first (pumps up to 3 s for "USB:" paths,
   no-op otherwise). Stick truly absent → reopen skipped, like a deleted SD file.
-- **Throughput ceiling ~64 KB/s — DON'T re-investigate** (hw-measured on m1p2):
-  the RP2350 native USB host transfers bulk data at ~1 packet (64 B) per 1 ms SOF
-  frame, so USB MSC is hard-capped near 0.05–0.06 MB/s **regardless of block
-  size**. Proven: one 32 KB (64-sector) `read10` took 558 ms — identical to 64
-  single-sector reads (639 ms). It is NOT the block size, NOT the FatFs path, NOT
-  the stick, NOT the Speed Test — it's the host controller (E15-style frame
-  pacing; the batching lever does nothing). Only a vendor `hcd_rp2040` rewrite
-  (burst multiple packets/frame) could raise it. USB stick = fine for browsing /
-  small files, slow for big loads; use SD for speed. Speed Test's 0.06 MB/s is
-  the honest number.
-  **That rewrite now exists upstream**: TinyUSB 0.21.0 (June 2026) reworked the
-  RP2 HCD — "EPX for non-interrupt endpoints + ping-pong double buffering". Try
-  it via `-DPICO_TINYUSB_PATH=<tinyusb-0.21 checkout>` (see the CMakeLists block
-  before `pico_sdk_init`; our sources are 0.21-compatible — only
-  `usbh_class_driver_t::open` changed signature, shimmed in `xinput_host.h`).
-  NOT hw-tested yet — measure with Speed Test, regression keyboard+pad+CDC (the
-  `usbService` pumping model was tuned against the old driver). FS bulk absolute
-  ceiling ≈ 1.2 MB/s (19 × 64 B/frame). If it holds, it also lifts the USB-CDC
-  ~64 KB/s drain cap (→ `ZIFI_CDC_MAX_BAUD` could go back up).
+- **Throughput: ~64 KB/s cap SOLVED by TinyUSB 0.21 (hw-confirmed 2026-07-06,
+  PICO_DV)**. The old cap: TinyUSB ≤0.20 (SDK 2.2.0 bundles 0.18) moves bulk data
+  at ~1 packet (64 B) per 1 ms SOF frame → USB MSC hard-capped at 0.05–0.06 MB/s
+  regardless of block size (one 32 KB read10 = 558 ms ≈ 64 single-sector reads;
+  not the block size / FatFs / stick — the HCD). TinyUSB **0.21.0** reworked the
+  RP2 HCD ("EPX for non-interrupt endpoints + ping-pong double buffering") and
+  Speed Test jumped to **0.89 MB/s rd / 0.75 MB/s wr** (~15×, near the FS-bulk
+  theoretical ≈1.2 MB/s). TinyUSB 0.21 is **vendored at `external/tinyusb`**
+  (subset: LICENSE, src/, hw/bsp/rp2040 + family_support) and is the default via
+  `PICO_TINYUSB_PATH` set before `pico_sdk_init` — every build gets the fast HCD;
+  `-DPICO_TINYUSB_PATH=...` on the cmake line still overrides for experiments.
+  Source compat: `usbh_class_driver_t::open` returns consumed length on 0.21+
+  (version-gated shim in `xinput_host.h`) and `ps2kbd_mrmltr.cpp` needs its own
+  `<cstdio>` (printf leaked transitively from ≤0.18 tusb headers). Still pending:
+  long-run regression keyboard+pad+CDC together (the `usbService` pumping model
+  was tuned on the old driver); revisiting `ZIFI_CDC_MAX_BAUD=460800` — the
+  host-side ~64 KB/s drain limit is gone, but the CH340's own sustained-RX
+  ceiling is a separate constraint, so re-test before raising.
 - **diskio dispatch**: `drivers/sdcard/sdcard.c` routes `pdrv==1` to `usb_disk_*`
   in `src/UsbMsc.cpp` (TinyUSB `tuh_msc_read10/write10` made synchronous by pumping
   a guarded `tuh_task()` — same re-entrancy rules as ZiFi's `usbService()`; NEVER
