@@ -46,20 +46,21 @@ extern size_t getFreeHeap(void);
 #define ZIFI_NIC_MAX_BAUD 230400
 
 // USB-CDC transport ceiling — for EVERY rate on that path, boosted host sessions
-// included. The RP2350 native USB host drains bulk IN at ~64 KB/s (~1 × 64 B packet
-// per 1 ms SOF frame — the same hw-measured pacing that caps USB MSC, see
-// benchFsSpeed in OSDMain.cpp). 460800 (~46 KB/s) fits under that drain rate;
-// 921600 (~92 KB/s) exceeds it, so the dongle's UART side outruns USB and the
-// CH340's ~256 B internals overflow SILENTLY mid-burst (one 2 KB CIPRECVDATA chunk
-// builds ~600 B of backlog) — a wire-rate deficit no FIFO size can absorb.
-#define ZIFI_CDC_MAX_BAUD 460800
+// included. With TinyUSB <=0.20 the host drained bulk IN at ~64 KB/s (1 x 64 B
+// packet per 1 ms frame), so 921600 (~92 KB/s) out of the ESP overran the CH340's
+// ~256 B internals mid-burst and the ceiling was 460800 (hw-confirmed working).
+// The vendored TinyUSB 0.21 HCD drains ~0.9 MB/s (see external/tinyusb), so the
+// full menu rate fits with headroom. 921600-over-CDC not hw-confirmed yet — a drop
+// shows up as Ftp::get rx_dropped/short-transfer retries; revert to 460800 if so.
+#define ZIFI_CDC_MAX_BAUD 921600
 
-// Live-NIC ceiling for the CDC path. The 230400 UART ceiling above came from RX-IRQ
-// starvation, which CDC doesn't have: RX is pumped from the main loop into the
-// TinyUSB rx FIFO (8 KB ≈ 180 ms of cushion at 460800, vs ~350 µs of UART FIFO), so
-// the NIC can idle at the full CDC-safe rate. NOT hw-confirmed yet — if the guest AT
-// handshake proves flaky over USB, drop this back to ZIFI_NIC_MAX_BAUD.
-#define ZIFI_NIC_MAX_BAUD_USB ZIFI_CDC_MAX_BAUD
+// Live-NIC ceiling for the CDC path: same 230400 as the UART one. The NIC over
+// CDC only works at all with cdcPump() (see below) — the "460800 breaks MRF"
+// observation of 2026-07-06 predates the pump (MRF was broken at EVERY rate
+// then), so higher NIC rates over CDC are simply UNTESTED with the pump in
+// place. 230400 is the hw-proven value; raising this is a possible follow-up.
+// Boosted host sessions are unaffected (full menu rate, emu paused).
+#define ZIFI_NIC_MAX_BAUD_USB ZIFI_NIC_MAX_BAUD
 
 // Runtime UART selection — pins come from Config (resolved via BoardPins), not a
 // compile-time #define. g_uart == nullptr means no physical UART (OFF/invalid):
@@ -483,6 +484,7 @@ void ZiFi::init() {
     // downstream (FIFO/16550/AT/spill) is unchanged.
     if (Config::zifi_transport == 1) {
         g_usb_mode = true;
+        cdcNicActive = true;   // CPU::loop starts driving cdcPump()
         g_uart = nullptr; g_tx = g_rx = BoardPins::PIN_OFF;
         g_cur_baud = ZIFI_BAUD;
         g_cdc_idx = -1;
@@ -576,6 +578,7 @@ void ZiFi::deinit() {
         g_cur_baud = ZIFI_BAUD;   // even if the downshift failed (unplugged dongle)
     }
     g_usb_mode = false;
+    cdcNicActive = false;
     g_cdc_idx  = -1;
 #endif
     rxReset();                         // close/delete swap file, clear buffers
@@ -587,6 +590,34 @@ void ZiFi::deinit() {
 }
 
 // ─── Port register access ────────────────────────────────────────────────────
+
+// Live-NIC servicing for the CDC transport. Over GPIO UART the RX IRQ lands ESP
+// bytes in the ring within microseconds and TX drains per frame — fine. Over CDC
+// BOTH directions only move when tuh_task() runs: each completed 64 B IN transfer
+// needs a tuh_task pass to re-arm the endpoint (CFG_TUH_CDC_RX_EPSIZE=64, and the
+// CH340 answers with short packets so bigger EP buffers don't help), and the
+// dongle's ~256 B internals overflow ~14 ms after the wire stops at 230400. The
+// per-frame ZiFi::tick() (~20 ms) is therefore not enough for the live NIC:
+// guest drivers miss their short post-command poll windows (MRF's AT handshake
+// never completed), and mid-frame +IPD bursts get truncated while the guest is
+// busy rendering (hw 2026-07-06: MRF's 1412-byte gopher page lost ~800 bytes).
+// cdcPump() closes both gaps — it is driven, rate-limited to ~1 kHz, from every
+// otherwise-unpumped stretch of the frame:
+//   - CPU::loop, every ~3500 guest T-states (active emulation, via cdcNicActive);
+//   - ESPectrum::loop frame-pacing waits (v-sync spin / idle delay — the longest
+//     gaps, up to ~13 ms, and where the CH340 actually overflowed).
+volatile bool ZiFi::cdcNicActive = false;
+
+void __not_in_flash("zifi") ZiFi::cdcPump() {
+#if CFG_TUH_CDC
+    if (!g_usb_mode) return;
+    static uint32_t last_us = 0;
+    uint32_t now = time_us_32();
+    if (now - last_us < 1000) return;
+    last_us = now;
+    ZiFi::tick();   // drains the TX ring to CDC + pumps tuh_task (RX → ring)
+#endif
+}
 
 uint8_t __not_in_flash("zifi") ZiFi::read(uint8_t hi) {
     if (hi <= 0xBF) {

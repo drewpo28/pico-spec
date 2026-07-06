@@ -2730,15 +2730,33 @@ void ESPectrum::loop() {
     totalsecondsnodelay += elapsed;
 
     if (!maxSpeed) {
+      // ZiFi over USB-CDC: the frame-pacing waits below are the longest no-pump
+      // windows in the whole loop (up to ~13 ms busy-NOP) — long enough for a
+      // mid-burst +IPD to overflow the CH340's ~256 B internals (hw: MRF's gopher
+      // page truncated at the same offset every run). Keep servicing the host
+      // stack while we wait; cdcPump() self-limits to ~1 kHz and is a no-op on
+      // the GPIO UART transport.
       if (Config::v_sync_enabled) {
-        for (;;)
+        for (;;) {
+#if !PICO_RP2040
+          if (ZiFi::cdcNicActive) ZiFi::cdcPump();
+#endif
           if (v_sync) {
             v_sync = false;
             break;
           }
+        }
       } else {
         if (idle > 0) {
-          delayMicroseconds(idle);
+#if !PICO_RP2040
+          if (ZiFi::cdcNicActive) {
+            int64_t e = (int64_t)time_us_64() + idle;
+            while ((int64_t)time_us_64() < e) ZiFi::cdcPump();
+          } else
+#endif
+          {
+            delayMicroseconds(idle);
+          }
         }
       }
     }

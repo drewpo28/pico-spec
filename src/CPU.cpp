@@ -45,6 +45,9 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Debug.h"
 #include "Z80DMA.h"
 #if !PICO_RP2040
+#include "ZiFi.h"
+#endif
+#if !PICO_RP2040
 #include "DivMMC.h"
 #endif
 
@@ -258,10 +261,20 @@ IRAM_ATTR void CPU::loop() {
         Z80::execute();
         Z80::doNMI();
     }
+#if !PICO_RP2040
+    // ZiFi over USB-CDC: service the host stack mid-frame (~1 kHz) even while the
+    // guest isn't touching the ZiFi ports — see ZiFi::cdcPump(). The cadence check
+    // costs one compare per instruction, same class as the dma_mode check below.
+    uint32_t zifi_pump_due = tstates + 3500; // ~1 ms at 3.5 MHz guest clock
+#endif
     while (tstates < IntEnd) {
         Z80::execute();
 #if !PICO_RP2040
         if (Config::dma_mode) Z80DMA::handleDMA();
+        if (ZiFi::cdcNicActive && tstates >= zifi_pump_due) {
+            zifi_pump_due = tstates + 3500;
+            ZiFi::cdcPump();
+        }
 #endif
         BREAKPOINTS
     }
@@ -279,6 +292,10 @@ IRAM_ATTR void CPU::loop() {
         Z80::execute();
 #if !PICO_RP2040
         if (Config::dma_mode) Z80DMA::handleDMA();
+        if (ZiFi::cdcNicActive && tstates >= zifi_pump_due) {
+            zifi_pump_due = tstates + 3500;
+            ZiFi::cdcPump();
+        }
 #endif
         BREAKPOINTS
     }

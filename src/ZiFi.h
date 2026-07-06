@@ -23,6 +23,14 @@ public:
     // Drain ZIFI-out FIFO → UART TX; call from main loop / emulator tick
     static void tick();
 
+    // USB-CDC transport only: true while the NIC link runs over the CDC dongle.
+    // CPU::loop polls it per instruction (same cost class as Config::dma_mode) to
+    // drive cdcPump() — the CDC path has no RX IRQ, so without a fine-grained
+    // tuh_task pump a mid-frame +IPD burst overflows the CH340's ~256 B internals
+    // whenever the guest stops touching the ZiFi ports (e.g. MRF rendering text).
+    static volatile bool cdcNicActive;
+    static void cdcPump();   // rate-limited (~1 kHz) tuh_task pump + TX drain
+
     static uint8_t enabled; // 0=Off 1=On (mirrors Config::zifi_enabled at runtime)
 
     // Expose for ZiFiAT raw access (bypasses FIFO, direct UART)

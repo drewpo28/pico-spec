@@ -354,17 +354,28 @@ Port low byte `0xEF`; high address byte = register. Gated by `Config::zifi_enabl
   configured rate.
 - **GPIO UART**: NIC (live Z80) ceiling `ZIFI_NIC_MAX_BAUD=230400` (hw-found: RX-IRQ
   starvation above). Boost unclamped — 921600 (~92 KB/s) hw-verified.
-- **USB-CDC** (`Config::zifi_transport==1`): everything clamped to
-  `ZIFI_CDC_MAX_BAUD=460800`. Original reason: TinyUSB ≤0.20 host drains bulk IN at
-  ~64 KB/s (1 packet/frame), so 921600 out of the ESP overruns the CH340's ~256 B
-  internals mid-chunk regardless of FIFO sizes. On a TinyUSB-0.21 build that
-  host-side limit is GONE (hw: MSC 0.89 MB/s) — but keep the clamp until re-tested:
-  the CH340 chip itself silently drops sustained RX well below 921600 (see
-  esp01_usb_cdc_transport memory), a separate constraint. NIC ceiling on CDC is
-  also 460800 (`ZIFI_NIC_MAX_BAUD_USB` — no RX IRQ to starve; 8 KB TinyUSB FIFO
-  ≈ 180 ms cushion; not hw-confirmed yet, revert to 230400 if guest AT flakes).
-- Net effect: **for max download speed prefer GPIO UART at 921600; USB-CDC tops out
-  at 460800 (~46 KB/s)** — the dongle is a pin-saver, not a speed-up.
+- **USB-CDC** (`Config::zifi_transport==1`): boost ceiling `ZIFI_CDC_MAX_BAUD` is
+  **921600** since the vendored TinyUSB 0.21 (host bulk drain ~0.9 MB/s — the old
+  ≤0.20 driver drained ~64 KB/s, which overran the CH340's ~256 B internals above
+  460800 and was the original clamp reason; 460800 hw-confirmed working, incl. FTP
+  download). 921600-over-CDC pending hw-confirm — a CH340 drop shows as Ftp::get
+  rx_dropped/short-transfer retries; revert to 460800 if it flakes. NIC (live Z80)
+  ceiling on CDC = **230400, same as UART** (`ZIFI_NIC_MAX_BAUD_USB`) — the
+  hw-proven value; higher untested since cdcPump landed (possible follow-up).
+- **Live NIC over CDC requires `ZiFi::cdcPump()` (hw-confirmed 2026-07-06, fixed
+  "MRF hangs on USB")**: CDC has no RX IRQ — every 64 B IN transfer needs a
+  tuh_task() pass to re-arm the endpoint (bigger EP buffers don't help: CH340
+  answers with short packets), and the CH340 holds only ~256 B ≈ 11 ms at 230400.
+  With only the per-frame ZiFi::tick (20 ms) MRF's AT handshake missed every
+  poll window and +IPD bursts were truncated (~800 of 1412 bytes lost while MRF
+  rendered). cdcPump (~1 kHz, self-rate-limited) is driven from CPU::loop
+  (`cdcNicActive`, every ~3500 T-states) AND from ESPectrum::loop's frame-pacing
+  waits (v-sync spin / idle delay — the longest unpumped gaps, where the CH340
+  actually overflowed). No-op on GPIO UART and RP2040.
+- FTP **upload** over CDC is much slower than download at the same baud — that's
+  not the link rate: `sock_send`/chanSend pays an AT+CIPSEND `>`-prompt +
+  "SEND OK" round-trip per ~2 KB chunk, so upload is handshake-bound. Raising
+  baud barely moves it; fixing it means bigger send chunks or pipelining CIPSEND.
 
 ## USB flash stick (MSC host → FatFs volume "USB:")
 
