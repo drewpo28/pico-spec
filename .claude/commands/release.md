@@ -9,7 +9,7 @@ Current PORT_VERSION (working tree): !`grep -oP 'set \(PORT_VERSION "\K[0-9.]+' 
 PORT_VERSION committed at HEAD: !`git show HEAD:CMakeLists.txt | grep -oP 'set \(PORT_VERSION "\K[0-9.]+'`
 Working tree status: !`git status --porcelain`
 HEAD vs origin: !`git fetch origin --quiet; git rev-parse HEAD; git branch --show-current; git merge-base --is-ancestor HEAD origin/$(git branch --show-current) && echo "HEAD is pushed" || echo "HEAD is NOT pushed"`
-Draft release state: !`VER=$(grep -oP 'set \(PORT_VERSION "\K[0-9.]+' CMakeLists.txt); gh release view "v$VER" -R drewpo28/pico-spec --json name,isDraft,targetCommitish,assets --template '{{.name}} draft={{.isDraft}} target={{.targetCommitish}} assets={{len .assets}}: {{range .assets}}{{.name}} {{end}}' 2>&1`
+Draft release state: !`VER=$(grep -oP 'set \(PORT_VERSION "\K[0-9.]+' CMakeLists.txt); gh release view "v$VER" -R drewpo28/pico-spec --json name,isDraft,targetCommitish,assets --template '{{.name}} draft={{.isDraft}} target={{.targetCommitish}} assets={{len .assets}}: {{range .assets}}{{.name}} {{end}}' 2>&1 || true`
 
 Steps — ALL checks must pass before asking to publish; on any failure STOP and
 report what is wrong and how to fix it (do not fix, commit or push anything
