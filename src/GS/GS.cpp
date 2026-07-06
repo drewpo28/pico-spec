@@ -138,10 +138,22 @@ static uint8_t* s_gs_ram      = nullptr;
 static uint32_t s_gs_ram_mask = 0;
 static uint32_t s_int_timer_ts = 0;
 static bool     s_int_pending  = false;
+// GS-Z80 runs from core1 (pump), while machine reset/OSD commands happen on
+// core0. Guard whole-state mutations against z80_run() being in flight; otherwise
+// F12 can reset s_cpu/rings/FIFOs halfway through an instruction and leave GS in
+// a "sometimes clean, sometimes distorted" state.
+enum : uint32_t {
+    GS_RUN_IDLE      = 0,
+    GS_RUN_PUMPING   = 1,
+    GS_RUN_RESETTING = 2,
+};
+static volatile uint32_t s_run_state = GS_RUN_IDLE;
 // Wall-clock anchor for pump(). 0 means "uninitialized — sample on next
 // pump call"; reset() clears it so a paused/restarted GS doesn't try to
 // catch up time spent paused.
 static uint32_t s_pump_last_us = 0;
+static int32_t  s_pump_credit_t = 0;
+static uint32_t s_pump_frac_t = 0;
 // s_gs_booted: set on first GS OUT(03) (end of RAM test).
 // s_gs_main_loop: set on second GS OUT(03) (end of C000 init — command
 // dispatch table ready). Also set if GS polls port 4 from main loop PCs.
@@ -234,6 +246,31 @@ static volatile uint32_t s_perf_h_bbw   = 0;
 static volatile uint32_t s_perf_h_bbr   = 0;
 static volatile uint32_t s_perf_h_spin_us = 0;     // total spinwait µs/sec in hostWriteB3
 #endif  // GS_PERF_TRACE
+
+static inline bool __not_in_flash_func(gs_try_begin_pump)() {
+    uint32_t expected = GS_RUN_IDLE;
+    return __atomic_compare_exchange_n(&s_run_state, &expected, GS_RUN_PUMPING,
+                                       false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+
+static inline void __not_in_flash_func(gs_end_pump)() {
+    __atomic_store_n(&s_run_state, GS_RUN_IDLE, __ATOMIC_RELEASE);
+}
+
+static inline void __not_in_flash_func(gs_begin_reset)() {
+    for (;;) {
+        uint32_t expected = GS_RUN_IDLE;
+        if (__atomic_compare_exchange_n(&s_run_state, &expected, GS_RUN_RESETTING,
+                                        false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            return;
+        }
+        tight_loop_contents();
+    }
+}
+
+static inline void __not_in_flash_func(gs_end_reset)() {
+    __atomic_store_n(&s_run_state, GS_RUN_IDLE, __ATOMIC_RELEASE);
+}
 
 
 
@@ -363,7 +400,23 @@ static inline zuint8 __not_in_flash_func(gs_pc_read)(uint32_t psram_off) {
     uint8_t v = s_pc_next[set];
     s_pc_next[set] = (v + 1) & (GS_PC_WAYS - 1);
     if (s_gs_use_spi) {
-        readpsram(s_pc_data[set][v], s_gs_ram_base + (line << GS_PC_LINE_BITS), GS_PC_LINE_SZ);
+        // SPI PSRAM burst reads rarely glitch under cross-core bus contention
+        // (~1e-3 per fill: byte 4, LSB — the RX DMA loses arbitration and the
+        // PIO autopush stalls mid-bit; see gs_spi_tcem_read_glitch memory).
+        // The GS firmware boot test verifies all 2 MB through this path and
+        // silently drops every page with one wrong byte (53-57 of 63 found
+        // even after the psram_spi cross-core races were fixed), and MOD
+        // streaming (ZPlayer) reads sample data through it while the host
+        // uploads. Read until two consecutive reads agree (~7 µs extra per
+        // cache miss, hit rate >98%).
+        uint32_t addr = s_gs_ram_base + (line << GS_PC_LINE_BITS);
+        readpsram(s_pc_data[set][v], addr, GS_PC_LINE_SZ);
+        for (int attempt = 0; attempt < 4; attempt++) {
+            uint8_t chk[GS_PC_LINE_SZ];
+            readpsram(chk, addr, GS_PC_LINE_SZ);
+            if (memcmp(chk, s_pc_data[set][v], GS_PC_LINE_SZ) == 0) break;
+            memcpy(s_pc_data[set][v], chk, GS_PC_LINE_SZ);
+        }
     } else {
         memcpy(s_pc_data[set][v], &s_gs_ram[line << GS_PC_LINE_BITS], GS_PC_LINE_SZ);
     }
@@ -569,6 +622,15 @@ static void __not_in_flash_func(gs_cb_out)(void* ctx, zuint16 port, zuint8 value
             GS::reg_data_gs = value;
             __dmb();  // data must be visible to core0 before setting D7
             gs_status_or(&GS::reg_status, 0x80u);
+            // Boot health indicator: the firmware reports its RAM-test result
+            // (number of good 32 KB pages) with the OUT (3),A at ROM 0x025E
+            // (callback PC = 0x0260). Must be 63 on 2 MB — anything less
+            // means PSRAM access corruption (see gs_spi_tcem_read_glitch
+            // memory: cross-core psram_spi races caused a 1..57 lottery).
+            // One log line per GS reset, ~2 ms core1 stall — harmless.
+            if (Z80_PC(s_cpu) == 0x0260) {
+                Debug::log("GS: RAM test found %u pages (of 63)", (unsigned)value);
+            }
             bool first_main = false;
             if (s_gs_booted && !s_gs_main_loop) {
                 // Second OUT(03) = C000 init done, command dispatch ready.
@@ -801,6 +863,7 @@ bool GS::init(uint32_t ram_size_bytes) {
 }
 
 void GS::deinit() {
+    gs_begin_reset();
     enabled = false;
     s_gs_ram = nullptr;
     s_gs_ram_base = 0;
@@ -813,6 +876,7 @@ void GS::deinit() {
     delete[] s_pc_data;     s_pc_data     = nullptr;
     delete[] s_pc_tag;      s_pc_tag      = nullptr;
     delete[] s_pc_next;     s_pc_next     = nullptr;
+    gs_end_reset();
 }
 
 void GS::reset() {
@@ -826,6 +890,7 @@ void GS::reset() {
         traceDump();
     }
 #endif
+    gs_begin_reset();
     reg_command = 0;
     reg_data_zx = 0;
     reg_data_gs = 0;
@@ -836,6 +901,8 @@ void GS::reset() {
     s_int_timer_ts = 0;
     s_int_pending = false;
     s_pump_last_us = 0;
+    s_pump_credit_t = 0;
+    s_pump_frac_t = 0;
     s_ring_wpos = 0;
     s_ring_rpos = 0;
     s_drain_frac = 0;
@@ -862,6 +929,7 @@ void GS::reset() {
         z80_instant_reset(&s_cpu);
         gs_trace_gs(TR_RESET, 0, reg_status);
     }
+    gs_end_reset();
 }
 
 void __not_in_flash_func(GS::topUpBudget)(int tstates) {
@@ -1022,6 +1090,7 @@ void GS::pollPerf() {
 
 void __not_in_flash_func(GS::pump)() {
     if (!enabled) return;
+    if (!gs_try_begin_pump()) return;
     GS_PERF(s_perf_pump_calls++);
     // Wall-clock-locked pacing. Independent of how fast the emulator can
     // crunch instructions — we always advance GS-Z80 time at exactly
@@ -1037,23 +1106,47 @@ void __not_in_flash_func(GS::pump)() {
     uint32_t now = time_us_32();
     if (s_pump_last_us == 0) s_pump_last_us = now;
     uint32_t dt_us = now - s_pump_last_us;
-    if (dt_us == 0) return;
+    if (dt_us == 0) {
+        gs_end_pump();
+        return;
+    }
     if (dt_us > 1000) dt_us = 1000;          // clamp: max 1 ms per pump
-    // Budget matches GS_CLOCK_HZ exactly: 13125 T/ms → INT every 350T = 37500Hz
-    int budget_t = (int)((uint32_t)dt_us * (GS_CLOCK_HZ / 1000u) / 1000u);
+    // Accumulate fractional T-states and coalesce tiny 1-us calls. At 504 MHz
+    // the core1 loop can call pump() so often that running z80_run() in 12-13T
+    // slices spends too much time in dispatch overhead; debug/perf tracing hid
+    // this by accidentally spacing calls out. Keep the exact wall-clock rate,
+    // but execute in modest chunks.
+    uint64_t scaled = (uint64_t)dt_us * (uint64_t)GS_CLOCK_HZ + s_pump_frac_t;
+    s_pump_credit_t += (int32_t)(scaled / 1000000u);
+    s_pump_frac_t = (uint32_t)(scaled % 1000000u);
     s_pump_last_us = now;
+
+    constexpr int GS_PUMP_MIN_TSTATES = 128;
+    if (s_pump_credit_t < GS_PUMP_MIN_TSTATES) {
+        gs_end_pump();
+        return;
+    }
 
     // Ring-fill safety: if consumer fell badly behind (shouldn't happen
     // when wall-clock paced), don't push more or we'll overrun.
     uint32_t used = s_ring_wpos - s_ring_rpos;
     if (used >= (GS_RING_SIZE * 7 / 8)) {
+        if (s_pump_credit_t > (int32_t)GS_INT_PERIOD) {
+            s_pump_credit_t = (int32_t)GS_INT_PERIOD;
+        }
         GS_PERF(s_perf_pump_skip++);
+        gs_end_pump();
         return;
     }
 
-    int ran = step(budget_t);
+    int ran = step(s_pump_credit_t);
+    s_pump_credit_t -= ran;
+    if (s_pump_credit_t < -(int32_t)GS_INT_PERIOD) {
+        s_pump_credit_t = -(int32_t)GS_INT_PERIOD;
+    }
     GS_PERF(s_perf_tstates += (uint32_t)ran);
     (void)ran;
+    gs_end_pump();
 }
 
 int __not_in_flash_func(GS::step)(int tstates) {
@@ -1244,6 +1337,12 @@ static inline uint8_t gs_to_u8(int32_t v) {
 }
 
 void __not_in_flash_func(GS::getLiveLR)(uint8_t& L, uint8_t& R) {
+    if (__atomic_load_n(&s_run_state, __ATOMIC_ACQUIRE) == GS_RUN_RESETTING) {
+        L = 128;
+        R = 128;
+        return;
+    }
+
     // Drain from ring with 6:5 fractional decimation (37500→31250).
     // Consumer rate: 31250 Hz (audio IRQ). Producer: 37500 Hz avg (INT).
     // Each call consumes 37500/31250 = 1.2 ring entries on average.

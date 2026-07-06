@@ -100,6 +100,16 @@ void __not_in_flash_func(psram_update_clkdiv)(void) {
 #ifdef PSRAM
     if (!__psram_sz) return; // PSRAM not present
     psram_async_join();      // never re-clock the SM with a write in flight
+#if defined(PSRAM_SPINLOCK)
+    // Serialize against a transfer running on the other core, and drain the
+    // tail of any DMA-blocking write still being clocked out (those return
+    // at DMA-finish, not transaction end) before touching the divider.
+    spin_lock_unsafe_blocking(psram_spi.spinlock);
+#endif
+    while (!pio_sm_is_tx_fifo_empty(psram_spi.pio, psram_spi.sm)) tight_loop_contents();
+    psram_spi.pio->fdebug = 1u << (PIO_FDEBUG_TXSTALL_LSB + psram_spi.sm);
+    while (!(psram_spi.pio->fdebug & (1u << (PIO_FDEBUG_TXSTALL_LSB + psram_spi.sm))))
+        tight_loop_contents();
     float sys_mhz = (float)clock_get_hz(clk_sys) / 1e6f;
     float clkdiv_f = sys_mhz / (g_psram_sck_mhz * 2.0f);
     // Round to nearest integer to guarantee a clean duty cycle.
@@ -107,6 +117,9 @@ void __not_in_flash_func(psram_update_clkdiv)(void) {
     if (clkdiv < 1.0f) clkdiv = 1.0f;
     pio_sm_set_clkdiv(psram_spi.pio, psram_spi.sm, clkdiv);
     pio_sm_clkdiv_restart(psram_spi.pio, psram_spi.sm);
+#if defined(PSRAM_SPINLOCK)
+    spin_unlock_unsafe(psram_spi.spinlock);
+#endif
 #endif
 }
 
@@ -219,6 +232,14 @@ static bool psram_memtest(void) {
 // two SM program switches cost more than the saved command bytes.
 #define PSRAM_BURST_MIN 32
 
+// tCEM cap: APS6404 allows CS low for max 8 µs — refresh is suspended while CS
+// is asserted, and sustained long bursts (16 KB single-CS ≈ 2 ms) starve
+// refresh chip-wide: OTHER cells decay, hw-observed as the GS firmware RAM
+// test dropping to 0-1 of 63 pages at 504 MHz during MemESP swap storms
+// (markers written seconds before the verify read had decayed). At SCK 63 MHz
+// one CS may carry (5+n)*8 bits ≤ 8 µs*63 MHz = 504 → n ≤ 58; use 56.
+#define PSRAM_TCEM_MAX 56u
+
 // Burst-read `total` bytes from SPI PSRAM into `dst`.
 // Large transfers go through the 32-bit-counter program: ONE CS assertion and
 // ONE DMA setup per up-to-16KB chunk (no per-31-byte command overhead, no CPU
@@ -227,7 +248,7 @@ static bool psram_memtest(void) {
 void psram_read_range(uint32_t addr, uint8_t* dst, size_t total) {
     if (psram_page_ready && total >= PSRAM_BURST_MIN) {
         while (total > 0) {
-            size_t n = (total > PSRAM_PG_SZ) ? PSRAM_PG_SZ : total;
+            size_t n = (total > PSRAM_TCEM_MAX) ? PSRAM_TCEM_MAX : total;
             psram_burst_read_one(addr, dst, n);
             addr  += n;
             dst   += n;
@@ -261,7 +282,7 @@ void psram_read_range(uint32_t addr, uint8_t* dst, size_t total) {
 void psram_write_range(uint32_t addr, const uint8_t* src, size_t total) {
     if (psram_page_ready && total >= PSRAM_BURST_MIN) {
         while (total > 0) {
-            size_t n = (total > PSRAM_PG_SZ) ? PSRAM_PG_SZ : total;
+            size_t n = (total > PSRAM_TCEM_MAX) ? PSRAM_TCEM_MAX : total;
             psram_burst_write_one(addr, src, n);
             addr  += n;
             src   += n;
@@ -318,6 +339,15 @@ static void psram_page_sm_init(PIO pio, float clkdiv, bool fudge) {
 static inline void psram_sm_switch(uint offset) {
     PIO pio = psram_spi.pio;
     uint sm = psram_spi.sm;
+    // Drain any in-flight 8-bit transaction FIRST. The DMA-blocking write ops
+    // (write8/16/32, small write chunks) return as soon as their bytes hit
+    // the TX FIFO — the SM is still clocking them out for a few µs. Clearing
+    // the FIFOs here truncated that write mid-CS: hw-confirmed as the GS
+    // firmware boot markers (write8 from core1) being shredded by core0 swap
+    // bursts — RAM test found 1-4 of 63 pages under load, 63 idle.
+    while (!pio_sm_is_tx_fifo_empty(pio, sm)) tight_loop_contents();
+    pio->fdebug = 1u << (PIO_FDEBUG_TXSTALL_LSB + sm);
+    while (!(pio->fdebug & (1u << (PIO_FDEBUG_TXSTALL_LSB + sm)))) tight_loop_contents();
     pio_sm_set_enabled(pio, sm, false);
     pio_sm_clear_fifos(pio, sm);
     pio_sm_restart(pio, sm);          // reset OSR/ISR shift counters + autopull state
@@ -464,40 +494,23 @@ static void psram_burst_write_one(uint32_t addr, const uint8_t* src, size_t n) {
 // Full 16KB page transfers (from_vram / to_vram) — thin wrappers over the burst
 // cores; the !psram_page_ready fallback stays on the 8-bit chunk path (the range
 // functions only take the burst path once psram_page_ready is set).
+// Full 16KB page transfers — now routed through the tCEM-capped range
+// functions (many short CS bursts instead of one 2 ms CS assertion, so the
+// chip can refresh between chunks; see PSRAM_TCEM_MAX).
 void psram_read_page(uint32_t addr, uint8_t* dst) {
-    if (!psram_page_ready) { psram_read_range(addr, dst, PSRAM_PG_SZ); return; }
-    psram_burst_read_one(addr, dst, PSRAM_PG_SZ);
+    psram_read_range(addr, dst, PSRAM_PG_SZ);
 }
 
 void psram_write_page(uint32_t addr, const uint8_t* src) {
-    if (!psram_page_ready) { psram_write_range(addr, src, PSRAM_PG_SZ); return; }
-    psram_burst_write_one(addr, src, PSRAM_PG_SZ);
+    psram_write_range(addr, src, PSRAM_PG_SZ);
 }
 
-// Start a 16KB page write and return while PIO+DMA clock it out (see the
-// async block above burst_read_one).  `src` must stay untouched until the
-// write is joined — MemESP keeps the frame as an unused spare until then.
+// Async single-CS 16KB page write retired together with the 16KB single-CS
+// transfers (tCEM). Kept as a synchronous alias so MemESP call sites stay
+// unchanged; if page-swap throughput ever needs the overlap back, re-add it
+// on top of tCEM-sized chunks.
 void psram_write_page_async(uint32_t addr, const uint8_t* src) {
-    if (!psram_page_ready) { psram_write_page(addr, src); return; }
-    psram_async_join();   // only one write can be in flight
-    __atomic_store_n(&g_async_state, (uint8_t)PSRAM_ASYNC_ARMING, __ATOMIC_RELEASE);
-    uint8_t cmd[4];
-    cmd[0]=0x02u;                                   // Write
-    cmd[1]=(uint8_t)(addr>>16); cmd[2]=(uint8_t)(addr>>8); cmd[3]=(uint8_t)addr;
-#if defined(PSRAM_SPINLOCK)
-    spin_lock_unsafe_blocking(psram_spi.spinlock);  // released by psram_async_join
-#endif
-    psram_sm_jump32();
-    io_rw_32 *txf32 = (io_rw_32*)&psram_spi.pio->txf[psram_spi.sm];
-    *txf32 = (4u + PSRAM_PG_SZ) * 8u;  // x = write bits (cmd+addr + 16KB)
-    *txf32 = 0;                        // y = 0 (write-only)
-    // cmd[] is a local: safe because this DMA is waited on before return.
-    dma_channel_transfer_from_buffer_now(psram_spi.write_dma_chan, cmd, 4);
-    dma_channel_wait_for_finish_blocking(psram_spi.write_dma_chan);
-    // Payload DMA left running — the drain/TXSTALL/jump8/unlock tail runs in
-    // psram_async_join() on whichever core touches PSRAM next.
-    dma_channel_transfer_from_buffer_now(psram_spi.write_dma_chan, src, PSRAM_PG_SZ);
-    __atomic_store_n(&g_async_state, (uint8_t)PSRAM_ASYNC_INFLIGHT, __ATOMIC_RELEASE);
+    psram_write_page(addr, src);
 }
 
 void psram_cleanup() {

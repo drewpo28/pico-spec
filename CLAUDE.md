@@ -71,12 +71,30 @@ Flattened from CSAAFreq, CSAANoise, CSAAEnv, CSAAAmp, CSAADevice into a single c
   SIO lines to the SPI PSRAM (MURM1 wires only MOSI/MISO); RP2350 quad goes via
   QMI. Kept with a "what enabling takes" note in psram_spi.pio.
 - **Burst API**: `psram_read_range`/`psram_write_range` (any length; ≥32 bytes →
-  single-CS transfer per up-to-16KB chunk via the 32-bit-counter PIO program,
-  ONE DMA setup, no per-31-byte command overhead; smaller → 8-bit program
+  single-CS transfers via the 32-bit-counter PIO program, chunked to
+  `PSRAM_TCEM_MAX`=56 bytes per CS to honor the APS6404 tCEM spec (CS low ≤8µs
+  — refresh is suspended while CS is asserted); smaller → 8-bit program
   31/27-byte chunks). `readpsram`/`writepsram` are aliases of the range calls
   (were per-byte loops — never reintroduce per-byte PSRAM loops: one SPI byte
   transaction costs ~57 SCK cycles + 2 DMA setups). `psram_read_page`/`write_page`
-  = 16KB wrappers over the same burst core (used by MemESP from_vram/to_vram).
+  = 16KB wrappers over the chunked range calls (used by MemESP from_vram/to_vram);
+  `psram_write_page_async` is now a synchronous alias — the fire-and-forget
+  single-CS 16KB write was retired with the tCEM cap.
+- **Cross-core safety (hw-confirmed 2026-07-06; root cause of the GS "504 MHz
+  sound lottery" — see gs_spi_tcem_read_glitch memory). Three invariants, all
+  load-bearing, never regress:**
+  (1) command scratch buffers in psram_spi.h are PER-CORE (`[get_core_num()]`)
+  — they are filled BEFORE the lock, and a shared buffer let core0/core1 tear
+  each other's address/data bytes;
+  (2) `psram_write` sends header+payload under ONE lock — splitting them lets
+  the other core's bytes be consumed as this write's payload (PIO byte-stream
+  desync, arbitrary-address corruption both ways);
+  (3) `psram_sm_switch` / `psram_update_clkdiv` DRAIN the SM (TX FIFO empty +
+  TXSTALL) before clear/restart/re-clock — DMA-blocking writes return at
+  DMA-finish while the SM is still clocking out the tail, and `clear_fifos`
+  truncated cross-core writes mid-CS (GS firmware RAM test: 1-4 of 63 pages
+  under swap load before the fix, 63/63 after; audible as garbled/absent GS
+  sound scaling with sys_clk).
 - **SCK (MURM1)**: target `PSRAM_MAX_SCK_MHZ=94` → clkdiv 2.0 at sys 378 → SCK
   94.5 MHz (integer divider, clean waveform; fractional divider = jitter =
   corruption on APS6404 — never allow one; `psram_update_clkdiv()` rounds to
@@ -86,9 +104,10 @@ Flattened from CSAAFreq, CSAANoise, CSAAEnv, CSAAAmp, CSAADevice into a single c
 - **Locking**: all transfers take the `PSRAM_SPINLOCK` (cross-core, GS on
   core1). Long single-CS bursts use the IRQ-PRESERVING lock — never hold IRQs
   off during a 16KB transfer (VGA DMA IRQ starves → monitor loses signal).
-- **tCEM caveat**: single-CS 16KB transfers hold CS low far beyond the APS6404
-  8µs tCEM spec; verified working on the shipped hardware (pre-dates the burst
-  generalization — pages always did this).
+- **tCEM**: fixed 2026-07-06 — all bursts are now ≤56 bytes per CS (≤8µs at
+  SCK 63). The old single-CS 16KB transfers (~2ms CS low) are gone; page swaps
+  are correspondingly somewhat slower (re-optimizing chunk size / restoring
+  async on top of tCEM-sized chunks is a possible follow-up).
 - **MemESP snapshot paths** (`from_file/to_file/from_mem/cleanup`) transfer via
   a malloc'd 1KB bounce (gated on `getLargestAllocatable()`, per-byte fallback
   on tight heap — pico malloc panics on OOM).
