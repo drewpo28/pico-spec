@@ -1033,6 +1033,14 @@ static const char *MENU_RTC[2]       = { "RTC + NVRAM\n",    "RTC + NVRAM\n" };
     "Overclock (!)\t>\n"
 static const char *MENU_HARDWARE[2] = { MENU_HARDWARE_EN, MENU_HARDWARE_ES };
 
+// NET row (HTTPS download benchmark) only exists where the net client is built.
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+#define MENU_SPEEDTEST_NET_EN "Network\n"
+#define MENU_SPEEDTEST_NET_ES "Red\n"
+#else
+#define MENU_SPEEDTEST_NET_EN ""
+#define MENU_SPEEDTEST_NET_ES ""
+#endif
 #define MENU_SPEEDTEST_EN \
     "Speed Test\n"\
     "CPU MIPS\n"\
@@ -1040,6 +1048,7 @@ static const char *MENU_HARDWARE[2] = { MENU_HARDWARE_EN, MENU_HARDWARE_ES };
     "PSRAM\n"\
     "SD Card\n"\
     "USB Drive\n"\
+    MENU_SPEEDTEST_NET_EN \
     "All tests\n"
 #define MENU_SPEEDTEST_ES \
     "Test velocidad\n"\
@@ -1048,6 +1057,7 @@ static const char *MENU_HARDWARE[2] = { MENU_HARDWARE_EN, MENU_HARDWARE_ES };
     "PSRAM\n"\
     "Tarjeta SD\n"\
     "Unidad USB\n"\
+    MENU_SPEEDTEST_NET_ES \
     "Todos\n"
 static const char *MENU_SPEEDTEST[2] = { MENU_SPEEDTEST_EN, MENU_SPEEDTEST_ES };
 

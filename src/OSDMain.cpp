@@ -11564,6 +11564,89 @@ static bool benchFsSpeed(const char* benchPath, const char* volName,
     return ok;
 }
 
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+// NET download benchmark — GET the catalog's speedtest blob (512 KB of
+// incompressible bytes published by gen_static.py) and count body bytes.
+// Always the built-in Pages URL: a Config::catalog_host override may point at
+// a dynamic /v1 proxy that doesn't serve the blob, and the point is to measure
+// the device's real HTTPS-download path, not a LAN server.
+// TLS handshake time and body throughput are reported separately — on a
+// ~100 KB/s link the multi-second mbedTLS handshake would swamp the KB/s
+// figure otherwise. Nothing is written to SD. ZiFiSock::sock_open already
+// boostBaud()s the link, same as FTP/archive sessions.
+#define SPEEDTEST_NET_URL "https://drewpo28.github.io/pico-spec-catalog/speedtest.bin"
+
+struct NetBenchCtx {
+    uint64_t t_start;      // just before HttpsGet::get
+    uint64_t t_first;      // first body byte
+    uint64_t t_end;        // last body byte
+    uint64_t ui_last;      // progress-redraw rate limit
+    uint32_t bytes;
+    HttpsGet::Result r;
+};
+
+// Body cap: stop after this much measured time — a slow link (115200 baud)
+// would otherwise take ~45 s for the full 512 KB. Aborting via the sink is
+// fine: speed is computed from what arrived.
+static const uint64_t NET_BENCH_BODY_US = 8 * 1000000ULL;
+
+static bool netBenchSink(void* ctx, const uint8_t* data, size_t len) {
+    (void)data;
+    NetBenchCtx* c = (NetBenchCtx*)ctx;
+    uint64_t now = time_us_64();
+    if (!c->bytes) c->t_first = now;
+    c->bytes += len;
+    c->t_end = now;
+    return now - c->t_first < NET_BENCH_BODY_US;
+}
+
+// Progress by bytes, rate-limited: the redraw runs between recv chunks and
+// would otherwise eat into the measured throughput.
+static bool netBenchProgress(void* ctx, uint32_t done, uint32_t total) {
+    NetBenchCtx* c = (NetBenchCtx*)ctx;
+    uint64_t now = time_us_64();
+    if (total > 0 && now - c->ui_last > 250000ULL) {
+        c->ui_last = now;
+        OSD::progressDialog("", "", (int)((uint64_t)done * 100 / total), 1);
+    }
+    return true;
+}
+
+static void netBenchRun(void* p) {
+    NetBenchCtx* c = (NetBenchCtx*)p;
+    c->t_start = time_us_64();
+    c->r = HttpsGet::get(SPEEDTEST_NET_URL, netBenchSink, c,
+                         CONFIG_DIR "/cacert.pem", netBenchProgress, c);
+    if (!c->t_end) c->t_end = time_us_64();
+}
+
+// Runs the GET on the big heap alt-stack (mbedTLS handshake doesn't fit the
+// core stack). Returns false when no alt-stack could be allocated; success of
+// the transfer itself is judged from ctx (2xx + bytes received — an abort by
+// the time cap clears r.ok, but the sample is still valid).
+static bool benchNetSpeed(NetBenchCtx& ctx, const char* title) {
+    memset(&ctx, 0, sizeof(ctx));
+    OSD::progressDialog(title, "NET download...", 0, 0);
+    NetArenaLease lease;   // borrow the dormant Gigascreen prevFB if available
+    size_t stksz = 12 * 1024;
+    uint8_t* stk = netAltStackAlloc(stksz);
+    if (!stk) {
+        OSD::progressDialog("", "", 0, 2);
+        return false;
+    }
+    void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7);
+    net_call_on_stack(top, netBenchRun, &ctx);
+    Buffer::pfree(stk);
+    OSD::progressDialog(title, "", 100, 1);
+    OSD::progressDialog("", "", 0, 2);
+    Debug::log("SpeedTest NET: status=%d bytes=%lu hs_us=%lu body_us=%lu",
+               ctx.r.status, (unsigned long)ctx.bytes,
+               (unsigned long)(ctx.bytes ? ctx.t_first - ctx.t_start : 0),
+               (unsigned long)(ctx.bytes ? ctx.t_end - ctx.t_first : 0));
+    return true;
+}
+#endif // !PICO_RP2040 && ZIFI_NET_CLIENT
+
 void OSD::SpeedTest() {
     menu_level = 2;
     menu_curopt = 1;
@@ -11573,11 +11656,18 @@ void OSD::SpeedTest() {
         uint8_t st_opt = menuRun(MENU_SPEEDTEST[Config::lang]);
         if (st_opt == 0) break;
 
-        const bool do_cpu   = (st_opt == 1 || st_opt == 6);
-        const bool do_sram  = (st_opt == 2 || st_opt == 6);
-        const bool do_psram = (st_opt == 3 || st_opt == 6);
-        const bool do_sd    = (st_opt == 4 || st_opt == 6);
-        const bool do_usb   = (st_opt == 5 || st_opt == 6);
+        // With the net client built in, row 6 is NET and "All tests" shifts to 7.
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+        const uint8_t all_opt = 7;
+        const bool do_net   = (st_opt == 6 || st_opt == all_opt);
+#else
+        const uint8_t all_opt = 6;
+#endif
+        const bool do_cpu   = (st_opt == 1 || st_opt == all_opt);
+        const bool do_sram  = (st_opt == 2 || st_opt == all_opt);
+        const bool do_psram = (st_opt == 3 || st_opt == all_opt);
+        const bool do_sd    = (st_opt == 4 || st_opt == all_opt);
+        const bool do_usb   = (st_opt == 5 || st_opt == all_opt);
 
         const char* title = Config::lang ? "Test velocidad" : "Speed Test";
 
@@ -11732,6 +11822,18 @@ void OSD::SpeedTest() {
         if (do_usb && usb_present)
             usb_ok = benchFsSpeed("USB:/bench.tmp", "USB", title, usb_rd, usb_wr);
 
+        // --- NET (HTTPS download from the catalog Pages) ---
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+        NetBenchCtx net_ctx = {};
+        bool net_wifi = false, net_ran = false;
+        if (do_net) {
+            string ssid, ip;
+            net_wifi = ZiFiAT::getStatus(ssid, ip);
+            if (net_wifi)
+                net_ran = benchNetSpeed(net_ctx, title);
+        }
+#endif
+
         // --- Build result text ---
         char (&buf)[OSD_INFO_BUF_SZ] = osd_info_buf;
         int pos = 0;
@@ -11795,6 +11897,27 @@ void OSD::SpeedTest() {
                     " USB     : Error\n\n");
             }
         }
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+        if (do_net) {
+            // 2xx + bytes counts as success even when r.ok was cleared by the
+            // sink's time cap — the sample is what we measure.
+            if (!net_wifi) {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " NET     : No WiFi\n\n");
+            } else if (net_ran && net_ctx.r.status >= 200 && net_ctx.r.status < 300 &&
+                       net_ctx.bytes > 0 && net_ctx.t_end > net_ctx.t_first) {
+                float kbs = (float)net_ctx.bytes * (1000000.0f / 1024.0f)
+                          / (float)(net_ctx.t_end - net_ctx.t_first);
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " NET rd  : %.1f KB/s\n"
+                    " TLS hshk: %lu ms\n\n",
+                    kbs, (unsigned long)((net_ctx.t_first - net_ctx.t_start) / 1000));
+            } else {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " NET     : Error (%d)\n\n", net_ctx.r.status);
+            }
+        }
+#endif
 
         showTextDialog(title, buf);
         menu_curopt = st_opt;
