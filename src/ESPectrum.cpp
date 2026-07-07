@@ -145,10 +145,8 @@ void kbdPushData(fabgl::VirtualKey virtualKey, bool down) {
            virtualKey == fabgl::VirtualKey::VK_KP_PERIOD)
     delPressed = down;
   if (ctrlPressed && altPressed && delPressed) {
-    close_all();
-    watchdog_enable(1, true);
-    while (true)
-      ;
+    // Single reboot choke point (logs the caller, handles the 595 latch).
+    OSD::esp_hard_reset();
   }
   if (down) {
     if (ctrlPressed && virtualKey == fabgl::VirtualKey::VK_J) {

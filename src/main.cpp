@@ -13,6 +13,8 @@
 #include <hardware/xip_cache.h>   // xip_cache_invalidate_all (clock/flash-timing fix-up)
 #include <hardware/flash.h>
 #include <hardware/clocks.h>
+#include <hardware/uart.h>
+#include <hardware/watchdog.h>    // watchdog_caused_reboot (boot breadcrumb)
 
 #include <hardware/pll.h>
 
@@ -1018,6 +1020,18 @@ static bool __no_inline_not_in_flash_func(psram_detect)() {
 void __no_inline_not_in_flash_func(psram_init)(uint cs_pin) {
     gpio_set_function(cs_pin, GPIO_FUNC_XIP_CS1);
 
+    // DIRECT-MODE WINDOW — strict discipline (root cause of the intermittent
+    // post-reset boot hang, hw-traced 2026-07-07): while DIRECT_CSR.EN is set,
+    // ANY flash (CS0) fetch stalls the core forever. That includes (a) calls
+    // into flash-resident code — psram_retiming() used to run inside this
+    // window and its clock_get_hz() is flash code, so the boot hung whenever
+    // that line wasn't already XIP-cache-resident — and (b) any IRQ whose
+    // handler lives in flash (USB is live here: tuh_init ran before us). So:
+    // IRQs off for the whole window, nothing but RAM code inside, and the
+    // window ends BEFORE psram_retiming/format setup (plain register writes
+    // that don't need direct mode).
+    const uint32_t ints = save_and_disable_interrupts();
+
     // Enable direct mode (manual CS for the ID probe), clkdiv of 30.
     qmi_hw->direct_csr = 30 << QMI_DIRECT_CSR_CLKDIV_LSB | QMI_DIRECT_CSR_EN_BITS;
     while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
@@ -1028,6 +1042,7 @@ void __no_inline_not_in_flash_func(psram_init)(uint cs_pin) {
     // return a consistent garbage value and report a chip that is not there.
     if (!psram_detect()) {
         qmi_hw->direct_csr = 0;
+        restore_interrupts(ints);
         BUTTER_PSRAM_SIZE = 0;
         return;
     }
@@ -1045,6 +1060,10 @@ void __no_inline_not_in_flash_func(psram_init)(uint cs_pin) {
 
     while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
         ;
+
+    // END of the direct-mode window — flash code is safe again from here on.
+    qmi_hw->direct_csr = 0;
+    restore_interrupts(ints);
 
     psram_retiming();
 
@@ -1069,9 +1088,6 @@ void __no_inline_not_in_flash_func(psram_init)(uint cs_pin) {
         QMI_M0_WFMT_PREFIX_LEN_VALUE_8   << QMI_M0_WFMT_PREFIX_LEN_LSB;
 
     qmi_hw->m[1].wcmd = 0x38;
-
-    // Disable direct mode
-    qmi_hw->direct_csr = 0;
 
     // Enable writes to PSRAM
     hw_set_bits(&xip_ctrl_hw->ctrl, XIP_CTRL_WRITABLE_M1_BITS);
@@ -1261,6 +1277,17 @@ volatile uint32_t g_tusb_assert_count = 0;
 extern "C" void picospec_tusb_assert_hook(void) { g_tusb_assert_count++; }
 
 int main() {
+#if defined(DBG_UART_ENABLED) && defined(PICO_DEFAULT_UART)
+    // Early console at the boot clock: proves bootrom/crt0 completed and logs the
+    // reset reason before any flash/clock/PSRAM bring-up (the pre-stdio window
+    // used to be silent, which made early-boot hangs undebuggable). The UART
+    // divider goes stale after set_sys_clock; stdio_init_all below re-inits it,
+    // so no prints in between.
+    uart_init(uart_default, 115200);
+    gpio_set_function(PICO_DEFAULT_UART_TX_PIN, GPIO_FUNC_UART);
+    Debug::log("main: entry, wd_reboot=%d", (int)watchdog_caused_reboot());
+    uart_tx_wait_blocking(uart_default);   // drain before the clock switch garbles it
+#endif
     flash_info();
 #ifdef PICO_RP2040
     vreg_set_voltage(VREG_VOLTAGE_MAX); // 1.30V — max for RP2040
@@ -1319,8 +1346,10 @@ int main() {
         psram_pin = 255;   // PSRAM disabled via CMake kill-switch (set(PSRAM OFF))
     #else
         psram_pin = chip_is_rp2350a() ? BUTTER_PSRAM_GPIO : 47;
+        Debug::log("main: psram_init begin");
         psram_init(psram_pin);
         butter_psram_size();
+        Debug::log("main: butter=%u KB", butter_psram_size() >> 10);
     #endif
     #endif
     exception_set_exclusive_handler(HARDFAULT_EXCEPTION, sigbus);
@@ -1335,6 +1364,7 @@ int main() {
     if (butter_psram_size() == 0 || psram_pin != PSRAM_PIN_SCK) {
 #endif
     #ifndef MURM2
+        Debug::log("main: init_psram begin");
         init_psram();
     #endif
 #if PICO_RP2350

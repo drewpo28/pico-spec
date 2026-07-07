@@ -33,6 +33,7 @@ visit https://zxespectrum.speccy.org/contacto
 */
 #include <malloc.h>
 #include <hardware/watchdog.h>
+#include <hardware/uart.h>
 #include <hardware/clocks.h>
 #include <hardware/flash.h>
 #include <hardware/vreg.h>
@@ -365,6 +366,10 @@ void OSD::esp_hard_reset() {
     Debug::log("esp_hard_reset called from %p", __builtin_return_address(0));
     if (Config::audio_driver == 3) send_to_595(LOW(AY_Enable));
     close_all();
+    Debug::log("ehr: close_all done, arming watchdog");
+#if defined(DBG_UART_ENABLED) && defined(PICO_DEFAULT_UART)
+    uart_tx_wait_blocking(uart_default);   // drain FIFO — 32B @115200 ≈ 3ms > watchdog delay
+#endif
     watchdog_enable(1, true);
     while (true);
 }
