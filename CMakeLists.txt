@@ -72,7 +72,7 @@ endif()
 # PICO_RP2040 macro directly in the source guards (no separate define needed).
 
 set(CPU_MHZ 378)
-set (PORT_VERSION "1.2.26")
+set (PORT_VERSION "1.2.27")
 string(LENGTH "${PORT_VERSION}" PORT_VERSION_LEN)
 
 # Target board (default: PICO_PC; override with -D flags, e.g. cmake -DMURM2=ON)

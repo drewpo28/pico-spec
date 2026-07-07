@@ -95,7 +95,7 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 
 ## Byte Emulation Details (https://zxbyte.org/)
 
-- 48K ROM
+- 48K ROM (no Beta Disk interface — Betadisk is switched off automatically when this model is selected)
 - 128K ROM + TR-DOS
 - 128K ROM + TR-DOS + Mr. Gluk Reset Service
 - Sovmest (COBMECT) Mode (more accurate emulation of a real ZX Spectrum 48/128)
