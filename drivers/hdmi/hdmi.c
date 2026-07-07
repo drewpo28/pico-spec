@@ -65,7 +65,17 @@ static uint8_t hdmi_scanline_buf[400];
 
 //ДМА палитра для конвертации
 //в хвосте этой памяти выделяется dma_data
+#if PICO_RP2040
+// HDMI-only: on RP2040 the VGA-HDMI build runs only ONE output per boot (VGA or
+// HDMI, picked at runtime). Keeping this 4960 B (+4 KB alignment hole) in .bss
+// costs SRAM on VGA boots — which is where RP2040 is tightest (the framebuffer
+// barely fits). So allocate it lazily, 4 KB-aligned, in graphics_init_hdmi()
+// only when HDMI is the active output; stays NULL on VGA boots. The PIO addr
+// generator needs the 4 KB alignment (its low 12 bits index into the table).
+static uint32_t *conv_color = NULL;
+#else
 static alignas(4096) uint32_t conv_color[1240];
+#endif
 // Snapshot of the standard palette taken at DS80-enable time. Used to restore
 // conv_color back to the doubled-pixel mode when DS80 turns off.
 // pico-spec: lazily heap-allocated (~5 KB) — kept out of .bss while DS80 is off
@@ -966,6 +976,10 @@ void graphics_set_palette(uint8_t i, uint32_t color888) {
          (i >= IDX_DI_PREAMBLE_VS && i <= IDX_DI_GUARD_TRAIL_VS))) return;
 #endif
 
+    // On RP2040 conv_color is NULL on VGA boots (allocated only for HDMI, see
+    // graphics_init_hdmi) — the parallel vga_set_palette_entry() above already
+    // updated the live VGA LUT, so there is nothing more to do here.
+    if (!conv_color) return;
     uint64_t* conv_color64 = (uint64_t *)conv_color;
     const uint8_t R = (color888 >> 16) & 0xff;
     const uint8_t G = (color888 >> 8) & 0xff;
@@ -1114,6 +1128,26 @@ void hdmi_set_profi_ds80_mode(bool active,
 }
 
 void graphics_init_hdmi() {
+#if PICO_RP2040
+    // conv_color is not in .bss on RP2040 (saves ~5 KB on VGA boots). Allocate it
+    // now that HDMI is confirmed to be the active output. The PIO addr generator
+    // reconstructs table addresses from its X register = (base >> 12), so the
+    // table MUST be 4 KB-aligned — over-allocate and round up (never freed; lives
+    // for the whole HDMI session).
+    // pico_malloc PANICs on OOM instead of returning NULL, so pre-check the
+    // largest satisfiable block (same guard as Buffer::palloc) — this runs on
+    // core1 right after setup, when free heap can be only a few KB.
+    if (!conv_color) {
+        extern size_t getLargestAllocatable(void);
+        const size_t need = 1240 * sizeof(uint32_t) + 4096;
+        if (getLargestAllocatable() >= need) {
+            uintptr_t raw = (uintptr_t)malloc(need);
+            conv_color = (uint32_t *)((raw + 4095) & ~(uintptr_t)4095);
+        } else {
+            printf("graphics_init_hdmi: OOM allocating conv_color (%u B needed)\n", (unsigned)need);
+        }
+    }
+#endif
     // PIO и DMA
     SM_video = pio_claim_unused_sm(PIO_VIDEO, true);
     SM_conv = pio_claim_unused_sm(PIO_VIDEO_ADDR, true);

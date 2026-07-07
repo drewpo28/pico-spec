@@ -240,14 +240,25 @@ bool FileUtils::mountSDCard() {
     // Probe the physical drive up front so absence of a card is detected here instead of
     // blocking the first FatFS call later (e.g. OSD SaveRect.clear → f_unlink → 500 ms SPI stall per op).
     if (disk_initialize(0) & STA_NOINIT) { fsMount = false; return false; }
+#if PICO_RP2040
+    // RP2040 is single-volume (FF_VOLUMES=1, no USB MSC, no FF_STR_VOLUME_ID) —
+    // mount the default drive with an empty path. "SD:" would not parse without
+    // FF_STR_VOLUME_ID and the mount would fail.
+    fsMount = f_mount(&fs, "", 1) == FR_OK;
+#else
     // "SD:" with the colon — with FF_FS_RPATH a bare "SD" parses as "no volume
     // prefix" and would target the CURRENT volume instead.
     fsMount = f_mount(&fs, "SD:", 1) == FR_OK;
+#endif
     return fsMount;
 }
 
 void FileUtils::unmountSDCard() {
+#if PICO_RP2040
+    f_unmount("");
+#else
     f_unmount(usbRoot ? "USB:" : "SD:");
+#endif
 }
 
 bool FileUtils::waitVolumeReady(const string& path) {
@@ -274,7 +285,11 @@ bool FileUtils::remountSD() {
 #endif
     {
         // Unmount FatFS and force full SD card reinit
+#if PICO_RP2040
+        f_mount(NULL, "", 0);   // single-volume: default drive
+#else
         f_mount(NULL, "SD:", 0);
+#endif
         disk_invalidate();
         if (!mountSDCard()) return false;
     }

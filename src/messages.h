@@ -551,6 +551,16 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
 #define MENU_MAIN_NETWORK_ITEM ""
 #endif
 
+// Hardware menu — RP2350 only; removed on SRAM-tight RP2040. Dropping the whole
+// submenu lets --gc-sections reclaim the info screens + the 1.5 KB osd_info_buf
+// AND Speed Test's static FILs (~1.1 KB), which is what lets core1 graphics_init
+// fit its VGA tables on the ext_ram (PSRAM+SD) path. Overclock via config file.
+#if !PICO_RP2040
+#define MENU_MAIN_HARDWARE_ITEM "Hardware\t>\n"
+#else
+#define MENU_MAIN_HARDWARE_ITEM ""
+#endif
+
 #if TFT
 #define MENU_MAIN_EN \
 	"Volume\n"\
@@ -561,7 +571,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Reset\t>\n"\
     "Options\t>\n"\
     "Debug\t>\n"\
-    "Hardware\t>\n"\
+    MENU_MAIN_HARDWARE_ITEM \
     "ZX Keyboard\n"\
     "Help\n"\
     "About\n"\
@@ -575,7 +585,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Resetear\t>\n"\
     "Opciones\t>\n"\
 	"Depurar\t>\n"\
-    "Hardware\t>\n"\
+    MENU_MAIN_HARDWARE_ITEM \
     "Teclado ZX\n"\
     "Ayuda\n"\
     "Acerca de\n"\
@@ -590,7 +600,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Reset\t>\n"\
     "Options\t>\n"\
     "Debug\t>\n"\
-    "Hardware\t>\n"\
+    MENU_MAIN_HARDWARE_ITEM \
     MENU_MAIN_NETWORK_ITEM \
     "ZX Keyboard\n"\
     "Help\n"\
@@ -604,7 +614,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Resetear\t>\n"\
     "Opciones\t>\n"\
 	"Depurar\t>\n"\
-    "Hardware\t>\n"\
+    MENU_MAIN_HARDWARE_ITEM \
     MENU_MAIN_NETWORK_ITEM \
     "Teclado ZX\n"\
     "Ayuda\n"\
@@ -621,7 +631,7 @@ static const char *MENU_MAIN[2] = { MENU_MAIN_EN, MENU_MAIN_ES };
     "Reset\t>\n"\
     "Options\t>\n"\
     "Debug\t>\n"\
-    "Hardware\t>\n"\
+    MENU_MAIN_HARDWARE_ITEM \
     MENU_MAIN_NETWORK_ITEM \
     "ZX Keyboard\n"\
     "Help\n"\
@@ -635,7 +645,7 @@ static const char *MENU_MAIN[2] = { MENU_MAIN_EN, MENU_MAIN_ES };
     "Resetear\t>\n"\
     "Opciones\t>\n"\
     "Depurar\t>\n"\
-    "Hardware\t>\n"\
+    MENU_MAIN_HARDWARE_ITEM \
     MENU_MAIN_NETWORK_ITEM \
     "Teclado ZX\n"\
     "Ayuda\n"\

@@ -198,8 +198,15 @@ extern bool SELECT_VGA;
 
 extern int ram_pages, butter_pages, psram_pages, swap_pages;
 
-// Shared buffer for HWInfo/ChipInfo/BoardInfo/EmulatorInfo (never called concurrently)
+// Shared buffer for HWInfo/ChipInfo/BoardInfo/EmulatorInfo (never called concurrently).
+// RP2040 keeps only HWInfo (Alt+F1) — the Hardware menu (and its other, larger info
+// screens) is removed there — and HWInfo fills only ~500 B, so a 640 B buffer suffices
+// and saves ~900 B of the tight SRAM. RP2350 keeps 1536 for the bigger screens.
+#if PICO_RP2040
+#define OSD_INFO_BUF_SZ 640
+#else
 #define OSD_INFO_BUF_SZ 1536
+#endif
 static char osd_info_buf[OSD_INFO_BUF_SZ] __attribute__((aligned(4)));
 
 uint8_t OSD::cols;                     // Maximum columns
@@ -1860,7 +1867,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
         esp_hard_reset();
     } else
 #endif
-    if (hkIdx == Config::HK_HW_INFO) { // Show mem info
+    if (hkIdx == Config::HK_HW_INFO) { // Show mem info (Alt+F1)
+            // Kept on RP2040 too (useful for debugging the tight heap); uses the
+            // 640 B osd_info_buf there. The rest of the Hardware menu is still
+            // removed on RP2040 — HWInfo is the only remaining osd_info_buf user.
             OSD::HWInfo();
             if (VIDEO::OSD) OSD::drawStats(); // Redraw stats for 16:9 modes
         } else
@@ -6898,6 +6908,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     }
                 }
             }
+#if !PICO_RP2040
             else if (opt == 9) { // Hardware
                 // ***********************************************************************************
                 // HARDWARE MENU
@@ -7135,6 +7146,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     }
                 }
             }
+#endif
 #if !PICO_RP2040
             else if (opt == 10) { // Network
                 menu_saverect = true;
@@ -7497,7 +7509,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if !PICO_RP2040
             else if (opt == 11) { // ZX Keyboard — bitmap overlay
 #else
-            else if (opt == 10) { // ZX Keyboard — bitmap overlay
+            else if (opt == 9) { // ZX Keyboard (RP2040: Network+Hardware removed)
 #endif
                 // Protect OSD area from Z80 video renderer overwrite
                 bool kbd_osd_enabled = (VIDEO::OSD != 0);
@@ -7556,7 +7568,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if !PICO_RP2040
             else if (opt == 12) { // Help — dynamic from hotkeys
 #else
-            else if (opt == 11) { // Help — dynamic from hotkeys
+            else if (opt == 10) { // Help — dynamic from hotkeys (RP2040 shifted)
 #endif
                 // Build index of visible hotkeys (no large buffer needed)
                 auto descs = Config::lang ? hkDescES : hkDescEN;
@@ -7653,7 +7665,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if !PICO_RP2040
             else if (opt == 13) { // About
 #else
-            else if (opt == 12) { // About
+            else if (opt == 11) { // About (RP2040 shifted)
 #endif
                 // About
                 // Protect OSD area from Z80 video renderer overwrite
@@ -7775,7 +7787,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 return;
             }
 #if TFT
+            // TFT: RP2350 opt 13; RP2040-TFT opt 12 (Hardware removed, no Network row).
+#if PICO_RP2040
+            else if (FileUtils::fsMount && opt == 12) { // TFT
+#else
             else if (FileUtils::fsMount && opt == 13) { // TFT
+#endif
                 menu_saverect = true;
                 menu_curopt = 1;
                 while(1) {
@@ -10092,7 +10109,7 @@ size_t getContiguousHeap(void) {
 // that reflects what a single allocation can really get.
 extern "C" void* __real_malloc(size_t);
 extern "C" void  __real_free(void*);
-size_t getLargestAllocatable(void) {
+extern "C" size_t getLargestAllocatable(void) {
     extern size_t getFreeHeap(void);
     size_t hi = getFreeHeap();          // a single block can't exceed total free
     if (hi == 0) return 0;

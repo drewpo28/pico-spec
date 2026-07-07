@@ -107,8 +107,21 @@ static uint16_t (*palette_vga_ds80)[256] = (uint16_t (*)[256]) 0;  // pico-spec:
 
 // Allocate the VGA-only palette tables on first use (VGA active only). Idempotent.
 // Keeps ~4 KB out of .bss on HDMI boots, where these are never touched.
+// pico_malloc/calloc PANIC on OOM instead of returning NULL, so pre-check the
+// largest satisfiable block (same guard as Buffer::palloc / graphics_init_hdmi)
+// — this runs on core1 right after setup, when free heap can be only a few KB.
 static void vga_alloc_buffers(void) {
     if (vga_color888) return;                                   // already allocated
+    extern size_t getLargestAllocatable(void);
+    size_t need = 2 * 256 * sizeof(uint16_t) + 256 * sizeof(uint16_t)
+                + 256 * sizeof(uint32_t) + 256 * sizeof(bool);
+#if !PICO_RP2040
+    need += 2 * 256 * sizeof(uint16_t);
+#endif
+    if (getLargestAllocatable() < need) {
+        printf("vga_alloc_buffers: OOM allocating VGA palette tables (%u B needed)\n", (unsigned)need);
+        return;
+    }
     palette_vga16          = (uint16_t (*)[256]) calloc(2 * 256, sizeof(uint16_t));
     palette_vga16_scanline = (uint16_t *)        calloc(256,     sizeof(uint16_t));
     vga_color888           = (uint32_t *)        calloc(256,     sizeof(uint32_t));
@@ -439,6 +452,17 @@ void graphics_set_mode(enum graphics_mode_t mode) {
         dma_channel_set_trans_count(dma_chan, line_size / 4, false);
 
         // Allocate to max possible line_size so re-renders during mode switches don't overrun.
+        // pico_calloc PANICs on OOM instead of returning NULL — pre-check the
+        // largest satisfiable block (this runs on core1 right after setup, when
+        // free heap can be only a few KB).
+        {
+            extern size_t getLargestAllocatable(void);
+            size_t need = (VGA_MAX_LINE_SIZE * 4 / 4) * sizeof(uint32_t);
+            if (getLargestAllocatable() < need) {
+                printf("graphics_set_mode: OOM allocating lines_pattern_data (%u B needed)\n", (unsigned)need);
+                return;
+            }
+        }
         lines_pattern_data = (uint32_t *)calloc(VGA_MAX_LINE_SIZE * 4 / 4, sizeof(uint32_t));
 
         for (int i = 0; i < 4; i++) {

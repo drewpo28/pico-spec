@@ -27,6 +27,7 @@
 
 extern int butter_pages;             // MemESP.cpp — pages placed in butter PSRAM
 extern size_t getFreeHeap(void);     // platform heap probe (see ESPectrum.cpp)
+extern "C" size_t getLargestAllocatable(void);  // OSDMain.cpp; C linkage so hdmi.c can call it too
 
 // Keep enough headroom that routing a buffer to the heap never starves the boot
 // allocations / framebuffer. Below this, large buffers prefer PSRAM instead.
@@ -122,6 +123,13 @@ Region   g_swapAlloc;         // file offset base 0 (SD swap, accessor)
 FIL      g_bufswap;
 bool     g_swap_ready = false;
 
+// TIER_ARENA (lent SRAM, e.g. Gigascreen prevFB) and TIER_FLASH (GM.DLS bank
+// partition) are RP2350-only in practice: the only lendArena() caller needs
+// Gigascreen's prevFB (RP2350-only, see Video.cpp), and the only
+// initFlashPool() caller is MidiSynth.cpp (RP2350-only, no MIDI on RP2040).
+// Gate the Region objects themselves so the linker can drop them on RP2040
+// (~780 B each) — mirrors how g_butter is already dropped there.
+#if !PICO_RP2040
 Region   g_arena;             // temporarily-lent SRAM region (e.g. Gigascreen prevFB)
 uint8_t* g_arena_base = nullptr;
 uint32_t g_arena_size = 0;
@@ -130,20 +138,27 @@ bool     g_arena_on   = false;
 Region   g_flash;             // single registered flash partition (XIP read, flash* write)
 uint8_t* g_flash_xip   = nullptr;   // partition XIP base (== absolute read pointer at off 0)
 uint32_t g_flash_total = 0;
-#if !PICO_RP2040
 uint32_t g_flash_saved_hz = 0;      // clk_sys captured by flashClockEnter(), restored by Exit()
 #endif
 
 inline bool inFlash(const void* p) {
+#if !PICO_RP2040
     if (!g_flash_xip || !g_flash_total) return false;
     uintptr_t a = (uintptr_t)p;
     return a >= (uintptr_t)g_flash_xip && a < (uintptr_t)g_flash_xip + g_flash_total;
+#else
+    (void)p; return false;
+#endif
 }
 
 inline bool inArena(const void* p) {
+#if !PICO_RP2040
     if (!g_arena_on) return false;
     uintptr_t a = (uintptr_t)p;
     return a >= (uintptr_t)g_arena_base && a < (uintptr_t)g_arena_base + g_arena_size;
+#else
+    (void)p; return false;
+#endif
 }
 
 inline bool inButter(const void* p) {
@@ -215,6 +230,7 @@ void Buffer::initPools() {
                (int)g_swap_ready);
 }
 
+#if !PICO_RP2040
 void Buffer::initFlashPool(void* xipBase, size_t size) {
     if (g_flash_xip == (uint8_t*)xipBase && g_flash_total == size) return;  // idempotent
     g_flash_xip   = (uint8_t*)xipBase;
@@ -222,6 +238,9 @@ void Buffer::initFlashPool(void* xipBase, size_t size) {
     g_flash.init(g_flash_total);
     Debug::log("Buffer::initFlashPool %uKB @ %p", (unsigned)(size >> 10), xipBase);
 }
+#else
+void Buffer::initFlashPool(void*, size_t) {}
+#endif
 
 #if !PICO_RP2040
 // ── Flash partition write primitives (TIER_FLASH) ────────────────────────────────
@@ -356,6 +375,7 @@ void* Buffer::palloc(size_t bytes, uint32_t flags) {
     if (!bytes) return nullptr;
     bool preferPsram = flags & PREFER_PSRAM;
 
+#if !PICO_RP2040
     // Lent SRAM arena (e.g. the Gigascreen prevFB during a paused network session)
     // — first choice for opt-in allocations so the TLS/socket working set lands
     // there instead of the scarce heap on butter-less boards.
@@ -364,14 +384,12 @@ void* Buffer::palloc(size_t bytes, uint32_t flags) {
         if (off != UINT32_MAX) return (void*)(g_arena_base + off);
     }
 
-#if !PICO_RP2040
     auto tryButter = [&]() -> void* {
         if (!g_butter.ready()) return nullptr;
         uint32_t off = g_butter.alloc((uint32_t)bytes);
         if (off == UINT32_MAX) return nullptr;
         return (void*)(PSRAM_DATA + g_butter_base + off);
     };
-#endif
     // Flash partition (read-only pointer). Opt-in via ALLOW_FLASH — the caller must
     // treat it as read-only and write through flashErase/flashProgram.
     auto tryFlash = [&]() -> void* {
@@ -380,6 +398,7 @@ void* Buffer::palloc(size_t bytes, uint32_t flags) {
         if (off == UINT32_MAX) return nullptr;
         return (void*)(g_flash_xip + off);
     };
+#endif
     auto tryHeap = [&]() -> void* {
         if (getFreeHeap() < bytes + HEAP_SAFETY_MARGIN) return nullptr;
         return malloc(bytes);
@@ -397,7 +416,6 @@ void* Buffer::palloc(size_t bytes, uint32_t flags) {
     }
 #else
     if (void* p = tryHeap()) return p;
-    if (void* p = tryFlash()) return p;
 #endif
     // Last resort: heap below the safety margin — but NEVER blind-call malloc here.
     // pico_malloc PANICs on OOM ("*** PANIC *** Out of memory"); it does not return
@@ -406,30 +424,30 @@ void* Buffer::palloc(size_t bytes, uint32_t flags) {
     // runs if palloc panics first (m1p2+Profi boots with ~21 KB free, no butter PSRAM,
     // SPI PSRAM not pointer-addressable, NET arena off). Pre-check the largest block
     // the allocator can really satisfy so the caller gets nullptr instead of a hard OOM.
-    extern size_t getLargestAllocatable(void);
     if (getLargestAllocatable() >= bytes) return malloc(bytes);
     return nullptr;
 }
 
 void Buffer::pfree(void* p) {
     if (!p) return;
+#if !PICO_RP2040
     if (inArena(p)) {
         g_arena.free((uint32_t)((uintptr_t)p - (uintptr_t)g_arena_base));
         return;
     }
-#if !PICO_RP2040
     if (inButter(p)) {
         g_butter.free((uint32_t)((uintptr_t)p - (uintptr_t)PSRAM_DATA - g_butter_base));
         return;
     }
-#endif
     if (inFlash(p)) {
         g_flash.free((uint32_t)((uintptr_t)p - (uintptr_t)g_flash_xip));
         return;
     }
+#endif
     ::free(p);
 }
 
+#if !PICO_RP2040
 bool Buffer::lendArena(void* base, size_t size) {
     if (g_arena_on || !base || !size) return false;
     g_arena_base = (uint8_t*)base;
@@ -451,6 +469,11 @@ bool Buffer::reclaimArena() {
 }
 
 bool Buffer::arenaActive() { return g_arena_on; }
+#else
+bool Buffer::lendArena(void*, size_t) { return false; }
+bool Buffer::reclaimArena() { return true; }
+bool Buffer::arenaActive() { return false; }
+#endif
 
 // ─── Instance alloc / free ───────────────────────────────────────────────────────
 bool Buffer::alloc(size_t bytes, uint32_t flags) {
@@ -462,6 +485,7 @@ bool Buffer::alloc(size_t bytes, uint32_t flags) {
         if (!p) return false;
         _ptr  = (uint8_t*)p;
         _size = bytes;
+#if !PICO_RP2040
         if (inArena(p)) {
             _tier = TIER_ARENA;
             _off  = (uint32_t)((uintptr_t)p - (uintptr_t)g_arena_base);
@@ -474,6 +498,9 @@ bool Buffer::alloc(size_t bytes, uint32_t flags) {
         } else {
             _tier = TIER_HEAP;
         }
+#else
+        _tier = TIER_HEAP;
+#endif
         return true;
     }
 
@@ -506,13 +533,13 @@ bool Buffer::alloc(size_t bytes, uint32_t flags) {
 void Buffer::free() {
     switch (_tier) {
         case TIER_HEAP:   ::free(_ptr); break;
-        case TIER_ARENA:  g_arena.free(_off); break;
 #if !PICO_RP2040
+        case TIER_ARENA:  g_arena.free(_off); break;
         case TIER_BUTTER: g_butter.free(_off); break;
+        case TIER_FLASH:  g_flash.free(_off); break;   // bookkeeping only; flash persists
 #endif
         case TIER_SPI:    g_spi.free(_off); break;
         case TIER_SWAP:   g_swapAlloc.free(_off); break;
-        case TIER_FLASH:  g_flash.free(_off); break;   // bookkeeping only; flash persists
         default: break;
     }
     _tier = TIER_NONE; _ptr = nullptr; _off = 0; _size = 0;
@@ -549,10 +576,10 @@ Buffer::PoolStat Buffer::poolStat(Tier t) {
     switch (t) {
 #if !PICO_RP2040
         case TIER_BUTTER: r = &g_butter;    break;
+        case TIER_FLASH:  r = &g_flash;     break;
 #endif
         case TIER_SPI:    r = &g_spi;       break;
         case TIER_SWAP:   r = &g_swapAlloc; break;
-        case TIER_FLASH:  r = &g_flash;     break;
         default: break;
     }
     if (!r || !r->ready()) return { 0, 0, 0 };

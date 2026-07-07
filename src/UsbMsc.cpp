@@ -15,9 +15,7 @@
 #include "FileUtils.h"
 #include "UsbMsc.h"
 
-// C++ linkage (defined in main.cpp) — must be declared OUTSIDE the extern "C"
-// diskio block below or the reference comes out unmangled and fails to link.
-extern size_t getLargestAllocatable(void);
+extern "C" size_t getLargestAllocatable(void);  // defined in OSDMain.cpp
 
 // ── Stick state ──────────────────────────────────────────────────────────────
 // g_daddr = 0 means "no stick". Set/cleared ONLY by the TinyUSB mount/umount

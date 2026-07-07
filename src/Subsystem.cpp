@@ -14,7 +14,7 @@
 #include "AySound.h"
 
 extern size_t getFreeHeap(void);
-extern size_t getLargestAllocatable(void);  // largest block malloc() can really satisfy now
+extern "C" size_t getLargestAllocatable(void);  // largest block malloc() can really satisfy now
 
 #if !PICO_RP2040
 #include "SAASound.h"
