@@ -400,7 +400,13 @@ void* Buffer::palloc(size_t bytes, uint32_t flags) {
     };
 #endif
     auto tryHeap = [&]() -> void* {
-        if (getFreeHeap() < bytes + HEAP_SAFETY_MARGIN) return nullptr;
+        // getFreeHeap() sums all free blocks incl. fragmented free-list entries;
+        // malloc(bytes) needs one contiguous block. On a fragmented heap (e.g.
+        // m1p2: no butter, tight SRAM) getFreeHeap() can overreport past this
+        // margin while no single block of `bytes` exists, and malloc() then hits
+        // the SDK's un-catchable OOM panic instead of returning nullptr. Probe the
+        // real allocator, same as the last-resort check below.
+        if (getLargestAllocatable() < bytes + HEAP_SAFETY_MARGIN) return nullptr;
         return malloc(bytes);
     };
 
@@ -505,7 +511,9 @@ bool Buffer::alloc(size_t bytes, uint32_t flags) {
     }
 
     // Accessor-OK: heap (if comfortable) → butter → SPI → SD swap → heap last resort.
-    if (!(flags & PREFER_PSRAM) && getFreeHeap() >= bytes + HEAP_SAFETY_MARGIN) {
+    // Same contiguous-block probe as tryHeap() above — getFreeHeap() would overreport
+    // on a fragmented heap and malloc(bytes) would panic instead of returning nullptr.
+    if (!(flags & PREFER_PSRAM) && getLargestAllocatable() >= bytes + HEAP_SAFETY_MARGIN) {
         if ((_ptr = (uint8_t*)malloc(bytes))) { _tier = TIER_HEAP; _size = bytes; return true; }
     }
 #if !PICO_RP2040
