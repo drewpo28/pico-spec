@@ -83,6 +83,36 @@ enum mem_type_t {
     SWAP
 };
 
+// Butter/QSPI (RP2350 XIP CS1) backing for a vram page offset.  Used by the
+// Profi memory layout on butter boards: pages 8+ are pool/accessor-backed vram
+// (same LRU + accessor-window machinery as SPI-PSRAM boards) instead of direct
+// XIP pointers — direct pointers push the whole Z80 working set through the
+// 16KB XIP cache that also serves the emulator's own flash code, and the two
+// evict each other (FPS drop / negative IDL on Profi CP/M).  SPI PSRAM keeps
+// priority: the two backends never coexist on real boards, but if both probes
+// report a size the established SPI dispatch stays authoritative.
+static inline bool vram_butter(uint32_t ba) {
+#if PICO_RP2040
+    (void)ba;
+    return false;
+#else
+    return psram_size() == 0 && butter_psram_size() >= ba + MEM_PG_SZ;
+#endif
+}
+
+#if !PICO_RP2040
+// Uncached, non-allocating alias (XIP_NOCACHE_NOALLOC window) of a butter
+// backing offset.  ALL vram-backing traffic (page swaps, accessor per-byte
+// access, snapshot load/save) goes through this alias so it never allocates
+// or evicts XIP cache lines — the 16KB cache stays dedicated to host code.
+// Coherence rule: the backing strip (pages 0..MEM_PG_CNT+1) must NEVER be
+// touched through the cached alias; setup() cleans the cache once after the
+// butter size probe (which writes markers through the cached alias).
+static inline uint8_t* butter_nc(uint32_t ba) {
+    return (uint8_t*)((uintptr_t)PSRAM_DATA + 0x04000000u + ba);
+}
+#endif
+
 class mem_desc_t {
     static std::list<mem_desc_t> pages; // a pool of assigned pages
     static uint8_t* plugged_in[4]; // pointers are plugged to 64k space (do not revoke 'em)
@@ -184,7 +214,8 @@ public:
     // (per-byte SD access would be catastrophically slow).
     inline uint8_t* sync(uint8_t bank) {
         if (bank < 4 && _int->mem_type != POINTER &&
-            psram_size() >= _int->vram_off + MEM_PG_SZ) {
+            (psram_size() >= _int->vram_off + MEM_PG_SZ ||
+             vram_butter(_int->vram_off))) {
             acc_bank[bank] = *this;
             plugged_in[bank] = 0;
             bank_dirty[bank] = &dirty_sink;   // accessor writes go straight to backing

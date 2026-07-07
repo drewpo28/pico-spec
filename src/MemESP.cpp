@@ -166,6 +166,18 @@ void mem_desc_t::reset(void) {
 uint8_t* mem_desc_t::to_vram(void) {
     uint8_t* res = _int->p;
     uint32_t ba = _int->vram_off;
+#if !PICO_RP2040
+    if (vram_butter(ba)) {
+        // Uncached alias: pure QMI write burst, no XIP cache allocation/eviction
+        // (a cached-alias write would read-allocate every line first).
+        memcpy(butter_nc(ba), res, MEM_PG_SZ);
+        _int->mem_type = PSRAM_SPI;   // "external PSRAM" backing; butter vs SPI is
+                                      // re-dispatched per access via vram_butter()
+        vram_pg_set_valid(ba);
+        _int->p = 0;
+        return res;
+    }
+#endif
     if (psram_size() >= ba + MEM_PG_SZ) {
         psram_write_page(ba, res); // single SPI CS for full 16KB (32-bit PIO, exact x)
         _int->mem_type = PSRAM_SPI;
@@ -201,6 +213,14 @@ void mem_desc_t::from_vram(uint8_t* p) {
         mem_spi_read_skip++;
         return;
     }
+#if !PICO_RP2040
+    if (vram_butter(ba)) {
+        mem_spi_evict_count++;
+        mem_spi_evict_page = ba / MEM_PG_SZ;
+        memcpy(p, butter_nc(ba), MEM_PG_SZ);   // uncached: no XIP cache wipe
+        return;
+    }
+#endif
     if (psram_size() >= ba + MEM_PG_SZ) {
         mem_spi_evict_count++;
         mem_spi_evict_page = ba / MEM_PG_SZ;
@@ -214,6 +234,11 @@ void mem_desc_t::from_vram(uint8_t* p) {
 }
 uint8_t mem_desc_t::_read(uint16_t addr) {
     uint32_t ba = _int->vram_off;
+#if !PICO_RP2040
+    if (vram_butter(ba)) {
+        return butter_nc(ba)[addr];
+    }
+#endif
     if (psram_size() >= ba + MEM_PG_SZ) {
         return read8psram(ba + addr);
     }
@@ -229,6 +254,12 @@ void mem_desc_t::_write(uint16_t addr, uint8_t v) {
     // The byte lands in the backing store — a later from_vram must not skip
     // the load anymore (the rest of the page stays garbage, like real RAM).
     vram_pg_set_valid(ba);
+#if !PICO_RP2040
+    if (vram_butter(ba)) {
+        butter_nc(ba)[addr] = v;
+        return;
+    }
+#endif
     if (psram_size() >= ba + MEM_PG_SZ) {
         write8psram(ba + addr, v);
         return;
@@ -264,6 +295,11 @@ void mem_desc_t::_sync(uint8_t bank) {
             {
                 uint32_t vba = page._int->vram_off;
                 bool vspi = psram_size() >= vba + MEM_PG_SZ;
+                // butter backing counts as external PSRAM for the victim's new
+                // mem_type; the async-spare arm stays SPI-only (g_swap_spare is
+                // never allocated on butter boards and psram_write_page_async
+                // is a PIO-SPI call).
+                bool vext = vspi || vram_butter(vba);
 #if MEM_ACCESS_TRACE
                 // How many Z80 accesses did this page's 16KB load actually
                 // serve?  Clean victims with a low count are the accessor-mode
@@ -289,7 +325,7 @@ void mem_desc_t::_sync(uint8_t bank) {
                     // read-only code banks) skip the 16KB write entirely.
                     uint8_t* vf = page._int->p;
                     page._int->p = 0;
-                    page._int->mem_type = vspi ? PSRAM_SPI : SWAP;
+                    page._int->mem_type = vext ? PSRAM_SPI : SWAP;
                     mem_spi_wb_skip++;
                     from_vram(vf);
                 } else if (g_swap_spare && vspi) {
@@ -339,8 +375,9 @@ void mem_desc_t::from_file(FIL* f_in, size_t sz) {
         return;
     }
     uint32_t ba = _int->vram_off;
-    bool spi = psram_size() >= ba + MEM_PG_SZ;
-    if (!spi) {
+    bool btr = vram_butter(ba);
+    bool spi = !btr && psram_size() >= ba + MEM_PG_SZ;
+    if (!spi && !btr) {
         #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
         gpio_put(PICO_DEFAULT_LED_PIN, true);
         #endif
@@ -352,6 +389,14 @@ void mem_desc_t::from_file(FIL* f_in, size_t sz) {
         for (size_t off = 0; off < sz; off += bsz) {
             size_t n = (sz - off > bsz) ? bsz : sz - off;
             f_read(f_in, buf, n, &br);
+            // Bounce + CPU memcpy for butter (no f_read straight into the XIP
+            // window: the SD driver may DMA into the destination, and bulk QMI
+            // DMA starves the PIO video — see gigascreen_prevfb notes).
+#if !PICO_RP2040
+            if (btr) {
+                memcpy(butter_nc(ba + off), buf, n);
+            } else
+#endif
             if (spi) {
                 psram_write_range(ba + off, buf, n);
             } else {
@@ -364,13 +409,17 @@ void mem_desc_t::from_file(FIL* f_in, size_t sz) {
         uint8_t v;
         for (size_t addr = 0; addr < sz; ++addr) {
             f_read(f_in, &v, 1, &br);
+#if !PICO_RP2040
+            if (btr) butter_nc(ba)[addr] = v;
+            else
+#endif
             if (spi) write8psram(ba + addr, v);
             else     f_write(&f, &v, 1, &br);
         }
     }
     vram_pg_set_valid(ba);
     #if defined(PICO_DEFAULT_LED_PIN) && PICO_DEFAULT_LED_PIN != 255
-    if (!spi) gpio_put(PICO_DEFAULT_LED_PIN, false);
+    if (!spi && !btr) gpio_put(PICO_DEFAULT_LED_PIN, false);
     #endif
 }
 void mem_desc_t::to_file(FIL* f_out, size_t sz) {
@@ -388,13 +437,18 @@ void mem_desc_t::to_file(FIL* f_out, size_t sz) {
     uint32_t ba = _int->vram_off;
     // Same page-fits-in-PSRAM test as to_vram/_read/_write — a bare psram_size()
     // check would read a high page (evicted to SD swap) from wrapped PSRAM addresses.
-    bool spi = psram_size() >= ba + MEM_PG_SZ;
-    if (!spi) f_lseek(&f, ba);
+    bool btr = vram_butter(ba);
+    bool spi = !btr && psram_size() >= ba + MEM_PG_SZ;
+    if (!spi && !btr) f_lseek(&f, ba);
     size_t bsz = 0;
     uint8_t* buf = mem_bounce_acquire(&bsz);
     if (buf) {
         for (size_t off = 0; off < sz; off += bsz) {
             size_t n = (sz - off > bsz) ? bsz : sz - off;
+#if !PICO_RP2040
+            if (btr)      memcpy(buf, butter_nc(ba + off), n);
+            else
+#endif
             if (spi) psram_read_range(ba + off, buf, n);
             else     f_read(&f, buf, n, &br);
             f_write(f_out, buf, n, &br);
@@ -403,6 +457,10 @@ void mem_desc_t::to_file(FIL* f_out, size_t sz) {
     } else {
         uint8_t v;
         for (size_t addr = 0; addr < sz; ++addr) {
+#if !PICO_RP2040
+            if (btr)      v = butter_nc(ba)[addr];
+            else
+#endif
             if (spi) v = read8psram(ba + addr);
             else     f_read(&f, &v, 1, &br);
             f_write(f_out, &v, 1, &br);
@@ -422,16 +480,26 @@ void mem_desc_t::from_mem(mem_desc_t& ram, size_t sz) {
     }
     uint32_t sba = ram._int->vram_off;
     uint32_t dba = _int->vram_off;
-    bool sspi = psram_size() >= sba + MEM_PG_SZ;
-    bool dspi = psram_size() >= dba + MEM_PG_SZ;
+    bool sbtr = vram_butter(sba);
+    bool dbtr = vram_butter(dba);
+    bool sspi = !sbtr && psram_size() >= sba + MEM_PG_SZ;
+    bool dspi = !dbtr && psram_size() >= dba + MEM_PG_SZ;
     UINT brw;
     if (dstPtr) {          // vram/swap → SRAM: one block transfer, no bounce
         _int->dirty = true;
+#if !PICO_RP2040
+        if (sbtr) memcpy(direct(), butter_nc(sba), sz);
+        else
+#endif
         if (sspi) psram_read_range(sba, direct(), sz);
         else { f_lseek(&f, sba); f_read(&f, direct(), sz, &brw); }
         return;
     }
     if (srcPtr) {          // SRAM → vram/swap: one block transfer, no bounce
+#if !PICO_RP2040
+        if (dbtr) memcpy(butter_nc(dba), ram.direct(), sz);
+        else
+#endif
         if (dspi) psram_write_range(dba, ram.direct(), sz);
         else { f_lseek(&f, dba); f_write(&f, ram.direct(), sz, &brw); }
         vram_pg_set_valid(dba);
@@ -443,8 +511,16 @@ void mem_desc_t::from_mem(mem_desc_t& ram, size_t sz) {
     if (buf) {
         for (size_t off = 0; off < sz; off += bsz) {
             size_t n = (sz - off > bsz) ? bsz : sz - off;
+#if !PICO_RP2040
+            if (sbtr) memcpy(buf, butter_nc(sba + off), n);
+            else
+#endif
             if (sspi) psram_read_range(sba + off, buf, n);
             else { f_lseek(&f, sba + off); f_read(&f, buf, n, &brw); }
+#if !PICO_RP2040
+            if (dbtr) memcpy(butter_nc(dba + off), buf, n);
+            else
+#endif
             if (dspi) psram_write_range(dba + off, buf, n);
             else { f_lseek(&f, dba + off); f_write(&f, buf, n, &brw); }
         }
@@ -461,6 +537,13 @@ void mem_desc_t::cleanup() {
         // Zero the vram backing store (same effect as the old per-byte _write
         // loop — 16384 SPI transactions — but chunked).
         uint32_t ba = _int->vram_off;
+#if !PICO_RP2040
+        if (vram_butter(ba)) {
+            memset(butter_nc(ba), 0, MEM_PG_SZ);
+            vram_pg_set_valid(ba);
+            return;
+        }
+#endif
         bool spi = psram_size() >= ba + MEM_PG_SZ;
         size_t bsz = 0;
         uint8_t* buf = mem_bounce_acquire(&bsz);

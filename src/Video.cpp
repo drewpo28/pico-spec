@@ -525,12 +525,11 @@ static unsigned int curline;
 // the live grmem/profi_clrmem, which we pick up at the next frame's line 0.
 static uint8_t* ds80_frame_grmem  = nullptr;
 static uint8_t* ds80_frame_clrmem = nullptr;
-// SRAM snapshot of the 16 KB clrmem page (pages 56/58).  Lives at file scope so
-// EndFrame (vblank) can populate it before the rasterizer runs.  Allocated from
-// heap only when arch==Profi (see VIDEO::Reset) so non-Profi machines reclaim the
-// 16 KB; freed when leaving Profi.
-#define DS80_CLR_SRAM_SIZE 16384
-static uint8_t* ds80_clr_sram = nullptr;
+// NOTE: the old butter-only SRAM snapshot of the clrmem page (ds80_clr_sram,
+// 16 KB heap + a per-frame 16 KB copy that wiped the whole XIP cache) was
+// removed: pages 56/58 are force_sram_locked heap SRAM on ALL RP2350 boards
+// now (unified Profi layout), so ds80_frame_clrmem is always a plain SRAM
+// pointer.  Restore from git history if colour pages ever move back to XIP.
 #endif
 
 static unsigned int bmpOffset;  // offset for bitmap in graphic memory
@@ -2175,18 +2174,6 @@ void VIDEO::Reset() {
         init_profi_pair_lookup();
         // Reset live palette to defaults on machine reset
         profiPaletteReset();
-        // DS80 clrmem snapshot: needed only when pages 56/58 live in XIP butter PSRAM.
-        // On those boards a direct ISR read hits the XIP cache and may stall hundreds of
-        // cycles on a miss — corrupting HDMI timing. The snapshot converts one sequential
-        // burst (vblank) into fast SRAM reads for every scanline.
-        // On SPI-PSRAM/SWAP boards pages 56/58 are force_sram_locked (regular heap SRAM),
-        // so ds80_frame_clrmem is already a plain SRAM pointer — no snapshot needed,
-        // saving 16 KB on the memory-constrained boards that need it most.
-        if (!ds80_clr_sram && butter_psram_size() > 0)
-            ds80_clr_sram = (uint8_t*)malloc(DS80_CLR_SRAM_SIZE);
-    } else if (ds80_clr_sram) {
-        free(ds80_clr_sram);
-        ds80_clr_sram = nullptr;
     }
 #endif
 
@@ -2737,18 +2724,10 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
         if ((line == 0 && start_col == 0) || ds80_frame_grmem == nullptr) {
             ds80_frame_grmem  = grmem;
             ds80_frame_clrmem = profi_clrmem;
-            // Refresh snapshot at the START of each active scan so Z80 writes made
-            // since vblank (e.g. ROM service-menu attr init over multiple frames) are
-            // captured immediately.  One sequential burst here; renderer reads SRAM
-            // for all remaining lines without scattered XIP stalls.
-            if (profi_clrmem && ds80_clr_sram)
-                memcpy(ds80_clr_sram, profi_clrmem, DS80_CLR_SRAM_SIZE);
         }
         uint8_t* fgrmem  = ds80_frame_grmem;
-        // ds80_clr_sram is only allocated on butter-PSRAM boards (XIP cache stall risk);
-        // on SPI-PSRAM/SWAP boards it is null and ds80_frame_clrmem (force_sram_locked
-        // SRAM pointer) is used directly — no stall risk, saves 16 KB heap.
-        uint8_t* fclrmem = ds80_frame_clrmem ? (ds80_clr_sram ? ds80_clr_sram : ds80_frame_clrmem) : nullptr;
+        // Pages 56/58 are force_sram_locked heap SRAM on all boards — direct read.
+        uint8_t* fclrmem = ds80_frame_clrmem;
         //
         // Row layout: pad_l bytes of border, then 256 content bytes (with (k^2) pre-swap
         // for the ISR's x^2 read pattern), then pad_r bytes of border.
@@ -3176,10 +3155,6 @@ IRAM_ATTR void VIDEO::EndFrame() {
                 // SRAM-resident, never in the evictable pool, direct() is always
                 // valid — no preload/pin/precheck needed.
                 profi_clrmem = MemESP::ram[clrPg].direct();
-                // Snapshot the 16 KB clrmem page into SRAM here (vblank) so the
-                // rasterizer never touches XIP PSRAM during active scan.
-                if (profi_clrmem && ds80_clr_sram)
-                    memcpy(ds80_clr_sram, profi_clrmem, DS80_CLR_SRAM_SIZE);
 #if PROFI_PORT_TRACE
                 ds80_dbg_grmem  = grmem;
                 ds80_dbg_clrmem = profi_clrmem;

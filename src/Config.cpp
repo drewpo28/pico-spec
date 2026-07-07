@@ -221,19 +221,29 @@ extern std::string g_snapshot_loading_path;  // Snapshot.cpp — snapshot mid-lo
 void Config::requestMachine(const string& newArch, const string& newRomSet)
 {
 #if !PICO_RP2040
-    // Profi boundary on SPI-PSRAM boards (no butter): setup() lays out ~96KB
-    // of forced-SRAM pages (DS80 colour 56/58 + CP/M pool) once at boot and
-    // nothing frees or creates them at runtime, so ANY arch change crossing
-    // the Profi boundary must reboot so setup() re-lays out memory.  The OSD
-    // Machine menu checks this itself, but snapshot loaders call
-    // requestMachine directly: a Pentagon snapshot loaded on Profi left the
-    // ~96KB allocated; a Profi snapshot loaded elsewhere got no DS80 colour
-    // pages.  Persist the target arch and the in-flight snapshot — setup()
-    // resumes the load via Config::ram_file after the reboot (same pattern as
-    // savePendingVideoMode).  If the config write fails, nothing is persisted
-    // (NvsWriter is atomic) and the next boot comes up unchanged — no loop.
-    bool profiSramLayout = (MemESP::ram[56].memType() == mem_type_t::POINTER);
-    if (butter_psram_size() == 0 && (newArch == "Profi") != profiSramLayout) {
+    // Profi boundary: setup() lays out the Profi memory once at boot —
+    // forced-SRAM pages (DS80 colour 56/58 + CP/M pool 60/61) on ALL RP2350
+    // boards, plus the pool/accessor-backed butter vram strip on butter/QSPI
+    // boards — and nothing frees or creates them at runtime, so ANY arch
+    // change crossing the Profi boundary must reboot so setup() re-lays out
+    // memory.  The OSD Machine menu checks this itself, but snapshot loaders
+    // call requestMachine directly: a Pentagon snapshot loaded on Profi left
+    // the layout allocated; a Profi snapshot loaded elsewhere got no DS80
+    // colour pages.  Persist the target arch and the in-flight snapshot —
+    // setup() resumes the load via Config::ram_file after the reboot (same
+    // pattern as savePendingVideoMode).  If the config write fails, nothing is
+    // persisted (NvsWriter is atomic) and the next boot comes up unchanged —
+    // no loop.
+    // Layout marker: on butter boards page 56 is a POINTER for BOTH layouts
+    // (heap SRAM in Profi mode, direct butter otherwise), so page 8 is the
+    // discriminator there (vram in the Profi layout, direct butter pointer
+    // otherwise); elsewhere page 56 keeps its historical role.
+    bool profiSramLayout;
+    if (psram_size() == 0 && butter_psram_size() > 0)
+        profiSramLayout = (MemESP::ram[8].memType() != mem_type_t::POINTER);
+    else
+        profiSramLayout = (MemESP::ram[56].memType() == mem_type_t::POINTER);
+    if ((newArch == "Profi") != profiSramLayout) {
         arch = newArch;
         if (!newRomSet.empty()) romSet = newRomSet;
         if (!g_snapshot_loading_path.empty())

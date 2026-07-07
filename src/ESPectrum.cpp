@@ -52,6 +52,9 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Tape.h"
 #include "Video.h"
 #include "Z80_JLS/z80.h"
+#if !PICO_RP2040
+#include "hardware/xip_cache.h"
+#endif
 #include "messages.h"
 #include "pwm_audio.h"
 #include "wd1793.h"
@@ -580,9 +583,12 @@ static void assign_ram(int i) {
   // Page 61 left UNPINNED so it stays in the evictable pool ({56,58,61}).
   // 1024K BIOS test stays correct (the earlier 160K was the buggy 32-bit
   // write_page truncating writes, not force_sram).
-  // butter/QSPI-XIP boards are excluded: forcing these into SRAM there gave no
-  // IDL gain (the bottleneck is the whole Z80 working set in XIP, not the color
-  // pages), so don't waste 48KB SRAM.
+  // butter/QSPI-XIP boards now use the SAME layout: forcing only the colour
+  // pages there gave no IDL gain back when pages 8+ stayed direct XIP pointers
+  // (the whole Z80 working set thrashed the 16KB XIP cache against the
+  // emulator's own flash code), but with pages 8+ pool/accessor-backed (see
+  // the profi_butter branch below) the hot set migrates to SRAM adaptively
+  // and the colour pages must be POINTER-stable for the DS80 renderer.
   //
   // +1 extra LRU pool buffer (60 = 16KB): HC's CP/M bank-switch trampoline
   // (OUT 0x7FFD/0xDFFD) ping-pongs read-only code banks; historically that
@@ -606,10 +612,10 @@ static void assign_ram(int i) {
   // With locked=true: no pin/unpin/preload needed in the render path → the
   // HDMI/VGA renderer never stalls on SPI DMA → no sync loss.
   //
-  // Profi CP/M pool layout (RP2350, SPI-PSRAM only):
+  // Profi CP/M pool layout (RP2350, SPI-PSRAM and butter/QSPI alike):
   //   Locked SRAM (never evicted): pages 56, 58 — DS80 colour-attribute data
   //   LRU pool (evictable):        pages 1, 2, 3, 60, 61 — CP/M working set
-  //   All other pages:             SPI PSRAM, on demand via accessor window
+  //   All other pages:             external PSRAM, on demand via accessor window
   //
   // RP2040 (ZERO/MURM): DS80 not available; heap budget ~181KB with MEM_REMAIN=96KB
   // reserved for framebuffer. Use 3-page set {56,58,61} on RP2040.
@@ -620,11 +626,21 @@ static void assign_ram(int i) {
                     && (butter_psram_size() == 0);
 #else
   bool force_sram_locked = (Config::arch == "Profi")
-                           && (i == 56 || i == 58)
-                           && (butter_psram_size() == 0);
+                           && (i == 56 || i == 58);
   bool force_sram = (Config::arch == "Profi")
-                    && (i == 61 || i == 60)
-                    && (butter_psram_size() == 0);
+                    && (i == 61 || i == 60);
+  // Profi on butter/QSPI boards: pages 8+ (minus the forced-SRAM set above)
+  // become pool/accessor-backed vram with a LINEAR butter backing layout
+  // (page i ↔ offset i*16KB, incl. slots 0-7 for pool-page evictions).  The
+  // backing is accessed exclusively through the uncached alias (butter_nc) so
+  // Z80 trampoline visits and 16KB page swaps stop evicting XIP cache lines
+  // that hold the emulator's flash code — the direct-XIP-pointer scheme let
+  // the guest working set and host code thrash each other in the shared 16KB
+  // cache (Profi CP/M: FPS drop + negative IDL).  setup() reserves the strip
+  // (butter_pages) and cleans the XIP cache once (size-probe markers were
+  // written through the cached alias).
+  bool profi_butter_vram = (Config::arch == "Profi")
+                           && psram_size() == 0 && butter_psram_size() > 0;
 #endif
   if (force_sram_locked) {
     MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, true); // LOCKED: permanent SRAM
@@ -632,6 +648,16 @@ static void assign_ram(int i) {
   } else if (force_sram) {
     MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, false); // unlocked → in pool
     ++ram_pages;
+#if !PICO_RP2040
+  } else if (profi_butter_vram) {
+    if (butter_psram_size() >= MEM_PG_SZ * (size_t)(i + 1)) {
+      // Counted wholesale via the butter_pages strip reservation in setup().
+      MemESP::ram[i].assign_vram(i, mem_type_t::PSRAM_SPI);
+    } else {
+      MemESP::ram[i].assign_vram(i, mem_type_t::SWAP); // page beyond the chip
+      ++swap_pages;
+    }
+#endif
   } else if (getFreeHeap() >= MEM_PG_SZ + MEM_REMAIN) {
     MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, false);
     ++ram_pages;
@@ -811,6 +837,26 @@ void ESPectrum::setup() {
     for (size_t i = 8; i < (MEM_PG_CNT + 2); ++i) {
       assign_ram(i);
     }
+#if !PICO_RP2040
+    if (Config::arch == "Profi" && psram_size() == 0 && butter_psram_size() > 0) {
+      // Linear butter backing strip: page i ↔ offset i*16KB, including slots
+      // 0-7 (pool pages 1-3 evict there) and the forced-SRAM 56/58/60/61 slots
+      // (60/61 are unlocked pool members and evict too).  Reserve the whole
+      // strip so DivMMC / Buffer arenas (butter_used = butter_pages*16KB)
+      // start above it.
+      size_t slots = MEM_PG_CNT + 2;
+      size_t cap   = butter_psram_size() / MEM_PG_SZ;
+      butter_pages = (int)(slots < cap ? slots : cap);
+      // The butter size probe wrote its markers through the CACHED alias; from
+      // now on the strip is accessed only through the uncached alias
+      // (butter_nc).  Clean+invalidate once so no stale dirty line can later
+      // evict on top of uncached backing writes (RP2350-E11: clean_all also
+      // invalidates).
+      xip_cache_clean_all();
+      Debug::log("setup: Profi butter pool: strip=%d pages, freeHeap=%u",
+                 butter_pages, getFreeHeap());
+    }
+#endif
     Debug::log("setup: ext_ram: all pages done, freeHeap=%u", getFreeHeap());
     Debug::log("setup: ram5=%p ram7=%p diff=%d", MemESP::ram[5].direct(), MemESP::ram[7].direct(),
                (int)((uint8_t*)MemESP::ram[7].direct() - (uint8_t*)MemESP::ram[5].direct()));
