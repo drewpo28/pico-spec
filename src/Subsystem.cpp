@@ -660,10 +660,11 @@ void featureSetEnabled(FeatureId f, bool on) {
 // (added back into freeNow) and must NOT appear in the popup's candidate list.
 static uint32_t autoDisabledMask(FeatureId f) {
     // Entering Profi auto-disables these (OSDMain arch-switch) — credited as freed
-    // and excluded from the manual free-list popup. FEAT_MIDI: GM.DLS is turned off
-    // on Profi entry on butter-less boards (g_voices + Profi SRAM don't fit).
+    // and excluded from the manual free-list popup. FEAT_MIDI is deliberately NOT
+    // here: GM.DLS stays on across the Profi switch; on tight boards the budget
+    // popup offers it as a manual free candidate instead.
     if (f == FEAT_PROFI) return (1u << FEAT_GIGASCREEN) | (1u << FEAT_ZIFI)
-                              | (1u << FEAT_DIVMMC) | (1u << FEAT_MIDI);
+                              | (1u << FEAT_DIVMMC);
     // Z-Controller and IDE both displace esxDOS DivMMC (shared SD ports) — credit
     // its freed SRAM and exclude it from the manual free-list.
     if (f == FEAT_ZCONTROLLER || f == FEAT_IDE) return (1u << FEAT_DIVMMC);

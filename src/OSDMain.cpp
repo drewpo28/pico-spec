@@ -5739,6 +5739,15 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::betadisk = true;
                                     OSD::osdCenteredMsg("Betadisk enabled", LEVEL_WARN, 1500);
                                 }
+                                // Byte 48K has no Beta Disk interface — force it off on entry.
+                                if (romset == "48Kby" && Config::betadisk) {
+                                    Config::betadisk = false;
+                                    if (ESPectrum::trdos) {
+                                        ESPectrum::trdos = false;
+                                        MemESP::recoverPage0();
+                                    }
+                                    OSD::osdCenteredMsg("Betadisk disabled", LEVEL_WARN, 1500);
+                                }
 #if !PICO_RP2040
                                 // Switching into Profi: Gigascreen is incompatible —
                                 // turn it off and free its 52 KB prev-FB before saving
@@ -5766,19 +5775,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     DivMMC::init();   // teardown path frees buffers
                                     OSD::osdCenteredMsg("DivMMC disabled", LEVEL_WARN, 1500);
                                 }
-                                // Switching into Profi on a butter-less board: GM.DLS MIDI
-                                // (g_voices ~5 KB + L/R buffers, re-allocated at boot) plus
-                                // Profi's ~96 KB forced-SRAM pages + DS80 FB don't fit → boot
-                                // OOMs. Turn GM.DLS off (budgetCheck credits this — FEAT_MIDI in
-                                // autoDisabledMask(FEAT_PROFI)). Butter boards keep MIDI (Profi
-                                // costs 0 SRAM there).
-                                if (Config::arch == "Profi" && Config::midi == 4 &&
-                                    butter_psram_size() == 0) {
-                                    Config::midi = 0;
-                                    Midi::enabled = 0;
-                                    Midi::deinit();
-                                    OSD::osdCenteredMsg("DLS MIDI disabled", LEVEL_WARN, 1500);
-                                }
+                                // NOTE: GM.DLS MIDI is NOT auto-disabled on Profi entry anymore.
+                                // On tight butter-less boards the featureBudgetGate popup offers
+                                // MIDI as a manual free candidate instead (user decides).
 #endif
                                 Config::save();
 #if !PICO_RP2040
