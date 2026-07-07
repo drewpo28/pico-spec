@@ -10109,7 +10109,7 @@ size_t getContiguousHeap(void) {
 // that reflects what a single allocation can really get.
 extern "C" void* __real_malloc(size_t);
 extern "C" void  __real_free(void*);
-size_t getLargestAllocatable(void) {
+extern "C" size_t getLargestAllocatable(void) {
     extern size_t getFreeHeap(void);
     size_t hi = getFreeHeap();          // a single block can't exceed total free
     if (hi == 0) return 0;

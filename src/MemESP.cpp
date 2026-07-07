@@ -170,7 +170,7 @@ static inline void vram_pg_set_valid(uint32_t ba) {
 // is tight (ZiFi TLS needs ~50KB headroom for HTTPS).
 static uint8_t* g_swap_spare = nullptr;
 static bool     g_spare_tried = false;
-extern size_t getLargestAllocatable(void);  // also used by mem_bounce_acquire below
+extern "C" size_t getLargestAllocatable(void);  // also used by mem_bounce_acquire below
 
 // Cold paths for memory breakpoints — see declaration in MemESP.h.
 __attribute__((noinline)) void MemESP::checkMemReadBP(uint16_t addr) {
@@ -406,7 +406,7 @@ void mem_desc_t::_sync(uint8_t bank) {
 // returning NULL, so gate on getLargestAllocatable() (see Buffer::palloc) and
 // fall back to the per-byte path when the heap is too tight (e.g. RP2040 after
 // VIDEO::Init with ~5KB free).
-extern size_t getLargestAllocatable(void);
+extern "C" size_t getLargestAllocatable(void);
 static uint8_t* mem_bounce_acquire(size_t* sz) {
     const size_t WANT = 1024;
     if (getLargestAllocatable() < WANT + 2048) return nullptr;

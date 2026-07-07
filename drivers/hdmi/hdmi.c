@@ -1134,9 +1134,18 @@ void graphics_init_hdmi() {
     // reconstructs table addresses from its X register = (base >> 12), so the
     // table MUST be 4 KB-aligned — over-allocate and round up (never freed; lives
     // for the whole HDMI session).
+    // pico_malloc PANICs on OOM instead of returning NULL, so pre-check the
+    // largest satisfiable block (same guard as Buffer::palloc) — this runs on
+    // core1 right after setup, when free heap can be only a few KB.
     if (!conv_color) {
-        uintptr_t raw = (uintptr_t)malloc(1240 * sizeof(uint32_t) + 4096);
-        conv_color = (uint32_t *)((raw + 4095) & ~(uintptr_t)4095);
+        extern size_t getLargestAllocatable(void);
+        const size_t need = 1240 * sizeof(uint32_t) + 4096;
+        if (getLargestAllocatable() >= need) {
+            uintptr_t raw = (uintptr_t)malloc(need);
+            conv_color = (uint32_t *)((raw + 4095) & ~(uintptr_t)4095);
+        } else {
+            printf("graphics_init_hdmi: OOM allocating conv_color (%u B needed)\n", (unsigned)need);
+        }
     }
 #endif
     // PIO и DMA

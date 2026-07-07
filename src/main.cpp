@@ -853,7 +853,9 @@ extern "C" void refresh_lcd(void);
 
 void __scratch_x("render") render_core() {
     multicore_lockout_victim_init();
+    { extern size_t getFreeHeap(void); Debug::log("render: graphics_init begin, freeHeap=%u", (unsigned)getFreeHeap()); }
     graphics_init();
+    { extern size_t getFreeHeap(void); Debug::log("render: graphics_init done, freeHeap=%u", (unsigned)getFreeHeap()); }
 #if SOFTTV
     sem_release(&graphics_init_done_semaphore);
 #endif
@@ -1525,6 +1527,7 @@ int main() {
 #if SOFTTV
     sem_init(&graphics_init_done_semaphore, 0, 1);
 #endif
+    { extern size_t getFreeHeap(void); Debug::log("main: launching core1, freeHeap=%u", (unsigned)getFreeHeap()); }
     Debug::log2SD("main: launching core1");
     multicore_launch_core1(render_core);
 #if SOFTTV
@@ -1536,6 +1539,7 @@ int main() {
 #endif
     Debug::log2SD("main: releasing vga_start_semaphore");
     sem_release(&vga_start_semaphore);
+    { extern size_t getFreeHeap(void); Debug::log("main: entering ESPectrum::loop(), freeHeap=%u", (unsigned)getFreeHeap()); }
     Debug::log2SD("main: entering ESPectrum::loop()");
     ESPectrum::loop();
     __unreachable();

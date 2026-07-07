@@ -38,7 +38,11 @@
 /* This option switches fast seek function. (0:Disable or 1:Enable) */
 
 
+#if PICO_RP2040
+#define FF_USE_EXPAND	0
+#else
 #define FF_USE_EXPAND	1
+#endif
 /* This option switches f_expand function. (0:Disable or 1:Enable) */
 
 
@@ -159,7 +163,15 @@
 // RPATH enabled an unprefixed path resolves on the CURRENT volume (not
 // volume 0), so volume-level calls must always spell the volume out with a
 // colon ("SD:", "USB:") — a bare "SD" parses as "no prefix".
+// RP2040 has no USB MSC (CFG_TUH_MSC=0) so it needs only the single SD volume.
+// Reverting the multi-volume/USB config there (as in 1.2.24) reclaims ~2 KB of
+// its scarce SRAM (bigger FATFS + volume tables). RP2350 keeps the USB "USB:"
+// volume. FileUtils mounts with "" (default vol) on RP2040, "SD:" on RP2350.
+#if PICO_RP2040
+#define FF_FS_RPATH		0
+#else
 #define FF_FS_RPATH		1
+#endif
 /* This option configures support for relative path.
 /
 /   0: Disable relative path and remove related functions.
@@ -186,12 +198,20 @@
 // Volume 0 = SD card (default drive: paths without a prefix), volume 1 = USB
 // mass-storage stick ("USB:/..." paths, RP2350 only). Physical drive mapping
 // lives in drivers/sdcard/sdcard.c (drv 0 = SD SPI, drv 1 = TinyUSB MSC).
+#if PICO_RP2040
+#define FF_VOLUMES		1
+#else
 #define FF_VOLUMES		2
+#endif
 /* Number of volumes (logical drives) to be used. (1-10) */
 
 
+#if PICO_RP2040
+#define FF_STR_VOLUME_ID	0
+#else
 #define FF_STR_VOLUME_ID	1
 #define FF_VOLUME_STRS		"SD","USB"
+#endif
 /* FF_STR_VOLUME_ID switches support for volume ID in arbitrary strings.
 /  When FF_STR_VOLUME_ID is set to 1 or 2, arbitrary strings can be used as drive
 /  number in the path name. FF_VOLUME_STRS defines the volume ID strings for each
