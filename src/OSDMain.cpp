@@ -5875,7 +5875,29 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             esp_hard_reset();
                         }
                     } else if ((mos && opt2 == 5) || (!mos && opt2 == 4)) {
+                        // True factory reset: wipe storage.nvs AND skip the
+                        // user's saved default.nvs on the next load() (see
+                        // SKIP_DEFAULT_FLAG in Config::load()).
                         if (confirmReboot(OSD_DLG_LOADDEFAULTS)) {
+                            FIL* flag = fopen2(SKIP_DEFAULT_FLAG, FA_WRITE | FA_CREATE_ALWAYS);
+                            if (flag) fclose2(flag);
+                            f_unlink(STORAGE_NVS);
+                            esp_hard_reset();
+                        }
+                    } else if ((mos && opt2 == 6) || (!mos && opt2 == 5)) {
+                        // Save as Default: snapshot current live config as the
+                        // fallback used whenever no storage.nvs exists yet for
+                        // this board (fresh firmware version, or "My Default"
+                        // reset below). Per-board on purpose — never crosses
+                        // to a different board (video wiring / RAM budget).
+                        if (confirmReboot(OSD_DLG_SAVEDEFAULT)) {
+                            Config::save(DEFAULT_NVS);
+                            osdCenteredMsg(MSG_DEFAULT_SAVED[Config::lang], LEVEL_INFO, 500);
+                        }
+                    } else if ((mos && opt2 == 7) || (!mos && opt2 == 6)) {
+                        // My Default: wipe storage.nvs only — default.nvs is
+                        // left intact, so the next load() falls back to it.
+                        if (confirmReboot(OSD_DLG_LOADMYDEFAULT)) {
                             f_unlink(STORAGE_NVS);
                             esp_hard_reset();
                         }

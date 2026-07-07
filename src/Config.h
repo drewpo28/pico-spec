@@ -58,7 +58,7 @@ public:
     static void load();           // load main settings before emulator init
     static void loadDiskMounts(); // mount disks from storage.nvs after FDD/MB02 init
     static void loadMb02DiskMounts(); // (re)mount only MB-02+ disks (on enable at runtime)
-    static void save();
+    static void save(const char* path = nullptr); // nullptr = STORAGE_NVS (normal path)
     static bool loaded;  // true after successful load() from file/RAM
 
     static void requestMachine(const string& newArch, const string& newRomSet);

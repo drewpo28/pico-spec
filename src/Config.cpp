@@ -681,8 +681,15 @@ void Config::load() {
     initHotkeys(); // fill defaults before overriding from NVS
     vector<string> sts;
     if (FileUtils::fsMount) {
+        // One-shot marker set by a true factory reset (Hold-R / menu
+        // "Defaults"): consume it and skip the user's saved default.nvs this
+        // boot, falling straight through to compiled-in defaults.
+        bool skipDefault = (f_unlink(SKIP_DEFAULT_FLAG) == FR_OK);
         string nvs = STORAGE_NVS;
         FIL* handle = fopen2(nvs.c_str(), FA_READ);
+        if (!handle && !skipDefault) {
+            handle = fopen2(DEFAULT_NVS, FA_READ);
+        }
         if (!handle) {
             return;
         }
@@ -1054,13 +1061,19 @@ static void nvs_set_sc(NvsWriter& buf, const char* name, signed char val) {
     nvs_set_i(buf, name, val);
 }
 
-// Dump actual config to FS
-void Config::save() {
-    static const char* nvs_tmp = STORAGE_NVS ".tmp";
-    static const char* nvs_path = STORAGE_NVS;
+// Dump actual config to FS. path==nullptr writes the normal per-version/
+// per-board storage.nvs; a caller passes DEFAULT_NVS to snapshot the current
+// live settings as the user's own default (see "Save as Default").
+void Config::save(const char* path) {
+    const bool toDefault = (path != nullptr);
+    if (toDefault && !FileUtils::fsMount) return; // no SD: nothing to persist a default to
+    string nvs_path_s = toDefault ? path : STORAGE_NVS;
+    string nvs_tmp_s = nvs_path_s + ".tmp";
+    const char* nvs_tmp = nvs_tmp_s.c_str();
+    const char* nvs_path = nvs_path_s.c_str();
     FIL* handle = nullptr;
     if (FileUtils::fsMount) {
-        if (!loaded) {
+        if (!toDefault && !loaded) {
             // Config was never loaded from file — refuse to overwrite
             // existing storage.nvs with defaults
             FILINFO fi;
@@ -1069,11 +1082,12 @@ void Config::save() {
                 return;
             }
         }
-        // Make sure /.config/pico-spec/<ver>/<board>/ exists before writing.
-        // If mkdir fails (broken/full SD), refuse to write — otherwise the
-        // following f_open would silently fail and we'd lose original state.
-        if (!FileUtils::mkdirParents(CONFIG_DIR_BOARD)) {
-            Debug::log("Config::save FAILED — cannot create %s", CONFIG_DIR_BOARD);
+        // Make sure the target directory exists before writing. If mkdir
+        // fails (broken/full SD), refuse to write — otherwise the following
+        // f_open would silently fail and we'd lose original state.
+        const char* dir = toDefault ? CONFIG_DIR_BOARD_ANYVER : CONFIG_DIR_BOARD;
+        if (!FileUtils::mkdirParents(dir)) {
+            Debug::log("Config::save FAILED — cannot create %s", dir);
         } else {
             // Atomic write: stream to .tmp, then rename over the original
             handle = fopen2(nvs_tmp, FA_WRITE | FA_CREATE_ALWAYS);
@@ -1326,7 +1340,7 @@ void Config::save() {
             if (rn != FR_OK) {
                 Debug::log("Config::save FAILED — rename error (rn=%d)", rn);
                 // Leave .tmp behind for manual recovery if needed.
-            } else {
+            } else if (!toDefault) {
                 // File is authoritative — drop any stale RAM copy
                 nvs_ram_buf.clear();
                 nvs_ram_buf.shrink_to_fit();
