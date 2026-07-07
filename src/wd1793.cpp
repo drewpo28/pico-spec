@@ -32,6 +32,7 @@ THE SOFTWARE.
 #include "Debug.h"
 #include "Config.h"
 #include "CPU.h"
+#include "Z80_JLS/z80.h"  // Z80Ops::isProfi — cached arch bool for hot paths
 #include "Ports.h"
 #include "MemESP.h"
 #include "OSDMain.h"
@@ -47,6 +48,10 @@ THE SOFTWARE.
 static bool sclConvertToTRD(rvmWD1793 *wd);
 #if !PICO_RP2040
 static void mbdFlushTrack(rvmWD1793 *wd); // defined below; also re-declared near its callers
+// Deferred PRO f_sync (see mbdFlushTrack / wdIdleIO): unit whose Diskfile has
+// flushed-but-unsynced sector data, executed in the frame's idle window.
+static rvmWD1793 *g_wdSyncPendingWd = nullptr;
+static int8_t     g_wdSyncPendingUnit = -1;
 #endif
 
 // Shared 8 KB track scratch for raw-format loads: FDI whole-track bulk read and
@@ -109,6 +114,15 @@ static const uint16_t sectdatapos[16]= { 162,554,946,1338,1730,2122,2514,2906,32
 #define indexMark 0xC2
 #define sectorMark 0xA1
 
+// Hot WD1793 step path runs from SRAM (same pattern as CPU.cpp/Video.cpp).
+// During CP/M transfers rvmWD1793Step fires once per byte (~624/frame) with
+// ~32 µs of Z80 emulation between calls — the Z80 core's ~43 KB of flash code
+// churns the 16 KB XIP cache in between, so every step call ran fully cold
+// (~10.5 µs measured on MURM2, ~6.5 ms/frame during CP/M disk transfers).
+// Covers _end/_do/rvmWD1793Step/Read/Write/rvmwdDiskStep (~6.5 KB of .data);
+// the track LOADERS stay in flash — they run in the frame's idle window.
+#undef IRAM_ATTR
+#define IRAM_ATTR __not_in_flash("wd1793")
 #ifndef IRAM_ATTR
 #define IRAM_ATTR
 #endif
@@ -793,7 +807,13 @@ case kRVMWD177XWriteData: {
       // .e erase) is lost on re-insert, leaving the on-SD catalog out of sync
       // with the data area ("file not found" / "Sector not found").
       // mbdFlushTrack re-reads from the buffer + f_sync; it self-clears diskDirty.
-      if (wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsMBDFile && wd->diskDirty)
+      // PRO (Profi CP/M) is excluded: it reuses the MBD reader but has normal
+      // track-switch flush semantics — the per-sector full-track flush +
+      // f_sync (10-50 ms SD program spikes) was a major negative-IDL source
+      // during CP/M saves.  PRO flushes on track switch / FDC-quiet idle
+      // (wdIdleIO) / eject, with the f_sync deferred to the idle window.
+      if (wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsMBDFile
+          && !wd->disk[wd->diskS]->IsProFile && wd->diskDirty)
           mbdFlushTrack(wd);
 #endif
 
@@ -1080,7 +1100,7 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
 #if !PICO_RP2040
   // Hoisted out of the per-byte loop: arch/CPM-bit/fastmode can't change
   // while the Z80 is suspended inside this call.
-  const bool profi_cpm = (Ports::portDFFD & 0x20) && Config::arch == "Profi";
+  const bool profi_cpm = (Ports::portDFFD & 0x20) && Z80Ops::isProfi;
 #endif
 
   for (;steps > 0; steps--) {
@@ -1129,6 +1149,20 @@ IRAM_ATTR void rvmWD1793Step(rvmWD1793 *wd, uint32_t steps) {
 
     uint8_t pd = s ^ wd->diskP;
     wd->diskP=s;
+
+#if !PICO_RP2040
+    // Deferred track load in progress: diskTrackBuf still holds the PREVIOUS
+    // track, so neither the byte stream nor the WaitingMark find_marker
+    // fast-path (which scans diskTrackBuf/fdiSectorIdPos directly) may run.
+    // Freeze the whole step machine — rotation, index pulses and retry
+    // counting all stop until wdIdleIO() loads the track (or the in-frame
+    // fallback in wdTrackReady fires).  If the command ended meanwhile
+    // (Force Interrupt), drop the stale request instead of freezing idle.
+    if (wd->trackLoadPending) {
+      if (wd->stepState >= kRVMWD177XStepWaitingMark) break;
+      wd->trackLoadPending = 0;
+    }
+#endif
 
     // Force Interrupt condition check: bit 2 = index pulse
     if ((wd->control >> 16) & 0x4) {
@@ -1522,7 +1556,7 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
             //   - SYS ROM active (romInUse==0) — boot ROM FDC probe at 0x0710.
             // TR-DOS (romInUse=1, CP/M off) relies on BUSY=0 after instant
             // completion, so the oneshot stays OFF there.
-            if (Config::arch == "Profi" &&
+            if (Z80Ops::isProfi &&
                 ((Ports::portDFFD & 0x20) || MemESP::romInUse == 0))
               wd->typeI_busy_oneshot = true;
 
@@ -1539,7 +1573,7 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
             // Instant completion means every re-issue is accepted (BUSY→0 before next
             // OUT), causing infinite stack growth. Keep BUSY=1 for multiple FDDStep
             // calls (like real hardware / UnrealSpeccy) so re-issues are rejected.
-            bool profi_cpm = (Config::arch == "Profi" && (Ports::portDFFD & 0x20));
+            bool profi_cpm = (Z80Ops::isProfi && (Ports::portDFFD & 0x20));
             if (!(wd->command & kRVMWD177XTypeI) && !profi_cpm) {
               while (wd->stepState == kRVMWD177XStepWaiting) {
                 _do(wd);
@@ -1581,7 +1615,7 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
           wd->command = 0x00;
           wd->control |= kRVMWD177XFINTRQ;
 #if !PICO_RP2040
-          if (Config::arch == "Profi")
+          if (Z80Ops::isProfi)
             Debug::log("[FDC!] CMD=0x%02X NOT_READY: disk=%p power=0x%X diskS=%d",
                        wd->command, wd->disk[wd->diskS],
                        wd->control & 0xf000, wd->diskS);
@@ -1590,7 +1624,7 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
 
       } else {
 #if !PICO_RP2040
-        if (Config::arch == "Profi" && wd->disk[wd->diskS] &&
+        if (Z80Ops::isProfi && wd->disk[wd->diskS] &&
             (wd->disk[wd->diskS]->IsProFile || wd->disk[wd->diskS]->IsTD0File)) {
           Debug::log("[FDCw!] CMD=0x%02X REJECTED (BUSY) t=%d s=%d prev_cmd=0x%02X st=%d ss=%d",
                      value, wd->track, wd->sector, wd->command, wd->state, wd->stepState);
@@ -1605,7 +1639,7 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
         wd->track=value;
       //}
 #if !PICO_RP2040 && FDD_PORT_TRACE
-      if (Config::arch == "Profi")
+      if (Z80Ops::isProfi)
         Debug::log("[FDC TRK] track<-%d pc=%04X", value, Z80::getRegPC());
 #endif
       break;
@@ -1769,6 +1803,7 @@ void rvmWD1793Reset(rvmWD1793 *wd) {
   wd->fdiTstates = 0;
   wd->fdiSectorCount = 0;
   wd->fdiDataCrcError = false;
+  wd->trackLoadPending = 0;
 #endif
 }
 
@@ -3155,29 +3190,198 @@ static void mbdFlushTrack(rvmWD1793 *wd) {
     int spt = disk->mbdSectorsPerTrack;
     int secSize = disk->mbdSectorSize;
 
-    // Extract sector data from MFM track buffer and write back
-    for (int sec = 0; sec < spt && sec < wd->fdiSectorCount; sec++) {
+    // Locate each sector's data area in the MFM buffer first.
+    int dataStarts[32];
+    int found = 0;
+    int nsec = (spt < wd->fdiSectorCount) ? spt : wd->fdiSectorCount;
+    if (nsec > 32) nsec = 32;
+    for (int sec = 0; sec < nsec; sec++) {
         // Find data mark (0xFB) after the sector's ID mark
         int idPos = wd->fdiSectorIdPos[sec];
         // Skip: FE + C + H + R + N + CRC(2) + gap2 + sync + A1s + FB
         int searchStart = idPos + 7; // past ID mark and CHRN+CRC
-        int dataStart = -1;
+        dataStarts[sec] = -1;
         for (int i = searchStart; i < (int)wd->diskTrackLen - 1; i++) {
             if (wd->diskTrackBuf[i] == 0xFB || wd->diskTrackBuf[i] == 0xF8) {
-                dataStart = i + 1;
+                dataStarts[sec] = i + 1;
                 break;
             }
         }
-        if (dataStart < 0 || dataStart + secSize > (int)wd->diskTrackLen) continue;
-
-        uint32_t fileOffset = ((uint32_t)wd->diskLoadedCyl * disk->sides + wd->diskLoadedSide) * spt * secSize
-                            + sec * secSize;
-        UINT bw;
-        f_lseek(disk->Diskfile, fileOffset);
-        f_write(disk->Diskfile, wd->diskTrackBuf + dataStart, secSize, &bw);
+        if (dataStarts[sec] >= 0 && dataStarts[sec] + secSize > (int)wd->diskTrackLen)
+            dataStarts[sec] = -1;
+        if (dataStarts[sec] >= 0) found++;
     }
-    f_sync(disk->Diskfile);
+
+    uint32_t trackBase = ((uint32_t)wd->diskLoadedCyl * disk->sides + wd->diskLoadedSide)
+                         * (uint32_t)spt * (uint32_t)secSize;
+    uint32_t totalRaw = (uint32_t)nsec * (uint32_t)secSize;
+    // Sectors are contiguous in the image file — when every data area was
+    // located and the staging zone (same high-end scratch mbdLoadTrack uses)
+    // does not overlap the MFM data, assemble the whole track and write it in
+    // ONE f_write (one SD multi-block transaction instead of spt separate
+    // lseek+write pairs).  The staging bytes land in the 0x4E tail padding of
+    // the track image, which carries no data.
+    uint32_t maxMFM = (uint32_t)spt * (102u + (uint32_t)secSize);
+    UINT bw;
+    if (found == nsec && nsec == spt && maxMFM + totalRaw <= (uint32_t)DISK_TRACK_BUF_SZ) {
+        uint8_t *stage = wd->diskTrackBuf + DISK_TRACK_BUF_SZ - totalRaw;
+        for (int sec = 0; sec < nsec; sec++)
+            memcpy(stage + (uint32_t)sec * secSize, wd->diskTrackBuf + dataStarts[sec], secSize);
+        f_lseek(disk->Diskfile, trackBase);
+        f_write(disk->Diskfile, stage, totalRaw, &bw);
+    } else {
+        for (int sec = 0; sec < nsec; sec++) {
+            if (dataStarts[sec] < 0) continue;
+            f_lseek(disk->Diskfile, trackBase + (uint32_t)sec * secSize);
+            f_write(disk->Diskfile, wd->diskTrackBuf + dataStarts[sec], secSize, &bw);
+        }
+    }
+    // PRO (Profi CP/M): defer the f_sync to the frame's idle window (wdIdleIO).
+    // f_sync = FAT + directory update + SD program latency (10-50+ ms spikes);
+    // doing it inside the emulation frame was a large negative-IDL source
+    // during CP/M saves.  Real MBD (MB-02 BS-DOS) keeps the immediate sync —
+    // its catalog-persistence semantics depend on it.  Data safety: the sync
+    // still happens within ~a frame of going idle, and f_close (eject/unmount)
+    // syncs implicitly.
+    if (disk->IsProFile) {
+        g_wdSyncPendingWd = wd;
+        g_wdSyncPendingUnit = (int8_t)u;
+    } else {
+        f_sync(disk->Diskfile);
+    }
     wd->diskDirty = false;
+}
+
+// ---------------------------------------------------------------------------
+// Deferred (idle-window) WD1793 SD I/O.
+//
+// A blocking track load (bulk f_read + MFM build) costs ~4-7 ms; with DRQ
+// pacing the guest reads a track side over ~8 frames, so every track/side
+// switch used to burn one frame's IDL (negative IDL / dropped frames on Profi
+// CP/M disk ops).  Instead of loading inside the emulated frame, a data-state
+// step that needs a not-yet-loaded track registers a PENDING request and the
+// whole WD step machine freezes (no rotation, no index pulses — for the guest
+// this is an ordinary long address-mark search; WD timeouts count index
+// pulses, which are frozen too, so no spurious RNF).  ESPectrum::loop then
+// runs the load in the frame's idle window via wdIdleIO().  If idle stays too
+// small for WD_DEFER_FALLBACK_US, the next step falls back to the old
+// blocking in-frame load, bounding the added latency.
+//
+// Scope: raw-format loaders (PRO/FDI/TD0/UDI), gated per frame by
+// g_wdDeferLoads (Profi arch, not maxSpeed).  Real MBD (MB-02 BS-DOS) always
+// loads blocking — its driver timing is hw-tuned and it runs on its own wd
+// instance.  TRD/SCL (cursectbuf path) never reach this code.
+// ---------------------------------------------------------------------------
+bool g_wdDeferLoads = false;
+#define WD_DEFER_FALLBACK_US 100000u   // ~5 frames: give up deferring, load in-frame
+static uint32_t g_wdLoadEstUs = 7000;  // rolling estimate of one blocking track load
+static uint32_t g_wdSyncEstUs = 10000; // rolling estimate of one f_sync
+static uint32_t g_wdQuietFrames = 0;   // consecutive idle-window calls with FDC quiet
+
+static void wdRunTrackLoader(rvmWD1793 *wd, uint8_t cyl, uint8_t side) {
+    rvmwdDisk *disk = wd->disk[wd->diskS];
+    uint64_t t0 = time_us_64();
+    if (disk->IsUDIFile)      udiLoadTrack(wd, cyl, side);
+    else if (disk->IsTD0File) td0LoadTrack(wd, cyl, side);
+    else if (disk->IsFDIFile) fdiLoadTrack(wd, cyl, side);
+    else                      mbdLoadTrack(wd, cyl, side);   // MBD + PRO
+    uint32_t dt = (uint32_t)(time_us_64() - t0);
+    // Rolling average, clamped: keeps the idle-window admission test honest
+    // for both quick (already-cached FatFs cluster) and slow (cluster-chain
+    // seek) loads.
+    g_wdLoadEstUs = (g_wdLoadEstUs + dt) / 2;
+    if (g_wdLoadEstUs < 2000)  g_wdLoadEstUs = 2000;
+    if (g_wdLoadEstUs > 15000) g_wdLoadEstUs = 15000;
+}
+
+// Ensure the track for (cyl, side) is in diskTrackBuf.  Returns false when the
+// load was deferred to the idle window — the caller must freeze this step.
+static inline bool wdTrackReady(rvmWD1793 *wd, uint8_t cyl, uint8_t side) {
+    if (wd->diskLoadedCyl == (int)cyl && wd->diskLoadedSide == (int)side &&
+        wd->diskLoadedUnit == (int)wd->diskS) {
+        wd->trackLoadPending = 0;
+        return true;
+    }
+    rvmwdDisk *disk = wd->disk[wd->diskS];
+    // Blocking path: feature off, real MBD, or the transfer states where a
+    // reload is a same-track no-op anyway (belt-and-braces — see loadSide
+    // pinning at the call sites).
+    if (!g_wdDeferLoads || (disk->IsMBDFile && !disk->IsProFile)) {
+        wdRunTrackLoader(wd, cyl, side);
+        return true;
+    }
+    uint64_t now = time_us_64();
+    if (wd->trackLoadPending && wd->pendCyl == cyl && wd->pendSide == side &&
+        wd->pendUnit == wd->diskS) {
+        if (now - wd->pendSince >= WD_DEFER_FALLBACK_US) {
+            // Idle windows were too small for ~5 frames — load in-frame.
+            wd->trackLoadPending = 0;
+            wdRunTrackLoader(wd, cyl, side);
+            return true;
+        }
+        return false;
+    }
+    wd->trackLoadPending = 1;
+    wd->pendCyl  = cyl;
+    wd->pendSide = side;
+    wd->pendUnit = wd->diskS;
+    wd->pendSince = now;
+    return false;
+}
+
+void wdIdleIO(rvmWD1793 *wd, uint64_t deadline_us) {
+    rvmwdDisk *disk = wd->disk[wd->diskS];
+    // 1. Pending track load — highest priority (the guest is frozen on it).
+    if (wd->trackLoadPending) {
+        g_wdQuietFrames = 0;
+        // A dirty buffer means the loader flushes first — budget both halves.
+        uint32_t est = g_wdLoadEstUs + (wd->diskDirty ? g_wdLoadEstUs : 0);
+        uint64_t now = time_us_64();
+        // Overdue escape: in negative-IDL streaks the budget test never
+        // passes (this hook is only reached with idle > 0 at all), so a
+        // pending load would sit frozen until wdTrackReady's 100 ms in-frame
+        // fallback — the worst of both worlds (long stall AND a blocking
+        // load).  After ~1 frame of freeze, run the load here regardless of
+        // the remaining budget: same cost, ~5 frames sooner, and the overrun
+        // lands at the frame boundary instead of mid-emulation.
+        bool overdue = (now - wd->pendSince) > 20000u;
+        if (disk && wd->pendUnit == wd->diskS &&
+            (overdue || now + est <= deadline_us)) {
+            wd->trackLoadPending = 0;
+            wdRunTrackLoader(wd, wd->pendCyl, wd->pendSide);
+        }
+        return;
+    }
+    bool quiet = wd->stepState <= kRVMWD177XStepWaiting;
+    if (!quiet) { g_wdQuietFrames = 0; return; }
+    if (g_wdQuietFrames < 0xffffffffu) g_wdQuietFrames++;
+    // 2. Pending PRO f_sync (set by mbdFlushTrack) — run once the FDC is quiet.
+    if (g_wdSyncPendingWd == wd && g_wdSyncPendingUnit >= 0) {
+        rvmwdDisk *sd_ = wd->disk[g_wdSyncPendingUnit];
+        if (!sd_ || !sd_->Diskfile) {   // ejected meanwhile: f_close already synced
+            g_wdSyncPendingWd = nullptr;
+            g_wdSyncPendingUnit = -1;
+            return;
+        }
+        if (time_us_64() + g_wdSyncEstUs <= deadline_us) {
+            uint64_t t0 = time_us_64();
+            f_sync(sd_->Diskfile);
+            uint32_t dt = (uint32_t)(time_us_64() - t0);
+            g_wdSyncEstUs = (g_wdSyncEstUs + dt) / 2;
+            if (g_wdSyncEstUs < 3000)  g_wdSyncEstUs = 3000;
+            if (g_wdSyncEstUs > 40000) g_wdSyncEstUs = 40000;
+            g_wdSyncPendingWd = nullptr;
+            g_wdSyncPendingUnit = -1;
+        }
+        return;
+    }
+    // 3. Dirty PRO track with the FDC quiet for ~half a second: flush now (in
+    // idle) instead of on the next track switch mid-transfer.  Sets the
+    // sync-pending state above; the sync itself runs on a later idle window.
+    if (wd->diskDirty && g_wdQuietFrames >= 25 && disk && disk->IsProFile &&
+        time_us_64() + g_wdLoadEstUs <= deadline_us) {
+        mbdFlushTrack(wd);
+    }
 }
 
 #endif
@@ -3256,7 +3460,8 @@ IRAM_ATTR uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control) {
                        || wd->stepState == kRVMWD177XStepWriteByte);
         if (activeCmd && wd->diskLoadedCyl == (int)disk->t && wd->diskLoadedSide >= 0)
             loadSide = (uint8_t)wd->diskLoadedSide;
-        udiLoadTrack(wd, disk->t, loadSide);
+        if (!wdTrackReady(wd, (uint8_t)disk->t, loadSide))
+          return disk->s; // load deferred to idle window — rotation frozen
       }
 
       if(disk->indx != 0xffffffff && disk->indx >= wd->diskTrackLen) {
@@ -3310,7 +3515,8 @@ IRAM_ATTR uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control) {
                        || wd->stepState == kRVMWD177XStepWriteByte);
         if (activeCmd && wd->diskLoadedCyl == (int)disk->t && wd->diskLoadedSide >= 0)
             loadSide = (uint8_t)wd->diskLoadedSide;
-        td0LoadTrack(wd, disk->t, loadSide);
+        if (!wdTrackReady(wd, (uint8_t)disk->t, loadSide))
+          return disk->s; // load deferred to idle window — rotation frozen
       }
 
       if(disk->indx != 0xffffffff && disk->indx >= wd->diskTrackLen) {
@@ -3364,7 +3570,8 @@ IRAM_ATTR uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control) {
                        || wd->stepState == kRVMWD177XStepWriteByte);
         if (activeCmd && wd->diskLoadedCyl == (int)disk->t && wd->diskLoadedSide >= 0)
             loadSide = (uint8_t)wd->diskLoadedSide;
-        fdiLoadTrack(wd, disk->t, loadSide);
+        if (!wdTrackReady(wd, (uint8_t)disk->t, loadSide))
+          return disk->s; // load deferred to idle window — rotation frozen
       }
 
       if(disk->indx != 0xffffffff && disk->indx >= wd->diskTrackLen) {
@@ -3418,7 +3625,8 @@ IRAM_ATTR uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control) {
                        || wd->stepState == kRVMWD177XStepWriteByte);
         if (activeCmd && wd->diskLoadedCyl == (int)disk->t && wd->diskLoadedSide >= 0)
             loadSide = (uint8_t)wd->diskLoadedSide;
-        mbdLoadTrack(wd, disk->t, loadSide);
+        if (!wdTrackReady(wd, (uint8_t)disk->t, loadSide))
+          return disk->s; // load deferred to idle window — rotation frozen
       }
 
       if(disk->indx != 0xffffffff && disk->indx >= wd->diskTrackLen) {
@@ -3541,6 +3749,14 @@ void wdDiskEject(rvmWD1793 *wd, unsigned char UnitNum) {
             else if (wd->disk[UnitNum]->IsFDIFile) fdiFlushTrack(wd);
             else if (wd->disk[UnitNum]->IsMBDFile) mbdFlushTrack(wd);
         }
+        // Deferred PRO sync for this unit is covered by the f_close below
+        // (f_close syncs); drop the stale pending marker.
+        if (g_wdSyncPendingWd == wd && g_wdSyncPendingUnit == (int)UnitNum) {
+            g_wdSyncPendingWd = nullptr;
+            g_wdSyncPendingUnit = -1;
+        }
+        if (wd->trackLoadPending && wd->pendUnit == UnitNum)
+            wd->trackLoadPending = 0;
 #endif
         fclose2(wd->disk[UnitNum]->Diskfile);
         wd->disk[UnitNum]->Diskfile = NULL;

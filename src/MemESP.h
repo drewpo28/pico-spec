@@ -64,6 +64,8 @@ extern volatile uint32_t mem_spi_wb_skip;     // clean-victim evictions, write-b
 extern volatile uint32_t mem_spi_swap_us;     // total µs spent in _sync page swaps
 extern volatile uint32_t mem_spi_accb;        // accessor-mode per-byte SPI accesses
 extern volatile uint32_t mem_spi_promo;       // accessor→pool promotions
+extern volatile uint32_t mem_spi_promo_idle;  // ...of which executed in the idle window
+extern volatile uint32_t mem_spi_swap_idle_us;// µs of swap work done in the idle window
 #if MEM_ACCESS_TRACE
 // Access counts of evicted pages, split clean/dirty — see [ACC] log in Video.cpp.
 extern volatile uint32_t mem_acc_clean_cnt, mem_acc_clean_sum, mem_acc_clean_max;
@@ -143,6 +145,10 @@ public:
     // pages trampolined often-but-lightly racking up 27k per-byte ops with a
     // per-visit counter); it resets only when the page is loaded into the pool.
     inline bool acc_tick() { return ++_int->acc_hits >= 128; }
+    // True when this page has crossed the promotion threshold — used by the
+    // idle-window promoter to re-validate a deferred request (the bank may
+    // have been re-synced to a colder page since the request was queued).
+    inline bool acc_hot() { return _int->acc_hits >= 128; }
 private:
     struct mem_desc_int_t {
         uint8_t* p;
@@ -340,6 +346,14 @@ public:
     static uint8_t accessorRead(uint8_t bank, uint16_t off);
     static void    accessorWrite(uint8_t bank, uint16_t off, uint8_t v);
     static void    promoteBank(uint8_t bank);
+    // Deferred promotions (Profi on butter): bank-trampoline storms used to
+    // cluster several 16KB pool swaps into one emulated frame (negative IDL).
+    // Only the FIRST promotion of a frame runs inline; the rest are queued and
+    // executed by idleService() in the frame's idle window — the accessor
+    // window keeps serving the bank per-byte meanwhile, so this is purely a
+    // scheduling change.  promoFrameReset() is called once per frame.
+    static void promoFrameReset(uint8_t inlineBudget);
+    static void idleService(uint64_t deadline_us);
     // For code that needs a raw ramCurrent[page] pointer (tape flashload,
     // debugger poke): force an accessor-mode bank into a real SRAM frame.
     static inline void ensureResident(uint8_t page) {

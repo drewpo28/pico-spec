@@ -65,6 +65,7 @@ uint32_t CPU::tstates_diff = 0;
 // Frame timing accumulators (µs); read+reset in VIDEO::EndFrame diagnostic.
 volatile uint32_t cpu_frame_us  = 0;  // total CPU::loop() time (incl. FDC)
 volatile uint32_t fdd_step_us   = 0;  // time inside rvmWD1793Step only
+volatile uint32_t endframe_us   = 0;  // last VIDEO::EndFrame() duration (main path)
 
 uint64_t CPU::global_tstates = 0;
 uint32_t CPU::statesInFrame = 0;
@@ -299,7 +300,11 @@ IRAM_ATTR void CPU::loop() {
 #endif
         BREAKPOINTS
     }
-    VIDEO::EndFrame();
+    {
+        uint64_t _ef_t0 = time_us_64();
+        VIDEO::EndFrame();
+        endframe_us = (uint32_t)(time_us_64() - _ef_t0);
+    }
 
     CPU::tstates_diff += CPU::tstates - CPU::prev_tstates;
 

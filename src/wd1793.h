@@ -371,9 +371,33 @@ typedef struct
     int      fdiSectorCount;       // sector count on current track
     uint32_t fdiTstates;           // intra-command byte offset (for find_marker progression)
     bool     fdiDataCrcError;      // matched sector has CRC error
+
+    // Deferred track load (idle-window SD I/O — see wdIdleIO in wd1793.cpp).
+    // While pending, the MFM buffer still holds the PREVIOUS track: disk
+    // rotation and the whole per-step state machine are frozen (the guest just
+    // sees a longer address-mark search; WD-side timeouts count index pulses,
+    // which are frozen too).  The actual SD read runs in the frame's idle
+    // window (wdIdleIO) or, if idle stays too small, as an in-frame fallback
+    // after WD_DEFER_FALLBACK_US.
+    uint8_t  trackLoadPending;     // 1 = a data-state step needs pendCyl/pendSide
+    uint8_t  pendCyl;
+    uint8_t  pendSide;
+    uint8_t  pendUnit;             // diskS at registration (revalidated at load)
+    uint64_t pendSince;            // wall-clock µs when this target was registered
 #endif
 
 } rvmWD1793;
+
+#if !PICO_RP2040
+// Per-frame enable for deferred track loads (set by ESPectrum::loop: Profi
+// arch and not maxSpeed).  When false, wdTrackReady() loads blocking in-frame
+// exactly as before — TR-DOS/Pentagon and maxSpeed behaviour is unchanged.
+extern bool g_wdDeferLoads;
+// Run pending WD1793 SD I/O (deferred track load / PRO flush + f_sync) inside
+// the frame's idle window.  deadline_us = absolute time_us_64() budget; the
+// call does nothing when the estimated cost does not fit.
+void wdIdleIO(rvmWD1793 *wd, uint64_t deadline_us);
+#endif
 
 void _do(rvmWD1793 *wd);
 void rvmWD1793Write(rvmWD1793 *wd, uint8_t a, uint8_t v);

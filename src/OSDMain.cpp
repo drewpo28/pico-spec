@@ -2189,6 +2189,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
         }
         else if (hkIdx == Config::HK_GIGASCREEN) {
 #if !PICO_RP2040
+            // Profi is incompatible with Gigascreen (renderer geometry never
+            // touches the prev-FB coherently) — same guard as the Video menu;
+            // without it the Alt+PgUp toggle enabled it mid-Profi and the
+            // render path SIGBUS-stormed (hw, PICO_DV).
+            if (Z80Ops::isProfi) {
+                osdCenteredMsg("Gigascreen: not available on Profi", LEVEL_WARN, 1500);
+                return;
+            }
             Config::gigascreen_onoff = (Config::gigascreen_onoff + 1) % 3; // Off -> On -> Auto -> Off
             bool want_on = (Config::gigascreen_onoff != 0);
             if (want_on && !Config::gigascreen_enabled &&
@@ -4883,6 +4891,19 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::gigascreen_onoff = opt2 - 1; // 0=Off, 1=On, 2=Auto
                                     if (Config::gigascreen_onoff != prev_onoff) {
                                         bool want_on = (Config::gigascreen_onoff != 0);
+                                        // Profi is incompatible with Gigascreen (its renderer
+                                        // geometry never touches the prev-FB coherently) —
+                                        // arch switches INTO Profi already force it off
+                                        // (disableGigascreenForProfi), but enabling it FROM
+                                        // this menu while Profi is running crashed with a
+                                        // SIGBUS storm in the render path (hw, PICO_DV).
+                                        if (want_on && Z80Ops::isProfi) {
+                                            OSD::osdCenteredMsg("Gigascreen: not available on Profi", LEVEL_WARN, 1500);
+                                            Config::gigascreen_onoff = prev_onoff;
+                                            menu_curopt = prev_onoff + 1;
+                                            menu_saverect = false;
+                                            continue;
+                                        }
                                         if (want_on && !OSD::featureBudgetGate(Subsystems::FEAT_GIGASCREEN)) {
                                             // Denied / cancelled (a freeing reboot never returns here).
                                             Config::gigascreen_onoff = prev_onoff;

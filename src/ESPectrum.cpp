@@ -52,9 +52,6 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Tape.h"
 #include "Video.h"
 #include "Z80_JLS/z80.h"
-#if !PICO_RP2040
-#include "hardware/xip_cache.h"
-#endif
 #include "messages.h"
 #include "pwm_audio.h"
 #include "wd1793.h"
@@ -112,6 +109,12 @@ void joyPushData(fabgl::VirtualKey virtualKey, bool down) {
     kbd->injectVirtualKey(virtualKey, down);
   }
 }
+
+// Last pwm_audio_write() duration — [NEG2] attribution (it can block waiting
+// for DMA-ring space, which shows up as el−cpu time).
+volatile uint32_t g_aud_write_us = 0;
+volatile uint32_t g_kbd_us = 0;        // processKeyboard() per frame ([NEG2])
+volatile uint32_t g_mix_us = 0;        // audio synth+mix block per frame ([NEG2])
 
 volatile static uint32_t tickKbdRep = 0;
 volatile static fabgl::VirtualKey last_key_pressed = fabgl::VirtualKey::VK_NONE;
@@ -581,12 +584,11 @@ static void assign_ram(int i) {
   // Page 61 left UNPINNED so it stays in the evictable pool ({56,58,61}).
   // 1024K BIOS test stays correct (the earlier 160K was the buggy 32-bit
   // write_page truncating writes, not force_sram).
-  // butter/QSPI-XIP boards now use the SAME layout: forcing only the colour
-  // pages there gave no IDL gain back when pages 8+ stayed direct XIP pointers
-  // (the whole Z80 working set thrashed the 16KB XIP cache against the
-  // emulator's own flash code), but with pages 8+ pool/accessor-backed (see
-  // the profi_butter branch below) the hot set migrates to SRAM adaptively
-  // and the colour pages must be POINTER-stable for the DS80 renderer.
+  // butter/QSPI-XIP boards are excluded: direct XIP pointers serve all pages
+  // there, and per the 2026-07-07 A/B ([NEG2] cpu, HC idle + CP/M disk) the
+  // pool/accessor layout brought no cpu gain once the platform-independent
+  // costs were fixed — the real killers were AY/SAA synth, WD flash path and
+  // per-poll FDC stepping, all fixed separately.
   //
   // +1 extra LRU pool buffer (60 = 16KB): HC's CP/M bank-switch trampoline
   // (OUT 0x7FFD/0xDFFD) ping-pongs read-only code banks; historically that
@@ -610,10 +612,10 @@ static void assign_ram(int i) {
   // With locked=true: no pin/unpin/preload needed in the render path → the
   // HDMI/VGA renderer never stalls on SPI DMA → no sync loss.
   //
-  // Profi CP/M pool layout (RP2350, SPI-PSRAM and butter/QSPI alike):
+  // Profi CP/M pool layout (RP2350, SPI-PSRAM only):
   //   Locked SRAM (never evicted): pages 56, 58 — DS80 colour-attribute data
   //   LRU pool (evictable):        pages 1, 2, 3, 60, 61 — CP/M working set
-  //   All other pages:             external PSRAM, on demand via accessor window
+  //   All other pages:             SPI PSRAM, on demand via accessor window
   //
   // RP2040 (ZERO/MURM): DS80 not available; heap budget ~181KB with MEM_REMAIN=96KB
   // reserved for framebuffer. Use 3-page set {56,58,61} on RP2040.
@@ -623,22 +625,19 @@ static void assign_ram(int i) {
                     && (i == 56 || i == 58 || i == 61)
                     && (butter_psram_size() == 0);
 #else
+  // butter/QSPI boards keep the direct-XIP-pointer scheme for ALL Profi pages
+  // (56/58 included — the DS80 renderer reads them via the ds80_clr_sram
+  // vblank snapshot, see Video.cpp).  An A/B test (2026-07-07, [NEG2] cpu on
+  // HC idle + CP/M disk activity) showed the pool/accessor layout gave no cpu
+  // gain on butter once the platform-independent costs were fixed (AY/SAA
+  // silent paths, WD step path in SRAM, FDDStep fast exit, strcmp removal,
+  // idle-window track loads) — the forced-SRAM pages only spent ~64 KB heap.
   bool force_sram_locked = (Config::arch == "Profi")
-                           && (i == 56 || i == 58);
+                           && (i == 56 || i == 58)
+                           && (butter_psram_size() == 0);
   bool force_sram = (Config::arch == "Profi")
-                    && (i == 61 || i == 60);
-  // Profi on butter/QSPI boards: pages 8+ (minus the forced-SRAM set above)
-  // become pool/accessor-backed vram with a LINEAR butter backing layout
-  // (page i ↔ offset i*16KB, incl. slots 0-7 for pool-page evictions).  The
-  // backing is accessed exclusively through the uncached alias (butter_nc) so
-  // Z80 trampoline visits and 16KB page swaps stop evicting XIP cache lines
-  // that hold the emulator's flash code — the direct-XIP-pointer scheme let
-  // the guest working set and host code thrash each other in the shared 16KB
-  // cache (Profi CP/M: FPS drop + negative IDL).  setup() reserves the strip
-  // (butter_pages) and cleans the XIP cache once (size-probe markers were
-  // written through the cached alias).
-  bool profi_butter_vram = (Config::arch == "Profi")
-                           && psram_size() == 0 && butter_psram_size() > 0;
+                    && (i == 61 || i == 60)
+                    && (butter_psram_size() == 0);
 #endif
   if (force_sram_locked) {
     MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, true); // LOCKED: permanent SRAM
@@ -646,16 +645,6 @@ static void assign_ram(int i) {
   } else if (force_sram) {
     MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, false); // unlocked → in pool
     ++ram_pages;
-#if !PICO_RP2040
-  } else if (profi_butter_vram) {
-    if (butter_psram_size() >= MEM_PG_SZ * (size_t)(i + 1)) {
-      // Counted wholesale via the butter_pages strip reservation in setup().
-      MemESP::ram[i].assign_vram(i, mem_type_t::PSRAM_SPI);
-    } else {
-      MemESP::ram[i].assign_vram(i, mem_type_t::SWAP); // page beyond the chip
-      ++swap_pages;
-    }
-#endif
   } else if (getFreeHeap() >= MEM_PG_SZ + MEM_REMAIN) {
     MemESP::ram[i].assign_ram(new unsigned char[MEM_PG_SZ], i, false);
     ++ram_pages;
@@ -835,26 +824,6 @@ void ESPectrum::setup() {
     for (size_t i = 8; i < (MEM_PG_CNT + 2); ++i) {
       assign_ram(i);
     }
-#if !PICO_RP2040
-    if (Config::arch == "Profi" && psram_size() == 0 && butter_psram_size() > 0) {
-      // Linear butter backing strip: page i ↔ offset i*16KB, including slots
-      // 0-7 (pool pages 1-3 evict there) and the forced-SRAM 56/58/60/61 slots
-      // (60/61 are unlocked pool members and evict too).  Reserve the whole
-      // strip so DivMMC / Buffer arenas (butter_used = butter_pages*16KB)
-      // start above it.
-      size_t slots = MEM_PG_CNT + 2;
-      size_t cap   = butter_psram_size() / MEM_PG_SZ;
-      butter_pages = (int)(slots < cap ? slots : cap);
-      // The butter size probe wrote its markers through the CACHED alias; from
-      // now on the strip is accessed only through the uncached alias
-      // (butter_nc).  Clean+invalidate once so no stale dirty line can later
-      // evict on top of uncached backing writes (RP2350-E11: clean_all also
-      // invalidates).
-      xip_cache_clean_all();
-      Debug::log("setup: Profi butter pool: strip=%d pages, freeHeap=%u",
-                 butter_pages, getFreeHeap());
-    }
-#endif
     Debug::log("setup: ext_ram: all pages done, freeHeap=%u", getFreeHeap());
     Debug::log("setup: ram5=%p ram7=%p diff=%d", MemESP::ram[5].direct(), MemESP::ram[7].direct(),
                (int)((uint8_t*)MemESP::ram[7].direct() - (uint8_t*)MemESP::ram[5].direct()));
@@ -2319,9 +2288,13 @@ void ESPectrum::loop() {
     }
     ts_start = time_us_64();
 
-    if (!CPU::paused)
+    if (!CPU::paused) {
+      uint64_t _aud_t0 = time_us_64();
       pwm_audio_write((uint8_t *)audioBuffer_L, (uint8_t *)audioBuffer_R,
                       maxSpeed ? 1 : samplesPerFrame, 0, 0);
+      g_aud_write_us = (uint32_t)(time_us_64() - _aud_t0);
+    } else
+      g_aud_write_us = 0;
 
     // Send audioBuffer to pwmaudio
     audbufcnt = 0;
@@ -2435,6 +2408,7 @@ void ESPectrum::loop() {
     // uint64_t ay_start = time_us_64();
 
     // Process audio buffer
+    uint64_t _mix_t0 = time_us_64();
     faudbufcnt = audbufcnt;
     faudioBit = lastaudioBit;
     faudbufcntAY = audbufcntAY;
@@ -2602,7 +2576,12 @@ void ESPectrum::loop() {
         }
       }
     }
-    processKeyboard();
+    g_mix_us = (uint32_t)(time_us_64() - _mix_t0);
+    {
+      uint64_t _kbd_t0 = time_us_64();
+      processKeyboard();
+      g_kbd_us = (uint32_t)(time_us_64() - _kbd_t0);
+    }
 #ifdef USE_GS
     GS::pollPerf();
 #endif
@@ -2769,6 +2748,81 @@ void ESPectrum::loop() {
         snd_trace_frames = 0;
         Ports::sndTraceDump();
       }
+    }
+#endif
+
+#if !PICO_RP2040
+    // Negative-IDL attribution (Profi): track the worst frame of every
+    // 60-frame window and, when at least one frame overran the target, log a
+    // breakdown of where its time went.  Counter deltas are robust to the
+    // per-frame resets a PERF_TRACE build performs (cur < prev → external
+    // reset → the current value IS the delta).
+    if (Z80Ops::isProfi) {
+      extern volatile uint32_t cpu_frame_us, fdd_step_us, endframe_us;
+      extern volatile uint32_t g_frame_swap_us, g_frame_swap_idle_us, g_frame_accb;
+      extern volatile uint32_t g_aud_write_us;
+      static uint32_t p_cpu = 0, p_fdd = 0, p_ports = 0, p_pcalls = 0;
+      uint32_t c;
+      c = cpu_frame_us;        uint32_t d_cpu   = (c >= p_cpu)   ? c - p_cpu   : c; p_cpu = c;
+      c = fdd_step_us;         uint32_t d_fdd   = (c >= p_fdd)   ? c - p_fdd   : c; p_fdd = c;
+      c = Ports::fdd_ports_us; uint32_t d_ports = (c >= p_ports) ? c - p_ports : c; p_ports = c;
+      c = Ports::fdd_ports_calls; uint32_t d_pcalls = (c >= p_pcalls) ? c - p_pcalls : c; p_pcalls = c;
+      uint32_t pmax_win = Ports::fdd_ports_max; Ports::fdd_ports_max = 0;
+      static uint32_t neg_cnt = 0, frame_cnt = 0;
+      static int32_t  w_idle = INT32_MAX;
+      static uint32_t w_el = 0, w_cpu = 0, w_fdd = 0, w_ports = 0, w_pcalls = 0;
+      static uint32_t w_swap = 0, w_swapidle = 0, w_accb = 0;
+      static uint32_t w_ef = 0, w_aud = 0, w_kbd = 0, w_pmax = 0, w_mix = 0;
+      if ((int32_t)idle < w_idle) {
+        w_idle = (int32_t)idle;   w_el = (uint32_t)elapsed;
+        w_cpu = d_cpu;            w_fdd = d_fdd;   w_ports = d_ports;
+        w_pcalls = d_pcalls;
+        w_swap = g_frame_swap_us; w_swapidle = g_frame_swap_idle_us;
+        w_accb = g_frame_accb;
+        w_ef = endframe_us;       w_aud = g_aud_write_us;
+        w_kbd = g_kbd_us;         w_mix = g_mix_us;
+      }
+      if (pmax_win > w_pmax) w_pmax = pmax_win;
+      if (idle < 0) neg_cnt++;
+      if (++frame_cnt >= 60) {
+        // ef is inside cpu (EndFrame: DS80 border flush + the [SPI] print —
+        // Debug::log over USB-CDC can cost ms, so a worst frame with big ef
+        // and zero everything else is usually the diagnostics frame itself);
+        // aud = pwm_audio_write DMA wait; kbd = processKeyboard;
+        // post = el - cpu - aud - kbd (OSD stats/LED/ZiFi/RTC…);
+        // pmax = longest single WD stepping call in the window.
+        if (neg_cnt)
+          Debug::log("[NEG2] 60f: neg=%u worst: idle=%d el=%u cpu=%u ef=%u aud=%u mix=%u kbd=%u post=%d fdd=%u ports=%u/%u pmax=%u swap=%u(idle %u) accb=%u",
+                     neg_cnt, w_idle, w_el, w_cpu, w_ef, w_aud, w_mix, w_kbd,
+                     (int)(w_el - w_cpu - w_aud - w_mix - w_kbd),
+                     w_fdd, w_ports, w_pcalls, w_pmax,
+                     w_swap, w_swapidle, w_accb);
+        frame_cnt = 0; neg_cnt = 0; w_idle = INT32_MAX; w_pmax = 0;
+      }
+    }
+    // Deferred WD1793 SD I/O (track loads, PRO flush/f_sync) runs inside this
+    // frame's idle window, so disk operations stop eating frame time (negative
+    // IDL on Profi CP/M disk ops).  g_wdDeferLoads is refreshed EVERY frame,
+    // including maxSpeed ones — a stale 'true' with no idle runner would leave
+    // every track load waiting for wdTrackReady's in-frame fallback.
+    g_wdDeferLoads = !maxSpeed && Z80Ops::isProfi;
+    // Deferred pool promotions (butter accessor banks): allow 1 inline
+    // promotion per frame; the rest queue for the idle window below.  On
+    // maxSpeed there is no idle window — run everything inline as before.
+    MemESP::promoFrameReset(maxSpeed ? 255 : 1);
+    // Run the I/O hook also when a deferred track load is pending even with
+    // no idle budget: in negative-IDL streaks the guest is FROZEN on that
+    // load, and wdIdleIO's overdue escape must get a chance to run it (else
+    // it waits for the 100 ms in-frame fallback — long stall AND the same
+    // blocking cost).
+    if (!maxSpeed && (idle > 3000 || fdd.trackLoadPending)) {
+      uint64_t io_deadline = (uint64_t)(ts_start + target - 1200);
+      wdIdleIO(&fdd, io_deadline);
+      if (idle > 3000) MemESP::idleService(io_deadline);
+      // The I/O consumed part of the wait budget — re-derive the remaining
+      // idle for the pacing below (stats above keep the pre-I/O values).
+      int64_t rem = target - (int64_t)(time_us_64() - ts_start);
+      idle = rem > 0 ? rem : 0;
     }
 #endif
 

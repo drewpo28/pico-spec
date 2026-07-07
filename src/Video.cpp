@@ -214,6 +214,9 @@ static inline uint32_t profi_color_to_rgb888(uint8_t c) {
     return ((uint32_t)R << 16) | ((uint32_t)G << 8) | B;
 }
 
+// Per-frame swap/accessor snapshot for [NEG] attribution (see EndFrame).
+volatile uint32_t g_frame_swap_us = 0, g_frame_swap_idle_us = 0, g_frame_accb = 0;
+
 volatile bool VIDEO::profi_palette_dirty = false;
 volatile bool VIDEO::profi_ds80_activate_pending   = false;
 volatile bool VIDEO::profi_ds80_deactivate_pending = false;
@@ -525,11 +528,13 @@ static unsigned int curline;
 // the live grmem/profi_clrmem, which we pick up at the next frame's line 0.
 static uint8_t* ds80_frame_grmem  = nullptr;
 static uint8_t* ds80_frame_clrmem = nullptr;
-// NOTE: the old butter-only SRAM snapshot of the clrmem page (ds80_clr_sram,
-// 16 KB heap + a per-frame 16 KB copy that wiped the whole XIP cache) was
-// removed: pages 56/58 are force_sram_locked heap SRAM on ALL RP2350 boards
-// now (unified Profi layout), so ds80_frame_clrmem is always a plain SRAM
-// pointer.  Restore from git history if colour pages ever move back to XIP.
+// SRAM snapshot of the 16 KB clrmem page (pages 56/58).  Lives at file scope so
+// EndFrame (vblank) can populate it before the rasterizer runs.  Allocated from
+// heap only when arch==Profi on butter/QSPI boards (see VIDEO::Reset), where
+// pages 56/58 are plain XIP butter pointers; on SPI-PSRAM/SWAP boards those
+// pages are force_sram_locked heap SRAM and no snapshot is needed.
+#define DS80_CLR_SRAM_SIZE 16384
+static uint8_t* ds80_clr_sram = nullptr;
 #endif
 
 static unsigned int bmpOffset;  // offset for bitmap in graphic memory
@@ -2174,6 +2179,18 @@ void VIDEO::Reset() {
         init_profi_pair_lookup();
         // Reset live palette to defaults on machine reset
         profiPaletteReset();
+        // DS80 clrmem snapshot: needed only when pages 56/58 live in XIP butter
+        // PSRAM (butter boards keep the whole Profi RAM as direct XIP pointers —
+        // per A/B measurement the SRAM pool gave no cpu gain there).  A direct
+        // per-scanline read would hit the XIP cache from the render path; the
+        // snapshot converts that into one sequential burst per frame.
+        // On SPI-PSRAM/SWAP boards pages 56/58 are force_sram_locked heap SRAM,
+        // so ds80_frame_clrmem is already a plain SRAM pointer — no snapshot.
+        if (!ds80_clr_sram && butter_psram_size() > 0)
+            ds80_clr_sram = (uint8_t*)malloc(DS80_CLR_SRAM_SIZE);
+    } else if (ds80_clr_sram) {
+        free(ds80_clr_sram);
+        ds80_clr_sram = nullptr;
     }
 #endif
 
@@ -2724,10 +2741,18 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
         if ((line == 0 && start_col == 0) || ds80_frame_grmem == nullptr) {
             ds80_frame_grmem  = grmem;
             ds80_frame_clrmem = profi_clrmem;
+            // Refresh snapshot at the START of each active scan so Z80 writes made
+            // since vblank (e.g. ROM service-menu attr init over multiple frames) are
+            // captured immediately.  One sequential burst here; renderer reads SRAM
+            // for all remaining lines without scattered XIP stalls.
+            if (profi_clrmem && ds80_clr_sram)
+                memcpy(ds80_clr_sram, profi_clrmem, DS80_CLR_SRAM_SIZE);
         }
         uint8_t* fgrmem  = ds80_frame_grmem;
-        // Pages 56/58 are force_sram_locked heap SRAM on all boards — direct read.
-        uint8_t* fclrmem = ds80_frame_clrmem;
+        // ds80_clr_sram is only allocated on butter-PSRAM boards (XIP cache stall risk);
+        // on SPI-PSRAM/SWAP boards it is null and ds80_frame_clrmem (force_sram_locked
+        // SRAM pointer) is used directly — no stall risk, saves 16 KB heap.
+        uint8_t* fclrmem = ds80_frame_clrmem ? (ds80_clr_sram ? ds80_clr_sram : ds80_frame_clrmem) : nullptr;
         //
         // Row layout: pad_l bytes of border, then 256 content bytes (with (k^2) pre-swap
         // for the ISR's x^2 read pattern), then pad_r bytes of border.
@@ -3155,6 +3180,10 @@ IRAM_ATTR void VIDEO::EndFrame() {
                 // SRAM-resident, never in the evictable pool, direct() is always
                 // valid — no preload/pin/precheck needed.
                 profi_clrmem = MemESP::ram[clrPg].direct();
+                // Snapshot the 16 KB clrmem page into SRAM here (vblank) so the
+                // rasterizer never touches XIP PSRAM during active scan.
+                if (profi_clrmem && ds80_clr_sram)
+                    memcpy(ds80_clr_sram, profi_clrmem, DS80_CLR_SRAM_SIZE);
 #if PROFI_PORT_TRACE
                 ds80_dbg_grmem  = grmem;
                 ds80_dbg_clrmem = profi_clrmem;
@@ -3277,6 +3306,18 @@ IRAM_ATTR void VIDEO::EndFrame() {
     }
 #endif // PERF_TRACE
 
+    // Per-frame swap/accessor snapshot for the [NEG] worst-frame attribution
+    // in ESPectrum::loop (this block resets the live counters every frame, so
+    // the loop tail could not read them otherwise).  swap_us includes the
+    // idle-window part accrued after the previous frame's pacing; the in-frame
+    // share is swap_us - swap_idle_us.
+    {
+        extern volatile uint32_t g_frame_swap_us, g_frame_swap_idle_us, g_frame_accb;
+        g_frame_swap_us      = mem_spi_swap_us;
+        g_frame_swap_idle_us = mem_spi_swap_idle_us;
+        g_frame_accb         = mem_spi_accb;
+    }
+
     // SPI PSRAM swap diagnostics: log eviction count once every 60 frames.
     {
         static uint32_t evict_log_frame = 0;
@@ -3287,12 +3328,16 @@ IRAM_ATTR void VIDEO::EndFrame() {
         static uint32_t swap_us_accum = 0;
         static uint32_t accb_accum = 0;
         static uint32_t promo_accum = 0;
+        static uint32_t promo_idle_accum = 0;
+        static uint32_t swap_idle_us_accum = 0;
         evict_accum  += mem_spi_evict_count;
         skip_accum   += mem_spi_read_skip;
         wbskip_accum += mem_spi_wb_skip;
         swap_us_accum += mem_spi_swap_us;
         accb_accum   += mem_spi_accb;
         promo_accum  += mem_spi_promo;
+        promo_idle_accum   += mem_spi_promo_idle;
+        swap_idle_us_accum += mem_spi_swap_idle_us;
         evict_last_page = mem_spi_evict_page;
         mem_spi_evict_count = 0;
         mem_spi_read_skip = 0;
@@ -3300,17 +3345,28 @@ IRAM_ATTR void VIDEO::EndFrame() {
         mem_spi_swap_us = 0;
         mem_spi_accb = 0;
         mem_spi_promo = 0;
-        if (++evict_log_frame >= 60) {
+        mem_spi_promo_idle = 0;
+        mem_spi_swap_idle_us = 0;
+        // Every 300 frames (5 s): the Debug::log line itself costs ~6 ms over
+        // USB-CDC and was reliably the worst frame of every 60-frame window
+        // during disk/page activity — keep the diagnostic, shed 80% of its
+        // frame-time pollution.
+        if (++evict_log_frame >= 300) {
             evict_log_frame = 0;
+            // swap=TOTALms(idle Xms): X of the total ran in the frame's idle
+            // window (MemESP::idleService) — only TOTAL−X ate emulation time.
             if (evict_accum || skip_accum || accb_accum)
-                Debug::log("[SPI] evict/60f=%u skip=%u wbskip=%u accb=%u promo=%u swap=%ums last_pg=%u (%.1f/frame)",
+                Debug::log("[SPI] evict/60f=%u skip=%u wbskip=%u accb=%u promo=%u(idle %u) swap=%ums(idle %u) last_pg=%u (%.1f/frame)",
                            evict_accum, skip_accum, wbskip_accum, accb_accum, promo_accum,
-                           swap_us_accum / 1000u, evict_last_page, evict_accum / 60.0f);
+                           promo_idle_accum, swap_us_accum / 1000u,
+                           swap_idle_us_accum / 1000u, evict_last_page, evict_accum / 60.0f);
             skip_accum = 0;
             wbskip_accum = 0;
             swap_us_accum = 0;
             accb_accum = 0;
             promo_accum = 0;
+            promo_idle_accum = 0;
+            swap_idle_us_accum = 0;
             evict_accum = 0;
 #if MEM_ACCESS_TRACE
             // Accesses served per evicted-page load (accessor-mode feasibility):

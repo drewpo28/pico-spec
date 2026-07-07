@@ -415,6 +415,21 @@ IRAM_ATTR void AySound::gen_sound(int sound_bufsize, int bufpos)
 {
     uint8_t *sound_buf_L = SamplebufAY_L + bufpos;
     uint8_t *sound_buf_R = SamplebufAY_R + bufpos;
+    // Silent fast path: with envelope mode off and volume 0 on all three
+    // channels every AY_CHVOL term is table[Rampa_AY_table[0]], and table[]
+    // is normalized to table[0]==0 ("tie level 0 to silence" in
+    // set_chip_type) — the synth loop can only produce zeros.  Skip the
+    // ChipTacts_per_outcount×bufsize inner loop (56×624 ≈ 35k iterations per
+    // frame on Profi): CP/M and other non-AY software never touch the chip
+    // yet paid ~1 ms/frame per chip.  Tone/noise/envelope phases freeze
+    // while silent and resume on the next register write — inaudible, the
+    // output was zero throughout.
+    if (!ayregs.env_a && !ayregs.env_b && !ayregs.env_c &&
+        ayregs.vol_a == 0 && ayregs.vol_b == 0 && ayregs.vol_c == 0) {
+        memset(sound_buf_L, 0, (size_t)sound_bufsize);
+        memset(sound_buf_R, 0, (size_t)sound_bufsize);
+        return;
+    }
     switch (Config::ayConfig) {
     case 0:  gen_sound_ABC(sound_bufsize, sound_buf_L, sound_buf_R); break;
     case 1:  gen_sound_ACB(sound_bufsize, sound_buf_L, sound_buf_R); break;

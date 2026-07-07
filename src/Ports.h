@@ -78,6 +78,8 @@ public:
     static uint32_t portdffd_cnt;
     // Time spent in Ports::FDDStep (rvmWD1793Step calls from port handlers).
     static volatile uint32_t fdd_ports_us;
+    static volatile uint32_t fdd_ports_calls;
+    static volatile uint32_t fdd_ports_max;
 
 #if SND_PORT_TRACE
     // Per-port I/O histograms (index = low address byte) for hunting unknown

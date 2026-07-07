@@ -234,16 +234,12 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
     // pattern as savePendingVideoMode).  If the config write fails, nothing is
     // persisted (NvsWriter is atomic) and the next boot comes up unchanged —
     // no loop.
-    // Layout marker: on butter boards page 56 is a POINTER for BOTH layouts
-    // (heap SRAM in Profi mode, direct butter otherwise), so page 8 is the
-    // discriminator there (vram in the Profi layout, direct butter pointer
-    // otherwise); elsewhere page 56 keeps its historical role.
-    bool profiSramLayout;
-    if (psram_size() == 0 && butter_psram_size() > 0)
-        profiSramLayout = (MemESP::ram[8].memType() != mem_type_t::POINTER);
-    else
-        profiSramLayout = (MemESP::ram[56].memType() == mem_type_t::POINTER);
-    if ((newArch == "Profi") != profiSramLayout) {
+    // butter/QSPI boards are exempt: there the Profi and non-Profi layouts are
+    // identical (all pages are direct XIP pointers, no forced-SRAM set), so no
+    // reboot is needed — and page 56 is a POINTER for every arch there, which
+    // would otherwise read as a false "Profi layout" marker.
+    bool profiSramLayout = (MemESP::ram[56].memType() == mem_type_t::POINTER);
+    if (butter_psram_size() == 0 && (newArch == "Profi") != profiSramLayout) {
         arch = newArch;
         if (!newRomSet.empty()) romSet = newRomSet;
         if (!g_snapshot_loading_path.empty())

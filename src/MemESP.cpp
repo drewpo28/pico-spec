@@ -68,6 +68,8 @@ volatile uint32_t mem_spi_wb_skip     = 0;  // clean-victim evictions with the w
 volatile uint32_t mem_spi_swap_us     = 0;  // total µs spent in _sync page swaps
 volatile uint32_t mem_spi_accb       = 0;   // accessor-mode per-byte SPI accesses
 volatile uint32_t mem_spi_promo      = 0;   // accessor→pool promotions (16KB loads)
+volatile uint32_t mem_spi_promo_idle = 0;   // ...of which executed in the idle window
+volatile uint32_t mem_spi_swap_idle_us = 0; // µs of swap work done in the idle window
 
 // Accessor-mode bank window.  hw measurements (3 games) put the trampoline
 // bank-visit access counts at 0-128 in 85-100% of cases, with the real working
@@ -76,22 +78,68 @@ volatile uint32_t mem_spi_promo      = 0;   // accessor→pool promotions (16KB 
 // promotes genuinely hot pages quickly (a promoted page pays ≤128 per-byte
 // accesses ≈ 0.3ms on top of the 1.45ms load).
 
+// Deferred-promotion state (see MemESP::idleService).  Butter-only: the
+// butter accessor costs ~0.2 µs/byte (uncached XIP), so a hot page can keep
+// running per-byte for a frame or two while its 16KB swap waits for the idle
+// window.  SPI PSRAM keeps the old always-inline promotion — its per-byte
+// accessor is ~10× more expensive, so delaying a hot page there costs more
+// than the swap itself.
+static uint8_t g_promoPending    = 0;   // bit per CPU bank slot
+static uint8_t g_promoInlineLeft = 1;   // inline promotions left this frame
+
+static inline void maybePromote(uint8_t bank) {
+    if (vram_butter(mem_desc_t::acc_bank[bank].spiBase())) {
+        if (g_promoInlineLeft == 0) {
+            g_promoPending |= (uint8_t)(1u << bank);
+            return;
+        }
+        g_promoInlineLeft--;
+    }
+    MemESP::promoteBank(bank);
+}
+
 uint8_t MemESP::accessorRead(uint8_t bank, uint16_t off) {
     mem_spi_accb++;
     uint8_t v = mem_desc_t::acc_bank[bank].read(off);
-    if (mem_desc_t::acc_bank[bank].acc_tick()) promoteBank(bank);
+    if (mem_desc_t::acc_bank[bank].acc_tick()) maybePromote(bank);
     return v;
 }
 
 void MemESP::accessorWrite(uint8_t bank, uint16_t off, uint8_t v) {
     mem_spi_accb++;
     mem_desc_t::acc_bank[bank].write(off, v);   // _write → backing store + valid bit
-    if (mem_desc_t::acc_bank[bank].acc_tick()) promoteBank(bank);
+    if (mem_desc_t::acc_bank[bank].acc_tick()) maybePromote(bank);
 }
 
 void MemESP::promoteBank(uint8_t bank) {
     mem_spi_promo++;
+    g_promoPending &= (uint8_t)~(1u << bank);
     ramCurrent[bank] = mem_desc_t::acc_bank[bank].materialize(bank);
+}
+
+void MemESP::promoFrameReset(uint8_t inlineBudget) {
+    g_promoInlineLeft = inlineBudget;
+}
+
+void MemESP::idleService(uint64_t deadline_us) {
+    static uint32_t promoEstUs = 1500;   // rolling estimate of one promotion
+    while (g_promoPending) {
+        uint8_t bank = (uint8_t)__builtin_ctz(g_promoPending);
+        if (time_us_64() + promoEstUs > deadline_us) return;
+        g_promoPending &= (uint8_t)~(1u << bank);
+        // Re-validate: the slot may have been re-synced (or promoted via the
+        // inline budget) since the request was queued.
+        if (ramCurrent[bank] != nullptr) continue;
+        if (!mem_desc_t::acc_bank[bank].acc_hot()) continue;
+        uint64_t t0 = time_us_64();
+        promoteBank(bank);
+        uint32_t dt = (uint32_t)(time_us_64() - t0);
+        mem_spi_promo_idle++;
+        mem_spi_swap_idle_us += dt;
+        promoEstUs = (promoEstUs + dt) / 2;
+        if (promoEstUs < 600)  promoEstUs = 600;
+        if (promoEstUs > 4000) promoEstUs = 4000;
+    }
 }
 
 // Backing-store validity bitmap: bit set = this vram/swap page has been

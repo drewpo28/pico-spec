@@ -478,6 +478,19 @@ IRAM_ATTR void SAASound::gen_sound(int bufsize, int bufpos) {
     uint8_t *buf_L = SamplebufSAA_L + bufpos;
     uint8_t *buf_R = SamplebufSAA_R + bufpos;
 
+    // Muted fast path (reg 28 bit0 = 0, the power-on state): the per-sample
+    // loop below ticks 2 noise LFSRs + 6 channel counters only to accumulate
+    // nothing (outputEnabled gates every contribution) — ~624 iterations per
+    // frame wasted on machines that never enable the SAA (Profi CP/M).
+    // Generator phases freeze while muted and resume on re-enable; the real
+    // chip keeps counting, but the difference is a phase offset of silent
+    // oscillators — inaudible (same trade the syncState path makes).
+    if (!outputEnabled) {
+        memset(buf_L, 0, (size_t)bufsize);
+        memset(buf_R, 0, (size_t)bufsize);
+        return;
+    }
+
     while (bufsize-- > 0) {
         // During sync: output silence, don't advance generators
         if (syncState) {
