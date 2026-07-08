@@ -234,8 +234,8 @@ static const char *MSG_MYDEFAULT_RESET_Q[2] = {
 };
 // Guided boot prompt shown while the "hold R / hold M" reset window is open.
 static const char *MSG_FACTORY_RESET_HOLD[2] = {
-    "Hold R: Factory Reset   Hold M: My Default",
-    "Manten R: Reset fabrica   Manten M: Mis Defaults"
+    "Hold R: Factory Reset\nHold M: My Default",
+    "Manten R: Reset fabrica\nManten M: Mis Defaults"
 };
 
 #define OSD_FIRMW_EN "Updating firmware"
@@ -857,34 +857,34 @@ static const char *MENU_GIGASCREEN_SEL[2] = { MENU_GIGASCREEN_SEL_EN, MENU_GIGAS
     "Soft reset\n"\
     "Hard reset\t{HK_HARD_RESET}\n"\
     "RP2350 reset\t{HK_REBOOT}\n"\
-    "Defaults\n"\
-    "Save as Default\n"\
-    "My Default\n"
+    "Factory Reset\n"\
+    "Save Config as Default\n"\
+    "Load My Default Config\n"
 #define MENU_RESET_ES \
     "Resetear\n"\
     "Reset parcial\n"\
     "Reset completo\t{HK_HARD_RESET}\n"\
     "Resetear RP2350\t{HK_REBOOT}\n"\
-	"Predeterminados\n"\
-	"Guardar como Mio\n"\
-	"Mis Defaults\n"
+	"Reset de fabrica\n"\
+	"Guardar Config. como Mio\n"\
+	"Cargar Mi Config. Default\n"
 #else
 #define MENU_RESET_EN \
     "Reset Menu\n"\
     "Soft reset\n"\
     "Hard reset\t{HK_HARD_RESET}\n"\
     "RP2040 reset\t{HK_REBOOT}\n"\
-    "Defaults\n"\
-    "Save as Default\n"\
-    "My Default\n"
+    "Factory Reset\n"\
+    "Save Config as Default\n"\
+    "Load My Default Config\n"
 #define MENU_RESET_ES \
     "Resetear\n"\
     "Reset parcial\n"\
     "Reset completo\t{HK_HARD_RESET}\n"\
     "Resetear RP2040\t{HK_REBOOT}\n"\
-	"Predeterminados\n"\
-	"Guardar como Mio\n"\
-	"Mis Defaults\n"
+	"Reset de fabrica\n"\
+	"Guardar Config. como Mio\n"\
+	"Cargar Mi Config. Default\n"
 #endif
 static const char *MENU_RESET[2] = { MENU_RESET_EN, MENU_RESET_ES };
 
@@ -907,18 +907,18 @@ static const char *MENU_DEBUG_LOG[2] = { "Write debug.log\n", "Escribir debug.lo
     "Hard reset\t{HK_HARD_RESET}\n"\
     "RP2350 reset\t{HK_REBOOT}\n"\
     "MurmulatorOS\n"\
-    "Defaults\n"\
-    "Save as Default\n"\
-    "My Default\n"
+    "Factory Reset\n"\
+    "Save Config as Default\n"\
+    "Load My Default Config\n"
 #define MENU_RESET_MOS_ES \
     "Resetear\n"\
     "Reset parcial\n"\
     "Reset completo\t{HK_HARD_RESET}\n"\
     "Resetear RP2350\t{HK_REBOOT}\n"\
     "MurmulatorOS\n"\
-	"Predeterminados\n"\
-	"Guardar como Mio\n"\
-	"Mis Defaults\n"
+	"Reset de fabrica\n"\
+	"Guardar Config. como Mio\n"\
+	"Cargar Mi Config. Default\n"
 static const char *MENU_RESET_MOS[2] = { MENU_RESET_MOS_EN, MENU_RESET_MOS_ES };
 
 #define MENU_TFT_EN \

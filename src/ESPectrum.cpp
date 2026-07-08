@@ -2219,8 +2219,12 @@ void ESPectrum::loop() {
       extern void repeat_me_for_input();
       auto Kbd = PS2Controller.keyboard();
 
+      // R/M state can't survive a reset (crt0 zeroes .bss, incl. the keyboard's
+      // "currently down" bitmap, on every boot) and PS/2 has no "what's held
+      // right now" query — only a fresh down-edge after this point sets it.
+      // So the window below is the only chance to catch it; keep it generous.
       const uint32_t FR_PROMPT_DELAY_US = 400000;   // fast key-hold skips the prompt
-      const uint32_t FR_GRACE_US        = 800000;    // poll this long once kbd is ready
+      const uint32_t FR_GRACE_US        = 1000000;   // poll this long once kbd is ready
       const uint32_t FR_MAX_US          = 3500000;   // hard cap if no keyboard appears
 
       uint32_t fr_t0 = time_us_32();
