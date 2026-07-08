@@ -788,8 +788,21 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // (which never has a disk mounted at that point) — floating-bus mismatch
     // on the very first OUT/IN(0xC3) pair → immediate self-test "Fail".
     bool cpm83 = (portDFFD & 0x20), rom14_83 = MemESP::romLatch, dos83 = ESPectrum::trdos;
-    if (Z80Ops::isProfi && (cpm83 || (dos83 && !rom14_83)) &&
-        ((address & 0x9F) == 0x83)) {
+    uint8_t fr83 = (address >> 5) & 0x3;
+    // In the DOS&&!ROM14 self-test context (CPM not yet toggled on), restrict
+    // the shifted-family match to fr 0 (CMD, #83) and 2 (SECTOR, #C3) — the
+    // only two the self-test actually exercises this way (ROM 0x1450/0x1443
+    // for CMD/status polling, ROM 0x140C round-trip for SECTOR, per
+    // disassembly of github.com/andykarpov/karabas-pro's bios_pqdos.hex).
+    // fr 1 (TRACK, #A3) must fall through to the standard-scheme switch
+    // below: the same self-test's drive-select routine (ROM 0x148D,
+    // OUT (#A3),A) uses #A3 as the RQ93 SYS register (address&0xe3==0xa3,
+    // same masked value as #BF) while CPM=0, NOT as the shifted TRACK
+    // register. Claiming it here stole every self-test drive-select write,
+    // leaving fdd.diskS stuck at its default — FDD0:/FDD1: showed "Fail"
+    // even with a disk mounted (hw-confirmed 2026-07-09).
+    if (Z80Ops::isProfi && ((address & 0x9F) == 0x83) &&
+        (cpm83 || (dos83 && !rom14_83 && (fr83 == 0 || fr83 == 2)))) {
       // FDDStep(false) here, NOT (true): this path is now reachable with NO
       // disk mounted (moved outside skip_real_fdc, see above) — force=true
       // unconditionally drives rvmWD1793Step()'s real state machine, which
@@ -803,7 +816,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       // HLT are never set, so this is a no-op step, which is fine: register
       // *contents* don't need FDC-state advancement to read back correctly.
       FDDStep(false);
-      return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
+      return rvmWD1793Read(&ESPectrum::fdd, fr83);
     }
 
     // Profi CP/M mode: when the selected drive has no disk, FDC status reads
@@ -831,11 +844,22 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       // Profi CP/M port 0x3F: per manual "Порты FDD", in the ROM14=1 & CPM=1
       // (MBOOTHDD) scheme #3F is the WD93 SYS register (RQ93) — read returns the
       // status (INTRQ bit7, DRQ bit6), used in the sector-read loop at 0x86A4
-      // (IN A,(0x3F); AND 0xC0; JP M → INI from 0xE3). In ROM14=0 (standard /
-      // BOOTFDD) #3F is the WD track register — handled by case 0x23 below.
+      // (IN A,(0x3F); AND 0xC0; JP M → INI from 0xE3). In ROM14=0 & CPM=1
+      // (BOOTFDD) #3F is the WD track register — handled by case 0x23 below.
       // Gate matches the OUT(#3F) SYS write path: CPM=1 & ROM14=1.
-      if (Z80Ops::isProfi && (portDFFD & 0x20) && MemESP::romLatch &&
-          ((address & 0xFF) == 0x3F)) {
+      // THIRD context (CPM=0, ROM14=0, DOS=1 — the SYS-ROM self-test itself,
+      // before CP/M is ever toggled on): #3F is ALSO the SYS register here.
+      // Confirmed by disassembling github.com/andykarpov/karabas-pro's
+      // bios_pqdos.hex (ROM 0x1432/0x1478, the FDD0:/FDD1: detect routine):
+      // it computes a drive/side/reset/test control byte and writes it to
+      // #3F while ROM14=0 and CPM has not been set — treating #3F as track
+      // register there (case 0x23) meant the self-test's drive-select write
+      // was silently dropped, so fdd.diskS never left its default and
+      // FDD0:/FDD1: showed "Fail" even with a disk mounted (hw-confirmed
+      // 2026-07-09).
+      bool cpm3f = (portDFFD & 0x20), rom14_3f = MemESP::romLatch, dos3f = ESPectrum::trdos;
+      if (Z80Ops::isProfi && ((address & 0xFF) == 0x3F) &&
+          ((cpm3f && rom14_3f) || (dos3f && !rom14_3f && !cpm3f))) {
         // SYS status poll — not counted as disk access.
         FDDStep(true);
         uint8_t v = 0;
@@ -1949,10 +1973,16 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       // Same DOS&&!ROM14 boot-context OR-gate as the read path above (self-test
       // FDC register check at ROM 0x140C runs before CPM is ever toggled on).
       bool cpm83o = (portDFFD & 0x20), rom14_83o = MemESP::romLatch, dos83o = ESPectrum::trdos;
-      if (Z80Ops::isProfi && (cpm83o || (dos83o && !rom14_83o)) &&
-          ((address & 0x9F) == 0x83)) {
+      uint8_t fr83o = (address >> 5) & 0x3;
+      // fr 1 (TRACK, #A3) excluded from the DOS&&!ROM14 self-test context —
+      // see matching read-side comment above (ROM 0x148D uses #A3 as the
+      // standard-scheme SYS register while CPM=0, not the shifted TRACK reg;
+      // claiming it here stole every self-test drive-select write, hw-confirmed
+      // 2026-07-09).
+      if (Z80Ops::isProfi && ((address & 0x9F) == 0x83) &&
+          (cpm83o || (dos83o && !rom14_83o && (fr83o == 0 || fr83o == 2)))) {
         FDDStep(false);
-        uint8_t fr = (address >> 5) & 0x3;
+        uint8_t fr = fr83o;
         // CMD write via shifted 0x83 → activate shifted-scheme status for IN(0x3F)
         if (fr == 0) profi_shifted_fdc = true;
         rvmWD1793Write(&ESPectrum::fdd, fr, data);
@@ -1969,14 +1999,20 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         // fetches all-zero NOPs from PC onward forever (hw-confirmed
         // 2026-07-08: PAGE0->RAM#0, PC stuck executing NOPs at ~0x1263).
         return;
-      } else if (Z80Ops::isProfi && (portDFFD & 0x20) && MemESP::romLatch &&
-                 (address & 0xFF) == 0x3F) {
+      } else if (Z80Ops::isProfi && (address & 0xFF) == 0x3F &&
+                 (((portDFFD & 0x20) && MemESP::romLatch) ||
+                  (ESPectrum::trdos && !MemESP::romLatch && !(portDFFD & 0x20)))) {
         // Per manual "Порты FDD": in the ROM14=1 & CPM=1 (MBOOTHDD) scheme the
         // WD93 SYS register (RQ93) is at #3F — NOT the track register. The
         // MBOOTHDD loader selects drive/side/reset via OUT(#3F) (e.g. 0x1C=side0,
         // 0x0C=side1). #3F&0xe3==0x23 would otherwise land in the track-register
         // case and silently drop the side select → fdd.side stuck → side-compare
         // rejects the catalog on track0/side0 → "FDD Read Error".
+        // Third OR-term (DOS=1, ROM14=0, CPM=0): the SYS-ROM self-test's own
+        // FDD0:/FDD1: drive-detect routine (ROM 0x1432/0x1478, see matching
+        // read-side comment above) writes drive/side/reset bits to #3F in
+        // this exact state, before CP/M is ever toggled on — hw-confirmed
+        // 2026-07-09 by disassembling karabas-pro's bios_pqdos.hex.
         // SYS register write (drive/side select) — housekeeping, not counted.
         FDDStep(true);
         profiFdcSysWrite(data);
