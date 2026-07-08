@@ -737,6 +737,11 @@ void ESPectrum::setup() {
           Config::romSet = Config::pref_romSetP1M;
         else
           Config::romSet = Config::romSetP1M;
+      } else if (Config::arch == "Profi") {
+        if (Config::pref_romSetProfi != "Last")
+          Config::romSet = Config::pref_romSetProfi;
+        else
+          Config::romSet = Config::romSetProfi;
       } else {
         if (Config::pref_romSetPent != "Last")
           Config::romSet = Config::pref_romSetPent;
