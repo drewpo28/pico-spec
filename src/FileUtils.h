@@ -157,6 +157,16 @@ private:
 #define CONFIG_DIR_VER  CONFIG_DIR "/" PORT_VERSION
 #define CONFIG_DIR_BOARD CONFIG_DIR_VER "/" CONFIG_BOARD_TAG
 #define STORAGE_NVS     CONFIG_DIR_BOARD "/storage.nvs"
+// User-saved default config: unversioned but still per-board (deliberately
+// NOT a single cross-board file — a saved default can carry a forced
+// video_driver, or a feature combination that fits this board's RAM/PSRAM
+// budget but not a different board's, so it must never cross board families).
+// Used as the fallback base when no storage.nvs exists yet for the current
+// version on THIS board (fresh firmware, or after "Reset to my Default"). A
+// true factory reset ("Defaults" menu / Hold-R) bypasses this via SKIP_DEFAULT_FLAG.
+#define CONFIG_DIR_BOARD_ANYVER CONFIG_DIR "/" CONFIG_BOARD_TAG
+#define DEFAULT_NVS       CONFIG_DIR_BOARD_ANYVER "/default.nvs"
+#define SKIP_DEFAULT_FLAG CONFIG_DIR "/skip_default.flag"
 #define PALETTE_NVS     CONFIG_DIR "/palette.nvs"
 #define DEBUG_LOG_PATH  CONFIG_DIR "/debug.log"
 #define DUMP_LOG_PATH   CONFIG_DIR "/dump.log"

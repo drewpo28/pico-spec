@@ -2199,36 +2199,45 @@ void ESPectrum::loop() {
       }
   }
 
-  // Factory reset: hold R at boot -> confirm -> wipe storage.nvs -> reboot to
-  // defaults. Pump the keyboard at FULL SPEED here, BEFORE the emulation for(;;)
+  // Factory reset: hold R at boot -> confirm -> wipe storage.nvs (+ skip the
+  // user's default.nvs this boot) -> reboot to compiled-in defaults.
+  // My-Default reset: hold M at boot -> confirm -> wipe storage.nvs only
+  // (default.nvs kept) -> reboot, which then falls back to it.
+  // Pump the keyboard at FULL SPEED here, BEFORE the emulation for(;;)
   // starts: once it runs, a thrashing machine (Profi DS80 on SPI-PSRAM, ~4 FPS)
   // pumps tuh_task too rarely for USB to even enumerate, so a per-frame check inside
-  // the loop never saw the key. R reads as VK_R or VK_r depending on CAPSLOCK.
+  // the loop never saw the key. R/M read as VK_R/VK_r or VK_M/VK_m depending on CAPSLOCK.
   //
   // Reliability (was ~50/50): the window is now guided and keyboard-aware.
   //  - We poll until the keyboard is actually READY (PS/2: instant; USB: mounted),
   //    then a short grace, instead of a blind fixed timeout that closed before a
   //    slow USB keyboard finished enumerating. Hard cap FR_MAX_US if none appears.
-  //  - After FR_PROMPT_DELAY_US we draw a centered "Hold R for Factory Reset" hint
+  //  - After FR_PROMPT_DELAY_US we draw a centered "Hold R / Hold M" hint
   //    so the user knows the window is open and holds long enough. A fast PS/2 hold
   //    is caught before the delay, so a normal reset never flashes the prompt.
   {
       extern void repeat_me_for_input();
       auto Kbd = PS2Controller.keyboard();
 
-      const uint32_t FR_PROMPT_DELAY_US = 400000;   // fast R-hold skips the prompt
-      const uint32_t FR_GRACE_US        = 800000;    // poll this long once kbd is ready
+      // R/M state can't survive a reset (crt0 zeroes .bss, incl. the keyboard's
+      // "currently down" bitmap, on every boot) and PS/2 has no "what's held
+      // right now" query — only a fresh down-edge after this point sets it.
+      // So the window below is the only chance to catch it; keep it generous.
+      const uint32_t FR_PROMPT_DELAY_US = 400000;   // fast key-hold skips the prompt
+      const uint32_t FR_GRACE_US        = 1000000;   // poll this long once kbd is ready
       const uint32_t FR_MAX_US          = 3500000;   // hard cap if no keyboard appears
 
       uint32_t fr_t0 = time_us_32();
       uint32_t fr_ready_at = 0;        // elapsed us when the keyboard became available
       bool rHeld = false;
+      bool mHeld = false;
       bool promptShown = false;
-      Debug::log("factory-reset: probing for held R (guided window)");
+      Debug::log("factory-reset: probing for held R/M (guided window)");
       for (;;) {
           uint32_t el = (uint32_t)(time_us_32() - fr_t0);
           repeat_me_for_input();       // pump USB (tuh_task) + PS/2 at full speed
           if (Kbd && (Kbd->isVKDown(fabgl::VK_R) || Kbd->isVKDown(fabgl::VK_r))) { rHeld = true; break; }
+          if (Kbd && (Kbd->isVKDown(fabgl::VK_M) || Kbd->isVKDown(fabgl::VK_m))) { mHeld = true; break; }
 
           if (!fr_ready_at) {
 #ifdef KBDUSB
@@ -2245,7 +2254,7 @@ void ESPectrum::loop() {
           }
 
           if (el >= FR_MAX_US) break;                             // no keyboard ever seen
-          if (fr_ready_at && (el - fr_ready_at) >= FR_GRACE_US) break;  // ready + grace, no R
+          if (fr_ready_at && (el - fr_ready_at) >= FR_GRACE_US) break;  // ready + grace, no R/M
           sleep_ms(2);
       }
       if (rHeld) {
@@ -2253,13 +2262,27 @@ void ESPectrum::loop() {
           if (OSD::msgDialog(MSG_FACTORY_RESET_TITLE[Config::lang],
                              MSG_FACTORY_RESET_Q[Config::lang]) == DLG_YES) {
               bool ok = false;
-              if (FileUtils::fsMount) ok = (f_unlink(STORAGE_NVS) == FR_OK);
+              if (FileUtils::fsMount) {
+                  FIL* flag = fopen2(SKIP_DEFAULT_FLAG, FA_WRITE | FA_CREATE_ALWAYS);
+                  if (flag) fclose2(flag);
+                  ok = (f_unlink(STORAGE_NVS) == FR_OK);
+              }
               Debug::log("factory-reset: unlink %s -> reboot", ok ? "OK" : "FAIL");
-              OSD::esp_hard_reset();   // never returns; Config::load() then uses defaults
+              OSD::esp_hard_reset();   // never returns; Config::load() then uses compiled defaults
           }
           Debug::log("factory-reset: declined");
+      } else if (mHeld) {
+          Debug::log("my-default-reset: M held -> confirm");
+          if (OSD::msgDialog(MSG_MYDEFAULT_RESET_TITLE[Config::lang],
+                             MSG_MYDEFAULT_RESET_Q[Config::lang]) == DLG_YES) {
+              bool ok = false;
+              if (FileUtils::fsMount) ok = (f_unlink(STORAGE_NVS) == FR_OK);
+              Debug::log("my-default-reset: unlink %s -> reboot", ok ? "OK" : "FAIL");
+              OSD::esp_hard_reset();   // never returns; Config::load() then falls back to default.nvs
+          }
+          Debug::log("my-default-reset: declined");
       } else {
-          Debug::log("factory-reset: no R (continue)");
+          Debug::log("factory-reset: no R/M (continue)");
       }
   }
 

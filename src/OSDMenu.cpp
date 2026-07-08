@@ -112,14 +112,25 @@ void OSD::menuPrintRow(uint8_t virtual_row_num, uint8_t line_type) {
     if (line.find(ASCII_TAB) != line.npos) {
         string left = line.substr(0, line.find(ASCII_TAB));
         string right = line.substr(line.find(ASCII_TAB) + 1);
+        // If an unrelated (non-hotkey) line is wider than the hotkey column
+        // needs, cols grows past tab_col+max_right — shift the WHOLE hotkey
+        // block right by that same "extra" so every hotkey row stays aligned
+        // to the same column (only the block's position changes, not its
+        // internal alignment), instead of right-flushing each row on its own
+        // (which would stagger start columns whenever hotkey text lengths differ,
+        // e.g. "A+F5" vs "A+F10").
+        int hotkey_extra = (int)cols - ((int)tab_col + (int)max_right + 2);
+        if (hotkey_extra < 0) hotkey_extra = 0;
         if (!right.empty() && right[0] != '[' && right != ">" && right != " >") {
-            // hotkey — left-align at tab_col
-            uint8_t pad = (tab_col > left.length()) ? tab_col - left.length() : 1;
+            // hotkey — left-align at tab_col (+ extra, see above)
+            int pad = (int)tab_col - (int)left.length() + hotkey_extra;
+            if (pad < 1) pad = 1;
             line = left + string(pad, ' ') + right;
         } else if ((right == ">" || right == " >") && tab_col > 2) {
             // submenu arrow in menu with hotkeys — align with hotkey ">" position
-            int pad = tab_col + max_right - right.length() - left.length();
-            line = left + string(pad > 0 ? pad : 1, ' ') + right;
+            int pad = (int)tab_col + (int)max_right - (int)right.length() - (int)left.length() + hotkey_extra;
+            if (pad < 1) pad = 1;
+            line = left + string(pad, ' ') + right;
         } else {
             // options or submenu arrow — right-align
             int pad = cols - margin - left.length() - right.length();
@@ -924,14 +935,25 @@ void OSD::PrintRow(uint8_t virtual_row_num, uint8_t line_type) {
     if (line.find(ASCII_TAB) != line.npos) {
         string left = line.substr(0, line.find(ASCII_TAB));
         string right = line.substr(line.find(ASCII_TAB) + 1);
+        // If an unrelated (non-hotkey) line is wider than the hotkey column
+        // needs, cols grows past tab_col+max_right — shift the WHOLE hotkey
+        // block right by that same "extra" so every hotkey row stays aligned
+        // to the same column (only the block's position changes, not its
+        // internal alignment), instead of right-flushing each row on its own
+        // (which would stagger start columns whenever hotkey text lengths differ,
+        // e.g. "A+F5" vs "A+F10").
+        int hotkey_extra = (int)cols - ((int)tab_col + (int)max_right + 2);
+        if (hotkey_extra < 0) hotkey_extra = 0;
         if (!right.empty() && right[0] != '[' && right != ">" && right != " >") {
-            // hotkey — left-align at tab_col
-            uint8_t pad = (tab_col > left.length()) ? tab_col - left.length() : 1;
+            // hotkey — left-align at tab_col (+ extra, see above)
+            int pad = (int)tab_col - (int)left.length() + hotkey_extra;
+            if (pad < 1) pad = 1;
             line = left + string(pad, ' ') + right;
         } else if ((right == ">" || right == " >") && tab_col > 2) {
             // submenu arrow in menu with hotkeys — align with hotkey ">" position
-            int pad = tab_col + max_right - right.length() - left.length();
-            line = left + string(pad > 0 ? pad : 1, ' ') + right;
+            int pad = (int)tab_col + (int)max_right - (int)right.length() - (int)left.length() + hotkey_extra;
+            if (pad < 1) pad = 1;
+            line = left + string(pad, ' ') + right;
         } else {
             // options or submenu arrow — right-align
             int pad = cols - margin - left.length() - right.length();

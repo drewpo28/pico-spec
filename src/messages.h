@@ -187,6 +187,18 @@ static const char *OSD_DLG_REBOOT[2] = { OSD_DLG_REBOOT_EN, OSD_DLG_REBOOT_ES};
 #define OSD_DLG_LOADDEFAULTS_ES "\xA8" "Cargar defaults y reiniciar?"
 static const char *OSD_DLG_LOADDEFAULTS[2] = { OSD_DLG_LOADDEFAULTS_EN, OSD_DLG_LOADDEFAULTS_ES};
 
+#define OSD_DLG_SAVEDEFAULT_EN "Save current config as your Default?"
+#define OSD_DLG_SAVEDEFAULT_ES "\xA8" "Guardar config actual como Mis Defaults?"
+static const char *OSD_DLG_SAVEDEFAULT[2] = { OSD_DLG_SAVEDEFAULT_EN, OSD_DLG_SAVEDEFAULT_ES};
+
+#define OSD_DLG_LOADMYDEFAULT_EN "Load your Default and reboot?"
+#define OSD_DLG_LOADMYDEFAULT_ES "\xA8" "Cargar Mis Defaults y reiniciar?"
+static const char *OSD_DLG_LOADMYDEFAULT[2] = { OSD_DLG_LOADMYDEFAULT_EN, OSD_DLG_LOADMYDEFAULT_ES};
+
+#define MSG_DEFAULT_SAVED_EN " Default saved "
+#define MSG_DEFAULT_SAVED_ES " Guardado "
+static const char *MSG_DEFAULT_SAVED[2] = { MSG_DEFAULT_SAVED_EN, MSG_DEFAULT_SAVED_ES};
+
 #define OSD_DLG_USBBOOT_EN "Reboot to USB mode?"
 #define OSD_DLG_USBBOOT_ES "\xA8" "Reiniciar en modo USB?"
 static const char *OSD_DLG_USBBOOT[2] = { OSD_DLG_USBBOOT_EN, OSD_DLG_USBBOOT_ES};
@@ -213,10 +225,17 @@ static const char *MSG_FACTORY_RESET_Q[2] = {
     "Reset all settings to defaults?",
     "Restablecer todos los ajustes?"
 };
-// Guided boot prompt shown while the "hold R" reset window is open.
+// "My Default" reset: hold M at boot → confirm → wipe storage.nvs (keeps
+// default.nvs) → reboot, which then falls back to the user's saved default.
+static const char *MSG_MYDEFAULT_RESET_TITLE[2] = { "Reset to my Default", "Restaurar Mis Defaults" };
+static const char *MSG_MYDEFAULT_RESET_Q[2] = {
+    "Reset settings to your saved Default?",
+    "Restablecer a Mis Defaults guardados?"
+};
+// Guided boot prompt shown while the "hold R / hold M" reset window is open.
 static const char *MSG_FACTORY_RESET_HOLD[2] = {
-    "Hold  R  for Factory Reset",
-    "Manten  R  para Reset de fabrica"
+    "Hold R: Factory Reset\nHold M: My Default",
+    "Manten R: Reset fabrica\nManten M: Mis Defaults"
 };
 
 #define OSD_FIRMW_EN "Updating firmware"
@@ -838,26 +857,34 @@ static const char *MENU_GIGASCREEN_SEL[2] = { MENU_GIGASCREEN_SEL_EN, MENU_GIGAS
     "Soft reset\n"\
     "Hard reset\t{HK_HARD_RESET}\n"\
     "RP2350 reset\t{HK_REBOOT}\n"\
-    "Defaults\n"
+    "Factory Reset\n"\
+    "Save Config as Default\n"\
+    "Load My Default Config\n"
 #define MENU_RESET_ES \
     "Resetear\n"\
     "Reset parcial\n"\
     "Reset completo\t{HK_HARD_RESET}\n"\
     "Resetear RP2350\t{HK_REBOOT}\n"\
-	"Predeterminados\n"
+	"Reset de fabrica\n"\
+	"Guardar Config. como Mio\n"\
+	"Cargar Mi Config. Default\n"
 #else
 #define MENU_RESET_EN \
     "Reset Menu\n"\
     "Soft reset\n"\
     "Hard reset\t{HK_HARD_RESET}\n"\
     "RP2040 reset\t{HK_REBOOT}\n"\
-    "Defaults\n"
+    "Factory Reset\n"\
+    "Save Config as Default\n"\
+    "Load My Default Config\n"
 #define MENU_RESET_ES \
     "Resetear\n"\
     "Reset parcial\n"\
     "Reset completo\t{HK_HARD_RESET}\n"\
     "Resetear RP2040\t{HK_REBOOT}\n"\
-	"Predeterminados\n"
+	"Reset de fabrica\n"\
+	"Guardar Config. como Mio\n"\
+	"Cargar Mi Config. Default\n"
 #endif
 static const char *MENU_RESET[2] = { MENU_RESET_EN, MENU_RESET_ES };
 
@@ -880,14 +907,18 @@ static const char *MENU_DEBUG_LOG[2] = { "Write debug.log\n", "Escribir debug.lo
     "Hard reset\t{HK_HARD_RESET}\n"\
     "RP2350 reset\t{HK_REBOOT}\n"\
     "MurmulatorOS\n"\
-    "Defaults\n"
+    "Factory Reset\n"\
+    "Save Config as Default\n"\
+    "Load My Default Config\n"
 #define MENU_RESET_MOS_ES \
     "Resetear\n"\
     "Reset parcial\n"\
     "Reset completo\t{HK_HARD_RESET}\n"\
     "Resetear RP2350\t{HK_REBOOT}\n"\
     "MurmulatorOS\n"\
-	"Predeterminados\n"
+	"Reset de fabrica\n"\
+	"Guardar Config. como Mio\n"\
+	"Cargar Mi Config. Default\n"
 static const char *MENU_RESET_MOS[2] = { MENU_RESET_MOS_EN, MENU_RESET_MOS_ES };
 
 #define MENU_TFT_EN \
