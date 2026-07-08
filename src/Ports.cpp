@@ -427,6 +427,15 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
             data &= (extPort[row] | 0xDF); // mask: only bit 5 can be cleared
         }
       }
+      // PAL_DETECT (bit7) = GX0 XOR BX0 — lets DS80 software self-detect the
+      // palette IC's presence/type (3:3:2 vs 3:3:3) by writing known values to
+      // GX0 (#7E) / BX0 (#FE bit7) and reading this back.
+      if (Z80Ops::isProfi) {
+        if (VIDEO::profi_gx0_latch ^ VIDEO::profi_bx0_latch)
+          data |= 0x80;
+        else
+          data &= ~0x80;
+      }
 #endif
     }
     if (Tape::tapeStatus == TAPE_LOADING) LED::touchR(LED::TAPE);
@@ -990,25 +999,22 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     CPU::portBasedBP = true;
   uint8_t rambank = address >> 14;
 #if !PICO_RP2040
-  // Profi dynamic palette: per ZXMAK2 UlaProfi5XX.WritePortFE,
-  // any OUT with (address & 0x0081) == 0 (port low byte even AND bit 7 = 0)
-  // and DS80 active (CMR1/DFFD bit 7) triggers palette write:
-  //   index = (port254 XOR 0x0F) & 0x0F
-  //   color = ~(address >> 8), decoded as Gg0Rr0Bb (2-2-2 with gaps).
-  if (Z80Ops::isProfi && (address & 0x0081) == 0 && (portDFFD & 0x80)) {
+  // Profi dynamic palette (#7E): per ZXMAK2 UlaProfi5XX.WritePortFE / hardware
+  // docs, any OUT with (address & 0x0081) == 0 (CS: A0=0, A7=0) is a palette
+  // write:
+  //   index = (port254 XOR 0x0F) & 0x0F               (last BORDER nibble)
+  //   color = ~(address >> 8), decoded GX2:0|RX2:0|BX2:1 (3-3-2).
+  // GX0 (bit5 of color) is latched for PAL_DETECT regardless of DS80 state —
+  // real hardware self-test can probe the palette IC before DS80 video mode is
+  // engaged. The actual RGB store (now 3-3-3 via profi_bx0_latch, see
+  // profiPaletteWrite) only applies once DS80 is active, to avoid corrupting
+  // defaults from incidental #7E-pattern writes during BIOS startup.
+  if (Z80Ops::isProfi && (address & 0x0081) == 0) {
     uint8_t index = (port254 ^ 0x0F) & 0x0F;
     uint8_t color = ~(uint8_t)(address >> 8);
-    static int s_pal_log_cnt = 0;
-    if (s_pal_log_cnt < 48) {
-      s_pal_log_cnt++;
-      // Decode same way as profi_color_to_rgb888 (2:2:2 GG_RR_BB layout).
-      uint8_t R = ((color >> 3) & 3) * 85;
-      uint8_t G = ((color >> 6) & 3) * 85;
-      uint8_t B = (color & 3) * 85;
-      // Debug::log("[PAL] idx=%2d byte=0x%02X RGB=#%02X%02X%02X (addr=0x%04X port254=0x%02X pc=0x%04X)",
-      //            index, color, R, G, B, address, port254, Z80::getRegPC());
-    }
-    VIDEO::profiPaletteWrite(index, color);
+    VIDEO::profi_gx0_latch = (color >> 5) & 1;
+    if (portDFFD & 0x80)
+      VIDEO::profiPaletteWrite(index, color);
   }
 #endif
 
@@ -1294,6 +1300,12 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // ULA =======================================================================
   if ((address & 0x0001) == 0) {
     port254 = data;
+#if !PICO_RP2040
+    // BX0 (blue LSB of the 3:3:3 palette) is port #FE bit7 — latched here for
+    // profiPaletteWrite() and for the PAL_DETECT read-back self-test (Ports::input).
+    if (Z80Ops::isProfi)
+      VIDEO::profi_bx0_latch = (data >> 7) & 1;
+#endif
     // Border color
     if (VIDEO::borderColor != data) {
       VIDEO::brdChange = true;

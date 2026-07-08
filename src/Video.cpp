@@ -199,24 +199,28 @@ uint32_t VIDEO::profi_palette_live[16] = {
     0x000000, 0x0000FF, 0xFF0000, 0xFF00FF, 0x00FF00, 0x00FFFF, 0xFFFF00, 0xFFFFFF
 };
 
-// Convert Profi palette byte to RGB888.
-// Format: GGGRRRBb — bits[7:5]=G (3-bit), bits[4:2]=R (3-bit), bits[1:0]=B (2-bit).
-// 256 distinct colors (8×8×4). Confirmed by ZX-Profi hardware docs (habr.com/ru/articles/836836/).
-// G/R: 3-bit scale — levels 0..6 map to 0,43,85,128,170,213,255; level 7 clamps to 255.
-// B:   2-bit scale — level × 85 (blue "has implicit LSB=0", equivalent to 3-bit value×2).
-// Standard palette bytes (bit5=bit2=0) decode identically to ZXMAK2: dim=170 (0xAA), bright=255.
-static inline uint32_t profi_color_to_rgb888(uint8_t c) {
+// Convert a Profi DS80 palette write to RGB888.
+// Byte written via the #7E-style port trick: bits[7:5]=GX2:0, bits[4:2]=RX2:0,
+// bits[1:0]=BX2:1. bx0 is the separate BX0 latch (port #FE bit7) — real DS80
+// hardware combines it with BX2:1 to form a full 3-bit blue component, giving a
+// genuine 3:3:3 (512-color) palette instead of the 3:3:2 (256-color) subset that
+// bx0=0 software (which never touches #FE bit7) reduces to.
+// G/R/B: 3-bit scale — levels 0..6 map to 0,43,85,128,170,213,255; level 7 clamps
+// to 255. Standard palette bytes (bit5=bit2=0, bx0=0) decode identically to the
+// old 3:3:2-only table: dim=170 (0xAA), bright=255.
+static inline uint32_t profi_color_to_rgb888(uint8_t c, uint8_t bx0) {
     static const uint8_t gr[8] = {0, 43, 85, 128, 170, 213, 255, 255};
-    static const uint8_t bl[4] = {0, 85, 170, 255};
-    uint8_t R = gr[(c >> 2) & 0x07];   // bits[4:2]
-    uint8_t G = gr[(c >> 5) & 0x07];   // bits[7:5]
-    uint8_t B = bl[c & 0x03];           // bits[1:0]
+    uint8_t R = gr[(c >> 2) & 0x07];                 // bits[4:2] = RX2:0
+    uint8_t G = gr[(c >> 5) & 0x07];                 // bits[7:5] = GX2:0
+    uint8_t B = gr[((c & 0x03) << 1) | (bx0 & 1)];   // BX2:1 (bits[1:0]) + BX0
     return ((uint32_t)R << 16) | ((uint32_t)G << 8) | B;
 }
 
 // Per-frame swap/accessor snapshot for [NEG] attribution (see EndFrame).
 volatile uint32_t g_frame_swap_us = 0, g_frame_swap_idle_us = 0, g_frame_accb = 0;
 
+uint8_t VIDEO::profi_bx0_latch = 0;
+uint8_t VIDEO::profi_gx0_latch = 0;
 volatile bool VIDEO::profi_palette_dirty = false;
 volatile bool VIDEO::profi_ds80_activate_pending   = false;
 volatile bool VIDEO::profi_ds80_deactivate_pending = false;
@@ -343,7 +347,7 @@ void VIDEO::profiPaletteWrite(uint8_t index, uint8_t profi_color) {
     // defaults from incidental port-0x7E writes during BIOS startup setup.
     if (!profi_ds80_active) return;
     uint8_t idx = index & 0x0F;
-    uint32_t newRgb = profi_color_to_rgb888(profi_color);
+    uint32_t newRgb = profi_color_to_rgb888(profi_color, profi_bx0_latch);
     profi_palette_live[idx] = newRgb;
     // Defer HDMI refresh to HDMI ISR vblank (set dirty flag, applied in EndFrame).
     profi_palette_dirty = true;

@@ -229,6 +229,11 @@ public:
   static uint8_t profi_pair_lookup[16][16];
   // Live 16-color palette in RGB888 — modifiable by guest via OUT (port_low=0x7E).
   static uint32_t profi_palette_live[16];
+  // 3:3:3 (512-color) palette latches — real DS80 hardware feeds the blue LSB (BX0)
+  // and PAL_DETECT self-test from separate flip-flops on the palette IC, not from
+  // the #7E data byte itself. See Ports::output/Ports::input and profiPaletteWrite.
+  static uint8_t profi_bx0_latch;  // last value of port #FE bit7 (BX0, write)
+  static uint8_t profi_gx0_latch;  // last GX0 (bit5 of the #7E-style palette byte)
   static volatile bool profi_palette_dirty;      // pending HDMI palette refresh — applied in EndFrame
   static volatile bool profi_ds80_activate_pending;   // deferred off→on mode switch (set in Ports, applied in EndFrame)
   static volatile bool profi_ds80_deactivate_pending; // deferred on→off mode switch (set in Ports, applied in EndFrame)
