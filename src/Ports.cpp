@@ -127,6 +127,9 @@ uint8_t Ports::sndriveUsed = 0;
 uint8_t Ports::portAFF7 = 0;
 uint8_t Ports::portDFFD = 0;
 uint8_t Ports::portEFF7 = 0;
+uint8_t Ports::port008B = 0;
+uint8_t Ports::port018B = 0;
+uint8_t Ports::port028B = 0;
 #if !PICO_RP2040
 Ports::PIT8253Channel Ports::pitChannels[3] = {};
 #endif
@@ -342,6 +345,27 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
   uint8_t rambank = address >> 14;
   p_states = CPU::tstates;
 
+#if !PICO_RP2040 && FDD_PORT_TRACE
+  // Unconditional probe: fires for ANY IN on a Profi FDC-relevant low byte,
+  // regardless of whether the CPM/ROM14 gates below actually claim it — shows
+  // whether the Z80 program even reaches these addresses, and with what
+  // cpm/rom14/trdos/romInUse/disk state, when the normal FDD_PORT_TRACE
+  // logging (inside wd1793.cpp, reached only once a gate already passed)
+  // stays silent.
+  if (Z80Ops::isProfi) {
+    uint8_t lo8f = address & 0xFF;
+    if (lo8f == 0x1F || lo8f == 0x3F || lo8f == 0x5F || lo8f == 0x7F ||
+        lo8f == 0x83 || lo8f == 0xA3 || lo8f == 0xC3 || lo8f == 0xE3 ||
+        lo8f == 0xFF || lo8f == 0xBF) {
+      bool has_any_disk_p = ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != nullptr;
+      bool skip_p = (MemESP::romInUse == 0 && !has_any_disk_p);
+      Debug::log("[FDC IN probe] addr=%04X lo=%02X cpm=%d rom14=%d trdos=%d romInUse=%d disk=%d skip=%d pc=%04X",
+                 address, lo8f, (portDFFD & 0x20) != 0, MemESP::romLatch,
+                 ESPectrum::trdos, MemESP::romInUse, has_any_disk_p, skip_p, Z80::getRegPC());
+    }
+  }
+#endif
+
   if (Z80Ops::isByte && address >= 0xC000) {
     // вместо VIDEO::Draw(1, MemESP::ramContended[rambank]);
     // добавляем задержку через таблицу MemESP
@@ -481,6 +505,9 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
 #endif
       return rv;
     }
+    // Karabas-Pro's OWN native RTC port interface (#FF/#BF AS, #DF/#9F DS) is
+    // handled LATER in this function, after the Beta-128/FDC switch — see the
+    // comment there for why (it must run only once FDC has declined the address).
 #if RTC_PORT_TRACE
     // Catch-all: any other IN with low byte 0xF7 (reveals a non-#BFF7 data port).
     if ((Z80Ops::isPentagon || Z80Ops::isProfi) && (address & 0xFF) == 0xF7)
@@ -603,6 +630,17 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       if (lo == 0x57) { LED::touchR(LED::ZCTRL); return DivMMC::zc_read_data(); }
     }
 
+#if FDD_PORT_TRACE
+    // Unconditional probe — fires for ANY IN with (addr&0xFF&0x9F)==0x8B
+    // (the IDE-PROFI family: #xxCB/#xxEB/#xxAB), regardless of the IDE::scheme
+    // and cpm/rom14 gates below. See the matching comment near the top of this
+    // function for why (same investigation as the FDC/RTC probes).
+    if (Z80Ops::isProfi && ((address & 0xFF) & 0x9F) == 0x8B) {
+      Debug::log("[IDE IN probe] addr=%04X scheme=%d cpm=%d rom14=%d pc=%04X",
+                 address, (int)IDE::scheme, (portDFFD & 0x20) != 0, MemESP::romLatch,
+                 Z80::getRegPC());
+    }
+#endif
     // IDE/HDD — PROFI scheme. Per Karabas-Pro/Profi manual "Порты IDE HDD (CF)":
     //   read regs at #xxCB, write regs at #xxEB, system reg at #xxAB.
     //   register selector = high byte A(10:8) = (address>>8)&7; #00CB = data low.
@@ -653,6 +691,43 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         }
       }
     }
+
+    // PQ-DOS extended config ports #008B/#018B/#028B. CS formula verified
+    // against the actual FPGA source (andykarpov/karabas-pro,
+    // firmware/src/fpga/profi/rtl/karabas_pro.vhd:1332-1365) rather than just
+    // the dev manual — #008B/#018B are CPM/ROM14/DOS-gated, but #028B is NOT
+    // (cs_028b has no cpm/rom14/dos_act term at all, unlike cs_008b/cs_018b).
+    // Register contents are stored/read back faithfully. Side effects are NOT
+    // wired: checking the same VHDL, only port_008b_reg bit0 (rom0) currently
+    // does anything in hardware (forces an alternate 16KB config-flash ROM
+    // bank for one FPGA-internal loader path, ext_rom_bank_pq — not applicable
+    // to pico-spec's static ROM-array model) — rom1..rom5 and ram0..ram7 are
+    // assigned but otherwise UNUSED (dead signals) even in real hardware as of
+    // this check (2026-07-08, release v25092420-romain292 / PQDOS BIOS
+    // 0.41h1); no PQDOS build (debug/pqdos/profi64k.rom, PQDOS1.FDI, or this
+    // release's bios_pqdos_patched_rtc_0.41h1.rom) contains any LD BC,#xx8B +
+    // OUT (C),A/IN A,(C) sequence either. Extend once real paging is added on
+    // both sides (checked again 2026-07-08 against the newer
+    // bios_pqdos_patched_rtc_0.41h1.rom now embedded as the PQDOS bank0 — same
+    // zero-hits result).
+    if (Z80Ops::isProfi) {
+      if (address == 0x028B) {
+#if PROFI_PORT_TRACE
+        Debug::log("[8B IN] #028B -> %02X pc=%04X", port028B, Z80::getRegPC());
+#endif
+        return port028B;              // unconditional (no CPM/ROM14/DOS gate)
+      }
+      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
+#if PROFI_PORT_TRACE
+      if (address == 0x008B || address == 0x018B)
+        Debug::log("[8B IN probe] addr=%04X cpm=%d rom14=%d dos=%d pc=%04X",
+                   address, cpm, rom14, dos, Z80::getRegPC());
+#endif
+      if ((cpm && rom14) || (dos && !rom14)) {
+        if (address == 0x008B) return port008B;
+        if (address == 0x018B) return port018B;
+      }
+    }
 #endif
 
     // Beta-128 ports: accessible when TR-DOS ROM is paged in,
@@ -681,6 +756,56 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // real FDC handle it so the SYS ROM disk probe can succeed.
     bool skip_real_fdc = (Z80Ops::isProfi && MemESP::romInUse == 0 && !has_any_disk);
 
+    // Profi CP/M mode: FDC data registers shift to 0x83/0xA3/0xC3/0xE3
+    // UnrealSpeccy decode: (addr & 0x9F) == 0x83 → reg index = (addr >> 5) & 3
+    //   0x83 → reg0 (CMD/STATUS), 0xA3 → reg1 (TRACK),
+    //   0xC3 → reg2 (SECTOR),     0xE3 → reg3 (DATA)
+    // 0xBF & 0x9F == 0x9F ≠ 0x83, so SYS port 0xBF falls through to switch below.
+    // Profi CP/M shifted FDC: 0x83/0xA3/0xC3/0xE3 → WD1793 regs 0..3.
+    // The Karabas-Pro manual p.22 says this is gated by ROM14=0, but the
+    // Dos5 5.30 CP/M floppy driver (e.g. at 0x8625: OUT (0x3F)/OUT (0x83) cmd;
+    // IN (0x83) BUSY poll) accesses these ports with ROM14=1 too. Gating on
+    // ROM14=0 left IN (0x83) returning 0xFF (bus float) → BUSY bit stuck high
+    // → the Type-I busy-wait at 0x862B (IN A,(0x83); RRCA; JR C) spun forever.
+    // CPM=1 alone is the correct enable; 0xBF (SYS) is unaffected since
+    // 0xBF & 0x9F == 0x9F ≠ 0x83.
+    // Same OR-gate as RTC AS/DS and #008B/#018B: the PQDOS self-test's FDC
+    // register round-trip check (ROM 0x140C: OUT/IN (0xC3), i.e. the SECTOR
+    // register via this shifted decode) runs from the SYS ROM boot context
+    // (DOS=1, ROM14=0, CPM=0 — CPM hasn't been toggled on yet at POST time),
+    // so CPM-only left this port unclaimed → floating-bus mismatch → self-test
+    // "Floppy Disc Controller: Fail" (confirmed via ROM disassembly of a
+    // hardware self-test memory dump plus a live hw trace: skip_real_fdc was
+    // true at that exact IN — see below — this block MUST be placed before
+    // the skip_real_fdc gate, not just gain the DOS&&!ROM14 OR-term).
+    // DELIBERATELY placed BEFORE skip_real_fdc/has_any_disk gating below:
+    // a real WD1793 register (esp. the plain SECTOR register under test here)
+    // is directly readable/writable regardless of whether a disk is in the
+    // drive — only STATUS bits depend on media presence, and those are
+    // synthesized separately (the #1F/#03-family stub right below, and the
+    // real rvmWD1793 status bits elsewhere). Gating this on skip_real_fdc
+    // (no disk mounted) left it fully unclaimed during the SYS ROM self-test
+    // (which never has a disk mounted at that point) — floating-bus mismatch
+    // on the very first OUT/IN(0xC3) pair → immediate self-test "Fail".
+    bool cpm83 = (portDFFD & 0x20), rom14_83 = MemESP::romLatch, dos83 = ESPectrum::trdos;
+    if (Z80Ops::isProfi && (cpm83 || (dos83 && !rom14_83)) &&
+        ((address & 0x9F) == 0x83)) {
+      // FDDStep(false) here, NOT (true): this path is now reachable with NO
+      // disk mounted (moved outside skip_real_fdc, see above) — force=true
+      // unconditionally drives rvmWD1793Step()'s real state machine, which
+      // was never previously exercised with fdd.disk[]==nullptr (force=true
+      // reads were always gated behind !skip_real_fdc, i.e. a disk present).
+      // The self-test's tight 0x140C round-trip loop (~254 back-to-back
+      // OUT/IN pairs) calling that every iteration hard-faulted the board
+      // (reboot loop, hw-confirmed 2026-07-08). force=false matches the
+      // sibling WRITE path just below (already proven safe with no disk:
+      // it's been reachable unconditionally all along) — with no disk, HLD/
+      // HLT are never set, so this is a no-op step, which is fine: register
+      // *contents* don't need FDC-state advancement to read back correctly.
+      FDDStep(false);
+      return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
+    }
+
     // Profi CP/M mode: when the selected drive has no disk, FDC status reads
     // must return NOT_READY | SEEK_ERROR (0x90) with BUSY=0.
     //
@@ -702,29 +827,6 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     if (!skip_real_fdc && (ESPectrum::trdos || has_raw_disk)) {
 
       uint8_t dat;
-
-      // Profi CP/M mode: FDC data registers shift to 0x83/0xA3/0xC3/0xE3
-      // UnrealSpeccy decode: (addr & 0x9F) == 0x83 → reg index = (addr >> 5) & 3
-      //   0x83 → reg0 (CMD/STATUS), 0xA3 → reg1 (TRACK),
-      //   0xC3 → reg2 (SECTOR),     0xE3 → reg3 (DATA)
-      // 0xBF & 0x9F == 0x9F ≠ 0x83, so SYS port 0xBF falls through to switch below.
-      // Profi CP/M shifted FDC: 0x83/0xA3/0xC3/0xE3 → WD1793 regs 0..3.
-      // The Karabas-Pro manual p.22 says this is gated by ROM14=0, but the
-      // Dos5 5.30 CP/M floppy driver (e.g. at 0x8625: OUT (0x3F)/OUT (0x83) cmd;
-      // IN (0x83) BUSY poll) accesses these ports with ROM14=1 too. Gating on
-      // ROM14=0 left IN (0x83) returning 0xFF (bus float) → BUSY bit stuck high
-      // → the Type-I busy-wait at 0x862B (IN A,(0x83); RRCA; JR C) spun forever.
-      // CPM=1 alone is the correct enable; 0xBF (SYS) is unaffected since
-      // 0xBF & 0x9F == 0x9F ≠ 0x83.
-      if (Z80Ops::isProfi && (portDFFD & 0x20) &&
-          ((address & 0x9F) == 0x83)) {
-        // Force FDC advancement (true = force, regardless of HLD/HLT motor state).
-        // The case 0xe3 SYS-register path uses FDDStep(true) for the same reason:
-        // IN A,(0x83) is polled in tight busy-wait loops at 0x8625/0x862B with no
-        // other code advancing the FDC, so we must force each step here.
-        FDDStep(true);
-        return rvmWD1793Read(&ESPectrum::fdd, ((address >> 5) & 0x3));
-      }
 
       // Profi CP/M port 0x3F: per manual "Порты FDD", in the ROM14=1 & CPM=1
       // (MBOOTHDD) scheme #3F is the WD93 SYS register (RQ93) — read returns the
@@ -796,6 +898,51 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         if (ESPectrum::fdd.control & (kRVMWD177XINTRQ | kRVMWD177XFINTRQ)) v |= 0x80;
         return v;
       }
+      }
+    }
+
+    // Same RTC:: singleton, Karabas-Pro's OWN native port interface (dev manual
+    // v1.01, distinct from the Gluk #DFF7/#BFF7 pair above):
+    //   #FF/#BF = AS (address latch, write-only, low byte only, bit6 don't-care)
+    //   #DF/#9F = DS (data, R/W, low byte only, bit6 don't-care)
+    // Full CS per the manual: (CPM=1&&ROM14=1)||(DOS=1&&ROM14=0). Placed HERE
+    // (after the Beta-128/FDC switch above, instead of using the same early
+    // spot as the Gluk ports) so it only ever fires once FDC has had first
+    // refusal on #FF/#BF: the switch above already `return`s for every case it
+    // claims and only reaches here via `break` (declined) or by never entering
+    // at all (skip_real_fdc, or trdos==false && !has_raw_disk). Confirmed via a
+    // real PC dump (2026-07-08, PQDOS BIOS 0.41h1 self-test, romInUse=0,
+    // romLatch=0, no disk mounted -> skip_real_fdc=true, FDC inert) that the
+    // boot-time RTC-format patch (pqdos_rtc_patch.asm get_ad/set_ad) runs
+    // exactly in this ROM14=0 window and NEEDS the DOS=1&&ROM14=0 branch —
+    // dropping it (as an earlier revision of this code did, to dodge a
+    // *theoretical* collision with FDC case 0xa3 when a disk IS mounted) left
+    // #BF/#9F unclaimed by anyone during the self-test, which is why RTC kept
+    // showing Fail even after the port decode itself was verified correct.
+#if RTC_PORT_TRACE
+    // Unconditional probe log: fires even when the gate is false, so a trace
+    // capture shows whether PQDOS ever touches #FF/#BF/#DF/#9F at all, and
+    // with what cpm/rom14/trdos state, when the gate doesn't pass.
+    if (Z80Ops::isProfi) {
+      uint8_t lo8t = address & 0xFF;
+      if ((lo8t | 0x40) == 0xFF || (lo8t | 0x40) == 0xDF)
+        Debug::log("[RTC-AS/DS IN probe] addr=%04X lo=%02X cpm=%d rom14=%d trdos=%d pc=%04X",
+                   address, lo8t, (portDFFD & 0x20) != 0, MemESP::romLatch,
+                   ESPectrum::trdos, Z80::getRegPC());
+    }
+#endif
+    if (Config::rtc_enabled && Z80Ops::isProfi) {
+      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
+      if ((cpm && rom14) || (dos && !rom14)) {
+        uint8_t lo8 = address & 0xFF;
+        if ((lo8 | 0x40) == 0xDF) {
+          uint8_t rv = RTC::readData();
+#if RTC_PORT_TRACE
+          Debug::log("[RTC-DS IN] sel=%02X -> %02X pc=%04X", RTC::dbgSel(), rv, Z80::getRegPC());
+#endif
+          return rv;
+        }
+        // #FF/#BF (AS) is write-only per the manual — no read defined.
       }
     }
 
@@ -998,6 +1145,21 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   if (Config::numPortWriteBP > 0 && Config::hasBreakPoint(address, Config::BP_PORT_WRITE))
     CPU::portBasedBP = true;
   uint8_t rambank = address >> 14;
+#if !PICO_RP2040 && FDD_PORT_TRACE
+  // Unconditional probe — see the matching read-side comment in Ports::input.
+  if (Z80Ops::isProfi) {
+    uint8_t lo8f = address & 0xFF;
+    if (lo8f == 0x1F || lo8f == 0x3F || lo8f == 0x5F || lo8f == 0x7F ||
+        lo8f == 0x83 || lo8f == 0xA3 || lo8f == 0xC3 || lo8f == 0xE3 ||
+        lo8f == 0xFF || lo8f == 0xBF) {
+      bool has_any_disk_p = ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != nullptr;
+      bool skip_p = (MemESP::romInUse == 0 && !has_any_disk_p);
+      Debug::log("[FDC OUT probe] addr=%04X lo=%02X data=%02X cpm=%d rom14=%d trdos=%d romInUse=%d disk=%d skip=%d pc=%04X",
+                 address, lo8f, data, (portDFFD & 0x20) != 0, MemESP::romLatch,
+                 ESPectrum::trdos, MemESP::romInUse, has_any_disk_p, skip_p, Z80::getRegPC());
+    }
+  }
+#endif
 #if !PICO_RP2040
   // Profi dynamic palette (#7E): per ZXMAK2 UlaProfi5XX.WritePortFE / hardware
   // docs, any OUT with (address & 0x0081) == 0 (CS: A0=0, A7=0) is a palette
@@ -1059,6 +1221,9 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     if (address == 0xDFF7) { RTC::selectReg(data); return; }
     if (address == 0xBFF7) { RTC::writeData(data); return; }
   }
+  // Karabas-Pro's own native RTC ports (#FF/#BF AS, #DF/#9F DS) are handled
+  // LATER in this function, after the Beta-128/FDC write switch — see the
+  // read-side comment in Ports::input for why (FDC must get first refusal).
 #endif
 
   if (address == 0xAFF7) {
@@ -1627,6 +1792,14 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       if (lo == 0x57) { LED::touchW(LED::ZCTRL); DivMMC::zc_write_data(data); return; }
     }
 
+#if FDD_PORT_TRACE
+    // Unconditional probe — see the matching read-side comment above.
+    if (Z80Ops::isProfi && ((address & 0xFF) & 0x9F) == 0x8B) {
+      Debug::log("[IDE OUT probe] addr=%04X data=%02X scheme=%d cpm=%d rom14=%d pc=%04X",
+                 address, data, (int)IDE::scheme, (portDFFD & 0x20) != 0, MemESP::romLatch,
+                 Z80::getRegPC());
+    }
+#endif
     // IDE/HDD — PROFI scheme, per UnrealSpeccy MM_PROFI modified-ports section:
     //   Gate: ROM14=1 AND CPM=1 (same as UnrealSpeccy: p7FFD&0x10 && pDFFD&0x20).
     //   Port decode: (p1 & 0x9F)==0x8B; CS1=A6=1 for data/registers.
@@ -1665,6 +1838,30 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
             return;
           }
         }
+      }
+    }
+
+    // PQ-DOS extended config ports #008B/#018B/#028B — see the read-side comment
+    // above (Ports::input) for the CS formula (verified against karabas_pro.vhd)
+    // and the "not yet wired" caveat. #028B is unconditional; #008B/#018B are
+    // CPM/ROM14/DOS-gated.
+    if (Z80Ops::isProfi) {
+      if (address == 0x028B) {
+        port028B = data;
+#if PROFI_PORT_TRACE
+        Debug::log("[8B OUT] #028B <- %02X pc=%04X", data, Z80::getRegPC());
+#endif
+        return;
+      }
+      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
+#if PROFI_PORT_TRACE
+      if (address == 0x008B || address == 0x018B)
+        Debug::log("[8B OUT probe] addr=%04X data=%02X cpm=%d rom14=%d dos=%d pc=%04X",
+                   address, data, cpm, rom14, dos, Z80::getRegPC());
+#endif
+      if ((cpm && rom14) || (dos && !rom14)) {
+        if (address == 0x008B) { port008B = data; return; }
+        if (address == 0x018B) { port018B = data; return; }
       }
     }
 #endif
@@ -1749,13 +1946,29 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       // Profi CP/M shifted FDC (see matching read path): enable on CPM=1 alone,
       // not gated by ROM14. The Dos5 5.30 CP/M driver writes Type-I commands to
       // 0x83 (e.g. OUT (0x83),0x0C/0x1C at 0x864F/0x866C) with ROM14=1.
-      if (Z80Ops::isProfi && (portDFFD & 0x20) &&
+      // Same DOS&&!ROM14 boot-context OR-gate as the read path above (self-test
+      // FDC register check at ROM 0x140C runs before CPM is ever toggled on).
+      bool cpm83o = (portDFFD & 0x20), rom14_83o = MemESP::romLatch, dos83o = ESPectrum::trdos;
+      if (Z80Ops::isProfi && (cpm83o || (dos83o && !rom14_83o)) &&
           ((address & 0x9F) == 0x83)) {
         FDDStep(false);
         uint8_t fr = (address >> 5) & 0x3;
         // CMD write via shifted 0x83 → activate shifted-scheme status for IN(0x3F)
         if (fr == 0) profi_shifted_fdc = true;
         rvmWD1793Write(&ESPectrum::fdd, fr, data);
+        // MUST return here (mirrors the read-side's early return): falling
+        // through reaches the #EFF7 decode further down, which for Profi is
+        // (address & 0xF008) == 0xE000 — a mask that all four shifted-FDC low
+        // bytes (0x83/A3/C3/E3, bit3=0) satisfy whenever the Z80 accumulator
+        // (which is BOTH the port's high byte AND the OUT data, since this is
+        // OUT (n),A) has its top nibble = 0xE. The self-test's FDC round-trip
+        // loop (ROM 0x140C) walks A=0xFF..0x01, so it hits e.g. 0xEFC3 —
+        // spuriously matching #EFF7 too and clobbering page0ram from data
+        // bit3, paging RAM#0 (zeroed) into the low 16K mid-self-test. Since
+        // the self-test code itself lives in that page0 ROM, the CPU then
+        // fetches all-zero NOPs from PC onward forever (hw-confirmed
+        // 2026-07-08: PAGE0->RAM#0, PC stuck executing NOPs at ~0x1263).
+        return;
       } else if (Z80Ops::isProfi && (portDFFD & 0x20) && MemESP::romLatch &&
                  (address & 0xFF) == 0x3F) {
         // Per manual "Порты FDD": in the ROM14=1 & CPM=1 (MBOOTHDD) scheme the
@@ -1874,6 +2087,43 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         FDDStep(true);
         profiFdcSysWrite(data);
         break;
+      }
+    }
+    // Karabas-Pro's OWN native RTC ports (#FF/#BF AS, #DF/#9F DS) — placed here,
+    // after the Beta-128/FDC write switch above, so FDC gets first refusal on
+    // these addresses (same reasoning as the read-side handler in Ports::input;
+    // see that comment for the full CS formula and the real-hardware trace that
+    // showed the DOS=1&&ROM14=0 branch is required for PQDOS's boot-time RTC
+    // format patch to ever reach these ports).
+#if RTC_PORT_TRACE
+    if (Z80Ops::isProfi) {
+      uint8_t lo8t = address & 0xFF;
+      if ((lo8t | 0x40) == 0xFF || (lo8t | 0x40) == 0xDF)
+        Debug::log("[RTC-AS/DS OUT probe] addr=%04X lo=%02X data=%02X cpm=%d rom14=%d trdos=%d pc=%04X",
+                   address, lo8t, data, (portDFFD & 0x20) != 0, MemESP::romLatch,
+                   ESPectrum::trdos, Z80::getRegPC());
+    }
+#endif
+    if (Config::rtc_enabled && Z80Ops::isProfi) {
+      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
+      if ((cpm && rom14) || (dos && !rom14)) {
+        uint8_t lo8 = address & 0xFF;
+        if ((lo8 | 0x40) == 0xFF) { // #FF/#BF (AS)
+          RTC::selectReg(data);
+#if RTC_PORT_TRACE
+          Debug::log("[RTC-AS OUT] sel<-%02X pc=%04X", data, Z80::getRegPC());
+#endif
+          ioContentionLate(MemESP::ramContended[rambank]);
+          return;
+        }
+        if ((lo8 | 0x40) == 0xDF) { // #DF/#9F (DS)
+          RTC::writeData(data);
+#if RTC_PORT_TRACE
+          Debug::log("[RTC-DS OUT] sel=%02X <-%02X pc=%04X", RTC::dbgSel(), data, Z80::getRegPC());
+#endif
+          ioContentionLate(MemESP::ramContended[rambank]);
+          return;
+        }
       }
     }
     ioContentionLate(MemESP::ramContended[rambank]);

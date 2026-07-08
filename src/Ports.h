@@ -73,6 +73,12 @@ public:
     static uint8_t portDFFD;
     static uint8_t portEFF7; // Extended feature register (Profi CP/M uses bit 1=EFF7_512)
 
+    // PQ-DOS extended config ports (Karabas-Pro dev manual v1.01). Register
+    // contents only — no side effects wired yet, see Ports::input/output.
+    static uint8_t port008B; // ROM64Kb PAGE (bits0-5) + ONROM (bit6) + UNLOCK_128 (bit7)
+    static uint8_t port018B; // RAM PAGE (bits0-7)
+    static uint8_t port028B; // HDD_OFF/HDD_TYPE/TURBOFDC_OFF/FDC_SWAP/SOUND_OFF/TURBO_MODE/LOCK_DFFD
+
     // Per-frame port-call counters; read+reset in VIDEO::EndFrame diagnostic.
     static uint32_t port7ffd_cnt;
     static uint32_t portdffd_cnt;

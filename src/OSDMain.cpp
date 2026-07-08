@@ -5512,20 +5512,21 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 string profi_sub =
                                     string(Config::lang ? "Profi\n" : "Profi\n") +
                                     "1024K\n" +
+                                    "1024K (PQDOS)\n" +
                                     string("XT keyboard [") +
                                     (Config::profi_ext_keys ? "ON" : "OFF") + "]\n" +
                                     string("OSD palette [") +
                                     (Config::profi_ds80_std_palette_osd ? "STD" : "DS80") + "]\n";
                                 uint8_t opt_p = menuRun(profi_sub);
-                                if (opt_p == 1) {
-                                    // ROM selected
+                                if (opt_p == 1 || opt_p == 2) {
+                                    // ROM selected — item 1 = stock Profi, item 2 = PQDOS romset
                                     arch = "Profi";
-                                    romset = "Profi";
+                                    romset = (opt_p == 2) ? "ProfiPQ" : "Profi";
                                     opt2 = 1; // signal machine switch
                                     menu_curopt = 1;
                                     menu_saverect = false;
                                     break;
-                                } else if (opt_p == 2) {
+                                } else if (opt_p == 3) {
                                     // XT keyboard toggle (Yes/No submenu) — level 3
                                     // Remind the user it can also be toggled live via the hotkey.
                                     osdCenteredMsg(Config::lang
@@ -5552,12 +5553,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             menu_curopt = opt3;
                                             menu_saverect = false;
                                         } else {
-                                            menu_curopt = 2;
+                                            menu_curopt = 3;
                                             menu_level = 2;
                                             break; // back to Profi submenu
                                         }
                                     }
-                                } else if (opt_p == 3) {
+                                } else if (opt_p == 4) {
                                     // OSD palette toggle (STD / DS80) submenu — level 3
                                     menu_level = 3;
                                     menu_curopt = 1;
@@ -5589,7 +5590,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             menu_curopt = opt3;
                                             menu_saverect = false;
                                         } else {
-                                            menu_curopt = 3;
+                                            menu_curopt = 4;
                                             menu_level = 2;
                                             break; // back to Profi submenu
                                         }
@@ -8884,6 +8885,11 @@ static void saveDumpToFile(uint16_t addr_from, uint16_t addr_to) {
 
     snprintf(line, sizeof(line), "TR-DOS: %s  TR-DOS BIOS: %d\n",
         ESPectrum::trdos ? "on" : "off", Config::trdosBios);
+    f_write(f, line, strlen(line), &bw);
+
+    snprintf(line, sizeof(line), "portDFFD: %02X  (CPM=%d ROM14=%d DS80=%d NOROM=%d)\n",
+        Ports::portDFFD, (Ports::portDFFD & 0x20) != 0, MemESP::romLatch,
+        (Ports::portDFFD & 0x80) != 0, (Ports::portDFFD & 0x10) != 0);
     f_write(f, line, strlen(line), &bw);
 
     // Registers

@@ -342,14 +342,27 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
     } else if (arch == "Profi") {
         if (newRomSet=="") romSet = "Profi"; else romSet = newRomSet;
         if (newRomSet=="") romSetProfi = "Profi"; else romSetProfi = newRomSet;
-        // bank0 (service) + bank1 (Profi TR-DOS) stay raw; bank2/bank3 are overlays
-        // over the Sinclair 128K halves (rom[0]/rom[1]). See RomOverlay.h.
-        MemESP::rom[0].assign_rom(gb_rom_profi_bank0);
-        MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
-        MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
-        MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2);
-        MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
-        MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_profi_bank3);
+        if (romSetProfi == "ProfiPQ") {
+            // PQDOS romset (debug/pqdos/profi64k.rom). bank0 is ~94% different from
+            // stock (raw array); bank1/2/3 overlay cheaply over the SAME bases as the
+            // stock romset below (see tools/rom_pack.py "profi" family).
+            MemESP::rom[0].assign_rom(gb_rom_profi_pq_bank0);
+            MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
+            MemESP::registerOverlay(gb_rom_profi_bank1, gb_overlay_profi_bank1_pq);
+            MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2_pq);
+            MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_profi_bank3_pq);
+        } else {
+            // bank0 (service) + bank1 (Profi TR-DOS) stay raw; bank2/bank3 are overlays
+            // over the Sinclair 128K halves (rom[0]/rom[1]). See RomOverlay.h.
+            MemESP::rom[0].assign_rom(gb_rom_profi_bank0);
+            MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
+            MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2);
+            MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_profi_bank3);
+        }
 #endif
     } else { // Pentagon by default
         if (newRomSet=="") romSet = "128Kp"; else romSet = newRomSet;

@@ -179,12 +179,29 @@ FAMILIES = {
     # Profi 64K (4 banks). bank0 (service) is unique and bank1 (TR-DOS variant) shares
     # the trdos_505d base with rom[4] -> both stay raw. bank2 maps to Sinclair 128K
     # rom[0], bank3 to Sinclair 128K rom[1] -> overlays.
+    #
+    # PQDOS romset: bank0_pq is the raw service/kernel bank (profi_pq_bank0.c),
+    # currently sourced from Karabas-Pro release v25092420-romain292's
+    # rom/PQDOS_041h1/bios_pqdos_patched_rtc_0.41h1.rom ("PQDOS BIOS v0.41h1 with
+    # RTC fix") — ~94% different from stock bank0 (overlay would be bigger than
+    # raw, so it stays a raw array). bank1_pq/bank2_pq/bank3_pq (this file) are
+    # BYTE-IDENTICAL between that build and the older debug/pqdos/profi64k.rom
+    # (only bank0/the BIOS kernel changed across PQDOS versions so far) and
+    # overlay cheaply against the SAME bases already used above (stock bank1,
+    # and the shared Sinclair 128K halves) -- 5061B + 101B + 2218B vs 48KB raw,
+    # ~40KB saved. Re-run `python3 tools/rom_pack.py profi` after updating any
+    # of src/roms/profi/src/bank{1,2,3}_pq.bin from a newer PQDOS build.
     'profi': {
         'id': 'profi',
         'base': {'name': 'sinclair_128k_0', 'sym': 'gb_rom_0_sinclair_128k'},
         'variants': [
             {'key': 'bank2', 'name': 'Profi bank2', 'sym': 'gb_rom_profi_bank2'},
             {'key': 'bank3', 'name': 'Profi bank3', 'sym': 'gb_rom_profi_bank3',
+             'base': {'name': 'sinclair_128k_1', 'sym': 'gb_rom_1_sinclair_128k'}},
+            {'key': 'bank1_pq', 'name': 'Profi bank1 (PQDOS)', 'sym': 'gb_rom_profi_pq_bank1',
+             'base': {'name': 'bank1', 'sym': 'gb_rom_profi_bank1'}},
+            {'key': 'bank2_pq', 'name': 'Profi bank2 (PQDOS)', 'sym': 'gb_rom_profi_pq_bank2'},
+            {'key': 'bank3_pq', 'name': 'Profi bank3 (PQDOS)', 'sym': 'gb_rom_profi_pq_bank3',
              'base': {'name': 'sinclair_128k_1', 'sym': 'gb_rom_1_sinclair_128k'}},
         ],
     },
