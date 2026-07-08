@@ -630,15 +630,15 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       if (lo == 0x57) { LED::touchR(LED::ZCTRL); return DivMMC::zc_read_data(); }
     }
 
-#if FDD_PORT_TRACE
+#if IDE_PORT_TRACE
     // Unconditional probe — fires for ANY IN with (addr&0xFF&0x9F)==0x8B
     // (the IDE-PROFI family: #xxCB/#xxEB/#xxAB), regardless of the IDE::scheme
     // and cpm/rom14 gates below. See the matching comment near the top of this
     // function for why (same investigation as the FDC/RTC probes).
     if (Z80Ops::isProfi && ((address & 0xFF) & 0x9F) == 0x8B) {
-      Debug::log("[IDE IN probe] addr=%04X scheme=%d cpm=%d rom14=%d pc=%04X",
+      Debug::log("[IDE IN probe] addr=%04X scheme=%d cpm=%d rom14=%d trdos=%d pc=%04X",
                  address, (int)IDE::scheme, (portDFFD & 0x20) != 0, MemESP::romLatch,
-                 Z80::getRegPC());
+                 ESPectrum::trdos, Z80::getRegPC());
     }
 #endif
     // IDE/HDD — PROFI scheme. Per Karabas-Pro/Profi manual "Порты IDE HDD (CF)":
@@ -652,8 +652,16 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     //   16-bit latch: #xxCB(A6=1,A5=0) → read_data()+latch_hi, return lo;
     //                 #xxEB(A6=1,A5=1) → return latch_hi (HIGH byte).
     if (IDE::scheme == IDE::PROFI && Z80Ops::isProfi) {
-      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch;
-      if (cpm && rom14) {                               // same gate as UnrealSpeccy
+      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
+      // UnrealSpeccy's gate (cpm&&rom14, "MBOOTHDD" scheme) never covered the
+      // DOS=1&&!ROM14 case from the manual's own CS formula above (line 647):
+      // the SYS-ROM self-test's own HDD0:/HDD1: probe (ROM 0x03BB → CALL
+      // 0x1AB0: OUT (#06AB),0x06/0x02 soft-reset, IN (#07CB)/(#01CB) status)
+      // runs with CPM=0/ROM14=0 — before CP/M is ever toggled on — so it was
+      // silently unclaimed and HDD0:/HDD1: always showed "None"/"Fail"
+      // regardless of a mounted image (hw-confirmed 2026-07-09 by
+      // disassembling github.com/andykarpov/karabas-pro's bios_pqdos.hex).
+      if ((cpm && rom14) || (dos && !rom14 && !cpm)) {
         uint8_t p1 = address & 0xFF;
         uint8_t reg = (address >> 8) & 7;
         if ((p1 & 0x9F) == 0x8B) {
@@ -1816,12 +1824,12 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       if (lo == 0x57) { LED::touchW(LED::ZCTRL); DivMMC::zc_write_data(data); return; }
     }
 
-#if FDD_PORT_TRACE
+#if IDE_PORT_TRACE
     // Unconditional probe — see the matching read-side comment above.
     if (Z80Ops::isProfi && ((address & 0xFF) & 0x9F) == 0x8B) {
-      Debug::log("[IDE OUT probe] addr=%04X data=%02X scheme=%d cpm=%d rom14=%d pc=%04X",
+      Debug::log("[IDE OUT probe] addr=%04X data=%02X scheme=%d cpm=%d rom14=%d trdos=%d pc=%04X",
                  address, data, (int)IDE::scheme, (portDFFD & 0x20) != 0, MemESP::romLatch,
-                 Z80::getRegPC());
+                 ESPectrum::trdos, Z80::getRegPC());
     }
 #endif
     // IDE/HDD — PROFI scheme, per UnrealSpeccy MM_PROFI modified-ports section:
@@ -1831,8 +1839,11 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     //                 #xxEB(A5=1, reg=0) → write 16-bit: data|(latch<<8).
     //   CS3: #xxAB(A6=0,A5=1, reg=6) → ATA control register (SRST/nIEN).
     if (IDE::scheme == IDE::PROFI && Z80Ops::isProfi) {
-      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch;
-      if (cpm && rom14) {
+      bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
+      // Same DOS&&!ROM14&&!CPM OR-term as the read side above — the SYS-ROM
+      // self-test's HDD probe issues its ATA soft-reset (OUT #06AB,0x06/0x02)
+      // in this exact state (hw-confirmed 2026-07-09).
+      if ((cpm && rom14) || (dos && !rom14 && !cpm)) {
         uint8_t p1 = address & 0xFF;
         uint8_t reg = (address >> 8) & 7;
         if ((p1 & 0x9F) == 0x8B) {
