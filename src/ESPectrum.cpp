@@ -1602,6 +1602,32 @@ IRAM_ATTR void ESPectrum::processKeyboard() {
         uint8_t sc = pqdosScancode(KeytoESP);
         if (sc != 0xFF) Ports::pushKey(sc);
       }
+      // Real Karabas-Pro "Menu"-key ROMSET hotkeys: Menu(Win/GUI)+F1..F4 pick
+      // ROMSET 0..3 (ROMain / PQDOS / Flash Tool / FDImage) and reset into its
+      // bank0 — mirrors the hardware combos from the Karabas-Pro manual.
+      // Active only while a Karabas* romset is already selected ("1024K
+      // (Original)" is not part of the real Karabas flash, so plain GUI+F1
+      // there still means nothing / OSD keeps its normal F-key behavior).
+      if (Kdown && Z80Ops::isProfi &&
+          KeytoESP >= fabgl::VK_F1 && KeytoESP <= fabgl::VK_F4 &&
+          (Kbd->isVKDown(fabgl::VK_LGUI) || Kbd->isVKDown(fabgl::VK_RGUI))) {
+        static const char* karabasRomsets[4] = {
+            "ProfiKarabas", "ProfiPQ", "ProfiKarabasFT", "ProfiKarabasFDI" };
+        bool inKarabas = false;
+        for (int i = 0; i < 4; i++)
+          if (Config::romSet == karabasRomsets[i]) { inKarabas = true; break; }
+        if (inKarabas) {
+          const char* target = karabasRomsets[KeytoESP - fabgl::VK_F1];
+          if (Config::romSet != target) {
+            Config::romSet = target;
+            if (Config::pref_romSetProfi == "Last") Config::romSetProfi = target;
+            Config::save();
+            Config::requestMachine("Profi", target);
+          }
+          ESPectrum::reset(); // hardware combo resets into the ROMSET's bank0
+          return;
+        }
+      }
 #endif
       if ((Kdown) &&
           ((KeytoESP >= fabgl::VK_F1 && KeytoESP <= fabgl::VK_F12) ||

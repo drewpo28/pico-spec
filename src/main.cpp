@@ -130,7 +130,7 @@ extern "C" bool handleScancode(const uint32_t ps2scancode) {
         bool pressed = cd < 0x80;
         cd &= 0x7F;
         switch (cd) {
-            case 0x5B: kbdPushData(fabgl::VirtualKey::VK_LCTRL, pressed); return true; /// L WIN
+            case 0x5B: kbdPushData(fabgl::VirtualKey::VK_LGUI, pressed); return true; /// L WIN = Karabas "Menu"
             case 0x1D: {
                 if (Config::CursorAsJoy) joyPushData(fabgl::VirtualKey::VK_DPAD_ALTFIRE, pressed);
                 kbdPushData(fabgl::VirtualKey::VK_RCTRL, pressed);
@@ -142,7 +142,7 @@ extern "C" bool handleScancode(const uint32_t ps2scancode) {
                 kbdPushData(fabgl::VirtualKey::VK_RCTRL, pressed);
                 return true;
             }
-            case 0x5D: kbdPushData(fabgl::VirtualKey::VK_F1, pressed); return true; /// MENU
+            case 0x5D: kbdPushData(fabgl::VirtualKey::VK_LGUI, pressed); return true; /// MENU = Karabas "Menu"
             case 0x37: kbdPushData(fabgl::VirtualKey::VK_PRINTSCREEN, pressed); return true;
             case 0x46: kbdPushData(fabgl::VirtualKey::VK_BREAK, pressed); return true;
             case 0x52: kbdPushData(fabgl::VirtualKey::VK_INSERT, pressed); return true;
@@ -764,8 +764,10 @@ static mod2key_t mod2key[] = {
     { KEYBOARD_MODIFIER_RIGHTCTRL,  fabgl::VirtualKey::VK_RCTRL},
     { KEYBOARD_MODIFIER_RIGHTSHIFT, fabgl::VirtualKey::VK_RSHIFT},
     { KEYBOARD_MODIFIER_LEFTSHIFT,  fabgl::VirtualKey::VK_LSHIFT},
-    { KEYBOARD_MODIFIER_RIGHTGUI,   fabgl::VirtualKey::VK_F2},
-    { KEYBOARD_MODIFIER_LEFTGUI,    fabgl::VirtualKey::VK_F1},
+    // GUI/Win = the Karabas-Pro "Menu" key (ROMSET hotkeys Menu+F1..F4, see
+    // ESPectrum::processKeyboard). Used to be bound to VK_F1/VK_F2 (OSD menu).
+    { KEYBOARD_MODIFIER_RIGHTGUI,   fabgl::VirtualKey::VK_RGUI},
+    { KEYBOARD_MODIFIER_LEFTGUI,    fabgl::VirtualKey::VK_LGUI},
 };
 
 void __not_in_flash_func(process_kbd_report)(
