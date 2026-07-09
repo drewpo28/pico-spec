@@ -990,6 +990,19 @@ IRAM_ATTR void Z80::check_trdos() {
                     (!Z80Ops::is48 && Config::arch != "Profi" && MemESP::romInUse == 1 && !MemESP::newSRAM)) {
                     // Profi uses its own TR-DOS in ROM bank 1; others use the external TR-DOS ROM (bank 4)
                     uint8_t dosBank = (Config::arch == "Profi") ? 1 : 4;
+#if !PICO_RP2040 && FDD_PORT_TRACE
+                    // trdos-transition trace (PQDOS RST8 chain: FE00 stub →
+                    // CALL 3D38 automap → bank1 → JP 5C92 exit — chasing where
+                    // the BIOS-path boot diverges, 2026-07-09).
+                    if (Z80Ops::isProfi) {
+                        static int dosMapCnt = 0;
+                        if (dosMapCnt < 120)
+                            Debug::log("[DOS MAP] pc=%04X romU %d->%d p0ram=%u rom14=%u #%d",
+                                       REG_PC, (int)MemESP::romInUse, dosBank,
+                                       (unsigned)MemESP::page0ram, (unsigned)MemESP::romLatch,
+                                       ++dosMapCnt);
+                    }
+#endif
                     MemESP::romInUse = dosBank;
                     MemESP::ramCurrent[0] = MemESP::rom[dosBank].direct();
                     ESPectrum::trdos = true;
@@ -1008,6 +1021,18 @@ IRAM_ATTR void Z80::check_trdos() {
 
             if (doExit) {
 
+#if !PICO_RP2040 && FDD_PORT_TRACE
+                // See matching [DOS MAP] trace above.
+                if (Z80Ops::isProfi) {
+                    static int dosExitCnt = 0;
+                    if (dosExitCnt < 120)
+                        Debug::log("[DOS EXIT] pc=%04X romU %d->%d p0ram=%u rom14=%u #%d",
+                                   REG_PC, (int)MemESP::romInUse,
+                                   (int)(MemESP::romLatch ? 3 : 2),
+                                   (unsigned)MemESP::page0ram, (unsigned)MemESP::romLatch,
+                                   ++dosExitCnt);
+                }
+#endif
                 if (Z80Ops::is48)
                     MemESP::romInUse = 0;
                 else if (Config::arch == "Profi")

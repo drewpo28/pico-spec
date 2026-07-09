@@ -73,6 +73,16 @@ public:
     static uint8_t portDFFD;
     static uint8_t portEFF7; // Extended feature register (Profi CP/M uses bit 1=EFF7_512)
 
+    // PQ-DOS serial keyboard emulation (ports #F3 status / #D3 data). PQDOS uses
+    // ONLY this controller for input (no IN A,(#FE) matrix reads anywhere in the
+    // firmware), so keys must be fed here. pushKey() enqueues a driver scancode
+    // (index into the QDOS key-table, see ESPectrum.cpp vk→scan map); the #F3/#D3
+    // handlers in Ports::input drain it. RP2350 Profi only.
+    static void pushKey(uint8_t scan);
+    static volatile uint8_t pqkBuf[16];
+    static volatile uint8_t pqkHead;  // write index (producer: keyboard task)
+    static volatile uint8_t pqkTail;  // read index  (consumer: Z80 #D3 read)
+
     // PQ-DOS extended config ports (Karabas-Pro dev manual v1.01). Register
     // contents only — no side effects wired yet, see Ports::input/output.
     static uint8_t port008B; // ROM64Kb PAGE (bits0-5) + ONROM (bit6) + UNLOCK_128 (bit7)

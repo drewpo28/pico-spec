@@ -353,6 +353,15 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
             MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2_pq);
             MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
             MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_profi_bank3_pq);
+        } else if (romSetProfi == "ProfiKarabas") {
+            // "Karabas" romset: official ROMain bank0 (graphical boot menu) +
+            // the SAME bank1/2/3 as the stock "Original" romset below.
+            MemESP::rom[0].assign_rom(gb_rom_profi_bank0_karabas);
+            MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
+            MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2);
+            MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_profi_bank3);
         } else {
             // bank0 (service) + bank1 (Profi TR-DOS) stay raw; bank2/bank3 are overlays
             // over the Sinclair 128K halves (rom[0]/rom[1]). See RomOverlay.h.

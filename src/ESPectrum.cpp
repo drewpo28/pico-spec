@@ -1289,6 +1289,17 @@ void ESPectrum::reset(uint8_t romInUse) {
   ESPectrum::trdos = (Config::arch == "Profi" && romInUse == 0);
 
   Debug::log("[reset] arch=%s romInUse=%d trdos=%d", Config::arch.c_str(), romInUse, (int)ESPectrum::trdos);
+#if !PICO_RP2040 && FDD_PORT_TRACE
+  // g_fdcCmdCount gates the [WR→DIR]/[WR→RSTVEC]/[WR→CBIOS] write-count caps
+  // in MemESP.h (only trace once real disk activity starts, skipping the
+  // SYS-ROM self-test's memtest/buffer-clear noise). It's a plain static, so
+  // without this it carries over across a soft reset within the same power
+  // session — on a SECOND boot attempt it's already >0 from the FIRST one,
+  // so the gate does nothing and the caps burn on self-test again. Reset it
+  // here so every [RESET] gets a fresh budget for its own disk activity.
+  extern uint32_t g_fdcCmdCount;
+  g_fdcCmdCount = 0;
+#endif
   // Memory
   MemESP::page0ram = 0;
   MemESP::romInUse = romInUse;
@@ -1496,6 +1507,64 @@ fabgl::VirtualKey ESPectrum::VK_ESPECTRUM_FIRE2 = fabgl::VK_NONE;
 fabgl::VirtualKey ESPectrum::VK_ESPECTRUM_TAB = fabgl::VK_TAB;
 fabgl::VirtualKey ESPectrum::VK_ESPECTRUM_GRAVEACCENT = fabgl::VK_GRAVEACCENT;
 
+#if !PICO_RP2040
+// Map a fabgl VirtualKey to a PQ-DOS serial-keyboard scancode. Table verified
+// against the 0.41h1 BIOS translate routine (ROM 0x2363: `LD HL,0x2429` —
+// 0x2429 holds 'B'): base layout is "BHY65TGVNJU74RFCMKI83EDX?LO92WSZ <cr>P01QA?./"
+// — scan 0='B', 1='H', 2='Y'… The Ctrl layer at ROM 0x2401 confirms the base:
+// index 0 = 0x02 (Ctrl+B/STX), 1 = 0x08 (Ctrl+H/BS), 2 = 0x19 (Ctrl+Y). The
+// same "BH"-prefixed table exists in every build (h1/h2 bank0+bank3, the old
+// profi64k.rom, and QDOS.SYS on pqdos1.fdi) — an earlier extraction matched
+// the table from its 'Y' byte, which shifted every code by -2 and left B/H
+// "missing". Slots 0x18/0x27 are genuinely NUL. Returns 0xFF for unmapped.
+// PQDOS reads keys ONLY via ports #F3/#D3 (Ports::pushKey), never the #FE matrix.
+static uint8_t pqdosScancode(fabgl::VirtualKey vk) {
+  switch (vk) {
+    case fabgl::VK_A: case fabgl::VK_a: return 0x26;
+    case fabgl::VK_B: case fabgl::VK_b: return 0x00;
+    case fabgl::VK_C: case fabgl::VK_c: return 0x0F;
+    case fabgl::VK_D: case fabgl::VK_d: return 0x16;
+    case fabgl::VK_E: case fabgl::VK_e: return 0x15;
+    case fabgl::VK_F: case fabgl::VK_f: return 0x0E;
+    case fabgl::VK_G: case fabgl::VK_g: return 0x06;
+    case fabgl::VK_H: case fabgl::VK_h: return 0x01;
+    case fabgl::VK_I: case fabgl::VK_i: return 0x12;
+    case fabgl::VK_J: case fabgl::VK_j: return 0x09;
+    case fabgl::VK_K: case fabgl::VK_k: return 0x11;
+    case fabgl::VK_L: case fabgl::VK_l: return 0x19;
+    case fabgl::VK_M: case fabgl::VK_m: return 0x10;
+    case fabgl::VK_N: case fabgl::VK_n: return 0x08;
+    case fabgl::VK_O: case fabgl::VK_o: return 0x1A;
+    case fabgl::VK_P: case fabgl::VK_p: return 0x22;
+    case fabgl::VK_Q: case fabgl::VK_q: return 0x25;
+    case fabgl::VK_R: case fabgl::VK_r: return 0x0D;
+    case fabgl::VK_S: case fabgl::VK_s: return 0x1E;
+    case fabgl::VK_T: case fabgl::VK_t: return 0x05;
+    case fabgl::VK_U: case fabgl::VK_u: return 0x0A;
+    case fabgl::VK_V: case fabgl::VK_v: return 0x07;
+    case fabgl::VK_W: case fabgl::VK_w: return 0x1D;
+    case fabgl::VK_X: case fabgl::VK_x: return 0x17;
+    case fabgl::VK_Y: case fabgl::VK_y: return 0x02;
+    case fabgl::VK_Z: case fabgl::VK_z: return 0x1F;
+    case fabgl::VK_0: case fabgl::VK_KP_0: return 0x23;
+    case fabgl::VK_1: case fabgl::VK_KP_1: return 0x24;
+    case fabgl::VK_2: case fabgl::VK_KP_2: return 0x1C;
+    case fabgl::VK_3: case fabgl::VK_KP_3: return 0x14;
+    case fabgl::VK_4: case fabgl::VK_KP_4: return 0x0C;
+    case fabgl::VK_5: case fabgl::VK_KP_5: return 0x04;
+    case fabgl::VK_6: case fabgl::VK_KP_6: return 0x03;
+    case fabgl::VK_7: case fabgl::VK_KP_7: return 0x0B;
+    case fabgl::VK_8: case fabgl::VK_KP_8: return 0x13;
+    case fabgl::VK_9: case fabgl::VK_KP_9: return 0x1B;
+    case fabgl::VK_SPACE: return 0x20;
+    case fabgl::VK_RETURN: case fabgl::VK_KP_ENTER: return 0x21;
+    case fabgl::VK_PERIOD: return 0x28;
+    case fabgl::VK_SLASH: return 0x29;
+    default: return 0xFF;
+  }
+}
+#endif
+
 IRAM_ATTR void ESPectrum::processKeyboard() {
   static uint8_t PS2cols[8] = {0xbf, 0xbf, 0xbf, 0xbf, 0xbf, 0xbf, 0xbf, 0xbf};
   auto Kbd = PS2Controller.keyboard();
@@ -1521,6 +1590,19 @@ IRAM_ATTR void ESPectrum::processKeyboard() {
     if (r) {
       KeytoESP = NextKey.vk;
       Kdown = NextKey.down;
+#if !PICO_RP2040
+      // PQ-DOS serial keyboard: feed key-downs to the #F3/#D3 queue (Profi only).
+      // Harmless on non-PQDOS software — those ports are ignored unless polled.
+#if FDD_PORT_TRACE
+      if (Kdown)
+        Debug::log("[PQKBD KEYDN] vk=%d profi=%d sc=%02X", (int)KeytoESP,
+                   (int)Z80Ops::isProfi, (int)pqdosScancode(KeytoESP));
+#endif
+      if (Kdown && Z80Ops::isProfi) {
+        uint8_t sc = pqdosScancode(KeytoESP);
+        if (sc != 0xFF) Ports::pushKey(sc);
+      }
+#endif
       if ((Kdown) &&
           ((KeytoESP >= fabgl::VK_F1 && KeytoESP <= fabgl::VK_F12) ||
             KeytoESP == fabgl::VK_PAUSE || KeytoESP == fabgl::VK_PRINTSCREEN ||
@@ -2835,6 +2917,35 @@ void ESPectrum::loop() {
         frame_cnt = 0; neg_cnt = 0; w_idle = INT32_MAX; w_pmax = 0;
       }
     }
+#if FDD_PORT_TRACE
+    // [FDC IDLE]: one-shot marker for "disk loading stopped here" — fires the
+    // first time 3 consecutive 60-frame windows (~3-4s) pass with no new WD1793
+    // command after having seen at least one, so a boot-load hang shows exactly
+    // which track/sector/side/PC the last accepted command was, instead of
+    // requiring a manual scan of every [FDC CMD]/[FDC RD-END] line by hand.
+    // Re-arms if disk activity resumes and later stops again.
+    if (Z80Ops::isProfi) {
+      extern uint32_t g_fdcCmdCount;
+      extern uint16_t g_fdcLastTrk, g_fdcLastPc;
+      extern uint8_t  g_fdcLastSec, g_fdcLastSide, g_fdcLastCmd;
+      static uint32_t p_fdcCmdCount = 0;
+      static uint32_t idleWindows = 0;
+      static bool reported = false;
+      if (g_fdcCmdCount != p_fdcCmdCount) {
+        p_fdcCmdCount = g_fdcCmdCount;
+        idleWindows = 0;
+        reported = false;
+      } else if (g_fdcCmdCount > 0 && !reported) {
+        if (++idleWindows >= 3) {
+          reported = true;
+          Debug::log("[FDC IDLE] no new WD1793 command for ~%u frames (total cmds=%u); "
+                     "last: cmd=%02X trk=%d sec=%d side=%d pc=%04X",
+                     idleWindows * 60, g_fdcCmdCount, g_fdcLastCmd, g_fdcLastTrk,
+                     g_fdcLastSec, g_fdcLastSide, g_fdcLastPc);
+        }
+      }
+    }
+#endif
     // Deferred WD1793 SD I/O (track loads, PRO flush/f_sync) runs inside this
     // frame's idle window, so disk operations stop eating frame time (negative
     // IDL on Profi CP/M disk ops).  g_wdDeferLoads is refreshed EVERY frame,

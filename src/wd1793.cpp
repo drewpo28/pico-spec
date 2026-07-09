@@ -62,6 +62,20 @@ static int8_t     g_wdSyncPendingUnit = -1;
 static uint8_t g_rawTrkDataBuf[8192];
 #endif
 
+#if !PICO_RP2040 && FDD_PORT_TRACE
+// First 8 bytes delivered for the current sector read — see [FDC RD-END] log.
+uint8_t g_rdFirst[8] = {0};
+uint8_t g_rdFirstN = 0;
+
+// Last-command snapshot for the [FDC IDLE] marker (ESPectrum.cpp's per-frame
+// diagnostics): lets a boot-load hang be pinpointed as "disk activity stopped
+// at trk/sec/side X" without manually cross-referencing FDC CMD lines by hand.
+uint32_t g_fdcCmdCount = 0;
+uint16_t g_fdcLastTrk = 0;
+uint8_t  g_fdcLastSec = 0, g_fdcLastSide = 0, g_fdcLastCmd = 0;
+uint16_t g_fdcLastPc = 0;
+#endif
+
 // SCL-translated track-0 cache (was per-fdd Track0[2304], 2 copies). Only one fdd
 // owns it at a time; a different fdd clears the previous owner's sclConverted flag
 // so the buffer is regenerated. On RP2350 it ALIASES the first 2304 B of
@@ -676,6 +690,10 @@ IRAM_ATTR void _do(rvmWD1793 *wd) {
 
     case kRVMWD177XReadDataFlag: {
 #if !PICO_RP2040 && FDD_PORT_TRACE
+      {
+        extern uint8_t g_rdFirstN;
+        g_rdFirstN = 0; // new sector — restart first-bytes capture
+      }
       if (wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsTD0File)
           Debug::log("[TD0 data] data-mark FOUND, starting read of %d bytes (sec=%d)",
                      (int)wd->c, wd->sector);
@@ -866,6 +884,18 @@ case kRVMWD177XWriteData: {
       wd->data = wd->a;
 
 #if !PICO_RP2040 && FDD_PORT_TRACE
+      // Capture the first 8 bytes actually delivered for this sector so the
+      // completion log (in ReadCRC) can show what the CP/M/PQDOS driver really
+      // received — decisive for "is the FAT12 directory / QDOS.SYS read
+      // returning the right data, or garbage/wrong sector?".
+      {
+        extern uint8_t g_rdFirst[8];
+        extern uint8_t g_rdFirstN;
+        if (g_rdFirstN < 8) g_rdFirst[g_rdFirstN++] = wd->a;
+      }
+#endif
+
+#if !PICO_RP2040 && FDD_PORT_TRACE
       if (wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsTD0File &&
           (wd->c >= 1023 || (wd->c & 0xFF) == 0 || wd->c <= 3))
           Debug::log("[TD0 data] ReadData a=%02X c=%d DRQwas=%d",
@@ -940,6 +970,27 @@ case kRVMWD177XWriteData: {
 
         } else { // Read sector: Multiple record flag off
 
+#if !PICO_RP2040 && FDD_PORT_TRACE
+          // Final status of a Read Sector command right before INTRQ — this is
+          // what the Z80 driver actually sees when it polls the SYS/status
+          // register after the read. If a load silently uses stale data (e.g.
+          // PQDOS CONFIG.SYS never landing in its buffer), this is where to
+          // check whether we told it "success" while lost/CRC/RNF was set, or
+          // whether we told it "success" when the caller's target track/sector
+          // never even matched (RNF is currently never set by this emulation —
+          // see the retry-exhaustion path in _fill's kRVMWD177XStepWaitingMark).
+          {
+            extern uint8_t g_rdFirst[8];
+            Debug::log("[FDC RD-END] trk=%d sec=%d side=%d lostData=%d crc=%d recType=%d data=%02X%02X%02X%02X%02X%02X%02X%02X pc=%04X",
+                       wd->track, wd->sector, wd->side,
+                       (wd->status & kRVMWD177XStatusLostData) != 0,
+                       (wd->status & kRVMWD177XStatusCRC) != 0,
+                       (wd->status & kRVMWD177XStatusRecordType) != 0,
+                       g_rdFirst[0], g_rdFirst[1], g_rdFirst[2], g_rdFirst[3],
+                       g_rdFirst[4], g_rdFirst[5], g_rdFirst[6], g_rdFirst[7],
+                       Z80::getRegPC());
+          }
+#endif
           _end(wd);
 
         }
@@ -1490,11 +1541,15 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
             else if ((c & 0xF0) == 0xF0)    cn = "WRTRK";
             else if ((c & 0xF0) == 0xD0)    cn = "FORCEINT";
             else                            cn = "?";
+            uint16_t pcNow = Z80::getRegPC();
             Debug::log("[FDC CMD] %02X %-7s trk=%d sec=%d side=%d dataReg=%d "
                        "diskS=%d cpm=%d romInUse=%d fast=%d pc=%04X",
                        c, cn, wd->track, wd->sector, wd->side, wd->data,
                        wd->diskS, (int)((Ports::portDFFD & 0x20) != 0),
-                       (int)MemESP::romInUse, (int)wd->fastmode, Z80::getRegPC());
+                       (int)MemESP::romInUse, (int)wd->fastmode, pcNow);
+            g_fdcCmdCount++;
+            g_fdcLastTrk = wd->track; g_fdcLastSec = wd->sector;
+            g_fdcLastSide = wd->side; g_fdcLastCmd = c; g_fdcLastPc = pcNow;
         }
 #endif
 
@@ -1705,6 +1760,26 @@ IRAM_ATTR uint8_t rvmWD1793Read(rvmWD1793 *wd,uint8_t a) {
       } else {
         r|=kRVMWD177XStatusNotReady;
       }
+#if !PICO_RP2040 && FDD_PORT_TRACE
+      // Targeted RDSEC/WRSEC completion-status trace: chasing the PQDOS
+      // RESTORE<->RDSEC infinite retry (2026-07-09) — decode the actual
+      // status bits the guest sees after a Type II command, to see WHY
+      // RDSEC keeps failing (busy stuck? seek error? record not found?).
+      {
+        static uint32_t typeIIStatusCnt = 0;
+        if ((g_fdcLastCmd & 0x80) && !(r & kRVMWD177XStatusBusy) && typeIIStatusCnt < 200) {
+          typeIIStatusCnt++;
+          Debug::log("[FDC T2-STATUS] cmd=%02X status=%02X busy=%d drq=%d lost=%d "
+                     "recNF=%d wrFault=%d notRdy=%d track=%d sector=%d side=%d "
+                     "diskS=%d pc=%04X",
+                     g_fdcLastCmd, r,
+                     (r & kRVMWD177XStatusBusy) != 0, (r & kRVMWD177XStatusDataRequest) != 0,
+                     (r & kRVMWD177XStatusLostData) != 0, (r & kRVMWD177XStatusRecordNotFound) != 0,
+                     (r & kRVMWD177XStatusWriteFault) != 0, (r & kRVMWD177XStatusNotReady) != 0,
+                     wd->track, wd->sector, wd->side, wd->diskS, Z80::getRegPC());
+        }
+      }
+#endif
       return r;
     }
     case 1: //Track
@@ -3281,6 +3356,15 @@ static uint32_t g_wdQuietFrames = 0;   // consecutive idle-window calls with FDC
 static void wdRunTrackLoader(rvmWD1793 *wd, uint8_t cyl, uint8_t side) {
     rvmwdDisk *disk = wd->disk[wd->diskS];
     uint64_t t0 = time_us_64();
+#if !PICO_RP2040 && FDD_PORT_TRACE
+    // Trace every real track load: (cyl,side) requested vs what was loaded
+    // before + reload count, to expose double-sided track thrashing.
+    static uint32_t g_trkLoadCnt = 0;
+    Debug::log("[TRKLOAD #%u] cyl=%u side=%u unit=%u (was cyl=%d side=%d) state=%u ss=%u",
+               (unsigned)++g_trkLoadCnt, (unsigned)cyl, (unsigned)side,
+               (unsigned)wd->diskS, wd->diskLoadedCyl, wd->diskLoadedSide,
+               (unsigned)wd->state, (unsigned)wd->stepState);
+#endif
     if (disk->IsUDIFile)      udiLoadTrack(wd, cyl, side);
     else if (disk->IsTD0File) td0LoadTrack(wd, cyl, side);
     else if (disk->IsFDIFile) fdiLoadTrack(wd, cyl, side);
