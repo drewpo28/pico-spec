@@ -90,6 +90,8 @@ private:
     // Per-slot device type + post-reset signature validity (master/slave).
     static bool is_atapi[2];   // slot is an ATAPI CD-ROM (.iso)
     static bool sig_valid[2];  // device still presenting its post-reset signature
+    static bool profi_hidd_slot[2]; // Profi HiDD header found → geometry from header,
+                                    // don't force H=16/S=16 at init (see open_image)
 
     // Per-drive geometry / format.
     static uint32_t data_offset[2];   // byte offset to sector data (HDF header, else 0)
