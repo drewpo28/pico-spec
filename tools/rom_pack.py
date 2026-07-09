@@ -203,6 +203,14 @@ FAMILIES = {
             {'key': 'bank2_pq', 'name': 'Profi bank2 (PQDOS)', 'sym': 'gb_rom_profi_pq_bank2'},
             {'key': 'bank3_pq', 'name': 'Profi bank3 (PQDOS)', 'sym': 'gb_rom_profi_pq_bank3',
              'base': {'name': 'sinclair_128k_1', 'sym': 'gb_rom_1_sinclair_128k'}},
+            # Karabas-Pro ROMain (ROMSET 0) bank1: TR-DOS with ramdisk mods — 1192
+            # positional diff bytes over the stock Profi bank1. The image's bank2
+            # is byte-identical to stock Profi bank2 (existing overlay) and its
+            # bank3 is byte-identical to plain sinclair_128k_1 (no overlay), so
+            # this is the only extra piece the faithful "Karabas" romset needs.
+            # Source: ROMain_ramdisk_A.rom (release v25092420-romain292) 0x4000+.
+            {'key': 'bank1_romain', 'name': 'Profi bank1 (ROMain)', 'sym': 'gb_rom_profi_romain_bank1',
+             'base': {'name': 'bank1', 'sym': 'gb_rom_profi_bank1'}},
         ],
     },
 }

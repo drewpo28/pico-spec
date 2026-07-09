@@ -43,6 +43,14 @@
       "len": 2218,
       "runs": 101,
       "diff_bytes": 1600
+    },
+    {
+      "name": "Profi bank1 (ROMain)",
+      "sym": "gb_rom_profi_romain_bank1",
+      "overlay_sym": "gb_overlay_profi_bank1_romain",
+      "len": 1486,
+      "runs": 47,
+      "diff_bytes": 1192
     }
   ]
 }

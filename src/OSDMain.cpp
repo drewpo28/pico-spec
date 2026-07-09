@@ -5514,21 +5514,28 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     "1024K (Original)\n" +
                                     "1024K (Karabas)\n" +
                                     "1024K (Karabas+PQDOS)\n" +
+                                    "1024K (Karabas+FlashTool)\n" +
+                                    "1024K (Karabas+FDImage)\n" +
                                     string("XT keyboard [") +
                                     (Config::profi_ext_keys ? "ON" : "OFF") + "]\n" +
                                     string("OSD palette [") +
                                     (Config::profi_ds80_std_palette_osd ? "STD" : "DS80") + "]\n";
                                 uint8_t opt_p = menuRun(profi_sub);
-                                if (opt_p >= 1 && opt_p <= 3) {
-                                    // ROM selected — 1=stock "Original", 2="Karabas" (ROMain
-                                    // menu bank0), 3="Karabas+PQDOS" (PQDOS romset)
+                                if (opt_p >= 1 && opt_p <= 5) {
+                                    // ROM selected — mirrors the real Karabas-Pro ROMSET
+                                    // slots: 1=stock "Original", 2="Karabas" (ROMain,
+                                    // ROMSET 0), 3=PQDOS BIOS (ROMSET 1), 4=Flash Tool
+                                    // (ROMSET 2), 5=FDImage (ROMSET 3)
+                                    static const char* profi_romsets[5] = {
+                                        "Profi", "ProfiKarabas", "ProfiPQ",
+                                        "ProfiKarabasFT", "ProfiKarabasFDI" };
                                     arch = "Profi";
-                                    romset = (opt_p == 3) ? "ProfiPQ" : (opt_p == 2) ? "ProfiKarabas" : "Profi";
+                                    romset = profi_romsets[opt_p - 1];
                                     opt2 = 1; // signal machine switch
                                     menu_curopt = 1;
                                     menu_saverect = false;
                                     break;
-                                } else if (opt_p == 4) {
+                                } else if (opt_p == 6) {
                                     // XT keyboard toggle (Yes/No submenu) — level 3
                                     // Remind the user it can also be toggled live via the hotkey.
                                     osdCenteredMsg(Config::lang
@@ -5555,12 +5562,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             menu_curopt = opt3;
                                             menu_saverect = false;
                                         } else {
-                                            menu_curopt = 4;
+                                            menu_curopt = 6;
                                             menu_level = 2;
                                             break; // back to Profi submenu
                                         }
                                     }
-                                } else if (opt_p == 5) {
+                                } else if (opt_p == 7) {
                                     // OSD palette toggle (STD / DS80) submenu — level 3
                                     menu_level = 3;
                                     menu_curopt = 1;
@@ -5592,7 +5599,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             menu_curopt = opt3;
                                             menu_saverect = false;
                                         } else {
-                                            menu_curopt = 5;
+                                            menu_curopt = 7;
                                             menu_level = 2;
                                             break; // back to Profi submenu
                                         }
