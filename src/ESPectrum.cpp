@@ -271,6 +271,11 @@ int32_t ESPectrum::mouseX = 0;
 int32_t ESPectrum::mouseY = 0;
 bool ESPectrum::mouseButtonL = 0;
 bool ESPectrum::mouseButtonR = 0;
+bool ESPectrum::mouseButtonM = 0;
+uint8_t ESPectrum::mouseWheel = 0;
+bool ESPectrum::mouseSeen = false;
+int32_t ESPectrum::mouseDX = 0;
+int32_t ESPectrum::mouseDY = 0;
 
 bool ESPectrum::maxSpeed = false;
 
@@ -677,6 +682,7 @@ void ESPectrum::setup() {
   mem_desc_t::reset();
   Ports::portAFF7 = 0;
   Ports::portDFFD = 0;
+  Ports::serialMouseReset();
   //=======================================================================================
   // LOAD CONFIG
   //=======================================================================================
@@ -1286,6 +1292,7 @@ void ESPectrum::reset(uint8_t romInUse) {
   }
 #endif
   Ports::portDFFD = 0;
+  Ports::serialMouseReset();
   // Profi SYSEN: boot into SYS ROM (bank0) with trdos=true to protect page0
   ESPectrum::trdos = (Config::arch == "Profi" && romInUse == 0);
 
@@ -2596,6 +2603,7 @@ void ESPectrum::loop() {
 
     if (ZiFi::enabled) ZiFi::tick();
     RTC::flushNVRAM(); // persist CMOS NVRAM to SD when dirty (debounced)
+    Ports::serialMouseTick(); // arm the COM-mouse RST20H when movement queued
 
     // Auto-sync the RTC over SNTP at startup when both ZiFi and RTC are on and a
     // WiFi network is configured. Runs entirely in the background (non-blocking

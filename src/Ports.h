@@ -89,6 +89,21 @@ public:
     static uint8_t port018B; // RAM PAGE (bits0-7)
     static uint8_t port028B; // HDD_OFF/HDD_TYPE/TURBOFDC_OFF/FDC_SWAP/SOUND_OFF/TURBO_MODE/LOCK_DFFD
 
+    // Karabas-Pro serial (COM) mouse — К580ВВ51 emulation on #F3 (command/
+    // status) and #D3 (data) with the hardware-INT enable on #B3/#93 bit0.
+    // Port truth from the FPGA (rtl/mouse/serial_mouse.vhd + hw_int.vhd): the
+    // draft dev manual's "#B3/#93 RS232" chapter actually describes only the
+    // INT_EN register — the VV51 itself decodes #F3/#D3 (A7=1, A4:0=10011,
+    // A6=1; A5 picks cmd/data), same gate as the other extended periphery.
+    static uint8_t serialMouseCtl;   // VV51 command reg; bit2 (RxE) = mouse mode
+    static uint8_t serialMouseIntEn; // #B3/#93 bit0 → RST20H on RX-ready (CPM only)
+    static bool serialMouseIntAsserted();
+    static void serialMouseReset();
+    // Per-frame packet pump: INT-driven drivers (pcmsmous) never poll the
+    // status port, so packet building can't be left to port reads alone —
+    // without this tick the first RST20H would never assert.
+    static void serialMouseTick();
+
     // Per-frame port-call counters; read+reset in VIDEO::EndFrame diagnostic.
     static uint32_t port7ffd_cnt;
     static uint32_t portdffd_cnt;

@@ -174,6 +174,68 @@ uint8_t Ports::portEFF7 = 0;
 uint8_t Ports::port008B = 0;
 uint8_t Ports::port018B = 0;
 uint8_t Ports::port028B = 0;
+uint8_t Ports::serialMouseCtl = 0;
+uint8_t Ports::serialMouseIntEn = 0;
+
+#if !PICO_RP2040
+// Serial-mouse packet pipeline (serial_mouse.vhd st_prepare/st_byteN machine,
+// simplified: the 8-tact RxRDY gaps between bytes are dropped — drivers poll
+// the status register or take level INTs, and both re-sample RxRDY anyway).
+static uint8_t sm_pkt[3] = {0, 0, 0};
+static uint8_t sm_pkt_pos = 3;   // 3 = idle, no packet in flight
+static bool    sm_rxrdy = false;
+static uint8_t sm_last_btns = 0;
+
+static void smTryBuildPacket() {
+  if (sm_pkt_pos < 3 || !(Ports::serialMouseCtl & 0x04)) return; // busy / RxE off
+  uint8_t btns = (ESPectrum::mouseButtonL ? 0x20 : 0) |
+                 (ESPectrum::mouseButtonR ? 0x10 : 0);
+  // Sensitivity: modern USB mice report far more counts than the ~200 DPI a
+  // serial mouse era expects — scale by 2 (÷4 felt sluggish on hw), at
+  // packet-build time with the remainder kept in the accumulator so slow
+  // movements still add up instead of being truncated away.
+  int dx = ESPectrum::mouseDX / 2, dy = ESPectrum::mouseDY / 2;
+  if (dx > 127) dx = 127; else if (dx < -128) dx = -128;
+  if (dy > 127) dy = 127; else if (dy < -128) dy = -128;
+  if (!dx && !dy && btns == sm_last_btns) return; // st_prepare: nothing new
+  ESPectrum::mouseDX -= dx * 2;
+  ESPectrum::mouseDY -= dy * 2;
+  sm_last_btns = btns;
+  // Microsoft Mouse 3-byte packet: 01LRyyxx, 00xxxxxx, 00yyyyyy
+  sm_pkt[0] = (uint8_t)(0x40 | btns | (((uint8_t)dy >> 4) & 0x0C) | (((uint8_t)dx >> 6) & 0x03));
+  sm_pkt[1] = (uint8_t)dx & 0x3F;
+  sm_pkt[2] = (uint8_t)dy & 0x3F;
+  sm_pkt_pos = 0;
+  sm_rxrdy = true;
+}
+#endif
+
+void Ports::serialMouseTick() {
+#if !PICO_RP2040
+  smTryBuildPacket(); // no-op unless RxE armed and deltas/buttons are pending
+#endif
+}
+
+void Ports::serialMouseReset() {
+  serialMouseCtl = 0;
+  serialMouseIntEn = 0;
+#if !PICO_RP2040
+  sm_pkt_pos = 3;
+  sm_rxrdy = false;
+  sm_last_btns = 0;
+  ESPectrum::mouseDX = ESPectrum::mouseDY = 0;
+#endif
+}
+
+bool Ports::serialMouseIntAsserted() {
+#if !PICO_RP2040
+  // hw_int.vhd: INT while (RxRDY && RxE) && CPM && INT_EN. sm_rxrdy is only
+  // ever set with RxE on, so the RxE term is already folded in.
+  return sm_rxrdy && serialMouseIntEn && Z80Ops::isProfi && (portDFFD & 0x20);
+#else
+  return false;
+#endif
+}
 
 // PQ-DOS serial keyboard scancode queue (drained by the #D3 read handler).
 volatile uint8_t Ports::pqkBuf[16] = {0};
@@ -850,19 +912,16 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // firmware/src/fpga/profi/rtl/karabas_pro.vhd:1332-1365) rather than just
     // the dev manual — #008B/#018B are CPM/ROM14/DOS-gated, but #028B is NOT
     // (cs_028b has no cpm/rom14/dos_act term at all, unlike cs_008b/cs_018b).
-    // Register contents are stored/read back faithfully. Side effects are NOT
-    // wired: checking the same VHDL, only port_008b_reg bit0 (rom0) currently
-    // does anything in hardware (forces an alternate 16KB config-flash ROM
-    // bank for one FPGA-internal loader path, ext_rom_bank_pq — not applicable
-    // to pico-spec's static ROM-array model) — rom1..rom5 and ram0..ram7 are
-    // assigned but otherwise UNUSED (dead signals) even in real hardware as of
-    // this check (2026-07-08, release v25092420-romain292 / PQDOS BIOS
-    // 0.41h1); no PQDOS build (debug/pqdos/profi64k.rom, PQDOS1.FDI, or this
-    // release's bios_pqdos_patched_rtc_0.41h1.rom) contains any LD BC,#xx8B +
-    // OUT (C),A/IN A,(C) sequence either. Extend once real paging is added on
-    // both sides (checked again 2026-07-08 against the newer
-    // bios_pqdos_patched_rtc_0.41h1.rom now embedded as the PQDOS bank0 — same
-    // zero-hits result).
+    // Register contents are stored/read back faithfully. Side effects wired
+    // per the FPGA "TR-DOS FLAG" process (2026-07-10): #008B ONROM (bit6) =
+    // forced DOS level (applied in the write handler below + exit suppression
+    // in Z80::check_trdos), UNLOCK_128 (bit7) = 0x3Dxx automap also from the
+    // 128K ROM (consumed in the trap). #028B TURBO_MODE (bits 5-6) is live
+    // (synthesized from/applied to ESPectrum::multiplicator). The rest are
+    // dead signals even in real hardware (rom1..rom5, ram0..ram7 assigned but
+    // unused; rom0 only feeds the FPGA config-flash loader path — not
+    // applicable to pico-spec's static ROM-array model). No PQDOS build up to
+    // BIOS 0.41h1 touches #008B/#018B at all (checked 2026-07-08).
     if (Z80Ops::isProfi) {
       if (address == 0x028B) {
         // TURBO_MODE (bits 5-6) is LIVE state, not a stored latch: ROMain's
@@ -904,6 +963,47 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       // reports 0 → modifiers 0.  Scancodes are QDOS key-table indices.
       uint8_t lo8 = address & 0xFF;
       if (lo8 == 0xF3 || lo8 == 0xD3) {
+        // К580ВВ51 serial mouse vs the PQDOS serial-keyboard hack: both live
+        // on #F3/#D3. The VV51 answers with a real 8251 status (base 0x05 =
+        // TxRDY+TxE — mouse drivers' presence check needs it), while the
+        // PQDOS keyboard driver expects RAW 0x00/0x02 there (its follow-up
+        // #F3 read after a scancode is the MODIFIER byte — a 0x05 base would
+        // read as phantom modifiers). The two are irreconcilable on one read,
+        // so pick by romset: the keyboard hack only exists for PQDOS. Within
+        // any romset, RxE (ctl bit2) set always selects the mouse — the PQDOS
+        // keyboard init never sets RxE (FPGA behaviour: the VV51 RX machine
+        // is gated on RxE).
+        if ((serialMouseCtl & 0x04) || Config::romSet != "ProfiPQ") {
+          if (lo8 == 0xF3) {              // VV51 status register
+            smTryBuildPacket();
+            uint8_t st = (uint8_t)(0x05 | (sm_rxrdy ? 0x02 : 0x00)); // TxRDY+TxE | RxRDY
+#if FDD_PORT_TRACE
+            static uint16_t smLastPc = 0xFFFF; static uint8_t smLastSt = 0xFF;
+            if (Z80::getRegPC() != smLastPc || st != smLastSt) {
+              smLastPc = Z80::getRegPC(); smLastSt = st;
+              Debug::log("[VV51 IN] F3 st=%02X ctl=%02X inten=%d pc=%04X",
+                         st, serialMouseCtl, (int)serialMouseIntEn, smLastPc);
+            }
+#endif
+            return st;
+          }
+          // #D3: VV51 data — current packet byte; a read advances the pipeline
+          uint8_t v = sm_pkt[sm_pkt_pos > 2 ? 2 : sm_pkt_pos];
+          if (sm_rxrdy) {
+            sm_rxrdy = false;
+            if (++sm_pkt_pos < 3) sm_rxrdy = true;
+            else smTryBuildPacket();      // next packet if more deltas queued
+          }
+#if FDD_PORT_TRACE
+          {
+            static uint32_t smRd = 0;
+            if (++smRd <= 60 || (smRd & 0x3F) == 0)
+              Debug::log("[VV51 IN] D3 -> %02X pos=%u pc=%04X n=%u",
+                         v, (unsigned)sm_pkt_pos, Z80::getRegPC(), (unsigned)smRd);
+          }
+#endif
+          return v;
+        }
         bool hasKey = (pqkHead != pqkTail);
 #if FDD_PORT_TRACE
         static uint16_t lastKbPc = 0xFFFF; static uint8_t lastKbLo = 0;
@@ -1266,19 +1366,33 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     /// if (ESPectrum::ps2mouse && Config::mouse == 1)
     // Karabas-Pro manual p.25-27: Kempston Mouse gate is "CPM=0" — in CP/M
     // mode #xxDF ports are reassigned to extended periphery (e.g. RTC #DF).
+    // Decode: the manual specifies FULL 16-bit addresses (#FADF/#FBDF/#FFDF),
+    // so on Profi we match them exactly — the classic partial &0x05FF decode
+    // aliased e.g. #0ADF onto the buttons port, which is exactly the address
+    // ROMain's Karabas-RTC presence probe reads (reg 0x0A in A → IN A,(#DF)),
+    // and a non-0xFF answer there fakes an RTC. Other archs keep the
+    // traditional partial decode (Pentagon-style Kempston mice rely on it).
     if (!(Z80Ops::isProfi && (portDFFD & 0x20))) {
-      if ((address & 0x05ff) == 0x01df) {
+      uint16_t mdec = Z80Ops::isProfi ? (uint16_t)address : (address & 0x05ff);
+      if (mdec == (Z80Ops::isProfi ? 0xFBDF : 0x01df)) {
         LED::touchR(LED::KEMPMOUSE);
         return (uint8_t)ESPectrum::mouseX;
       }
-      if ((address & 0x05ff) == 0x05df) {
+      if (mdec == (Z80Ops::isProfi ? 0xFFDF : 0x05df)) {
         LED::touchR(LED::KEMPMOUSE);
         return (uint8_t)ESPectrum::mouseY;
       }
-      if ((address & 0x05ff) == 0x00df) {
+      if (mdec == (Z80Ops::isProfi ? 0xFADF : 0x00df)) {
         LED::touchR(LED::KEMPMOUSE);
-        return 0xff & (ESPectrum::mouseButtonL ? 0xfd : 0xff) &
-               (ESPectrum::mouseButtonR ? 0xfe : 0xff);
+        // No mouse ever attached → keep the bus-float 0xFF so presence
+        // detection (buttons==0xFF) still reads "absent".
+        if (!ESPectrum::mouseSeen) return 0xff;
+        // Manual p.25: bit0=R, bit1=L, bit2=M (active low), bit3=1,
+        // bits4-7 = wheel notch counter.
+        return (uint8_t)(((ESPectrum::mouseWheel & 0x0F) << 4) | 0x08 |
+                         (ESPectrum::mouseButtonM ? 0 : 0x04) |
+                         (ESPectrum::mouseButtonL ? 0 : 0x02) |
+                         (ESPectrum::mouseButtonR ? 0 : 0x01));
       }
     }
 
@@ -2257,7 +2371,26 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
                    address, data, cpm, rom14, dos, Z80::getRegPC());
 #endif
       if ((cpm && rom14) || (dos && !rom14)) {
-        if (address == 0x008B) { port008B = data; return; }
+        if (address == 0x008B) {
+          uint8_t prev = port008B;
+          port008B = data;
+          // ONROM (bit6): forced DOS signal — in the FPGA (karabas_pro.vhd
+          // "TR-DOS FLAG" process) `or onrom='1'` sets dos_act every clock and
+          // outranks every exit condition, including NOROM. Map the rising
+          // edge here; while the bit stays set, Z80::check_trdos() suppresses
+          // the PC>=0x4000 DOS exit. UNLOCK_128 (bit7) is consumed in the
+          // 0x3Dxx automap trap. ROM0-5 / #018B RAM0-7 remain stub-stored —
+          // dead signals in the real FPGA too (only rom0 feeds the
+          // config-flash loader path, not applicable here).
+          if ((data & 0x40) && !(prev & 0x40) && !ESPectrum::trdos) {
+            ESPectrum::trdos = true;
+            if (!MemESP::page0ram) {
+              MemESP::romInUse = MemESP::romLatch ? 1 : 0; // f(DOS,ROM14)
+              MemESP::ramCurrent[0] = MemESP::rom[MemESP::romInUse].direct();
+            }
+          }
+          return;
+        }
         if (address == 0x018B) { port018B = data; return; }
       }
       // PQDOS/RS232 serial ports #F3/#D3 (keyboard) and #B3/#93 (RS232) — the
@@ -2274,6 +2407,14 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       {
         uint8_t lo8o = address & 0xFF;
         if (lo8o == 0xF3 || lo8o == 0xD3 || lo8o == 0xB3 || lo8o == 0x93) {
+          // #F3 = VV51 command register (bit2 RxE arms the serial mouse; the
+          // PQDOS keyboard init keeps it clear). #B3/#93 bit0 = hardware-INT
+          // enable (hw_int.vhd decodes BOTH; note #B3 writes are shadowed by
+          // the General Sound host port while GS is enabled — drivers using
+          // #93, like the stock Profi ones, are unaffected). #D3 data writes
+          // are dropped: the VV51 TX side isn't emulated (TxRDY/TxE stuck 1).
+          if (lo8o == 0xF3) serialMouseCtl = data;
+          else if (lo8o == 0xB3 || lo8o == 0x93) serialMouseIntEn = data & 0x01;
 #if FDD_PORT_TRACE
           static uint16_t lastPc = 0xFFFF; static uint8_t lastData = 0, lastLo = 0;
           uint16_t pcn = Z80::getRegPC();

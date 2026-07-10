@@ -225,7 +225,7 @@ void process_kbd_report(
   hid_keyboard_report_t const *prev_report
 );
 
-static void process_mouse_report(hid_mouse_report_t const * report);
+static void process_mouse_report(hid_mouse_report_t const * report, uint16_t len);
 static void process_generic_report(uint8_t dev_addr, uint8_t instance, uint8_t const* report, uint16_t len);
 static void process_hid_gamepad(uint8_t const* report, uint16_t len);
 static void process_ds4_gamepad(uint8_t instance, uint8_t const* report, uint16_t len);
@@ -391,7 +391,7 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
     case HID_ITF_PROTOCOL_MOUSE:
       TU_LOG2("HID receive boot mouse report\r\n");
       hid_snap_set_handler(instance, HID_HANDLER_MOUSE);
-      process_mouse_report( (hid_mouse_report_t const*) report );
+      process_mouse_report( (hid_mouse_report_t const*) report, len );
     break;
 
     default:
@@ -464,12 +464,23 @@ void cursor_movement(int8_t x, int8_t y, int8_t wheel)
 
 #include "ESPectrum.h"
 
-static void process_mouse_report(hid_mouse_report_t const * report)
+static void process_mouse_report(hid_mouse_report_t const * report, uint16_t len)
 {
+    ESPectrum::mouseSeen = true;
     ESPectrum::mouseButtonL = report->buttons & MOUSE_BUTTON_LEFT;
     ESPectrum::mouseButtonR = report->buttons & MOUSE_BUTTON_RIGHT;
+    ESPectrum::mouseButtonM = report->buttons & MOUSE_BUTTON_MIDDLE;
     ESPectrum::mouseX += report->x >> 2;
     ESPectrum::mouseY -= report->y >> 2; // TODO: DPI
+    // Kempston wheel-mouse: #FADF bits 4-7 are a free-running notch counter.
+    // 3-byte boot-protocol reports (buttons/x/y) have NO wheel field — reading
+    // report->wheel there picks up garbage past the report → phantom scrolls.
+    if (len >= 4) ESPectrum::mouseWheel += (int8_t)report->wheel;
+    // Serial (COM) mouse packets consume deltas from these accumulators.
+    // HID y is down-positive, which matches the Microsoft Mouse convention
+    // (the FPGA negates PS/2 y for the same reason: MS_Y => -ms_delta_y).
+    ESPectrum::mouseDX += report->x;
+    ESPectrum::mouseDY += report->y;
   /**
 
   //------------- button state  -------------//
@@ -1347,7 +1358,7 @@ static void process_generic_report(uint8_t dev_addr, uint8_t instance, uint8_t c
         TU_LOG1("HID receive mouse report\r\n");
         hid_snap_set_handler(instance, HID_HANDLER_MOUSE);
         // Assume mouse follow boot report layout
-        process_mouse_report( (hid_mouse_report_t const*) report );
+        process_mouse_report( (hid_mouse_report_t const*) report, len );
       break;
 
       case HID_USAGE_DESKTOP_GAMEPAD:
