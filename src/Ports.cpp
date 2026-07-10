@@ -624,6 +624,11 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
       if (zifi_hi >= 0xF8) // 16550 UART window (#F8EF..#FFEF) — raw-UART drivers
         return ZiFi::uart16550Read(zifi_hi);
     }
+    // ZX UNO register file (#FC3B address / #FD3B data) — Karabas-Pro's UART
+    // bridge to its on-board ESP8266. Full 16-bit decode (as on the FPGA), bit8
+    // picks the data port; bridges to the same ESP link as the #xxEF windows.
+    if (Config::zifi_enabled && (address | 0x0100) == 0xFD3B)
+      return ZiFi::unoUartRead(address & 0x0100);
     // MC146818 RTC data read (#BFF7) — Pentagon/Profi "Mr Gluk" TimeKeeper.
     // Register index was latched via OUT (#DFF7). Port is RTC-specific on these
     // machines, so no extra gating needed.
@@ -1539,6 +1544,13 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
       ZiFi::uart16550Write(zifi_hi, data);
       return;
     }
+  }
+  // ZX UNO register file (#FC3B address / #FD3B data) — Karabas-Pro's UART
+  // bridge to its on-board ESP8266. Full 16-bit decode (as on the FPGA), bit8
+  // picks the data port; bridges to the same ESP link as the #xxEF windows.
+  if (Config::zifi_enabled && (address | 0x0100) == 0xFD3B) {
+    ZiFi::unoUartWrite(address & 0x0100, data);
+    return;
   }
   // MC146818 RTC (Pentagon/Profi "Mr Gluk" TimeKeeper):
   //   OUT (#DFF7), reg  → latch register index
