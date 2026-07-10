@@ -3881,6 +3881,39 @@ void wdDiskEject(rvmWD1793 *wd, unsigned char UnitNum) {
 
 }
 
+// Swap the disks of two drive units in place (Karabas-Pro Menu+Tab "swap
+// drive letters"). The selected unit (diskS) keeps its number, so the guest
+// sees the other image under the same drive letter. The track cache and the
+// deferred per-unit markers are keyed by unit number — flush/remap them so
+// write-back can't land on the wrong image after the swap.
+void rvmWD1793SwapDrives(rvmWD1793 *wd, uint8_t a, uint8_t b) {
+#if !PICO_RP2040
+    if (wd->diskLoadedUnit == (int)a || wd->diskLoadedUnit == (int)b) {
+        rvmwdDisk *ld = wd->disk[wd->diskLoadedUnit];
+        if (wd->diskDirty && ld && ld->Diskfile) {
+            if (ld->IsUDIFile) udiFlushTrack(wd);
+            else if (ld->IsFDIFile) fdiFlushTrack(wd);
+            else if (ld->IsMBDFile) mbdFlushTrack(wd);
+        }
+        wd->diskLoadedCyl = -1;
+        wd->diskLoadedSide = -1;
+        wd->diskLoadedUnit = -1;
+        wd->diskTrackLen = 0;
+        wd->diskDirty = false;
+    }
+    if (g_wdSyncPendingWd == wd) {
+        if (g_wdSyncPendingUnit == (int)a) g_wdSyncPendingUnit = b;
+        else if (g_wdSyncPendingUnit == (int)b) g_wdSyncPendingUnit = a;
+    }
+    if (wd->trackLoadPending && (wd->pendUnit == a || wd->pendUnit == b))
+        wd->trackLoadPending = 0;
+#endif
+    rvmwdDisk *t = wd->disk[a];
+    wd->disk[a] = wd->disk[b];
+    wd->disk[b] = t;
+    rvmWD1793UpdateFastmode(wd); // fastmode follows the disk in the active unit
+}
+
 void SCLtoTRD(rvmwdDisk *d, unsigned char* track0) {
 
     uint8_t numberOfFiles;

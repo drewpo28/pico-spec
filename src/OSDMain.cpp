@@ -1746,6 +1746,60 @@ void OSD::bootTrdos() {
 }
 
 // OSD Main Loop
+void OSD::nmiAction() {
+#if !PICO_RP2040
+    if (DivMMC::enabled) {
+        // DivMMC NMI: automap at 0x0066 handled by preOpcFetch/postOpcFetch
+        Z80::triggerNMI();
+    } else
+#endif
+    if (Z80Ops::isByte) {
+        // ZX Byte: NMI menu with COBMECT mode toggle
+        menu_level = 0;
+        menu_curopt = 1;
+        menu_saverect = true;
+        string nmi_menu = MENU_NMI_TITLE[Config::lang];
+        nmi_menu += "NMI\n";
+        nmi_menu += MENU_BYTE_COBMECT_MODE[Config::lang];
+        uint8_t nmi_cols = 20;
+        uint16_t nmi_w = (nmi_cols * OSD_FONT_W) + 2;
+        uint16_t nmi_h = (rowCount(nmi_menu) * OSD_FONT_H) + 2;
+        uint8_t opt = simpleMenuRun(nmi_menu,
+            scrAlignCenterX(nmi_w), scrAlignCenterY(nmi_h),
+            rowCount(nmi_menu), nmi_cols);
+        if (opt == 1) {
+            Z80::triggerNMI();
+        } else if (opt == 2) {
+            Config::byte_cobmect_mode = !Config::byte_cobmect_mode;
+            Config::save();
+            // BYTE and BYTE-compat are both overlays over the Sinclair 48K base.
+            MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_48k,
+                Config::byte_cobmect_mode ? gb_overlay_48k_byte_sovmest : gb_overlay_48k_byte);
+            MemESP::recoverPage0();
+            osdCenteredMsg(Config::byte_cobmect_mode ? OSD_COBMECT_ON[Config::lang] : OSD_COBMECT_OFF[Config::lang], LEVEL_INFO, 500);
+        }
+    } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
+        menu_level = 0;
+        menu_curopt = 1;
+        menu_saverect = true;
+        string nmi_menu = MENU_NMI_TITLE[Config::lang];
+        nmi_menu += MENU_NMI_SEL[Config::lang];
+        uint8_t nmi_cols = 20;
+        uint16_t nmi_w = (nmi_cols * OSD_FONT_W) + 2;
+        uint16_t nmi_h = (rowCount(nmi_menu) * OSD_FONT_H) + 2;
+        uint8_t opt = simpleMenuRun(nmi_menu,
+            scrAlignCenterX(nmi_w), scrAlignCenterY(nmi_h),
+            rowCount(nmi_menu), nmi_cols);
+        if (opt == 1)
+            Z80::triggerNMI();
+        else if (opt == 2)
+            Z80::triggerNMIDOS();
+    } else {
+        Z80::triggerNMI();
+    }
+}
+
 void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 
     struct AYGuard {
@@ -1836,9 +1890,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
     }
 
 #if !PICO_RP2040
-    // Alt+` (grave/tilde) — toggle Profi extended keyboard mode (only in Profi arch)
-    if (Config::arch == "Profi" && ALT && !CTRL &&
-        (KeytoESP == fabgl::VK_GRAVEACCENT || KeytoESP == fabgl::VK_TILDE)) {
+    // Alt+` (grave/tilde) or plain PrtScr (the Karabas-Pro hardware combo) —
+    // toggle Profi extended keyboard mode (only in Profi arch)
+    if (Config::arch == "Profi" && !CTRL &&
+        ((ALT && (KeytoESP == fabgl::VK_GRAVEACCENT || KeytoESP == fabgl::VK_TILDE)) ||
+         (!ALT && KeytoESP == fabgl::VK_PRINTSCREEN))) {
         Config::profi_ext_keys = !Config::profi_ext_keys;
         Config::save();
         osdCenteredMsg(Config::profi_ext_keys ? " XT keyboard ON  " : " XT keyboard OFF ", LEVEL_INFO, 500);
@@ -1894,57 +1950,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             pokeDialog();
         } else
         if (hkIdx == Config::HK_NMI) { // NMI
-#if !PICO_RP2040
-            if (DivMMC::enabled) {
-                // DivMMC NMI: automap at 0x0066 handled by preOpcFetch/postOpcFetch
-                Z80::triggerNMI();
-            } else
-#endif
-            if (Z80Ops::isByte) {
-                // ZX Byte: NMI menu with COBMECT mode toggle
-                menu_level = 0;
-                menu_curopt = 1;
-                menu_saverect = true;
-                string nmi_menu = MENU_NMI_TITLE[Config::lang];
-                nmi_menu += "NMI\n";
-                nmi_menu += MENU_BYTE_COBMECT_MODE[Config::lang];
-                uint8_t nmi_cols = 20;
-                uint16_t nmi_w = (nmi_cols * OSD_FONT_W) + 2;
-                uint16_t nmi_h = (rowCount(nmi_menu) * OSD_FONT_H) + 2;
-                uint8_t opt = simpleMenuRun(nmi_menu,
-                    scrAlignCenterX(nmi_w), scrAlignCenterY(nmi_h),
-                    rowCount(nmi_menu), nmi_cols);
-                if (opt == 1) {
-                    Z80::triggerNMI();
-                } else if (opt == 2) {
-                    Config::byte_cobmect_mode = !Config::byte_cobmect_mode;
-                    Config::save();
-                    // BYTE and BYTE-compat are both overlays over the Sinclair 48K base.
-                    MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
-                    MemESP::registerOverlay(gb_rom_0_sinclair_48k,
-                        Config::byte_cobmect_mode ? gb_overlay_48k_byte_sovmest : gb_overlay_48k_byte);
-                    MemESP::recoverPage0();
-                    osdCenteredMsg(Config::byte_cobmect_mode ? OSD_COBMECT_ON[Config::lang] : OSD_COBMECT_OFF[Config::lang], LEVEL_INFO, 500);
-                }
-            } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
-                menu_level = 0;
-                menu_curopt = 1;
-                menu_saverect = true;
-                string nmi_menu = MENU_NMI_TITLE[Config::lang];
-                nmi_menu += MENU_NMI_SEL[Config::lang];
-                uint8_t nmi_cols = 20;
-                uint16_t nmi_w = (nmi_cols * OSD_FONT_W) + 2;
-                uint16_t nmi_h = (rowCount(nmi_menu) * OSD_FONT_H) + 2;
-                uint8_t opt = simpleMenuRun(nmi_menu,
-                    scrAlignCenterX(nmi_w), scrAlignCenterY(nmi_h),
-                    rowCount(nmi_menu), nmi_cols);
-                if (opt == 1)
-                    Z80::triggerNMI();
-                else if (opt == 2)
-                    Z80::triggerNMIDOS();
-            } else {
-                Z80::triggerNMI();
-            }
+            nmiAction();
         }
         else
         if (hkIdx == Config::HK_RESET_TO) { // Reset to...

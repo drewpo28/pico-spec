@@ -1,8 +1,10 @@
 // "Main menu" Profi service ROM (bank0) — Karabas-Pro official release
-// v25092420-romain292, rom/ROMain_292/ROMain_ramdisk_A.rom (bank0, first 16K;
-// byte-identical to the current master branch's ROMain_ramdisk_D.rom bank0 —
-// confirmed 2026-07-09, only the optional RAM-disk drive letter differs
-// between the A/B/C/D variants, not bank0). Adds the graphical boot menu seen
+// v25092420-romain292, ROMain_ramdisk_D.rom (bank0, first 16K; byte-identical
+// across the A/B/C/D variants — confirmed 2026-07-09/10, only 8 bank1 bytes
+// (the RAM-disk drive-letter compare) differ. The romset's bank1 overlay is
+// packed from the _D variant: RAM-disk on D:, mounted image stays on A: —
+// the _A variant hijacked A: so TR-DOS booted the RAM-disk instead of the
+// really mounted disk). Adds the graphical boot menu seen
 // on real hardware: "Loading CP/M system / Loading boot from SD / Run TR-DOS
 // 48K/128K / Run Sinclair 48K/128K / Run Test&Tools Menu" — the stock
 // gb_rom_profi_bank0 (profi_banks.c) only has a plain "TR-DOS 48K/128K /

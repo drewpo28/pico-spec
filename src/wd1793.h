@@ -415,6 +415,9 @@ void rvmWD1793FreeTrackBuf(rvmWD1793 *wd);
 bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string& Filename);
 uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control);
 void wdDiskEject(rvmWD1793 *wd, unsigned char UnitNum);
+// Swap the disks of two drive units (Karabas-Pro Menu+Tab); flushes/remaps the
+// unit-keyed track cache and deferred-sync markers, then updates fastmode.
+void rvmWD1793SwapDrives(rvmWD1793 *wd, uint8_t a, uint8_t b);
 void SCLtoTRD(rvmwdDisk *d, unsigned char *track0);
 bool rvmWD1793CreateEmptyTRD(const char *path);
 #if !PICO_RP2040

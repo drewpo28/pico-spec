@@ -96,6 +96,7 @@ extern "C" volatile bool profi_ds80_active;
 // specification ("C") is not permitted at block scope. ALL platforms — the
 // factory-reset probe uses it on RP2040 (MURM/ZERO) KBDUSB builds too.
 extern "C" bool usb_keyboard_mounted(void);
+extern "C" size_t getLargestAllocatable(void);  // defined in OSDMain.cpp
 #endif
 
 //=======================================================================================
@@ -1488,8 +1489,16 @@ IRAM_ATTR bool ESPectrum::readKbd(fabgl::VirtualKeyItem *Nextkey) {
     if (Nextkey->vk ==
         fabgl::VK_PRINTSCREEN) { // Capture framebuffer to BMP file in SD Card
                                  // (thx @dcrespo3d!)
-      CaptureToBmp();
-      r = false;
+      // On Profi plain PrtScr is the Karabas-Pro XT-keyboard toggle (handled
+      // in do_OSD) — there the BMP capture moves to Alt+PrtScr; other archs
+      // keep the plain-PrtScr capture.
+      bool xtToggle = Z80Ops::isProfi &&
+                      !PS2Controller.keyboard()->isVKDown(fabgl::VK_LALT) &&
+                      !PS2Controller.keyboard()->isVKDown(fabgl::VK_RALT);
+      if (!xtToggle) {
+        CaptureToBmp();
+        r = false;
+      }
     } else if (Nextkey->vk ==
                fabgl::VK_SCROLLLOCK) { // Change CursorAsJoy setting
       Config::CursorAsJoy = !Config::CursorAsJoy;
@@ -1629,6 +1638,95 @@ IRAM_ATTR void ESPectrum::processKeyboard() {
         }
       }
 #endif
+      // The rest of the Karabas-Pro "Menu"-key combos from the user manual.
+      // Unlike Menu+F1..F4 they map onto machine-independent emulator settings,
+      // so they work on any arch. osdCenteredMsg blocks for the toast duration —
+      // compensate ts_start like the do_OSD dispatch below does.
+      if (Kdown && (Kbd->isVKDown(fabgl::VK_LGUI) || Kbd->isVKDown(fabgl::VK_RGUI))) {
+        auto menuToast = [](const char *msg) {
+          int64_t t = esp_timer_get_time();
+          OSD::osdCenteredMsg(msg, LEVEL_INFO, 500);
+          ESPectrum::ts_start += esp_timer_get_time() - t;
+        };
+        if (KeytoESP == fabgl::VK_F5) { // TurboFDC = our TR-DOS fast mode
+          Config::trdosFastMode = !Config::trdosFastMode;
+          rvmWD1793UpdateFastmode(&ESPectrum::fdd);
+          Config::save();
+          menuToast(Config::trdosFastMode ? " Turbo FDC: On  " : " Turbo FDC: Off " );
+          return;
+        }
+        if (KeytoESP == fabgl::VK_F7) { // SSG stereo mode
+          static const char* const ayModes[3] =
+              { " AY stereo: ABC  ", " AY stereo: ACB  ", " AY stereo: Mono " };
+          Config::ayConfig = (Config::ayConfig + 1) % 3;
+          Config::save();
+          menuToast(ayModes[Config::ayConfig]);
+          return;
+        }
+        if (KeytoESP == fabgl::VK_F8 ||   // AY/YM chip select
+            KeytoESP == fabgl::VK_F9 ||   // VGA/TV scan mode
+            KeytoESP == fabgl::VK_F10) {  // 50/60 Hz scan rate
+          menuToast(" Not supported ");
+          return;
+        }
+        if (KeytoESP == fabgl::VK_F11) { // Turbo 3.5/7/14 MHz — 3-state cycle
+          // (the configurable Turbo hotkey also offers 28 MHz as a 4th state)
+          static const char* const mhz[3] =
+              { " CPU: 3.5 MHz " , " CPU: 7 MHz   ", " CPU: 14 MHz  " };
+          ESPectrum::multiplicator = (ESPectrum::multiplicator + 1) % 3;
+          CPU::updateStatesInFrame();
+          menuToast(mhz[ESPectrum::multiplicator]);
+          return;
+        }
+        if (KeytoESP == fabgl::VK_F12) { // NMI — route through do_OSD with the
+          // combo bound to the NMI hotkey, so its DS80/AY guards apply and
+          // Pentagon/Profi get the visible NMI/NMI+DOS chooser (a bare
+          // triggerNMI is invisible there: the ROM's 0x66 just RETNs).
+          const Config::HotkeyBinding &hk = Config::hotkeys[Config::HK_NMI];
+          if (hk.vk != (uint16_t)fabgl::VK_NONE) {
+            int64_t osd_start = esp_timer_get_time();
+            OSD::do_OSD((fabgl::VirtualKey)hk.vk, hk.alt, hk.ctrl);
+            Kbd->emptyVirtualKeyQueue();
+            VIDEO::brdnextframe = true;
+            ESPectrum::ts_start += esp_timer_get_time() - osd_start;
+          } else
+            Z80::triggerNMI();
+          return;
+        }
+        if (KeytoESP == fabgl::VK_TAB) { // swap drive letters A<->B
+          rvmWD1793SwapDrives(&ESPectrum::fdd, 0, 1);
+          bool wp = Config::driveWP[0];
+          Config::driveWP[0] = Config::driveWP[1];
+          Config::driveWP[1] = wp;
+          Config::save(); // persists the per-unit filenames + WP flags
+          menuToast(" Drives A <-> B ");
+          return;
+        }
+        if (KeytoESP == fabgl::VK_j || KeytoESP == fabgl::VK_J) { // joystick type
+          static const char* const joyNames[5] =
+              { " Joy: Cursor     ", " Joy: Kempston   ", " Joy: Sinclair 1 ",
+                " Joy: Sinclair 2 ", " Joy: Fuller     " };
+          Config::joystick = (Config::joystick + 1) % 5; // Custom stays OSD-only
+          // NOT setJoyMap() — it wipes joydef and pops a "load default map?"
+          // dialog; the pad-button mapping is orthogonal to the port type and
+          // stays editable in the OSD joystick menu.
+          Config::save();
+          menuToast(joyNames[Config::joystick]);
+          return;
+        }
+        if (KeytoESP == fabgl::VK_ESCAPE) { // open the OSD main menu
+          int64_t osd_start = esp_timer_get_time();
+          OSD::do_OSD(fabgl::VK_F1, false, false);
+          Kbd->emptyVirtualKeyQueue();
+#ifdef DIRTY_LINES
+          for (int i = 0; i < SPEC_H; i++)
+            VIDEO::dirty_lines[i] |= 0x01;
+#endif // DIRTY_LINES
+          VIDEO::brdnextframe = true;
+          ESPectrum::ts_start += esp_timer_get_time() - osd_start;
+          return;
+        }
+      }
       if ((Kdown) &&
           ((KeytoESP >= fabgl::VK_F1 && KeytoESP <= fabgl::VK_F12) ||
             KeytoESP == fabgl::VK_PAUSE || KeytoESP == fabgl::VK_PRINTSCREEN ||
@@ -2510,16 +2608,24 @@ void ESPectrum::loop() {
     // pull WiFi up as a side effect via `ZiFi::enabled && rtc_enabled`, which is
     // exactly the leak that made FTP/SSH work only with the NIC on). The background
     // state machine also runs SNTP, harmless when RTC is off.
-    if (!Config::wifi_ssid.empty() && Config::arch != "Profi" && Config::wifi_enabled) {
+    if (!Config::wifi_ssid.empty() && Config::wifi_enabled) {
         if (!rtc_autosync_begun) {
             uint32_t now = to_ms_since_boot(get_absolute_time());
             if (rtc_autosync_at == 0) rtc_autosync_at = now + 4000;
             else if (now >= rtc_autosync_at) {
                 rtc_autosync_begun = true;
-                ZiFiAT::autoSyncBegin(Config::wifi_ssid, Config::wifi_pass, Config::wifi_tz);
+                // Profi heap guard (decided once, replaces the old blanket
+                // `arch != "Profi"` exclusion that left the ROMain/PQDOS clock
+                // permanently at 00.00.00): autoSyncBegin brings the ESP link up
+                // (ZiFi::init allocs the 8 KB RX ring + TX FIFO on the heap) —
+                // fine on butter-PSRAM Profi (~68 KB free with CDC up), but the
+                // SPI-PSRAM m1p2 Profi runs with ~10 KB free and OOMs (see
+                // profi_zifi_oom_fix). Skip only when the headroom isn't there.
+                if (Config::arch != "Profi" || getLargestAllocatable() >= 16384)
+                    ZiFiAT::autoSyncBegin(Config::wifi_ssid, Config::wifi_pass, Config::wifi_tz);
             }
         } else {
-            ZiFiAT::autoSyncPoll();
+            ZiFiAT::autoSyncPoll(); // no-op unless autoSyncBegin actually ran
         }
     }
 #endif

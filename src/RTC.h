@@ -10,7 +10,9 @@
 //   OUT (#BFF7), data  — write selected register
 //   IN  A,(#BFF7)      — read selected register
 // Registers 0x00..0x09 are the live clock (BCD, 24h); 0x0A..0x0D are control;
-// 0x0E..0x3F are 50 bytes of battery-backed CMOS RAM.
+// 0x0E.. is battery-backed CMOS RAM (full 8-bit index space: Karabas-Pro's
+// DS1307-based emulation exposes 240 cells, so no 0x3F mask — an index mask
+// would alias high NVRAM cells onto the time registers).
 //
 // The clock is not ticked register-by-register: a base wall-clock time (set
 // from SNTP via ZiFi) plus the elapsed ms-since-boot yields the live value on
@@ -38,7 +40,9 @@ public:
     static void    flushNVRAM();
 
 private:
-    static uint8_t regs[64];      // 0x0A..0x3F live; time regs computed on read
+    static uint8_t regs[256];     // control + NVRAM live; time regs computed on read
+                                  // (0x00..0x09 double as the SET-mode write buffer)
+    static void    commitTimeRegs(); // apply buffered time regs on SET 1→0
     static uint8_t sel;           // selected register index
     static bool    time_valid;
     static uint32_t base_secs;    // local epoch-seconds at sync moment
@@ -46,6 +50,8 @@ private:
 
     static bool     nv_dirty;     // NVRAM changed since last flush
     static uint32_t nv_flush_ms;  // last flush time (debounce)
+    static uint32_t last_uf_sec;  // second of the last reg C UF report
+    static uint32_t last_c_ms;    // ms of the last reg C read (PF synthesis)
     static void     loadNVRAM();  // restore NVRAM from SD at init
 
     static uint32_t liveSecs();   // base_secs + elapsed

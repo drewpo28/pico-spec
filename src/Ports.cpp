@@ -635,8 +635,15 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     if (Config::rtc_enabled && (Z80Ops::isPentagon || Z80Ops::isProfi) && address == 0xBFF7) {
       uint8_t rv = RTC::readData();
 #if RTC_PORT_TRACE
-      Debug::log("[RTC RD ] BFF7 sel=%02X -> %02X pc=%04X eff7=%02X",
-                 RTC::dbgSel(), rv, Z80::getRegPC(), Ports::portEFF7);
+      // Rate cap: the ROMain status clock polls 6 regs per 50 Hz frame — an
+      // uncapped log (~300 lines/s) exceeds the 115200 console and stalls
+      // emulation. First 150 reads verbatim, then 1 of every 256.
+      {
+        static uint32_t rd_n = 0;
+        if (++rd_n <= 150 || (rd_n & 0xFF) == 0)
+          Debug::log("[RTC RD ] BFF7 sel=%02X -> %02X pc=%04X eff7=%02X n=%u",
+                     RTC::dbgSel(), rv, Z80::getRegPC(), Ports::portEFF7, (unsigned)rd_n);
+      }
 #endif
       return rv;
     }
@@ -645,9 +652,12 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // comment there for why (it must run only once FDC has declined the address).
 #if RTC_PORT_TRACE
     // Catch-all: any other IN with low byte 0xF7 (reveals a non-#BFF7 data port).
-    if ((Z80Ops::isPentagon || Z80Ops::isProfi) && (address & 0xFF) == 0xF7)
-      Debug::log("[RTC IN?] %04X pc=%04X eff7=%02X sel=%02X",
-                 address, Z80::getRegPC(), Ports::portEFF7, RTC::dbgSel());
+    if ((Z80Ops::isPentagon || Z80Ops::isProfi) && (address & 0xFF) == 0xF7) {
+      static uint32_t in_n = 0;
+      if (++in_n <= 150 || (in_n & 0xFF) == 0)
+        Debug::log("[RTC IN?] %04X pc=%04X eff7=%02X sel=%02X n=%u",
+                   address, Z80::getRegPC(), Ports::portEFF7, RTC::dbgSel(), (unsigned)in_n);
+    }
 #endif
 #endif
 #if !PICO_RP2040
@@ -855,10 +865,17 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // zero-hits result).
     if (Z80Ops::isProfi) {
       if (address == 0x028B) {
+        // TURBO_MODE (bits 5-6) is LIVE state, not a stored latch: ROMain's
+        // status bar polls IN #028B & 0x60 every frame and redraws its
+        // "Turbo:" field on change (rt 0x0592), and the FPGA hotkeys change
+        // the same latch on real hardware. Reflect our CPU turbo
+        // (multiplicator 0..3 = 3.5/7/14/28 MHz) so the guest sees the truth;
+        // the remaining bits stay stub-stored (see the caveat above).
+        uint8_t v = (port028B & ~0x60) | ((ESPectrum::multiplicator & 3) << 5);
 #if PROFI_PORT_TRACE
-        Debug::log("[8B IN] #028B -> %02X pc=%04X", port028B, Z80::getRegPC());
+        Debug::log("[8B IN] #028B -> %02X pc=%04X", v, Z80::getRegPC());
 #endif
-        return port028B;              // unconditional (no CPM/ROM14/DOS gate)
+        return v;                     // unconditional (no CPM/ROM14/DOS gate)
       }
       bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
 #if PROFI_PORT_TRACE
@@ -1220,12 +1237,16 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // with what cpm/rom14/trdos state, when the gate doesn't pass.
     if (Z80Ops::isProfi) {
       uint8_t lo8t = address & 0xFF;
-      if ((lo8t | 0x40) == 0xFF || (lo8t | 0x40) == 0xDF)
-        Debug::log("[RTC-AS/DS IN probe] addr=%04X lo=%02X cpm=%d rom14=%d trdos=%d pc=%04X",
-                   address, lo8t, (portDFFD & 0x20) != 0, MemESP::romLatch,
-                   ESPectrum::trdos, Z80::getRegPC());
+      if ((lo8t | 0x40) == 0xFF || (lo8t | 0x40) == 0xDF) {
+        static uint32_t pin_n = 0;
+        if (++pin_n <= 150 || (pin_n & 0x3FF) == 0)
+          Debug::log("[RTC-AS/DS IN probe] addr=%04X lo=%02X cpm=%d rom14=%d trdos=%d pc=%04X n=%u",
+                     address, lo8t, (portDFFD & 0x20) != 0, MemESP::romLatch,
+                     ESPectrum::trdos, Z80::getRegPC(), (unsigned)pin_n);
+      }
     }
 #endif
+#if !PICO_RP2040 // RTC (and Profi itself) are RP2350-only
     if (Config::rtc_enabled && Z80Ops::isProfi) {
       bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
       if ((cpm && rom14) || (dos && !rom14)) {
@@ -1240,6 +1261,7 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
         // #FF/#BF (AS) is write-only per the manual — no read defined.
       }
     }
+#endif
 
     /// if (ESPectrum::ps2mouse && Config::mouse == 1)
     // Karabas-Pro manual p.25-27: Kempston Mouse gate is "CPM=0" — in CP/M
@@ -1387,10 +1409,12 @@ static inline void profiFdcSysWrite(uint8_t data) {
                Z80::getRegPC());
   }
 #endif
-  // Change active disk unit. Profi 5.06 has 2 physical drives, so drive bits
-  // wrap modulo 2 (ZXMAK2 WD1793.cs:227).
+  // Change active disk unit. Full 2-bit select (4 units), per the Karabas-Pro
+  // dev manual RQ93 register (DRIVE bits 0-1). ZXMAK2's classic-Profi model
+  // masked this to 1 bit (2 physical drives, WD1793.cs:227) and we used to
+  // follow it on Profi — but that aliased C: onto A: (and D: onto B:), so a
+  // TR-DOS "LIST C:" showed drive A's catalog and units 2/3 were unreachable.
   uint8_t new_drive = data & 0x3;
-  if (Z80Ops::isProfi) new_drive &= 0x1;
   if (ESPectrum::fdd.diskS != new_drive) {
     ESPectrum::fdd.diskS = new_drive;
     if (ESPectrum::fdd.disk[ESPectrum::fdd.diskS] != NULL &&
@@ -1557,9 +1581,12 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   //   OUT (#BFF7), data → write selected register
   if (Config::rtc_enabled && (Z80Ops::isPentagon || Z80Ops::isProfi)) {
 #if RTC_PORT_TRACE
-    if (a8 == 0xF7)
-      Debug::log("[RTC OUT] %04X <- %02X pc=%04X eff7=%02X",
-                 address, data, Z80::getRegPC(), Ports::portEFF7);
+    if (a8 == 0xF7) {
+      static uint32_t out_n = 0;
+      if (++out_n <= 150 || (out_n & 0xFF) == 0)
+        Debug::log("[RTC OUT] %04X <- %02X pc=%04X eff7=%02X n=%u",
+                   address, data, Z80::getRegPC(), Ports::portEFF7, (unsigned)out_n);
+    }
 #endif
     if (address == 0xDFF7) { RTC::selectReg(data); return; }
     if (address == 0xBFF7) { RTC::writeData(data); return; }
@@ -2209,6 +2236,15 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     if (Z80Ops::isProfi) {
       if (address == 0x028B) {
         port028B = data;
+        // Apply TURBO_MODE (bits 5-6) to the CPU turbo — ROMain forces 7 MHz
+        // (OUT #028B,0x20) around heavy operations and clears it afterwards,
+        // exactly like the real hardware latch. Other bits (HDD/FDC/sound
+        // switches) remain unwired — see the read-side caveat.
+        uint8_t turbo = (data >> 5) & 3;
+        if (turbo != ESPectrum::multiplicator) {
+          ESPectrum::multiplicator = turbo;
+          CPU::updateStatesInFrame();
+        }
 #if PROFI_PORT_TRACE
         Debug::log("[8B OUT] #028B <- %02X pc=%04X", data, Z80::getRegPC());
 #endif
@@ -2511,12 +2547,16 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
 #if RTC_PORT_TRACE
     if (Z80Ops::isProfi) {
       uint8_t lo8t = address & 0xFF;
-      if ((lo8t | 0x40) == 0xFF || (lo8t | 0x40) == 0xDF)
-        Debug::log("[RTC-AS/DS OUT probe] addr=%04X lo=%02X data=%02X cpm=%d rom14=%d trdos=%d pc=%04X",
-                   address, lo8t, data, (portDFFD & 0x20) != 0, MemESP::romLatch,
-                   ESPectrum::trdos, Z80::getRegPC());
+      if ((lo8t | 0x40) == 0xFF || (lo8t | 0x40) == 0xDF) {
+        static uint32_t pout_n = 0;
+        if (++pout_n <= 150 || (pout_n & 0x3FF) == 0)
+          Debug::log("[RTC-AS/DS OUT probe] addr=%04X lo=%02X data=%02X cpm=%d rom14=%d trdos=%d pc=%04X n=%u",
+                     address, lo8t, data, (portDFFD & 0x20) != 0, MemESP::romLatch,
+                     ESPectrum::trdos, Z80::getRegPC(), (unsigned)pout_n);
+      }
     }
 #endif
+#if !PICO_RP2040 // RTC (and Profi itself) are RP2350-only
     if (Config::rtc_enabled && Z80Ops::isProfi) {
       bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
       if ((cpm && rom14) || (dos && !rom14)) {
@@ -2539,6 +2579,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         }
       }
     }
+#endif
     ioContentionLate(MemESP::ramContended[rambank]);
   }
   // Pentagon #EFF7 (page0ram/notMore128). The loose Pentagon decode
