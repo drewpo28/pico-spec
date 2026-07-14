@@ -28,6 +28,15 @@ public:
 
     static void log(const char* fmt, ...);
 
+    // Exception-safe variant for fault handlers: NO stdio/printf (the stdio
+    // path takes print_mutex and WFEs — blocking in exception context; if the
+    // other core died holding the mutex, the handler freezes the machine, and
+    // a mutex assert inside an already-faulted core escalates to a double
+    // fault → LOCKUP). Formats into a per-core static buffer (not the — maybe
+    // overflowed — fault stack) and emits via the bounded lock-free debug
+    // UART path. No-op when the debug UART is off.
+    static void fault_log(const char* fmt, ...);
+
     // Runtime-gated. The flag check is inlined here so when logging is
     // disabled the call collapses to a single branch on a global bool.
     static void log2SD_impl(const string& data);

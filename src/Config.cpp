@@ -106,8 +106,8 @@ bool Config::soundriveEnabled() {
     return Config::soundrive == 1 ||
            (Config::soundrive == 2 && Config::arch == "Profi");
 }
-uint8_t  Config::gs_enabled = 0;  // 0=OFF, 1=ON
-uint8_t  Config::gs_ram_size = 2; // 0=512K, 1=1M, 2=2M
+uint8_t  Config::gs_enabled = 0;  // 0=OFF, 1=GS, 2=NeoGS
+uint8_t  Config::gs_ram_size = 2; // 0=512K, 1=1M, 2=2M, 3=4M (NeoGS only)
 uint8_t  Config::gs_clock = 1;    // 0=12MHz 1=13MHz 2=14MHz 3=20MHz 4=24MHz
 uint8_t  Config::joy2cursor = true;
 uint8_t  Config::secondJoy = 2; // NPAD#2

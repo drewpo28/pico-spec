@@ -83,6 +83,32 @@ void Debug::log(const char* fmt, ...)
 #endif
 }
 
+void Debug::fault_log(const char* fmt, ...)
+{
+    // Per-core static buffers: the fault stack may itself be the problem
+    // (overflow), and both cores can fault near-simultaneously.
+    static char bufs[2][192];
+    char* buf = bufs[*(volatile uint32_t*)0xD0000000u & 1];  // SIO CPUID
+
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf, sizeof(bufs[0]), fmt, args);
+    va_end(args);
+    if (n < 0) return;
+    if (n > (int)sizeof(bufs[0]) - 1) n = sizeof(bufs[0]) - 1;
+
+#if defined(DBG_UART_ENABLED) && defined(PICO_DEFAULT_UART)
+    for (int i = 0; i < n; i++) {
+        if (buf[i] == '\n' && !dbg_uart_put('\r')) return;
+        if (!dbg_uart_put(buf[i])) return;
+    }
+    dbg_uart_put('\r');
+    dbg_uart_put('\n');
+#else
+    (void)n;  // no exception-safe sink without the debug UART
+#endif
+}
+
 void Debug::log2SD_impl(const string& data)
 {
     if (!FileUtils::fsMount) return;

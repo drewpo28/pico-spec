@@ -1495,6 +1495,13 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
         ioContentionLate(MemESP::ramContended[rambank]);
         return;
       }
+      // NeoGS control port GSCTR (#33): reset / NMI / LED
+      if (GS::neogs && a8 == 0x33) {
+        LED::touchW(LED::GS);
+        GS::hostWriteCtrl(data);
+        ioContentionLate(MemESP::ramContended[rambank]);
+        return;
+      }
     }
 #endif
     // Z80 DMA / zxnDMA port write: listen on both 0x0B and 0x6B

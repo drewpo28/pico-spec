@@ -1133,11 +1133,16 @@ extern "C" void sigbus_handler(uint32_t *frame) {
     // CFSR/BFAR only exist on Cortex-M3+ (not M0+)
     uint32_t cfsr = *(volatile uint32_t*)0xE000ED28u;
     uint32_t bfar = *(volatile uint32_t*)0xE000ED38u;
-    printf("SIGBUS[%d] core%u: PC=%08x LR=%08x SP=%08x CFSR=%08x BFAR=%08x stackOvf=%d (bot=%08x top=%08x)\n",
+    // NEVER printf here: stdio takes print_mutex and WFEs — blocking inside an
+    // exception. If the other core died holding the mutex the handler freezes
+    // the whole machine, and a mutex assert on the faulted core escalates to a
+    // double fault → LOCKUP (hw-seen: core1 LOCKUP + core0 handler parked on
+    // print_mutex = "F11 hangs hard, nothing in the log").
+    Debug::fault_log("SIGBUS[%d] core%u: PC=%08x LR=%08x SP=%08x CFSR=%08x BFAR=%08x stackOvf=%d (bot=%08x top=%08x)",
            count, (unsigned)core, (unsigned)pc, (unsigned)lr, (unsigned)sp, (unsigned)cfsr, (unsigned)bfar,
            ovf, (unsigned)bot, (unsigned)top);
 #else
-    printf("SIGBUS[%d] core%u: PC=%08x LR=%08x SP=%08x stackOvf=%d\n",
+    Debug::fault_log("SIGBUS[%d] core%u: PC=%08x LR=%08x SP=%08x stackOvf=%d",
            count, (unsigned)core, (unsigned)pc, (unsigned)lr, (unsigned)sp, ovf);
 #endif
 }
@@ -1170,9 +1175,10 @@ void __attribute__((naked)) sigbus(void) {
 }
 #endif
 void __attribute__((naked, noreturn)) __printflike(1, 0) dummy_panic(__unused const char *fmt, ...) {
-    printf("*** PANIC ***\n");
+    // Same rule as sigbus_handler: no stdio from a (possibly faulted) core.
+    Debug::fault_log("*** PANIC ***");
     if (fmt)
-        printf(fmt);
+        Debug::fault_log(fmt);
 }
 
 #ifndef PICO_RP2040

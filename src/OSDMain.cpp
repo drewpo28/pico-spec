@@ -4437,47 +4437,118 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #ifdef USE_GS
                         else if (gs_avail && options_num == 8) { // General Sound
                             static const char* GS_CLOCK_NAMES[5] = {"12 MHz", "13 MHz", "14 MHz", "20 MHz", "24 MHz"};
+                            static const char* GS_MODE_NAMES[3]  = {"Off", "GS", "NeoGS"};
+                            static const char* GS_RAM_NAMES[3]   = {"512 KB", "2 MB", "4 MB"};
                             menu_level = 2;
                             menu_curopt = 1;
                             bool gsFirstDraw = true;
                             while (1) {
+                                uint8_t mode = Config::gs_enabled > 2 ? 1 : Config::gs_enabled;
                                 string gsmenu = MENU_GS_TITLE[Config::lang];
                                 gsmenu += string(MENU_GS_MODE[Config::lang]) + "\t"
-                                        + (Config::gs_enabled ? "On" : "Off") + "\n";
+                                        + GS_MODE_NAMES[mode] + " >\n";
                                 uint8_t ci = Config::gs_clock < 5 ? Config::gs_clock : 1;
                                 string clockRow = string("Clock") + "\t"
                                                + GS_CLOCK_NAMES[ci] + " >\n";
-                                if (!Config::gs_enabled) clockRow = "\x01" + clockRow;
+                                // Clock applies to GS only — NeoGS firmware picks its
+                                // own clock via GSCFG0 CKSEL.
+                                if (mode != 1) clockRow = "\x01" + clockRow;
                                 gsmenu += clockRow;
+                                uint8_t ri = (Config::gs_ram_size == 0) ? 0
+                                           : (Config::gs_ram_size >= 3 ? 2 : 1);
+                                string ramRow = string("RAM") + "\t"
+                                             + GS_RAM_NAMES[ri] + " >\n";
+                                if (mode != 2) ramRow = "\x01" + ramRow;  // NeoGS only
+                                gsmenu += ramRow;
                                 menu_saverect = gsFirstDraw;
                                 uint8_t gs_num = menuRun(gsmenu);
                                 gsFirstDraw = false;
                                 if (gs_num == 1) {
-                                    // Mode toggle — requires reboot
-                                    uint8_t prev = Config::gs_enabled;
-                                    Config::gs_enabled = prev ? 0 : 1;
-                                    if (Config::gs_enabled != prev) {
-                                        if (Config::gs_enabled && !OSD::featureBudgetGate(Subsystems::FEAT_GENERAL_SOUND)) {
-                                            // Denied / cancelled (a freeing reboot never returns).
-                                            Config::gs_enabled = prev;
-                                        } else if (Config::gs_enabled && Config::esxdos == 2) {
-                                            if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
-                                                Config::esxdos = 0;
-                                                Config::save();
-                                                esp_hard_reset();
-                                            } else {
-                                                Config::gs_enabled = prev;
+                                    // Mode radio — requires reboot
+                                    menu_level = 3;
+                                    menu_curopt = mode + 1;
+                                    menu_saverect = true;
+                                    while (1) {
+                                        string mmenu = MENU_GS_MODE_SEL[Config::lang];
+                                        int mpos = -1; int idx = 0;
+                                        while ((mpos = mmenu.find("[ ]", mpos + 1)) != (int)string::npos) {
+                                            if (idx == mode) mmenu.replace(mpos, 3, "[*]");
+                                            idx++;
+                                        }
+                                        uint8_t opt2 = menuRun(mmenu);
+                                        if (opt2) {
+                                            uint8_t newmode = opt2 - 1;
+                                            if (newmode != mode) {
+                                                uint8_t prev = Config::gs_enabled;
+                                                Config::gs_enabled = newmode;
+                                                if (newmode && !OSD::featureBudgetGate(Subsystems::FEAT_GENERAL_SOUND)) {
+                                                    // Denied / cancelled (a freeing reboot never returns).
+                                                    Config::gs_enabled = prev;
+                                                } else if (newmode && Config::esxdos == 2) {
+                                                    if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
+                                                        Config::esxdos = 0;
+                                                        Config::save();
+                                                        esp_hard_reset();
+                                                    } else {
+                                                        Config::gs_enabled = prev;
+                                                    }
+                                                } else if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
+                                                    Config::save();
+                                                    esp_hard_reset();
+                                                } else {
+                                                    Config::gs_enabled = prev;
+                                                }
                                             }
-                                        } else if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
-                                            Config::save();
-                                            esp_hard_reset();
+                                            mode = Config::gs_enabled > 2 ? 1 : Config::gs_enabled;
+                                            menu_curopt = mode + 1;
+                                            menu_saverect = false;
                                         } else {
-                                            Config::gs_enabled = prev;
+                                            menu_curopt = 1;
+                                            menu_level = 2;
+                                            menu_saverect = false;
+                                            break;
                                         }
                                     }
-                                    menu_curopt = 1;
                                     continue;
-                                } else if (gs_num == 2 && Config::gs_enabled) {
+                                } else if (gs_num == 3 && mode == 2) {
+                                    // NeoGS RAM size — requires reboot (PSRAM reservation)
+                                    menu_level = 3;
+                                    menu_curopt = ri + 1;
+                                    menu_saverect = true;
+                                    while (1) {
+                                        string rmenu = MENU_GS_RAM_SEL[Config::lang];
+                                        int mpos = -1; int idx = 0;
+                                        while ((mpos = rmenu.find("[ ]", mpos + 1)) != (int)string::npos) {
+                                            if (idx == ri) rmenu.replace(mpos, 3, "[*]");
+                                            idx++;
+                                        }
+                                        uint8_t opt2 = menuRun(rmenu);
+                                        if (opt2) {
+                                            static const uint8_t ram_vals[3] = {0, 2, 3};
+                                            uint8_t newram = ram_vals[opt2 - 1];
+                                            if (newram != Config::gs_ram_size) {
+                                                uint8_t prevram = Config::gs_ram_size;
+                                                Config::gs_ram_size = newram;
+                                                if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
+                                                    Config::save();
+                                                    esp_hard_reset();
+                                                } else {
+                                                    Config::gs_ram_size = prevram;
+                                                }
+                                            }
+                                            ri = (Config::gs_ram_size == 0) ? 0
+                                               : (Config::gs_ram_size >= 3 ? 2 : 1);
+                                            menu_curopt = ri + 1;
+                                            menu_saverect = false;
+                                        } else {
+                                            menu_curopt = 3;
+                                            menu_level = 2;
+                                            menu_saverect = false;
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                } else if (gs_num == 2 && mode == 1) {
                                     // Clock submenu — radio button list
                                     menu_level = 3;
                                     menu_curopt = ci + 1;
@@ -4512,9 +4583,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         }
                                     }
                                     continue;
-                                } else if (gs_num == 2 && !Config::gs_enabled) {
+                                } else if (gs_num >= 2) {
                                     // Disabled row — ignore
-                                    menu_curopt = 2;
+                                    menu_curopt = gs_num;
                                     continue;
                                 } else {
                                     menu_curopt = 8;

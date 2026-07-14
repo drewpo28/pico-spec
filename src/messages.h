@@ -1014,6 +1014,15 @@ static const char *MENU_GS_CLOCK_SEL[2]  = {
     "12 MHz\t[ ]\n" "13 MHz\t[ ]\n" "14 MHz\t[ ]\n" "20 MHz\t[ ]\n" "24 MHz\t[ ]\n",
     "12 MHz\t[ ]\n" "13 MHz\t[ ]\n" "14 MHz\t[ ]\n" "20 MHz\t[ ]\n" "24 MHz\t[ ]\n"
 };
+static const char *MENU_GS_MODE_SEL[2]  = {
+    "Mode\n" "Off\t[ ]\n" "General Sound\t[ ]\n" "NeoGS\t[ ]\n",
+    "Modo\n" "Off\t[ ]\n" "General Sound\t[ ]\n" "NeoGS\t[ ]\n"
+};
+// NeoGS RAM size (fw 1.11 auto-detects exactly these three)
+static const char *MENU_GS_RAM_SEL[2]  = {
+    "RAM\n" "512 KB\t[ ]\n" "2 MB\t[ ]\n" "4 MB\t[ ]\n",
+    "RAM\n" "512 KB\t[ ]\n" "2 MB\t[ ]\n" "4 MB\t[ ]\n"
+};
 
 #define MENU_OTHER_EN "Other\n"\
     "ALU Timing\t>\n"\

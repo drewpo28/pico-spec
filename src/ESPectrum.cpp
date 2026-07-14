@@ -81,6 +81,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Z80DMA.h"
 #ifdef USE_GS
 #include "GS/GS.h"
+#include "GS/NgsSd.h"
 #endif
 
 using namespace std;
@@ -2607,6 +2608,10 @@ void ESPectrum::loop() {
     }
 #ifdef USE_GS
     GS::pollPerf();
+    // NeoGS SD: execute a sector request posted by the GS-Z80 on core1
+    // (FatFs/SD SPI are core0-only). Cheap no-op when idle; also serviced
+    // from the frame-pacing waits below for lower latency.
+    if (GS::neogs) NgsSd::service();
 #endif
     // Update stats every 50 frames
     if (VIDEO::OSD && VIDEO::framecnt >= 10) {
@@ -2863,6 +2868,9 @@ void ESPectrum::loop() {
 #if !PICO_RP2040
           if (ZiFi::cdcNicActive) ZiFi::cdcPump();
 #endif
+#ifdef USE_GS
+          if (GS::neogs) NgsSd::service();
+#endif
           if (v_sync) {
             v_sync = false;
             break;
@@ -2874,6 +2882,12 @@ void ESPectrum::loop() {
           if (ZiFi::cdcNicActive) {
             int64_t e = (int64_t)time_us_64() + idle;
             while ((int64_t)time_us_64() < e) ZiFi::cdcPump();
+          } else
+#endif
+#ifdef USE_GS
+          if (GS::neogs) {
+            int64_t e = (int64_t)time_us_64() + idle;
+            while ((int64_t)time_us_64() < e) NgsSd::service();
           } else
 #endif
           {

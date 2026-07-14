@@ -2,6 +2,8 @@
 
 #include "GS.h"
 #include "GS_ROM.h"
+#include "NGS_ROM.h"
+#include "NgsSd.h"
 #include "../Config.h"
 #include "Debug.h"
 #include "../LEDIndicators.h"
@@ -123,14 +125,15 @@ static const char* gs_trace_kind_name(uint8_t k) {
 // s_cpu and the host PC accessor are both in scope).
 
 bool     GS::enabled       = false;
+bool     GS::neogs         = false;
 uint32_t GS::gs_ram_size   = 0;
 volatile uint8_t  GS::reg_command   = 0;
 volatile uint8_t  GS::reg_data_zx   = 0;
 volatile uint8_t  GS::reg_data_gs   = 0;
 volatile uint8_t  GS::reg_status    = 0;
 uint8_t  GS::reg_page      = 0;
-uint8_t  GS::reg_vol[4]    = {0,0,0,0};
-uint8_t  GS::reg_ch[4]     = {0x80,0x80,0x80,0x80};
+uint8_t  GS::reg_vol[8]    = {0,0,0,0,0,0,0,0};
+uint8_t  GS::reg_ch[8]     = {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80};
 uint32_t GS::int_count     = 0;
 
 static Z80      s_cpu;
@@ -257,11 +260,31 @@ static inline void __not_in_flash_func(gs_end_pump)() {
     __atomic_store_n(&s_run_state, GS_RUN_IDLE, __ATOMIC_RELEASE);
 }
 
+// Begin-reset timeout diagnostic: core1's run state is stuck (pump never
+// returned to IDLE) — snapshot where the GS-Z80 was. Racy reads, log-only.
+static void gs_begin_reset_stuck_dump() {
+    Debug::log("GS: begin_reset stuck 500ms (state=%u) — forcing. GS-Z80 PC=%04X SP=%04X",
+               (unsigned)s_run_state,
+               (unsigned)Z80_PC(s_cpu), (unsigned)Z80_SP(s_cpu));
+}
+
 static inline void __not_in_flash_func(gs_begin_reset)() {
+    uint32_t t0 = time_us_32();
     for (;;) {
         uint32_t expected = GS_RUN_IDLE;
         if (__atomic_compare_exchange_n(&s_run_state, &expected, GS_RUN_RESETTING,
                                         false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            return;
+        }
+        // Never spin forever: if core1 died or wedged inside pump() (run
+        // state stuck at PUMPING), an unbounded wait turns every machine
+        // reset (F11) into a hard freeze of the whole firmware. Take the
+        // reset by force after 500 ms and log what core1 was doing — the
+        // GS-Z80 restarts from clean state right after, which is exactly
+        // what the reset wanted anyway.
+        if (time_us_32() - t0 > 500000u) {
+            gs_begin_reset_stuck_dump();
+            __atomic_store_n(&s_run_state, GS_RUN_RESETTING, __ATOMIC_SEQ_CST);
             return;
         }
         tight_loop_contents();
@@ -347,6 +370,55 @@ static inline uint32_t __not_in_flash_func(gs_map_addr)(uint16_t address) {
     return (uint32_t)(GS::reg_page - 1) * 0x8000u + (address - 0x8000u);
 }
 
+// =================================================================
+// NeoGS state
+// =================================================================
+// GSCFG0 bits (ports.inc): b0 NOROM, b1 RAMRO, b2 8CHANS, b3 EXPAG,
+// b4-5 CKSEL, b6 PAN4CH, b7 INV7B. Reset value 0x30 = CKSEL {1,1} = 10 MHz,
+// ROM mapped, 4 channels.
+#define NGS_CFG0_RESET   0x30
+#define NGS_LOW_RAM_SIZE 0x10000   // physical RAM pages 0+1, pointer-backed
+static bool     s_ngs = false;        // mirror of GS::neogs for hot paths
+static uint8_t  s_ngs_cfg0   = NGS_CFG0_RESET;
+static uint8_t  s_ngs_mpag   = 0;     // MPAG   #00
+static uint8_t  s_ngs_mpagex = 0;     // MPAGEX #10
+static uint8_t  s_ngs_intena = 0x01;  // INTENA #0C (b0 timer, b1 SD-DMA, b2 MP3-DMA)
+static uint8_t  s_ngs_intreq = 0;     // INTREQ #0D
+static uint8_t  s_ngs_tim_frq = 0;    // TIM_FRQ #0E
+static uint8_t  s_ngs_sctrl  = 0x03;  // SCTRL #11 (SDNCS=1, MCNCS=1 — both inactive)
+static uint8_t  s_ngs_led    = 0;     // LEDCTR #01 (b0: 0 = LED on)
+static uint8_t  s_ngs_win[4] = {0,0,0,0};  // WIN0-3 #20-#23 — latched, not implemented
+static uint8_t  s_ngs_dma_mod = 0;    // DMA_MOD #1B
+static uint8_t  s_ngs_dma_addr[3] = {0,0,0};  // DMA_HAD/MAD/LAD #1C-#1E
+static uint8_t  s_ngs_dma_cst = 0;    // DMA_CST #1F (b7 = run) — stub
+// Timer INT divider: TIM_FRQ selects 37500 Hz / {1,2,4,8,16,64,256,1024}.
+// The DAC keeps sampling at 37500 Hz regardless — only the CPU INT divides.
+static uint32_t s_ngs_int_div = 1;
+static uint32_t s_ngs_int_cnt = 0;
+// DAC latch channel mask for reads from 0x6000-0x7FFF: 3 (4ch/pan) or 7 (8ch).
+// GS mode always 3.
+static uint8_t  s_dac_mask = 3;
+// Host GSCTR (#33) requests, consumed by the GS-Z80 loop on core1 — never
+// mutate s_cpu from core0 while z80_run may be in flight.
+static volatile bool s_ngs_nmi_pending  = false;
+static volatile bool s_ngs_grst_pending = false;
+// Physical RAM pages 0+1 (64 KB, incl. the fixed 0x4000-0x7FFF work region =
+// page 1 second half) — pointer-backed like GS work RAM, because firmware
+// executes from page 0 when NOROM is set. Allocated as part of s_workRamBuf;
+// the trailing 8 KB is the shared blank page (0xFF) that serves unpopulated
+// ROM chunks.
+static uint8_t*       s_ngs_low_ram = nullptr;
+static const uint8_t* s_ngs_blank   = nullptr;
+static uint32_t       s_ngs_ram_total = 0;   // full RAM incl. the 64 KB low part
+// Per-8KB-slot banked-window offsets into the PSRAM reservation (physical
+// address − 0x10000), valid only where s_fetch_page[slot] == nullptr.
+// s_bank_woff mirrors it for the write path; NGS_BANK_NONE = not writable.
+#define NGS_BANK_NONE 0xFFFFFFFFu
+static uint32_t s_bank_off[8];
+static uint32_t s_bank_woff[8] = {NGS_BANK_NONE, NGS_BANK_NONE, NGS_BANK_NONE, NGS_BANK_NONE,
+                                  NGS_BANK_NONE, NGS_BANK_NONE, NGS_BANK_NONE, NGS_BANK_NONE};
+static uint8_t* s_write_page[8];
+
 // Private SRAM cache for PSRAM (banked sample pages). XIP cache on RP2350 is
 // shared between cores — core0 video rendering evicts lines we need. A small
 // private cache in SRAM is immune to that contention.
@@ -426,18 +498,23 @@ static inline zuint8 __not_in_flash_func(gs_pc_read)(uint32_t psram_off) {
     return s_pc_data[set][v][col];
 }
 
+// Page table for fast fetch/read of pointer-backed address space. GS mode
+// populates slots 0-3 only (0x0000-0x7FFF: ROM + work RAM) and resolves the
+// banked window with reg_page; NeoGS populates all 8 slots from
+// NOROM/MPAG/MPAGEX/EXPAG (ngs_rebuild_map), leaving nullptr only where a
+// window maps PSRAM-resident RAM (physical pages >= 2) — those reads go
+// through s_bank_off + the SRAM prefetch cache.
+static const uint8_t* s_fetch_page[8];
+
 static inline zuint8 __not_in_flash_func(gs_mem_raw_read)(zuint16 address) {
-    if (address < 0x4000) return ROM_GS_M[address];
-    if (address < 0x8000) return s_gs_work_ram[address - 0x4000];
+    const uint8_t* base = s_fetch_page[address >> 13];
+    if (base) return base[address & 0x1FFF];
+    if (s_ngs) return gs_pc_read(s_bank_off[address >> 13] + (address & 0x1FFF));
     if (GS::reg_page == 0) return ROM_GS_M[address - 0x8000];
     // Banked sample pages — use private SRAM cache to survive core0 XIP thrash.
     uint32_t off = (gs_map_addr(address) + 0x4000) & s_gs_ram_mask;
     return gs_pc_read(off);
 }
-
-// Page table for fast fetch/read of non-banked address space (0x0000-0x7FFF).
-// Populated by gs_init_fetch_pages() from GS::init.
-static const uint8_t* s_fetch_page[8];
 
 // Hot data-read path. Layout of the GS-Z80 address space for reads:
 //   0x0000-0x3FFF: ROM (one of two firmware images)
@@ -452,17 +529,19 @@ static const uint8_t* s_fetch_page[8];
 // fast path. Banked region falls through to gs_pc_read.
 static zuint8 __not_in_flash_func(gs_cb_read)(void* ctx, zuint16 address) {
     (void)ctx;
-    if (address < 0x8000) {
-        const uint8_t* base = s_fetch_page[address >> 13];
+    const uint8_t* base = s_fetch_page[address >> 13];
+    if (base) {
         zuint8 v = base[address & 0x1FFF];
         // DAC latch — only for the 0x6000-0x7FFF page. Cheap test: page-id
-        // bits 110 == 3, so check (address >> 13) == 3.
+        // bits 110 == 3, so check (address >> 13) == 3. Channel count: GS
+        // always 4; NeoGS 4 or 8 per GSCFG0 (s_dac_mask 3/7).
         if ((address >> 13) == 3) {
-            GS::reg_ch[(address >> 8) & 3] = v;
+            GS::reg_ch[(address >> 8) & s_dac_mask] = v;
         }
         return v;
     }
     // Banked PSRAM (sample data) — cache-backed.
+    if (s_ngs) return gs_pc_read(s_bank_off[address >> 13] + (address & 0x1FFF));
     if (GS::reg_page == 0) return ROM_GS_M[address - 0x8000];
     uint32_t off = (gs_map_addr(address) + 0x4000) & s_gs_ram_mask;
     return gs_pc_read(off);
@@ -470,6 +549,21 @@ static zuint8 __not_in_flash_func(gs_cb_read)(void* ctx, zuint16 address) {
 
 static void __not_in_flash_func(gs_cb_write)(void* ctx, zuint16 address, zuint8 value) {
     (void)ctx;
+    if (s_ngs) {
+        uint8_t slot = address >> 13;
+        uint8_t* p = s_write_page[slot];
+        if (p) { p[address & 0x1FFF] = value; return; }
+        uint32_t off = s_bank_woff[slot];
+        if (off == NGS_BANK_NONE) return;  // ROM window / RAMRO-protected page 0
+        off += address & 0x1FFF;
+        if (s_gs_use_spi) {
+            write8psram(s_gs_ram_base + off, value);
+        } else {
+            s_gs_ram[off] = value;
+        }
+        gs_pc_invalidate_line(off);
+        return;
+    }
     if (address < 0x4000) return;
     if (address < 0x8000) {
         s_gs_work_ram[address - 0x4000] = value;  // SRAM — no PSRAM latency
@@ -485,75 +579,127 @@ static void __not_in_flash_func(gs_cb_write)(void* ctx, zuint16 address, zuint8 
     gs_pc_invalidate_line(off);  // keep SRAM cache coherent
 }
 
+// =================================================================
+// Shared ZX-interface port bodies. GS and NeoGS have identical
+// ZXCMD/ZXDATRD/ZXDATWR/CLRCBIT semantics (ports 0x01r/0x02r/0x03w/0x05);
+// the helpers hold the single copy so the subtle FIFO/latch fixes below
+// can never diverge between the two modes.
+// =================================================================
+
+// Drain one command from cmd FIFO. D0 is NOT cleared here —
+// real hardware clears it only when the firmware acks via
+// IN/OUT 0x05, after the command is processed. ZPlayer polls
+// D0=0 as the signal that the response is ready; clearing D0
+// on read (before processing) breaks GS detection.
+static inline uint8_t __not_in_flash_func(gsio_in_cmd)() {
+    uint8_t v;
+    uint32_t r = s_cmd_fifo_r;
+    uint32_t w = s_cmd_fifo_w;
+    __dmb();
+    if (r != w) {
+        v = s_cmd_fifo[r & GS_CMD_FIFO_MASK];
+        s_cmd_fifo_r = r + 1;
+    } else {
+        v = GS::reg_command;
+    }
+    gs_trace_gs(TR_IN01, v, GS::reg_status);
+    return v;
+}
+
+// Real GS port 0x02 is a single-byte latch, not a stream. ROM's
+// idle/drain at 0x02C2 reads it unconditionally even when only
+// D0 (CMD) is pending, then uses S flag from the prior status
+// AND-mask to decide whether the read was valid data or just a
+// stale latch peek. So: drain (advance read pointer) ONLY when
+// D7=1 (host actually wrote something). When D7=0, return the
+// last value (or 0xFF) WITHOUT consuming — matches hardware
+// latch behavior and prevents losing the byte that the next
+// CMD handler is about to read.
+//
+// Without this, ZP4's "B3w X; BBw CMD" pattern loses X to the
+// idle-drain IN(02) at 0x02C2, and the CMD handler reads stale
+// FIFO content, scrambling write addresses (CMD 0x18/0x19/0x1B).
+static uint8_t s_p02_latch = 0xFF;
+static inline uint8_t __not_in_flash_func(gsio_in_data)() {
+    uint8_t v;
+    if (GS::reg_status & 0x80u) {
+        uint32_t r = s_host_fifo_r;
+        uint32_t w = s_host_fifo_w;
+        __dmb();
+        if (r != w) {
+            v = s_host_fifo[r & GS_HOST_FIFO_MASK];
+            s_host_fifo_r = r + 1;
+            s_p02_latch = v;
+            if ((r + 1) == w) {
+                gs_status_and(&GS::reg_status, ~0x80u);
+            }
+        } else {
+            // D7 said data ready but FIFO empty — race; hold latch.
+            v = s_p02_latch;
+            gs_status_and(&GS::reg_status, ~0x80u);
+        }
+    } else {
+        // D7=0: idle drain peek. Return last latched byte without
+        // consuming. ROM's 0x02C2 will discard via JP P,0x0295.
+        v = s_p02_latch;
+    }
+    gs_trace_gs(TR_IN02, v, GS::reg_status);
+    return v;
+}
+
+// GS firmware reads its own output register. Per UnrealSpeccy:
+// stores 0xFF so a stale response isn't re-returned to ZX host.
+// Does NOT set D7 — that would falsely signal "response ready"
+// to the host when GS is just reading its own register.
+static inline uint8_t __not_in_flash_func(gsio_in_selfdata)() {
+    GS::reg_data_gs = 0xFF;
+    return 0xFF;
+}
+
+// ZXDATWR: publish a byte for the host and raise D7.
+static inline void __not_in_flash_func(gsio_out_data)(zuint8 value) {
+    GS::reg_data_gs = value;
+    __dmb();  // data must be visible to core0 before setting D7
+    gs_status_or(&GS::reg_status, 0x80u);
+}
+
+// CLRCBIT (IN or OUT 0x05): clear D0 only. D7 is left untouched — it means
+// "GS response ready for host" and must stay set until the host
+// reads B3 (hostReadB3). Clearing D7 here races with ZPlayer's
+// wait-D7 loop: GS sets D7 via OUT(03) then immediately fires
+// OUT(05), clearing D7 before the host enters its wait loop.
+// D7 for data-streaming (FIFO) is handled by IN(02) + FIFO drain.
+static inline void __not_in_flash_func(gsio_clr_cbit)() {
+    gs_status_and(&GS::reg_status, ~0x01u);
+    if (s_cmd_fifo_r != s_cmd_fifo_w) {
+        gs_status_or(&GS::reg_status, 0x01u);
+    }
+}
+
+// Data-port ack (OUT 0x02) — only clear D7 if data FIFO empty.
+static inline void __not_in_flash_func(gsio_ack_data)() {
+    if (s_host_fifo_r == s_host_fifo_w) {
+        gs_status_and(&GS::reg_status, ~0x80u);
+    }
+}
+
+static zuint8 ngs_cb_in(void* ctx, zuint16 port);
+static void   ngs_cb_out(void* ctx, zuint16 port, zuint8 value);
+
 static zuint8 __not_in_flash_func(gs_cb_in)(void* ctx, zuint16 port) {
+    if (s_ngs) return ngs_cb_in(ctx, port);
     (void)ctx;
     uint8_t p = port & 0x0F;
     uint8_t v;
     switch (p) {
-        case 0x01: {
-            // Drain one command from cmd FIFO. D0 is NOT cleared here —
-            // real hardware clears it only when the firmware acks via
-            // IN/OUT 0x05, after the command is processed. ZPlayer polls
-            // D0=0 as the signal that the response is ready; clearing D0
-            // on read (before processing) breaks GS detection.
-            uint32_t r = s_cmd_fifo_r;
-            uint32_t w = s_cmd_fifo_w;
-            __dmb();
-            if (r != w) {
-                v = s_cmd_fifo[r & GS_CMD_FIFO_MASK];
-                s_cmd_fifo_r = r + 1;
-            } else {
-                v = GS::reg_command;
-            }
-            gs_trace_gs(TR_IN01, v, GS::reg_status);
+        case 0x01:
+            v = gsio_in_cmd();
             break;
-        }
-        case 0x02: {
-            // Real GS port 0x02 is a single-byte latch, not a stream. ROM's
-            // idle/drain at 0x02C2 reads it unconditionally even when only
-            // D0 (CMD) is pending, then uses S flag from the prior status
-            // AND-mask to decide whether the read was valid data or just a
-            // stale latch peek. So: drain (advance read pointer) ONLY when
-            // D7=1 (host actually wrote something). When D7=0, return the
-            // last value (or 0xFF) WITHOUT consuming — matches hardware
-            // latch behavior and prevents losing the byte that the next
-            // CMD handler is about to read.
-            //
-            // Without this, ZP4's "B3w X; BBw CMD" pattern loses X to the
-            // idle-drain IN(02) at 0x02C2, and the CMD handler reads stale
-            // FIFO content, scrambling write addresses (CMD 0x18/0x19/0x1B).
-            static uint8_t s_p02_latch = 0xFF;
-            if (GS::reg_status & 0x80u) {
-                uint32_t r = s_host_fifo_r;
-                uint32_t w = s_host_fifo_w;
-                __dmb();
-                if (r != w) {
-                    v = s_host_fifo[r & GS_HOST_FIFO_MASK];
-                    s_host_fifo_r = r + 1;
-                    s_p02_latch = v;
-                    if ((r + 1) == w) {
-                        gs_status_and(&GS::reg_status, ~0x80u);
-                    }
-                } else {
-                    // D7 said data ready but FIFO empty — race; hold latch.
-                    v = s_p02_latch;
-                    gs_status_and(&GS::reg_status, ~0x80u);
-                }
-            } else {
-                // D7=0: idle drain peek. Return last latched byte without
-                // consuming. ROM's 0x02C2 will discard via JP P,0x0295.
-                v = s_p02_latch;
-            }
-            gs_trace_gs(TR_IN02, v, GS::reg_status);
+        case 0x02:
+            v = gsio_in_data();
             break;
-        }
         case 0x03:
-            // GS firmware reads its own output register. Per UnrealSpeccy:
-            // stores 0xFF so a stale response isn't re-returned to ZX host.
-            // Does NOT set D7 — that would falsely signal "response ready"
-            // to the host when GS is just reading its own register.
-            GS::reg_data_gs = 0xFF;
-            v = 0xFF;
+            v = gsio_in_selfdata();
             break;
         case 0x04: {
             v = GS::reg_status;
@@ -575,16 +721,7 @@ static zuint8 __not_in_flash_func(gs_cb_in)(void* ctx, zuint16 port) {
             break;
         }
         case 0x05:
-            // CMD ACK: clear D0 only. D7 is left untouched — it means
-            // "GS response ready for host" and must stay set until the host
-            // reads B3 (hostReadB3). Clearing D7 here races with ZPlayer's
-            // wait-D7 loop: GS sets D7 via OUT(03) then immediately fires
-            // OUT(05), clearing D7 before the host enters its wait loop.
-            // D7 for data-streaming (FIFO) is handled by IN(02) + FIFO drain.
-            gs_status_and(&GS::reg_status, ~0x01u);
-            if (s_cmd_fifo_r != s_cmd_fifo_w) {
-                gs_status_or(&GS::reg_status, 0x01u);
-            }
+            gsio_clr_cbit();
             v = 0xFF;
             gs_trace_gs(TR_IN05, 0, GS::reg_status);
             break;
@@ -605,6 +742,7 @@ static zuint8 __not_in_flash_func(gs_cb_in)(void* ctx, zuint16 port) {
 }
 
 static void __not_in_flash_func(gs_cb_out)(void* ctx, zuint16 port, zuint8 value) {
+    if (s_ngs) { ngs_cb_out(ctx, port, value); return; }
     (void)ctx;
     uint8_t p = port & 0x0F;
     switch (p) {
@@ -612,16 +750,11 @@ static void __not_in_flash_func(gs_cb_out)(void* ctx, zuint16 port, zuint8 value
             GS::reg_page = value & 0x3F;
             return;
         case 0x02:
-            // Data-port ack — only clear D7 if data FIFO empty.
-            if (s_host_fifo_r == s_host_fifo_w) {
-                gs_status_and(&GS::reg_status, ~0x80u);
-            }
+            gsio_ack_data();
             gs_trace_gs(TR_OUT02, value, GS::reg_status);
             return;
         case 0x03: {
-            GS::reg_data_gs = value;
-            __dmb();  // data must be visible to core0 before setting D7
-            gs_status_or(&GS::reg_status, 0x80u);
+            gsio_out_data(value);
             // Boot health indicator: the firmware reports its RAM-test result
             // (number of good 32 KB pages) with the OUT (3),A at ROM 0x025E
             // (callback PC = 0x0260). Must be 63 on 2 MB — anything less
@@ -650,19 +783,419 @@ static void __not_in_flash_func(gs_cb_out)(void* ctx, zuint16 port, zuint8 value
             return;
         }
         case 0x05:
-            // CMD ACK: clear D0 only. D7 left untouched — same as IN(05).
-            // D7 = "response ready for host" must not be cleared here;
-            // only hostReadB3 (or FIFO drain via IN 02) clears it.
-            gs_status_and(&GS::reg_status, ~0x01u);
-            if (s_cmd_fifo_r != s_cmd_fifo_w) {
-                gs_status_or(&GS::reg_status, 0x01u);
-            }
+            gsio_clr_cbit();
             gs_trace_gs(TR_OUT05, 0, GS::reg_status);
             return;
         case 0x06: GS::reg_vol[0] = value & 0x3F; return;
         case 0x07: GS::reg_vol[1] = value & 0x3F; return;
         case 0x08: GS::reg_vol[2] = value & 0x3F; return;
         case 0x09: GS::reg_vol[3] = value & 0x3F; return;
+        default:
+            return;
+    }
+}
+
+// =================================================================
+// NeoGS: memory mapping, clock, ports
+// =================================================================
+
+// Z80 clock from GSCFG0 CKSEL bits (b5:b4): {1,1}=10, {0,1}=12, {1,0}=20,
+// {0,0}=24 MHz (ports.inc C_10MHZ..C_24MHZ). Index below = (cfg0>>4)&3.
+static const uint32_t NGS_CLOCK_TABLE[4] = {24000000, 12000000, 20000000, 10000000};
+
+static void ngs_apply_clock() {
+    GS_CLOCK_HZ   = NGS_CLOCK_TABLE[(s_ngs_cfg0 >> 4) & 3];
+    GS_INT_PERIOD = (GS_CLOCK_HZ + GS_INT_HZ / 2) / GS_INT_HZ;
+}
+
+// Resolve one 8 KB slot of the 512 KB flash ROM; unpopulated chunks read 0xFF.
+static inline const uint8_t* ngs_rom_slot(uint32_t phys) {
+    phys &= 0x7FFFF;
+    const uint8_t* c = NGS_ROM_CHUNK[phys >> 13];
+    return c ? c : s_ngs_blank;
+}
+
+// Map one 16 KB half-page (two slots starting at `slot`) of the 0x8000-0xFFFF
+// window to ROM or RAM. RAM physical addresses wrap at the installed size —
+// that's what lets fw 1.11 size the memory (512K/2M/4M) by writing high pages
+// and checking for aliasing.
+static void __not_in_flash_func(ngs_map_half16)(int slot, uint32_t page, uint32_t half,
+                                                bool rom, bool ramro) {
+    for (int i = 0; i < 2; i++) {
+        uint32_t phys = page * 0x8000u + half * 0x4000u + (uint32_t)i * 0x2000u;
+        if (rom) {
+            s_fetch_page[slot + i] = ngs_rom_slot(phys);
+            s_write_page[slot + i] = nullptr;
+            s_bank_woff[slot + i]  = NGS_BANK_NONE;
+        } else {
+            phys &= s_ngs_ram_total - 1;
+            if (phys < NGS_LOW_RAM_SIZE) {
+                // Physical pages 0+1 are pointer-backed (this also gives the
+                // documented aliasing with the fixed 0x4000-0x7FFF region).
+                bool ro = ramro && phys < 0x8000;  // RAMRO protects big page 0
+                s_fetch_page[slot + i] = s_ngs_low_ram + phys;
+                s_write_page[slot + i] = ro ? nullptr : s_ngs_low_ram + phys;
+                s_bank_woff[slot + i]  = NGS_BANK_NONE;
+            } else {
+                s_fetch_page[slot + i] = nullptr;
+                s_write_page[slot + i] = nullptr;
+                s_bank_off[slot + i]   = phys - NGS_LOW_RAM_SIZE;
+                s_bank_woff[slot + i]  = phys - NGS_LOW_RAM_SIZE;
+            }
+        }
+    }
+}
+
+// Rebuild all 8 slots from NOROM/RAMRO/EXPAG + MPAG/MPAGEX. Called on writes
+// to MPAG/MPAGEX/GSCFG0 (the firmware's mixer does this per channel per INT,
+// so it must stay cheap) and from init/reset.
+static void __not_in_flash_func(ngs_rebuild_map)() {
+    bool norom = s_ngs_cfg0 & 0x01;
+    bool ramro = s_ngs_cfg0 & 0x02;
+    bool expag = s_ngs_cfg0 & 0x08;
+    // 0x0000-0x3FFF: first half of page 0 — ROM unless NOROM
+    for (int s = 0; s < 2; s++) {
+        uint32_t phys = (uint32_t)s * 0x2000u;
+        if (norom) {
+            s_fetch_page[s] = s_ngs_low_ram + phys;
+            s_write_page[s] = ramro ? nullptr : s_ngs_low_ram + phys;
+        } else {
+            s_fetch_page[s] = ngs_rom_slot(phys);
+            s_write_page[s] = nullptr;
+        }
+        s_bank_woff[s] = NGS_BANK_NONE;
+    }
+    // 0x4000-0x7FFF: second half of RAM page 1, always mapped and writable
+    for (int s = 2; s < 4; s++) {
+        uint32_t phys = 0xC000u + (uint32_t)(s - 2) * 0x2000u;
+        s_fetch_page[s] = s_ngs_low_ram + phys;
+        s_write_page[s] = s_ngs_low_ram + phys;
+        s_bank_woff[s]  = NGS_BANK_NONE;
+    }
+    // 0x8000-0xFFFF: one 32 KB window (MPAG) or two 16 KB halves (EXPAG:
+    // MPAG → 0x8000-0xBFFF, MPAGEX → 0xC000-0xFFFF; D7 = half, D5-D0 = page)
+    if (!expag) {
+        uint32_t page = norom ? (uint32_t)(s_ngs_mpag & 0x7F)
+                              : (uint32_t)(s_ngs_mpag & 0x0F);  // 16 ROM pages
+        ngs_map_half16(4, page, 0, !norom, ramro);
+        ngs_map_half16(6, page, 1, !norom, ramro);
+    } else {
+        ngs_map_half16(4, s_ngs_mpag   & 0x3F, s_ngs_mpag   >> 7, !norom, ramro);
+        ngs_map_half16(6, s_ngs_mpagex & 0x3F, s_ngs_mpagex >> 7, !norom, ramro);
+    }
+}
+
+// ---------------------------------------------------------------
+// Minimal VS1011 MP3-decoder model — just enough for players to believe a
+// decoder is fitted and keep running (audio is discarded; real MP3 decode is
+// out of scope). NPL's internal player hardware-resets the chip and then
+// POLLS SSTAT B_MDDRQ until the decoder is ready — a 0-stub wedges it (and
+// with it the whole NGS mailbox). So: MDDRQ is always 1 (we're an infinitely
+// fast bit bucket) and the SCI control interface (MC_SEND/MC_READ, NCS in
+// SCTRL b1) implements the register file: STATUS identifies a VS1011,
+// DECODE_TIME advances with the MP3 byte stream at a nominal 128 kbit/s.
+// ---------------------------------------------------------------
+static uint16_t s_mp3_reg[16];
+static uint8_t  s_mp3_sci[2];      // op, addr of the current SCI frame
+static int      s_mp3_sci_idx = 0;
+static uint8_t  s_mp3_rx = 0xFF;   // byte "received" during the last MC_SEND
+static uint32_t s_mp3_md_bytes = 0;
+
+static void ngs_mp3_reset() {
+    memset(s_mp3_reg, 0, sizeof(s_mp3_reg));
+    // SCI_STATUS (reg 1) bits 7:4 = chip version; players read this to tell
+    // VS1001 from VS1011 (NGS manual §5.3 item 4). 2 = VS1011.
+    s_mp3_reg[1] = 0x20;
+    s_mp3_sci_idx = 0;
+    s_mp3_rx = 0xFF;
+    s_mp3_md_bytes = 0;
+}
+
+static uint16_t ngs_mp3_read_reg(uint8_t addr) {
+    if (addr == 4) {
+        // SCI_DECODE_TIME: seconds decoded ≈ bytes * 8 / 128000.
+        return (uint16_t)(s_mp3_md_bytes >> 14);
+    }
+    return s_mp3_reg[addr & 0x0F];
+}
+
+// One byte clocked into the SCI control interface (MC_SEND, NCS active).
+// Frames: write = 02 addr hi lo; read = 03 addr xx xx (responses appear in
+// MC_READ during the two trailing bytes).
+static void __not_in_flash_func(ngs_mp3_mc_send)(uint8_t v) {
+    switch (s_mp3_sci_idx) {
+        case 0:
+            s_mp3_sci[0] = v;
+            s_mp3_rx = 0xFF;
+            s_mp3_sci_idx = 1;
+            break;
+        case 1:
+            s_mp3_sci[1] = v & 0x0F;
+            s_mp3_rx = 0xFF;
+            s_mp3_sci_idx = 2;
+            break;
+        case 2:
+            if (s_mp3_sci[0] == 0x03) {
+                s_mp3_rx = (uint8_t)(ngs_mp3_read_reg(s_mp3_sci[1]) >> 8);
+            } else {
+                s_mp3_reg[s_mp3_sci[1]] = (uint16_t)((s_mp3_reg[s_mp3_sci[1]] & 0x00FF) | (v << 8));
+                s_mp3_rx = 0xFF;
+            }
+            s_mp3_sci_idx = 3;
+            break;
+        case 3:
+            if (s_mp3_sci[0] == 0x03) {
+                s_mp3_rx = (uint8_t)(ngs_mp3_read_reg(s_mp3_sci[1]) & 0xFF);
+            } else {
+                s_mp3_reg[s_mp3_sci[1]] = (uint16_t)((s_mp3_reg[s_mp3_sci[1]] & 0xFF00) | v);
+                if (s_mp3_sci[1] == 4) s_mp3_md_bytes = 0;  // DECODE_TIME write resets it
+                s_mp3_rx = 0xFF;
+            }
+            s_mp3_sci_idx = 0;
+            break;
+    }
+}
+
+// SETNCLR write protocol (INTENA/INTREQ/SCTRL): D7=1 sets the bits selected
+// in the written mask, D7=0 clears them; unselected bits are untouched.
+static inline uint8_t ngs_setnclr(uint8_t reg, uint8_t value, uint8_t mask) {
+    uint8_t bits = value & mask;
+    return (value & 0x80) ? (uint8_t)(reg | bits) : (uint8_t)(reg & ~bits);
+}
+
+// Register file + clock + mapping to power-on state. Shared by the GSCTR
+// warm reset (core1) and the full GS::reset() (core0, machine reset).
+static void ngs_reset_regs() {
+    s_ngs_cfg0    = NGS_CFG0_RESET;
+    s_ngs_mpag    = 0;
+    s_ngs_mpagex  = 0;
+    s_ngs_intena  = 0x01;   // GS-compatible: timer INT running out of reset
+    s_ngs_intreq  = 0;
+    s_ngs_tim_frq = 0;
+    s_ngs_int_div = 1;
+    s_ngs_int_cnt = 0;
+    s_ngs_sctrl   = 0x03;   // SDNCS=1, MCNCS=1
+    s_ngs_dma_mod = 0;
+    s_ngs_dma_cst = 0;
+    s_dac_mask    = 3;
+    ngs_mp3_reset();
+    ngs_apply_clock();
+    ngs_rebuild_map();
+}
+
+// Warm reset (host GSCTR C_GRST, executed on core1 from step()): registers
+// and CPU restart from ROM, RAM contents survive — like the real card's
+// reset without FPGA reconfiguration.
+static void __not_in_flash_func(ngs_warm_reset)() {
+    ngs_reset_regs();
+    // Host handshake resets with the card: firmware reboots and re-announces
+    // itself via OUT(03), so pending FIFOs/status are stale.
+    s_cmd_fifo_r  = s_cmd_fifo_w;
+    s_host_fifo_r = s_host_fifo_w;
+    GS::reg_status = 0;
+    s_gs_booted    = false;
+    s_gs_main_loop = false;
+    NgsSd::warmReset();
+    z80_instant_reset(&s_cpu);
+}
+
+static zuint8 __not_in_flash_func(ngs_cb_in)(void* ctx, zuint16 port) {
+    (void)ctx;
+    uint8_t v;
+    switch (port & 0xFF) {
+        case 0x01:  // ZXCMD
+            v = gsio_in_cmd();
+            // Boot gate: the firmware reading its command port means the
+            // dispatcher is up (NGS fw PCs differ from the GS-ROM heuristic
+            // used in the GS path) — release hostWriteBB's wait.
+            if (!s_gs_main_loop) s_gs_main_loop = true;
+            break;
+        case 0x02:  // ZXDATRD
+            v = gsio_in_data();
+            break;
+        case 0x03:
+            v = gsio_in_selfdata();
+            break;
+        case 0x04:  // ZXSTAT
+            v = GS::reg_status;
+#if GS_PERF_TRACE
+            {
+                uint16_t pc = Z80_PC(s_cpu);
+                s_perf_p04_total++;
+                if (pc == s_perf_p04_pc) s_perf_p04_spin++;
+                s_perf_p04_pc = pc;
+            }
+#endif
+            break;
+        case 0x05:  // CLRCBIT
+            gsio_clr_cbit();
+            v = 0xFF;
+            gs_trace_gs(TR_IN05, 0, GS::reg_status);
+            break;
+        case 0x0A:  // DAMNPORT1: data bit := INVERSE of MPAG bit 0 (ports.inc)
+            v = GS::reg_status;
+            gs_status_and(&GS::reg_status, 0x7Fu);
+            if (!(s_ngs_mpag & 0x01)) gs_status_or(&GS::reg_status, 0x80u);
+            break;
+        case 0x0B:  // DAMNPORT2: command bit := bit 5 of VOL4
+            v = GS::reg_status;
+            gs_status_and(&GS::reg_status, 0xFEu);
+            if ((GS::reg_vol[3] >> 5) & 0x01) gs_status_or(&GS::reg_status, 0x01u);
+            break;
+        case 0x0C: v = s_ngs_intena;  break;
+        case 0x0D: v = s_ngs_intreq;  break;
+        case 0x0E: v = s_ngs_tim_frq; break;
+        case 0x0F: v = s_ngs_cfg0;    break;  // "acts as memory cell"
+        case 0x10: v = s_ngs_mpagex;  break;
+        case 0x11: v = s_ngs_sctrl;   break;
+        case 0x12:  // SSTAT: b0 MDDRQ=1 (decoder model always takes data — a
+                    // 0-stub wedges NPL's init poll), b1 SDDET, b2 SDWP=0,
+                    // b3 MCRDY=1 (control SPI always ready)
+            v = 0x09 | (NgsSd::cardPresent() ? 0x02 : 0x00);
+            break;
+        case 0x13: v = NgsSd::lastRx(); break;  // SD_READ
+        case 0x14: v = NgsSd::rstr();   break;  // SD_RSTR
+        case 0x15: v = s_mp3_rx; break;         // MC_READ — VS1011 SCI model
+        case 0x1B: v = s_ngs_dma_mod; break;
+        case 0x1C: case 0x1D: case 0x1E:
+            v = s_ngs_dma_addr[(port & 0xFF) - 0x1C];
+            break;
+        case 0x1F: v = s_ngs_dma_cst; break;
+        case 0x20: case 0x21: case 0x22: case 0x23:
+            v = s_ngs_win[(port & 0xFF) - 0x20];
+            break;
+        default:
+            v = 0xFF;
+            break;
+    }
+    return v;
+}
+
+static void __not_in_flash_func(ngs_cb_out)(void* ctx, zuint16 port, zuint8 value) {
+    (void)ctx;
+    switch (port & 0xFF) {
+        case 0x00:  // MPAG
+            s_ngs_mpag = value;
+            GS::reg_page = value;  // keep pollPerf diagnostics meaningful
+            ngs_rebuild_map();
+            return;
+        case 0x01:  // LEDCTR: D0=0 → LED on (board LED; state kept, not wired)
+            s_ngs_led = value & 1;
+            return;
+        case 0x02:
+            gsio_ack_data();
+            gs_trace_gs(TR_OUT02, value, GS::reg_status);
+            return;
+        case 0x03:  // ZXDATWR
+            gsio_out_data(value);
+            // Boot progress, mirroring the GS-ROM lineage (fw 1.11 derives
+            // from Stinger's GS 1.04): first OUT(03) = RAM test done, second
+            // = init done, dispatcher ready. Without releasing the gate here,
+            // hostWriteBB stalls 2 s on the very FIRST command a program
+            // sends — short-timeout detects (NPL) then report "No GS".
+            if (!s_gs_booted) {
+                s_gs_booted = true;
+                Debug::log("NGS: first ZXDATWR %02X (fw alive)", (unsigned)value);
+            } else if (!s_gs_main_loop) {
+                s_gs_main_loop = true;
+                Debug::log("NGS: fw dispatcher ready");
+            }
+            gs_trace_gs(TR_OUT03, value, GS::reg_status);
+            return;
+        case 0x05:
+            gsio_clr_cbit();
+            gs_trace_gs(TR_OUT05, 0, GS::reg_status);
+            return;
+        case 0x06: case 0x07: case 0x08: case 0x09:  // VOL1-4
+            GS::reg_vol[(port & 0xFF) - 0x06] = value & 0x3F;
+            return;
+        case 0x16: case 0x17: case 0x18: case 0x19:  // VOL5-8
+            GS::reg_vol[4 + ((port & 0xFF) - 0x16)] = value & 0x3F;
+            return;
+        case 0x0A:  // DAMNPORT1 — write has the same effect as read
+            gs_status_and(&GS::reg_status, 0x7Fu);
+            if (!(s_ngs_mpag & 0x01)) gs_status_or(&GS::reg_status, 0x80u);
+            return;
+        case 0x0B:
+            gs_status_and(&GS::reg_status, 0xFEu);
+            if ((GS::reg_vol[3] >> 5) & 0x01) gs_status_or(&GS::reg_status, 0x01u);
+            return;
+        case 0x0C:  // INTENA (SETNCLR, bits 0-2)
+            s_ngs_intena = ngs_setnclr(s_ngs_intena, value, 0x07);
+            return;
+        case 0x0D:  // INTREQ (SETNCLR, bits 0-2) — clears pending requests
+            s_ngs_intreq = ngs_setnclr(s_ngs_intreq, value, 0x07);
+            return;
+        case 0x0E: {  // TIM_FRQ: 37500 Hz / {1,2,4,8,16,64,256,1024}
+            static const uint16_t div_tab[8] = {1, 2, 4, 8, 16, 64, 256, 1024};
+            s_ngs_tim_frq = value & 0x07;
+            s_ngs_int_div = div_tab[s_ngs_tim_frq];
+            s_ngs_int_cnt = 0;
+            return;
+        }
+        case 0x0F: {  // GSCFG0
+            uint8_t prev = s_ngs_cfg0;
+            s_ngs_cfg0 = value;
+            s_dac_mask = (value & 0x04) ? 7 : 3;         // 8CHANS
+            if ((prev ^ value) & 0x30) ngs_apply_clock();  // CKSEL
+            if ((prev ^ value) & 0x0B) ngs_rebuild_map();  // NOROM/RAMRO/EXPAG
+            return;
+        }
+        case 0x10:  // MPAGEX
+            s_ngs_mpagex = value;
+            ngs_rebuild_map();
+            return;
+        case 0x11: {  // SCTRL (SETNCLR, bits 0-5)
+            uint8_t prev = s_ngs_sctrl;
+            s_ngs_sctrl = ngs_setnclr(s_ngs_sctrl, value, 0x3F);
+            if ((prev ^ s_ngs_sctrl) & 0x01) {
+                NgsSd::csEdge(!(s_ngs_sctrl & 0x01));  // SDNCS is active-low
+            }
+            if ((prev ^ s_ngs_sctrl) & 0x02) {
+                s_mp3_sci_idx = 0;                     // MCNCS edge resets SCI frame
+            }
+            if ((prev ^ s_ngs_sctrl) & 0x04) {
+                // MPXRS is the decoder's hardware reset (active low).
+                if (!(s_ngs_sctrl & 0x04)) ngs_mp3_reset();
+            }
+            return;
+        }
+        case 0x13:  // SD_SEND
+            NgsSd::xfer(value);
+            return;
+        case 0x14:  // MD_SEND — MP3 data stream into the decoder model
+            s_mp3_md_bytes++;
+            return;
+        case 0x15:  // MC_SEND — MP3 control (VS1011 SCI model)
+            if (!(s_ngs_sctrl & 0x02)) ngs_mp3_mc_send(value);  // MCNCS active-low
+            return;
+        case 0x1B:  // DMA_MOD
+            s_ngs_dma_mod = value & 0x03;
+            return;
+        case 0x1C: case 0x1D: case 0x1E:  // DMA_HAD/MAD/LAD
+            s_ngs_dma_addr[(port & 0xFF) - 0x1C] = value;
+            return;
+        case 0x1F: {  // DMA_CST — stub: latch b7, warn once per module
+            s_ngs_dma_cst = value & 0x80;
+            if (value & 0x80) {
+                static uint8_t warned = 0;
+                if (!(warned & (1u << s_ngs_dma_mod))) {
+                    warned |= (uint8_t)(1u << s_ngs_dma_mod);
+                    Debug::log("NGS: DMA module %u not emulated", (unsigned)s_ngs_dma_mod);
+                }
+            }
+            return;
+        }
+        case 0x20: case 0x21: case 0x22: case 0x23: {  // WIN0-3 — stub latches
+            s_ngs_win[(port & 0xFF) - 0x20] = value;
+            static bool win_warned = false;
+            if (!win_warned) {
+                win_warned = true;
+                Debug::log("NGS: WIN0-3 paging not emulated (port %02X <- %02X)",
+                           (unsigned)(port & 0xFF), (unsigned)value);
+            }
+            return;
+        }
         default:
             return;
     }
@@ -735,6 +1268,16 @@ void   __not_in_flash_func(gs_direct_out         )(zuint16 port, zuint8 value) {
 }
 
 uint32_t GS::configuredRamBytes() {
+    if (Config::gs_enabled == 2) {
+        // NeoGS: total RAM 512K/2M/4M (fw 1.11 auto-detects exactly these).
+        // The PSRAM reservation excludes the 64 KB low part (physical pages
+        // 0+1), which is pointer-backed via s_workRamBuf.
+        uint32_t total = 2u << 20;
+        if (Config::gs_ram_size == 0)      total = 512u << 10;
+        else if (Config::gs_ram_size == 1) total = 2u << 20;   // no 1 MB on NGS
+        else if (Config::gs_ram_size >= 3) total = 4u << 20;
+        return total - NGS_LOW_RAM_SIZE;
+    }
     uint32_t bytes = 2u << 20;                       // default 2 MB
     if (Config::gs_ram_size == 0)      bytes = 512u << 10;
     else if (Config::gs_ram_size == 1) bytes = 1u  << 20;
@@ -745,6 +1288,12 @@ uint32_t GS::configuredRamBytes() {
 }
 
 void GS::setClock() {
+    if (neogs) {
+        // NeoGS clock is guest-controlled via GSCFG0 CKSEL; the menu value
+        // is ignored. (Called with the current cfg0 — 10 MHz out of reset.)
+        ngs_apply_clock();
+        return;
+    }
     uint8_t ci = Config::gs_clock < 5 ? Config::gs_clock : 1;
     GS_CLOCK_HZ   = GS_CLOCK_TABLE[ci];
     GS_INT_PERIOD = GS_CLOCK_HZ / GS_INT_HZ;
@@ -752,11 +1301,16 @@ void GS::setClock() {
 
 bool GS::init(uint32_t ram_size_bytes) {
     if (enabled) return true;
+    neogs = s_ngs = (Config::gs_enabled == 2);
     setClock();
 
-    uint32_t rounded = 0x20000;
-    while (rounded < ram_size_bytes && rounded < (2u << 20)) rounded <<= 1;
-    ram_size_bytes = rounded;
+    if (!s_ngs) {
+        uint32_t rounded = 0x20000;
+        while (rounded < ram_size_bytes && rounded < (2u << 20)) rounded <<= 1;
+        ram_size_bytes = rounded;
+    }
+    // NeoGS: ram_size_bytes is the PSRAM reservation from configuredRamBytes()
+    // (total − 64 KB pointer-backed low part) — not a power of two, no rounding.
 
     uint32_t psram = butter_psram_size();
     if (psram > 0) {
@@ -800,14 +1354,25 @@ bool GS::init(uint32_t ram_size_bytes) {
         Debug::log("GS::init: SPI PSRAM @ +%u MB (slow path, expect MOD glitches)",
                    (unsigned)(s_gs_ram_base >> 20));
     }
-    s_gs_ram_mask = ram_size_bytes - 1;
+    s_gs_ram_mask = ram_size_bytes - 1;   // GS only; NGS bank offsets are pre-masked
     gs_ram_size   = ram_size_bytes;
+    s_ngs_ram_total = s_ngs ? ram_size_bytes + NGS_LOW_RAM_SIZE : 0;
 
     // Work RAM + DAC rings → butter PSRAM (else heap). Allocated via Buffer, so this
     // MUST run after Buffer::initPools() (see ESPectrum::setup ordering).
+    // NeoGS needs the whole 64 KB of physical pages 0+1 pointer-backed (firmware
+    // executes from page 0 under NOROM) plus one 8 KB blank page (0xFF) that
+    // serves unpopulated ROM chunks.
     if (!s_gs_work_ram) {
-        if (!s_workRamBuf.alloc(GS_WORK_RAM_SIZE, Buffer::NEED_POINTER | Buffer::PREFER_PSRAM)) return false;
-        s_gs_work_ram = s_workRamBuf.data();
+        size_t wsz = s_ngs ? (NGS_LOW_RAM_SIZE + 0x2000) : GS_WORK_RAM_SIZE;
+        if (!s_workRamBuf.alloc(wsz, Buffer::NEED_POINTER | Buffer::PREFER_PSRAM)) return false;
+        if (s_ngs) {
+            s_ngs_low_ram = s_workRamBuf.data();
+            s_ngs_blank   = s_ngs_low_ram + NGS_LOW_RAM_SIZE;
+            s_gs_work_ram = s_ngs_low_ram + 0xC000;  // fixed 0x4000-0x7FFF region
+        } else {
+            s_gs_work_ram = s_workRamBuf.data();
+        }
     }
     if (!s_ring_L) {
         if (!s_ringLBuf.alloc(GS_RING_SIZE * sizeof(int16_t), Buffer::NEED_POINTER | Buffer::PREFER_PSRAM)) return false;
@@ -824,8 +1389,14 @@ bool GS::init(uint32_t ram_size_bytes) {
     if (!s_pc_tag)      s_pc_tag      = new uint32_t[GS_PC_SETS][GS_PC_WAYS];
     if (!s_pc_next)     s_pc_next     = new uint8_t[GS_PC_SETS];
 
-    memset(s_gs_work_ram, 0, GS_WORK_RAM_SIZE);
-    gs_init_fetch_pages();   // hot-path fetch table: see gs_cb_fetch_opcode
+    if (s_ngs) {
+        memset(s_ngs_low_ram, 0, NGS_LOW_RAM_SIZE);
+        memset(s_ngs_low_ram + NGS_LOW_RAM_SIZE, 0xFF, 0x2000);  // blank ROM page
+        // Fetch/write tables are built by ngs_reset_regs() from reset() below.
+    } else {
+        memset(s_gs_work_ram, 0, GS_WORK_RAM_SIZE);
+        gs_init_fetch_pages();   // hot-path fetch table: see gs_cb_fetch_opcode
+    }
     for (int i = 0; i < GS_PC_SETS; i++) {
         for (int w = 0; w < GS_PC_WAYS; w++) s_pc_tag[i][w] = ~0u;
         s_pc_next[i] = 0;
@@ -871,6 +1442,9 @@ void GS::deinit() {
     s_gs_ram_mask = 0;
     gs_ram_size = 0;
     s_workRamBuf.free();    s_gs_work_ram = nullptr;
+    s_ngs_low_ram = nullptr;
+    s_ngs_blank   = nullptr;
+    s_ngs_ram_total = 0;
     s_ringLBuf.free();      s_ring_L      = nullptr;
     s_ringRBuf.free();      s_ring_R      = nullptr;
     delete[] s_pc_data;     s_pc_data     = nullptr;
@@ -896,7 +1470,11 @@ void GS::reset() {
     reg_data_gs = 0;
     reg_status  = 0;
     reg_page    = 0;
-    for (int i = 0; i < 4; i++) { reg_vol[i] = 0; reg_ch[i] = 0x80; }
+    for (int i = 0; i < 8; i++) { reg_vol[i] = 0; reg_ch[i] = 0x80; }
+    if (s_ngs && s_ngs_low_ram) {
+        ngs_reset_regs();
+        NgsSd::reset();   // core0-only (disk probe) — reset() runs on core0
+    }
     int_count = 0;
     s_int_timer_ts = 0;
     s_int_pending = false;
@@ -939,6 +1517,28 @@ void __not_in_flash_func(GS::topUpBudget)(int tstates) {
 }
 
 void GS::pollPerf() {
+#if NGS_TRACE
+    // NeoGS 1 Hz health line: where the GS-Z80 is executing (fw ROM idle
+    // ~0x0xxx vs uploaded code high), mapping state, host handshake status
+    // and SD traffic. Racy cross-core reads — diagnostics only. The UART
+    // write blocks core0 ~2-4 ms (audible/visible once-per-second stutter),
+    // hence the CMake toggle.
+    if (s_ngs && enabled) {
+        static uint32_t s_ngs_last_log = 0;
+        uint32_t now = time_us_32();
+        if (now - s_ngs_last_log >= 1000000) {
+            s_ngs_last_log = now;
+            NgsSd::Stats st;
+            NgsSd::getStats(st);
+            Debug::log("NGS: pc=%04X cfg0=%02X mpag=%02X st=%02X | SD x=%lu rd=%lu wr=%lu err=%lu sec=%lu cs=%d",
+                       (unsigned)Z80_PC(s_cpu), (unsigned)s_ngs_cfg0,
+                       (unsigned)s_ngs_mpag, (unsigned)reg_status,
+                       (unsigned long)st.xfers, (unsigned long)st.reads,
+                       (unsigned long)st.writes, (unsigned long)st.errors,
+                       (unsigned long)st.last_sector, (int)st.cs_active);
+        }
+    }
+#endif  // NGS_TRACE
 #ifdef GS_DEBUG_TRACE
     if (s_trace_dump_pending) {
         s_trace_dump_pending = false;
@@ -1149,8 +1749,59 @@ void __not_in_flash_func(GS::pump)() {
     gs_end_pump();
 }
 
+// Current stereo DAC mix, GS or NeoGS flavor. GS: Unreal stereo mix
+// (L=0+1, R=2+3 with 50% cross-mix, /2 final scale). NeoGS: per GSCFG0 —
+// 4ch (L=1,2 R=3,4), 8ch (L=1,2,5,6 R=3,4,7,8, sum halved to keep the
+// full-scale range comparable), 4ch-panning (each channel × two volumes);
+// INV7B flips bit 7 of the sample before scaling (signed samples).
+static inline void __not_in_flash_func(gs_mix_lr)(int32_t& l, int32_t& r) {
+    if (!s_ngs) {
+        int32_t c0 = (int32_t)GS::reg_vol[0] * ((int32_t)GS::reg_ch[0] - 128);
+        int32_t c1 = (int32_t)GS::reg_vol[1] * ((int32_t)GS::reg_ch[1] - 128);
+        int32_t c2 = (int32_t)GS::reg_vol[2] * ((int32_t)GS::reg_ch[2] - 128);
+        int32_t c3 = (int32_t)GS::reg_vol[3] * ((int32_t)GS::reg_ch[3] - 128);
+        int32_t gl = c0 + c1;
+        int32_t gr = c2 + c3;
+        l = (gl + (gr >> 1)) >> 1;
+        r = (gr + (gl >> 1)) >> 1;
+        return;
+    }
+    uint8_t inv = (s_ngs_cfg0 & 0x80) ? 0x80 : 0x00;  // INV7B
+    int32_t c[8];
+    int nch = (s_ngs_cfg0 & 0x04) ? 8 : 4;
+    for (int i = 0; i < nch; i++) {
+        c[i] = (int32_t)(uint8_t)(GS::reg_ch[i] ^ inv) - 128;
+    }
+    if (s_ngs_cfg0 & 0x04) {          // 8CHANS: left 1,2,5,6 / right 3,4,7,8
+        l = (c[0] * GS::reg_vol[0] + c[1] * GS::reg_vol[1]
+           + c[4] * GS::reg_vol[4] + c[5] * GS::reg_vol[5]) >> 1;
+        r = (c[2] * GS::reg_vol[2] + c[3] * GS::reg_vol[3]
+           + c[6] * GS::reg_vol[6] + c[7] * GS::reg_vol[7]) >> 1;
+    } else if (s_ngs_cfg0 & 0x40) {   // PAN4CH: ch1-4 × VOL{1,2,5,6}L/{3,4,7,8}R
+        l = (c[0] * GS::reg_vol[0] + c[1] * GS::reg_vol[1]
+           + c[2] * GS::reg_vol[4] + c[3] * GS::reg_vol[5]) >> 1;
+        r = (c[0] * GS::reg_vol[2] + c[1] * GS::reg_vol[3]
+           + c[2] * GS::reg_vol[6] + c[3] * GS::reg_vol[7]) >> 1;
+    } else {                          // 4ch: left 1,2 / right 3,4
+        l = c[0] * GS::reg_vol[0] + c[1] * GS::reg_vol[1];
+        r = c[2] * GS::reg_vol[2] + c[3] * GS::reg_vol[3];
+    }
+}
+
 int __not_in_flash_func(GS::step)(int tstates) {
     if (!enabled) return 0;
+    if (s_ngs) {
+        // Host GSCTR requests are consumed here, between z80_run chunks —
+        // s_cpu must never be touched by core0 directly.
+        if (s_ngs_grst_pending) {
+            s_ngs_grst_pending = false;
+            ngs_warm_reset();
+        }
+        if (s_ngs_nmi_pending) {
+            s_ngs_nmi_pending = false;
+            z80_nmi(&s_cpu);
+        }
+    }
     int remaining = tstates;
     int total_ran = 0;
     while (remaining > 0) {
@@ -1162,14 +1813,25 @@ int __not_in_flash_func(GS::step)(int tstates) {
         remaining -= (int)ran;
         total_ran += (int)ran;
         if (s_int_timer_ts >= GS_INT_PERIOD) {
+            // 37500 Hz tick: DAC sample capture always; CPU INT every tick on
+            // GS, every s_ngs_int_div ticks on NeoGS (TIM_FRQ) when enabled.
             s_int_timer_ts -= GS_INT_PERIOD;
             int_count++;
+            bool fire_int = true;
+            if (s_ngs) {
+                fire_int = false;
+                if (++s_ngs_int_cnt >= s_ngs_int_div) {
+                    s_ngs_int_cnt = 0;
+                    s_ngs_intreq |= 0x01;              // timer request latch
+                    if (s_ngs_intena & 0x01) fire_int = true;
+                }
+            }
             // Level-triggered INT: assert only once per period; gs_cb_inta
             // deasserts when the Z80 acknowledges it. If firmware is in DI
             // when the period fires, INT_LINE stays high until EI executes
             // (redcode's EI: if (INT_LINE) REQUEST |= Z80_REQUEST_INT).
             // This matches real GS hardware and Unreal Speccy's int_pend model.
-            if (!s_int_pending) {
+            if (fire_int && !s_int_pending) {
                 s_int_pending = true;
                 z80_int(&s_cpu, Z_TRUE);
             }
@@ -1179,17 +1841,12 @@ int __not_in_flash_func(GS::step)(int tstates) {
             remaining -= (int)ran_int;
             total_ran += (int)ran_int;
 
-            // Capture DAC snapshot into ring. Per Unreal, apply Unreal stereo
-            // mix (L=0+1, R=2+3 with 50% cross-mix, /2 final scale).
-            int32_t c0 = (int32_t)reg_vol[0] * ((int32_t)reg_ch[0] - 128);
-            int32_t c1 = (int32_t)reg_vol[1] * ((int32_t)reg_ch[1] - 128);
-            int32_t c2 = (int32_t)reg_vol[2] * ((int32_t)reg_ch[2] - 128);
-            int32_t c3 = (int32_t)reg_vol[3] * ((int32_t)reg_ch[3] - 128);
-            int32_t l = c0 + c1;
-            int32_t r = c2 + c3;
+            // Capture DAC snapshot into ring.
+            int32_t l, r;
+            gs_mix_lr(l, r);
             uint32_t w = s_ring_wpos;
-            s_ring_L[w & GS_RING_MASK] = (int16_t)((l + (r >> 1)) >> 1);
-            s_ring_R[w & GS_RING_MASK] = (int16_t)((r + (l >> 1)) >> 1);
+            s_ring_L[w & GS_RING_MASK] = (int16_t)l;
+            s_ring_R[w & GS_RING_MASK] = (int16_t)r;
             // DMB: ring data must be written before wpos is visible to the
             // consumer on core0 (pcm_call_inner timer IRQ).
             __dmb();
@@ -1202,8 +1859,21 @@ int __not_in_flash_func(GS::step)(int tstates) {
     return total_ran;
 }
 
+// NeoGS: the GS-Z80 (core1) may be blocked inside the firmware's SD wait
+// loop while the ZX side polls #BB/#B3 — exactly the window where the sector
+// mailbox needs core0. Servicing from the host port handlers (all core0, the
+// same context that runs FatFs elsewhere) bounds SD latency by the guest's
+// poll rate instead of the 20 ms frame period; cheap no-op when idle. Same
+// pattern as ZiFi's cdcPump call sites.
+static inline void gs_host_sd_service() {
+#ifdef USE_GS
+    if (GS::neogs) NgsSd::service();
+#endif
+}
+
 uint8_t GS::hostReadB3() {
     GS_PERF(s_perf_h_b3r++);
+    gs_host_sd_service();
     uint8_t v = reg_data_gs;
     __dmb();  // consume data before clearing the flag
     uint32_t fifo_used = s_host_fifo_w - s_host_fifo_r;
@@ -1220,6 +1890,7 @@ uint8_t GS::hostReadB3() {
 
 uint8_t GS::hostReadBB() {
     GS_PERF(s_perf_h_bbr++);
+    gs_host_sd_service();
     uint8_t v = reg_status | 0x7E;
     gs_trace_host(TR_BBr, v, reg_status);
     return v;
@@ -1280,6 +1951,7 @@ void GS::hostWriteBB(uint8_t data) {
     if (!s_gs_main_loop) {
         uint32_t t0 = time_us_32();
         while (!s_gs_main_loop && (time_us_32() - t0) < 2000000) {
+            gs_host_sd_service();  // NGS: firmware may be inside the SD boot path
             __dmb();
         }
         if (!s_gs_main_loop) {
@@ -1315,13 +1987,34 @@ void GS::hostWriteBB(uint8_t data) {
     gs_status_or(&reg_status, 0x01u);  // D0=1: command available
 }
 
+// NeoGS ZX control port #33 (GSCTR). Reset and NMI are latched for core1 —
+// s_cpu must never be mutated from core0 while z80_run may be in flight;
+// step() consumes the flags between run chunks.
+void GS::hostWriteCtrl(uint8_t data) {
+    if (!enabled || !neogs) return;
+    gs_host_sd_service();
+    if (data & 0x80) s_ngs_grst_pending = true;   // C_GRST — warm reset
+    if (data & 0x40) s_ngs_nmi_pending  = true;   // C_GNMI
+    if (data & 0x20) s_ngs_led ^= 1;              // C_GLED — LED toggle
+}
+
 int16_t __not_in_flash_func(GS::getSampleLeft)() {
+    if (s_ngs) {
+        int32_t l, r;
+        gs_mix_lr(l, r);
+        return (int16_t)l;
+    }
     int l = (int)reg_vol[0] * ((int)reg_ch[0] - 128)
           + (int)reg_vol[3] * ((int)reg_ch[3] - 128);
     return (int16_t)l;
 }
 
 int16_t __not_in_flash_func(GS::getSampleRight)() {
+    if (s_ngs) {
+        int32_t l, r;
+        gs_mix_lr(l, r);
+        return (int16_t)r;
+    }
     int r = (int)reg_vol[1] * ((int)reg_ch[1] - 128)
           + (int)reg_vol[2] * ((int)reg_ch[2] - 128);
     return (int16_t)r;
