@@ -251,9 +251,9 @@ bool xinputh_init(void)
     return true;
 }
 
-bool xinputh_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_interface_t const *desc_itf, uint16_t max_len)
+xinputh_open_ret_t xinputh_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_interface_t const *desc_itf, uint16_t max_len)
 {
-    TU_VERIFY(dev_addr <= CFG_TUH_DEVICE_MAX);
+    TU_VERIFY(dev_addr <= CFG_TUH_DEVICE_MAX, XINPUTH_OPEN_FAIL);
 
     xinput_type_t type = XINPUT_UNKNOWN;
     if (desc_itf->bNumEndpoints < 2)
@@ -274,7 +274,7 @@ bool xinputh_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_interface_t const 
     if (type == XINPUT_UNKNOWN)
     {
         TU_LOG2("XINPUT: Not a valid interface\n");
-        return false;
+        return XINPUTH_OPEN_FAIL;
     }
 
     TU_LOG2("XINPUT opening Interface %u (addr = %u)\r\n", desc_itf->bInterfaceNumber, dev_addr);
@@ -317,7 +317,9 @@ bool xinputh_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_interface_t const 
     }
 
     xinput_dev->inst_count++;
-    return true;
+    // pos = interface descriptor + class descriptors + endpoints walked above —
+    // exactly the consumed length TinyUSB 0.21+ expects back (bool true pre-0.21).
+    return XINPUTH_OPEN_OK((uint16_t)pos);
 }
 
 void xbox360_init(uint8_t dev_addr) {

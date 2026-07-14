@@ -14,6 +14,17 @@
 #include "ff.h"
 #include "diskio.h"
 
+#if PICO_RP2350
+/* Physical drive 1 = USB mass-storage stick (FatFs volume "USB:"), served by
+ * TinyUSB MSC host in src/UsbMsc.cpp. Declared here to keep this file plain C.
+ * RP2350 only — CFG_TUH_MSC is 0 on RP2040 boards (see src/tusb_config.h). */
+extern DSTATUS usb_disk_status(void);
+extern DSTATUS usb_disk_initialize(void);
+extern DRESULT usb_disk_read(BYTE* buff, LBA_t sector, UINT count);
+extern DRESULT usb_disk_write(const BYTE* buff, LBA_t sector, UINT count);
+extern DRESULT usb_disk_ioctl(BYTE cmd, void* buff);
+#endif
+
 
 /*--------------------------------------------------------------------------
 
@@ -357,6 +368,9 @@ DSTATUS disk_initialize (
 	uint32_t t;
 
 
+#if PICO_RP2350
+	if (drv == 1) return usb_disk_initialize();
+#endif
 	if (drv) return STA_NOINIT;			/* Supports only drive 0 */
 	init_spi();							/* Initialize SPI */
     sleep_ms(10);
@@ -413,6 +427,9 @@ DSTATUS disk_status (
 	BYTE drv		/* Physical drive number (0) */
 )
 {
+#if PICO_RP2350
+	if (drv == 1) return usb_disk_status();
+#endif
 	if (drv) return STA_NOINIT;		/* Supports only drive 0 */
 
 	return Stat;	/* Return disk status */
@@ -514,6 +531,9 @@ DRESULT disk_read (
 	UINT count		/* Number of sectors to read (1..128) */
 )
 {
+#if PICO_RP2350
+	if (drv == 1) return usb_disk_read(buff, sector, count);
+#endif
 	if (drv || !count) return RES_PARERR;		/* Check parameter */
 	if (Stat & STA_NOINIT) return RES_NOTRDY;	/* Check if drive is ready */
 
@@ -604,6 +624,9 @@ DRESULT disk_write (
 	UINT count			/* Number of sectors to write (1..128) */
 )
 {
+#if PICO_RP2350
+	if (drv == 1) return usb_disk_write(buff, sector, count);
+#endif
 	if (drv || !count) return RES_PARERR;		/* Check parameter */
 	if (Stat & STA_NOINIT) return RES_NOTRDY;	/* Check drive status */
 	if (Stat & STA_PROTECT) return RES_WRPRT;	/* Check write protect */
@@ -654,6 +677,9 @@ DRESULT disk_ioctl (
 	DWORD *dp, st, ed, csize;
 
 
+#if PICO_RP2350
+	if (drv == 1) return usb_disk_ioctl(cmd, buff);
+#endif
 	if (drv) return RES_PARERR;					/* Check parameter */
 	if (Stat & STA_NOINIT) return RES_NOTRDY;	/* Check if drive is ready */
 

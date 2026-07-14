@@ -7,6 +7,7 @@
 #include "MemESP.h"
 #include "Config.h"
 #include "Debug.h"
+#include "FileUtils.h"
 #include "roms.h"
 extern "C" {
     #include "diskio.h"
@@ -248,6 +249,8 @@ void DivMMC::init() {
         for (int d = 0; d < 2; d++) {
             const char* image_path = Config::esxdos_hdf_image[d].empty() ? defaults[d] : Config::esxdos_hdf_image[d].c_str();
             if (image_path[0] == '\0') continue; // no slave configured
+            // "USB:/..." image at boot: wait for the stick to enumerate first.
+            if (!FileUtils::waitVolumeReady(image_path)) continue;
             FRESULT fr = f_open(&mmc_file[d], image_path, FA_READ | FA_WRITE);
             if (fr == FR_OK) {
                 mmc_file_open[d] = true;
@@ -273,6 +276,9 @@ void DivMMC::init() {
         // DivMMC: open .mmc image (shared hd0 slot with DivIDE).
         const char* default_path = "/esxdos.mmc";
         const char* image_path = Config::esxdos_hdf_image[0].empty() ? default_path : Config::esxdos_hdf_image[0].c_str();
+        // "USB:/..." image at boot: wait for the stick to enumerate first
+        // (if it never shows up the opens below just fail like a missing file).
+        FileUtils::waitVolumeReady(image_path);
         FRESULT fr = f_open(&mmc_file[0], image_path, FA_READ | FA_WRITE);
         if (fr == FR_OK) {
             mmc_file_open[0] = true;

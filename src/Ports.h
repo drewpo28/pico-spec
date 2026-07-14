@@ -63,6 +63,11 @@ public:
     // (right), #FB (both). Mixed in stereo into the covox L/R buffers.
     // Cleared on reset.
     static uint8_t sndriveLatch[6];
+    // Bitmask of latches ever written since reset (slot -> bit). Used as the
+    // analog summing-amp divisor: each rail is averaged over the DACs actually
+    // driven, so one DAC/side stays full-scale (Single Warrior) while two
+    // DACs/side average instead of summing-and-clipping (4-ch SounDrive music).
+    static uint8_t sndriveUsed;
 
     static uint8_t portAFF7;
     static uint8_t portDFFD;
@@ -73,6 +78,8 @@ public:
     static uint32_t portdffd_cnt;
     // Time spent in Ports::FDDStep (rvmWD1793Step calls from port handlers).
     static volatile uint32_t fdd_ports_us;
+    static volatile uint32_t fdd_ports_calls;
+    static volatile uint32_t fdd_ports_max;
 
 #if SND_PORT_TRACE
     // Per-port I/O histograms (index = low address byte) for hunting unknown

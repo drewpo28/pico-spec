@@ -67,6 +67,11 @@ public:
     // The absolute remote path of the current directory.
     virtual std::string cwdPath() const = 0;
 
+    // Short volume-style label shown as the browser's path-header prefix ("FTP:",
+    // "SSH:", "WEB:") in place of the SD/USB prefix fdDisplayPath() would add — so
+    // the header reflects the remote source instead of reading "SD:/".
+    virtual std::string schemeLabel() const = 0;
+
     // Download `remote` (relative to cwd or absolute) to SD path `localSdPath`.
     virtual bool get(const std::string& remote, const std::string& localSdPath,
                      XferProgressCb cb) = 0;

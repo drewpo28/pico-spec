@@ -69,9 +69,11 @@ bool parseUrl(const char* url, bool& https, char* host, size_t hostsz,
 }
 
 // Read one CRLF-terminated header line into buf (NUL-terminated, CR stripped).
-// Returns false on EOF/error before any byte.
-bool readLine(Conn& c, char* buf, size_t maxlen, absolute_time_t deadline) {
+// Returns false on EOF/error before any byte. eofOut (optional) is set when the
+// failure was a clean connection close, not a timeout/transport error.
+bool readLine(Conn& c, char* buf, size_t maxlen, absolute_time_t deadline, bool* eofOut = nullptr) {
     size_t pos = 0;
+    if (eofOut) *eofOut = false;
     for (;;) {
         uint8_t ch;
         int n = c.rd(&ch, 1);
@@ -79,6 +81,7 @@ bool readLine(Conn& c, char* buf, size_t maxlen, absolute_time_t deadline) {
             if (ch == '\n') { if (pos && buf[pos-1] == '\r') pos--; buf[pos] = '\0'; return true; }
             if (pos + 1 < maxlen) buf[pos++] = (char)ch;
         } else if (n == 0) {
+            if (eofOut && pos == 0) *eofOut = true;
             buf[pos] = '\0'; return pos > 0;          // EOF
         } else {
             if (time_reached(deadline)) { buf[pos] = '\0'; return false; }
@@ -166,23 +169,98 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
             strncpy(res.lastmod, v, sizeof(res.lastmod) - 1); res.lastmod[sizeof(res.lastmod) - 1] = '\0';
         }
     }
-    if (chunked) { Debug::log("HttpsGet: chunked encoding not supported"); res.status = -1; goto done; }
 #if ZIFI_NET_VERBOSE
-    Debug::log("HttpsGet: status=%d len=%lu", res.status, (unsigned long)res.length);
+    Debug::log("HttpsGet: status=%d len=%lu%s", res.status, (unsigned long)res.length,
+               chunked ? " chunked" : "");
 #endif
 
     // Body: Content-Length when known, else read until EOF (Connection: close).
     uint32_t total = res.length;
     uint32_t drop0 = ZiFi::rxDropped();  // RX-ring overflow count at body start
+    bool chunkedDone = false;
+
+    if (chunked) {
+        // Chunked transfer-encoding. Dynamic PHP backends switch to it when they
+        // omit Content-Length — spectrum4ever's download.php does this for some
+        // clients (hw log 2026-07-07) while sending Content-Length to others.
+        // Frames: "<hex-size>[;ext] CRLF <data> CRLF", terminated by a 0-size
+        // chunk + optional trailers + a blank line. res.length stays 0 (progress
+        // runs indeterminate); completion is the terminal chunk, so a dropped
+        // link mid-body is still detected even without a known length.
+        res.length = total = 0;
+        for (;;) {
+            // Chunk-size line. Real-world slack (hw log 2026-07-07, spectrum4ever):
+            // the peer closes cleanly right after the last data chunk's CRLF and
+            // never sends the terminal "0" — treat that EOF as completion (there
+            // is no length to check against anyway; the payload's consumer
+            // validates it). Stray blank lines before the size are skipped.
+            bool eof = false;
+            for (;;) {
+                deadline = make_timeout_time_ms(15000);    // per-frame, not per-body
+                if (!readLine(c, line, sizeof(line), deadline, &eof)) break;
+                if (line[0] != '\0') break;                // skip blank line(s)
+            }
+            if (eof && res.received > 0) {
+                Debug::log("HttpsGet: chunked EOF w/o terminal chunk @%lu — accept",
+                           (unsigned long)res.received);
+                chunkedDone = true;
+                break;
+            }
+            if (!isxdigit((unsigned char)line[0])) {
+                Debug::log("HttpsGet: bad chunk size @%lu \"%s\"",
+                           (unsigned long)res.received, line);
+                res.status = -1; goto done;
+            }
+            uint32_t csz = (uint32_t)strtoul(line, nullptr, 16);
+            if (csz == 0) {                                // terminal chunk: skip trailers
+                while (readLine(c, line, sizeof(line), deadline) && line[0] != '\0') {}
+                chunkedDone = true;
+                break;
+            }
+            for (uint32_t got = 0; got < csz; ) {
+                size_t want = csz - got;
+                if (want > HTTP_BUF_SZ) want = HTTP_BUF_SZ;
+                int n = c.rd(hb, want);
+                if (n <= 0) {                              // error, or EOF mid-chunk = truncated
+                    Debug::log("HttpsGet: chunk read err n=%d @%lu tlsErr=-0x%04x rxDrop=%lu bufDrop=%lu",
+                               n, (unsigned long)res.received,
+                               c.tls ? -c.ts->lastError() : 0,
+                               (unsigned long)(ZiFi::rxDropped() - drop0),
+                               (unsigned long)ZiFiSock::rxBufDropped());
+                    res.status = -1; goto done;
+                }
+                if (sink && !sink(sinkCtx, hb, n)) goto done; // caller abort (keep status)
+                res.received += n; got += n;
+                ZiFi::rxSpill();                           // same ESP-ring drain rule as below
+                if (progress && !progress(progCtx, res.received, 0)) { res.status = -1; goto done; }
+            }
+            deadline = make_timeout_time_ms(15000);
+            bool eof2 = false;
+            if (!readLine(c, line, sizeof(line), deadline, &eof2) || line[0] != '\0') {
+                if (eof2) {                                // closed right after chunk data
+                    Debug::log("HttpsGet: chunked EOF after data @%lu — accept",
+                               (unsigned long)res.received);
+                    chunkedDone = true;
+                    break;
+                }
+                Debug::log("HttpsGet: chunk framing error @%lu", (unsigned long)res.received);
+                res.status = -1; goto done;
+            }
+        }
+    } else
     while (total == 0 || res.received < total) {
         size_t want = HTTP_BUF_SZ;
         if (total && total - res.received < want) want = total - res.received;
         int n = c.rd(hb, want);
         if (n < 0) {  // read error (TLS alert, deadline, or dropped link)
-            Debug::log("HttpsGet: read err @%lu/%lu tlsErr=-0x%04x rxDrop=%lu",
+            // rxDrop = ZiFi 8 KB ring overflow; bufDrop = per-link rx_buf overflow.
+            // Both 0 on a USB-CDC MAC failure ⇒ loss is upstream (CDC FIFO / CH340
+            // overrun while tuh_task() was stalled), not in our pipeline.
+            Debug::log("HttpsGet: read err @%lu/%lu tlsErr=-0x%04x rxDrop=%lu bufDrop=%lu",
                        (unsigned long)res.received, (unsigned long)total,
                        c.tls ? -c.ts->lastError() : 0,
-                       (unsigned long)(ZiFi::rxDropped() - drop0));
+                       (unsigned long)(ZiFi::rxDropped() - drop0),
+                       (unsigned long)ZiFiSock::rxBufDropped());
             res.status = -1; goto done;
         }
         if (n == 0) { // EOF
@@ -190,7 +268,10 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
                 Debug::log("HttpsGet: EOF short @%lu/%lu", (unsigned long)res.received, (unsigned long)total);
             break;
         }
-        if (sink && !sink(sinkCtx, hb, n)) { res.status = -1; goto done; } // abort
+        // Sink abort is a caller decision (e.g. the speed test's time cap), not a
+        // transport error — keep the real HTTP status so the caller can tell the
+        // difference; res.ok stays false (only set on full completion below).
+        if (sink && !sink(sinkCtx, hb, n)) goto done;
         res.received += n;
         // Keep the ESP RX ring drained while we write this chunk to SD. With HTTPS,
         // mbedTLS hands back a whole decrypted record (up to 16 KB) and we drain it
@@ -203,7 +284,7 @@ HttpsGet::Result HttpsGet::get(const char* url, SinkCb sink, void* sinkCtx,
     }
 
     res.ok = (res.status >= 200 && res.status < 300) &&
-             (total == 0 || res.received == total);
+             (chunked ? chunkedDone : (total == 0 || res.received == total));
 #if ZIFI_NET_VERBOSE
     Debug::log("HttpsGet: done status=%d recv=%lu/%lu ok=%d rxDrop=%lu",
                res.status, (unsigned long)res.received, (unsigned long)total, res.ok,
@@ -244,9 +325,12 @@ HttpsGet::Result HttpsGet::getToFile(const char* url, const char* sdPath,
     // request from that offset. mbedTLS rejects a bad record whole, so `received`
     // always sits on a clean record boundary. Needs server Range support (206) —
     // GitHub Pages / Fastly do; a 200 (Range ignored) is detected and aborts.
+    // Chunked / connection-close bodies carry no length (total stays 0) — those
+    // are single-shot: complete only when get() saw proper termination (r.ok).
     const int  MAX_TRIES = 5;
     uint32_t   received  = 0;   // total good bytes written across attempts
-    uint32_t   total     = 0;   // full file size (from the first 200 response)
+    uint32_t   total     = 0;   // full file size (0 = unknown: chunked/conn-close)
+    bool       complete  = false;
     for (int attempt = 0; attempt < MAX_TRIES && fs.ok; attempt++) {
         Result r = get(url, fileSink, &fs, caPath, progress, progCtx,
                        attempt == 0 ? -1 : (long)received, -1);
@@ -262,15 +346,15 @@ HttpsGet::Result HttpsGet::getToFile(const char* url, const char* sdPath,
             fs.ok = false; break;
         }
         received += r.received;
-        if (r.ok && (total == 0 || received >= total)) break;   // complete
-        if (!total || received >= total) break;                 // nothing more to get / unknown size
+        if (r.ok && (total == 0 || received >= total)) { complete = true; break; }
+        if (!total || received >= total) break;                 // unknown size → can't resume
         Debug::log("HttpsGet: resume @%lu/%lu (attempt %d/%d)",
                    (unsigned long)received, (unsigned long)total, attempt + 1, MAX_TRIES);
     }
     fclose2(f);
     res.length   = total;
     res.received = received;
-    res.ok       = fs.ok && total != 0 && received >= total;
+    res.ok       = fs.ok && (complete || (total != 0 && received >= total));
     return res;
 }
 

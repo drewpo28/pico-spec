@@ -42,7 +42,7 @@ visit https://zxespectrum.speccy.org/contacto
 
 #if FONTFACE == 0 // original
 
-unsigned char Font6x8Pixels[] = {
+const unsigned char Font6x8Pixels[] = {
     0,   0,   0,   0,   0,   0, 0,   0,   0,   0,   0,   0, 0,   0,   0,   0,   0,   0, 0,   0,   0,   0,   0,   0,
     0,   0,   0,   0,   0,   0, 0,   0,   0,   0,   0,   0, 0,   0,   0,   0,   0,   0, 0,   0,   0,   0,   0,   0,
     0,   0,   255, 0,   0,   0, 0,   0,   255, 0,   0,   0, 0,   0,   255, 0,   0,   0, 0,   0,   255, 0,   0,   0,
@@ -904,7 +904,7 @@ const unsigned char Font6x8Pixels[] = {
 
 #if FONTFACE == 2 // imonlcd
 
-unsigned char Font6x8Pixels[] = {
+const unsigned char Font6x8Pixels[] = {
     0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   
     0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   
     0,   0,   0,   255, 0,   0,   0,   0,   255, 255, 255, 0,   0,   0,   255, 255, 255, 0,   0,   0,   0,   255, 0,   0,   

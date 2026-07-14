@@ -52,6 +52,8 @@ visit https://zxespectrum.speccy.org/contacto
 #include "wd1793.h"
 #include "sdcard.h"
 #include "diskio.h"
+#include "Debug.h"
+#include "UsbMsc.h"   // RP2040-safe: header provides inline stubs there
 #if !PICO_RP2040
 #include "DivMMC.h"
 #include "IDE.h"
@@ -71,21 +73,24 @@ string FileUtils::DSK_Path = "/";
 string FileUtils::ROM_Path = "/";
 string FileUtils::IMG_Path = "/";
 string FileUtils::ALL_Path = "/";
-DISK_FTYPE FileUtils::fileTypes[6] = {
+string FileUtils::DLS_Path = "/";
+DISK_FTYPE FileUtils::fileTypes[7] = {
 #if PICO_RP2040
     {".sna,.SNA,.z80,.Z80,.p,.P",2,2,0,""},
     {".tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3",2,2,0,""},
     {".trd,.TRD,.scl,.SCL",2,2,0,""},
-    {".rom,.ROM,.bin,.BIN",2,2,0,""},
+    {".rom,.ROM,.bin,.BIN,.zip,.ZIP",2,2,0,""},
     {".mmc,.MMC,.hdf,.HDF",2,2,0,""},
-    {".sna,.SNA,.z80,.Z80,.p,.P,.tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.trd,.TRD,.scl,.SCL",2,2,0,""}
+    {".sna,.SNA,.z80,.Z80,.p,.P,.tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.trd,.TRD,.scl,.SCL",2,2,0,""},
+    {".dls,.DLS",2,2,0,""}   // DISK_DLSFILE (GM.DLS; RP2040 has no GM.DLS MIDI but keep index parity)
 #else
     {".sna,.SNA,.z80,.Z80,.p,.P,.zip,.ZIP",2,2,0,""},
     {".tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.zip,.ZIP",2,2,0,""},
     {".trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.td0,.TD0,.mbd,.MBD,.pro,.PRO,.zip,.ZIP",2,2,0,""},
-    {".rom,.ROM,.bin,.BIN",2,2,0,""},
+    {".rom,.ROM,.bin,.BIN,.zip,.ZIP",2,2,0,""},
     {".mmc,.MMC,.hdf,.HDF,.hdd,.HDD,.vhd,.VHD,.iso,.ISO,.zip,.ZIP",2,2,0,""},
-    {".sna,.SNA,.z80,.Z80,.p,.P,.tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.td0,.TD0,.mbd,.MBD,.pro,.PRO,.mmc,.MMC,.hdf,.HDF,.zip,.ZIP",2,2,0,""}
+    {".sna,.SNA,.z80,.Z80,.p,.P,.tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.td0,.TD0,.mbd,.MBD,.pro,.PRO,.mmc,.MMC,.hdf,.HDF,.rom,.ROM,.bin,.BIN,.dls,.DLS,.zip,.ZIP",2,2,0,""},
+    {".dls,.DLS",2,2,0,""}   // DISK_DLSFILE (GM.DLS soundbank conversion)
 #endif
 };
 
@@ -175,30 +180,91 @@ bool FileUtils::mkdirParents(const char* path) {
 
 void FileUtils::initFileSystem() {
     SDReady = mountSDCard();
-    if (SDReady) {
-        f_mkdir("/tmp");
-        mkdirParents(CONFIG_DIR);
-        // User data (snapshots/screenshots) lives under visible /spec root.
-        f_mkdir(SPEC_DIR_ROOT);
-        f_mkdir(DISK_SCR_DIR);
-        f_mkdir(DISK_PSNA_DIR);
-        mkdirParents(CONFIG_DIR_BOARD);
+#if !PICO_RP2040
+    if (!SDReady) {
+        // No SD card — fall back to a USB flash stick as the default volume.
+        // SD is always the primary storage when a card is present; the stick
+        // becomes the root only when the SD probe failed. f_chdrive() makes
+        // every unprefixed path (CONFIG_DIR, /tmp, /spec, storage.nvs, ...)
+        // resolve on the stick, so no caller changes. The wait covers USB
+        // enumeration time: tuh_init already ran (main.cpp) but nothing has
+        // pumped tuh_task yet.
+        if (UsbMsc::waitReady(3000)) {
+            usbRoot = true;
+            f_chdrive("USB:");
+            fsMount = SDReady = true;
+            Debug::log("FileUtils: no SD card, USB stick is the root volume\n");
+        }
     }
+#endif
+    if (SDReady) {
+        ensureBootDirs();
+    }
+}
+
+// Create the directory tree pico-spec expects on the default volume. Split out
+// of initFileSystem so runtime automount (a card inserted after a card-less
+// boot) can bring the same structure online without a reboot.
+void FileUtils::ensureBootDirs() {
+    f_mkdir("/tmp");
+    mkdirParents(CONFIG_DIR);
+    // User data (snapshots/screenshots) lives under visible /spec root.
+    f_mkdir(SPEC_DIR_ROOT);
+    f_mkdir(DISK_SCR_DIR);
+    f_mkdir(DISK_PSNA_DIR);
+    mkdirParents(CONFIG_DIR_BOARD);
+}
+
+// Runtime SD automount: probe for a card only while the filesystem is offline
+// (booted with no card, and no USB stick took over as root). On the first
+// successful probe it mounts "SD:", creates the boot dir tree, and flips
+// fsMount/SDReady true so the OSD menus and file dialogs (which gate on fsMount
+// live) light up without a reboot. Returns true only on the tick the card
+// comes online, so the caller can run the one-shot follow-up (disk mounts,
+// notice). The physical probe is a few ms with no card (a single failed CMD0),
+// so callers must still throttle it — never call this every frame.
+bool FileUtils::automountSD() {
+    if (fsMount || usbRoot) return false;   // already online (SD or USB-as-root)
+    if (!mountSDCard()) return false;       // still no card
+    ensureBootDirs();
+    SDReady = true;                         // fsMount set by mountSDCard()
+    Debug::log("FileUtils: SD card detected at runtime, automounted\n");
+    return true;
 }
 
 static FATFS fs;
 bool FileUtils::fsMount = false;
+bool FileUtils::usbRoot = false;
 bool FileUtils::mountSDCard() {
     // f_mount with opt=1 is delayed mount — always succeeds without touching the card.
     // Probe the physical drive up front so absence of a card is detected here instead of
     // blocking the first FatFS call later (e.g. OSD SaveRect.clear → f_unlink → 500 ms SPI stall per op).
     if (disk_initialize(0) & STA_NOINIT) { fsMount = false; return false; }
-    fsMount = f_mount(&fs, "SD", 1) == FR_OK;
+#if PICO_RP2040
+    // RP2040 is single-volume (FF_VOLUMES=1, no USB MSC, no FF_STR_VOLUME_ID) —
+    // mount the default drive with an empty path. "SD:" would not parse without
+    // FF_STR_VOLUME_ID and the mount would fail.
+    fsMount = f_mount(&fs, "", 1) == FR_OK;
+#else
+    // "SD:" with the colon — with FF_FS_RPATH a bare "SD" parses as "no volume
+    // prefix" and would target the CURRENT volume instead.
+    fsMount = f_mount(&fs, "SD:", 1) == FR_OK;
+#endif
     return fsMount;
 }
 
 void FileUtils::unmountSDCard() {
-    f_unmount("SD");
+#if PICO_RP2040
+    f_unmount("");
+#else
+    f_unmount(usbRoot ? "USB:" : "SD:");
+#endif
+}
+
+bool FileUtils::waitVolumeReady(const string& path) {
+    if (path.compare(0, 4, "USB:") != 0) return true;   // SD — always there by now
+    if (UsbMsc::ready()) return true;
+    return UsbMsc::waitReady(3000);
 }
 
 bool FileUtils::checkSDCard() {
@@ -208,10 +274,25 @@ bool FileUtils::checkSDCard() {
 }
 
 bool FileUtils::remountSD() {
-    // Unmount FatFS and force full SD card reinit
-    f_mount(NULL, "SD", 0);
-    disk_invalidate();
-    if (!mountSDCard()) return false;
+#if !PICO_RP2040
+    if (usbRoot) {
+        // USB-as-root: there is no SD card to remount. The volume itself
+        // recovers via the re-plug callback (deferred f_mount); just verify
+        // the stick is back and fall through to reopening the files.
+        if (!UsbMsc::ready()) return false;
+        fsMount = true;
+    } else
+#endif
+    {
+        // Unmount FatFS and force full SD card reinit
+#if PICO_RP2040
+        f_mount(NULL, "", 0);   // single-volume: default drive
+#else
+        f_mount(NULL, "SD:", 0);
+#endif
+        disk_invalidate();
+        if (!mountSDCard()) return false;
+    }
 
     // Reopen WD1793 disk image files
     rvmWD1793 &wd = ESPectrum::fdd;

@@ -422,7 +422,16 @@ private:
   bool                      m_keyboardAvailable;  // self test passed and support for scancode set 2
 
 ///  TaskHandle_t              m_SCodeToVKConverterTask; // Task that converts scancodes to virtual key and populates m_virtualKeyQueue
-  std::queue<VirtualKeyItem>m_virtualKeyQueue;
+  // Fixed static ring buffer for virtual-key events (replaces std::queue<deque>):
+  // a key push must NEVER allocate. On a near-zero-heap machine (Profi DS80 +
+  // GM.DLS MIDI) the old deque chunk allocation panicked ("Out of memory").
+  // Drained every frame by ESPectrum::processKeyboard(), so 32 slots never fill
+  // under human input; on overflow the newest event is dropped (key state is also
+  // tracked in m_VKMap, so isVKDown stays correct).
+  static constexpr int       VK_QUEUE_CAP = 32;
+  VirtualKeyItem             m_vkRing[VK_QUEUE_CAP];
+  uint16_t                   m_vkHead  = 0;   // index of the oldest queued item
+  uint16_t                   m_vkCount = 0;   // number of queued items
 
   // allowed values: 1, 2 or 3
   // If virtual keys are enabled only 1 and 2 are possible. In case of scancode set 1 it is converted from scan code set 2, which is necessary

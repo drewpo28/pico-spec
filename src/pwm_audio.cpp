@@ -289,6 +289,22 @@ static bool hw_get_bit_LOAD() {
 #endif
 
 void init_sound() {
+#ifdef LOAD_WAV_PIO
+    // Audio (tape) input pin — independent of the audio OUTPUT path, so init it
+    // first. Must run for every output mode, including HDMI: the HDMI branch
+    // below returns early, and leaving this at the end meant the input GPIO was
+    // never configured in HDMI mode, breaking tape-in.
+    //пин ввода звука (не инициализировать если MIDI использует тот же пин)
+#if defined(PICO_RP2350) && defined(MIDI_TX_PIN) && (LOAD_WAV_PIO == MIDI_TX_PIN)
+    if (Config::midi != 1 && Config::midi != 2)
+#endif
+    {
+#if !PICO_RP2040
+        if (!BoardPins::zifiOwnsPin(LOAD_WAV_PIO)) // yield WAV input pin to ZiFi
+#endif
+            inInit(LOAD_WAV_PIO);
+    }
+#endif
 #if !PICO_RP2040 && defined(VGA_HDMI)
     // Buffers (~36.9 KB) are allocated/freed by HdmiAudioSubsys::apply() at
     // the next Subsystems::applyPending() — both init_sound() call sites are
@@ -348,7 +364,23 @@ void init_sound() {
     } else {
         if (link_i2s_code == 0xFF) {
             if (I2S_BCK_PIO != I2S_LCK_PIO && I2S_LCK_PIO != I2S_DATA_PIO && I2S_BCK_PIO != I2S_DATA_PIO) {
+                // Drain residual charge before probing: after a warm restart the
+                // PWM board's RC filter caps can hold GP26/27 high, so testPins
+                // reads 1 even under pull-down (code 0x1F) and falsely selects
+                // I2S — PIO bitstream into the analog amp, loud distorted boot.
+                gpio_init(I2S_DATA_PIO);
+                gpio_set_dir(I2S_DATA_PIO, GPIO_OUT);
+                gpio_put(I2S_DATA_PIO, 0);
+                gpio_init(I2S_BCK_PIO);
+                gpio_set_dir(I2S_BCK_PIO, GPIO_OUT);
+                gpio_put(I2S_BCK_PIO, 0);
+                sleep_ms(50);
+                gpio_deinit(I2S_DATA_PIO);
+                gpio_deinit(I2S_BCK_PIO);
                 link_i2s_code = testPins(I2S_DATA_PIO, I2S_BCK_PIO);
+                // A pin reading HIGH under pull-down (bits 4/2) is back-fed by
+                // external circuitry, not a floating I2S input — never I2S.
+                if (link_i2s_code & 0b10100) link_i2s_code = 0;
                 is_i2s_enabled = link_i2s_code; // TODO: ensure
             }
         }
@@ -366,18 +398,6 @@ void init_sound() {
             /// PWM_init_pin(BEEPER_PIN, (1 << 8) - 1);
         }
     }
-#ifdef LOAD_WAV_PIO
-    //пин ввода звука (не инициализировать если MIDI использует тот же пин)
-#if defined(PICO_RP2350) && defined(MIDI_TX_PIN) && (LOAD_WAV_PIO == MIDI_TX_PIN)
-    if (Config::midi != 1 && Config::midi != 2)
-#endif
-    {
-#if !PICO_RP2040
-        if (!BoardPins::zifiOwnsPin(LOAD_WAV_PIO)) // yield WAV input pin to ZiFi
-#endif
-            inInit(LOAD_WAV_PIO);
-    }
-#endif
 }
 
 #if LOAD_WAV_PIO

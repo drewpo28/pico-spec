@@ -36,33 +36,39 @@ visit https://zxespectrum.speccy.org/contacto
 #ifndef ROMS_H
 #define ROMS_H
 
-#include "roms/romSinclair48K.h"
-#include "roms/rom48Kspanish.h"
-#include "roms/rom48Kcustom.h"
-#include "roms/romSinclair128K.h"
-#include "roms/rom128Kspanish.h"
-#include "roms/romPlus2.h"
-#include "roms/RomPlus2spanish.h"
-#include "roms/rom128Kcustom.h"
-#include "roms/S128_ZX81+_ROM.h"
+#include "roms/48k/romSinclair48K.h"
+#include "roms/48k/rom48Kcustom.h"
+#include "roms/128k/romSinclair128K.h"
+#include "roms/128k/rom128Kspanish.h"
+#include "roms/128k/romPlus2.h"
+#include "roms/128k/RomPlus2spanish.h"
+#include "roms/128k/rom128Kcustom.h"
+#include "roms/128k/S128_ZX81+_ROM.h"
 
-#include "romByte48k.h"
+#include "roms/48k/byte/romByte48k.h"
 #include "romGluk.h"
 #include "roms/romSTS75.h"
 
-#ifndef NO_ALF
-extern "C" const unsigned char gb_rom_Alf_cart[];
+#if !PICO_RP2040
+// gb_rom_Alf_cart (built-in "Elf-1") removed — ALF carts are served lazily from SD
+// (see AlfCart). gb_rom_Alf = ALF system ROM; gb_rom_Alf_ep = open-bus filler.
 extern "C" const unsigned char gb_rom_Alf[];
 extern "C" const unsigned char gb_rom_Alf_ep[];
 #endif
 extern "C" unsigned char gb_rom_4_trdos_505d[];
-extern "C" unsigned char gb_rom_4_trdos_503[];
-extern "C" unsigned char gb_rom_4_trdos_504tm[];
+// gb_rom_4_trdos_503 / _504tm are no longer raw arrays: they are stored as small
+// read-only overlays over 5.05D (src/roms/trdos/, tools/rom_pack.py) and applied on
+// the fly by MemESP (see RomOverlay.h) — no RAM copy, no flash write, no reboot.
+#include "roms/trdos/trdos_overlays.h"
+#include "roms/48k/48k_overlays.h"
+#include "roms/128k/128k_overlays.h"
+#include "roms/pentagon/pentagon_overlays.h"
 extern "C" const unsigned char gb_rom_4_trdos_custom[];
-extern "C" const unsigned char gb_rom_pentagon_128k[];
+// gb_rom_pentagon_128k (32K blob) removed: Pentagon is a 101-byte overlay over the
+// Sinclair 128K base now (roms/pentagon/). Custom Pentagon uses the 128K custom slot.
 #if !PICO_RP2040
 extern "C" unsigned char gb_rom_esxdos[];
 extern "C" unsigned char gb_rom_esxide[];
 #endif
-#include "roms/romProfi.h"
+#include "roms/profi/romProfi.h"
 #endif

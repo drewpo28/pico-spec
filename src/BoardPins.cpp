@@ -99,12 +99,15 @@ bool resolveZifiPins(uint8_t cfg_tx, uint8_t cfg_rx, uint8_t& out_tx, uint8_t& o
 }
 
 bool zifiOwnsPin(uint8_t pin) {
-    // The pins belong to ZiFi whenever it's actively using them — i.e. the NIC is
-    // enabled, OR the ESP UART link is currently up (WiFi downloads/RTC use the
-    // link with the NIC off). Gating only on zifi_enabled meant a soft reset's
-    // init_sound() re-claimed the shared audio pins (GP26/27 on MURM1_P2) and
-    // silently killed a live WiFi link until a full reboot.
-    if (!Config::zifi_enabled && !ZiFi::linkUp()) return false;
+    // The pins belong to ZiFi whenever it's — or WiFi is — using (or about to use)
+    // them: the NIC is enabled, WiFi is enabled (the boot auto-connect runs ~4 s in
+    // and will grab the UART, so conflicting peripherals must yield at boot BEFORE
+    // that), OR the ESP UART link is already up. Gating only on zifi_enabled meant a
+    // soft reset's init_sound() re-claimed the shared audio pins (GP26/27 on
+    // MURM1_P2) and silently killed a live WiFi link until a full reboot; gating
+    // without wifi_enabled meant a WiFi-only setup (NIC off) lost the boot pin race
+    // to NESPAD on boards whose default UART pair overlaps it (MURM2/PICO_PC 20/21).
+    if (!Config::zifi_enabled && !Config::wifi_enabled && !ZiFi::linkUp()) return false;
     uint8_t tx, rx;
     if (!resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, tx, rx)) return false;
     return pin == tx || pin == rx;

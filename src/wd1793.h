@@ -45,6 +45,10 @@ THE SOFTWARE.
 #define kRVMwdDiskOutTrack0 0x80
 #define kRVMwdDiskOutIndex 0x20
 
+// Matches LED::DECAY_FRAMES (LEDIndicators.h) so the FDD lamp/glyph/hum decay at
+// the same rate as every other on-screen activity indicator.
+#define FDD_ACTIVE_DECAY_FRAMES 12
+
 #define TRACKHEADER 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, \
                     0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, \
                     0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, 0x4e, \
@@ -342,6 +346,16 @@ typedef struct
     int wtrackmark, wtracksector;
 
     uint8_t fdd_clicks;  // Pending step clicks count
+    // Frames remaining since the last genuine head-load/header-search/data-transfer
+    // event (real disk-rotation activity — see the state-machine sites in wd1793.cpp
+    // that set it to FDD_ACTIVE_DECAY_FRAMES). Decremented once per frame by
+    // LED::decay() (LEDIndicators.cpp), so it self-clears like the other LED activity
+    // counters. Deliberately NOT set by raw command-register writes (see Ports.cpp'
+    // LED::touchW on reg 0), so bus-probing software that issues WD1793 commands
+    // without ever moving a real byte doesn't keep the motor-hum/lamp alive. Drives
+    // the audio motor-hum, the corner FDD lamp, and the FDD glyph in the LED
+    // indicator strip — all three read this instead of LED::readActive/writeActive.
+    uint8_t fdd_active_decay;
 
 #if !PICO_RP2040
     uint8_t* diskTrackBuf;        // MFM track buffer (DISK_TRACK_BUF_SZ); heap-allocated
@@ -357,9 +371,33 @@ typedef struct
     int      fdiSectorCount;       // sector count on current track
     uint32_t fdiTstates;           // intra-command byte offset (for find_marker progression)
     bool     fdiDataCrcError;      // matched sector has CRC error
+
+    // Deferred track load (idle-window SD I/O — see wdIdleIO in wd1793.cpp).
+    // While pending, the MFM buffer still holds the PREVIOUS track: disk
+    // rotation and the whole per-step state machine are frozen (the guest just
+    // sees a longer address-mark search; WD-side timeouts count index pulses,
+    // which are frozen too).  The actual SD read runs in the frame's idle
+    // window (wdIdleIO) or, if idle stays too small, as an in-frame fallback
+    // after WD_DEFER_FALLBACK_US.
+    uint8_t  trackLoadPending;     // 1 = a data-state step needs pendCyl/pendSide
+    uint8_t  pendCyl;
+    uint8_t  pendSide;
+    uint8_t  pendUnit;             // diskS at registration (revalidated at load)
+    uint64_t pendSince;            // wall-clock µs when this target was registered
 #endif
 
 } rvmWD1793;
+
+#if !PICO_RP2040
+// Per-frame enable for deferred track loads (set by ESPectrum::loop: Profi
+// arch and not maxSpeed).  When false, wdTrackReady() loads blocking in-frame
+// exactly as before — TR-DOS/Pentagon and maxSpeed behaviour is unchanged.
+extern bool g_wdDeferLoads;
+// Run pending WD1793 SD I/O (deferred track load / PRO flush + f_sync) inside
+// the frame's idle window.  deadline_us = absolute time_us_64() budget; the
+// call does nothing when the estimated cost does not fit.
+void wdIdleIO(rvmWD1793 *wd, uint64_t deadline_us);
+#endif
 
 void _do(rvmWD1793 *wd);
 void rvmWD1793Write(rvmWD1793 *wd, uint8_t a, uint8_t v);

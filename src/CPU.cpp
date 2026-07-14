@@ -45,6 +45,9 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Debug.h"
 #include "Z80DMA.h"
 #if !PICO_RP2040
+#include "ZiFi.h"
+#endif
+#if !PICO_RP2040
 #include "DivMMC.h"
 #endif
 
@@ -62,6 +65,7 @@ uint32_t CPU::tstates_diff = 0;
 // Frame timing accumulators (µs); read+reset in VIDEO::EndFrame diagnostic.
 volatile uint32_t cpu_frame_us  = 0;  // total CPU::loop() time (incl. FDC)
 volatile uint32_t fdd_step_us   = 0;  // time inside rvmWD1793Step only
+volatile uint32_t endframe_us   = 0;  // last VIDEO::EndFrame() duration (main path)
 
 uint64_t CPU::global_tstates = 0;
 uint32_t CPU::statesInFrame = 0;
@@ -84,7 +88,7 @@ bool Z80Ops::is1024 = false;
 bool Z80Ops::isProfi = false;
 
 void CPU::updateStatesInFrame() {
-#if !NO_ALF
+#if !PICO_RP2040
     Z80Ops::isALF = (Config::arch == "ALF");
 #endif
     // Early/Late ULA timing: Early=latetiming=0, Late=latetiming=1.
@@ -136,7 +140,7 @@ void CPU::reset() {
 
     CPU::latetiming = Config::AluTiming;
 
-#if !NO_ALF
+#if !PICO_RP2040
     Z80Ops::isALF = (Config::arch == "ALF");
 #endif
     if (Config::arch == "48K") {
@@ -211,6 +215,7 @@ void CPU::reset() {
             Config::save();
         }
         VIDEO::mode16col_enabled = false;
+        VIDEO::free16colLut();   // release the LUT — 16col now off (0 SRAM)
     }
 #endif
 
@@ -257,10 +262,20 @@ IRAM_ATTR void CPU::loop() {
         Z80::execute();
         Z80::doNMI();
     }
+#if !PICO_RP2040
+    // ZiFi over USB-CDC: service the host stack mid-frame (~1 kHz) even while the
+    // guest isn't touching the ZiFi ports — see ZiFi::cdcPump(). The cadence check
+    // costs one compare per instruction, same class as the dma_mode check below.
+    uint32_t zifi_pump_due = tstates + 3500; // ~1 ms at 3.5 MHz guest clock
+#endif
     while (tstates < IntEnd) {
         Z80::execute();
 #if !PICO_RP2040
         if (Config::dma_mode) Z80DMA::handleDMA();
+        if (ZiFi::cdcNicActive && tstates >= zifi_pump_due) {
+            zifi_pump_due = tstates + 3500;
+            ZiFi::cdcPump();
+        }
 #endif
         BREAKPOINTS
     }
@@ -278,10 +293,18 @@ IRAM_ATTR void CPU::loop() {
         Z80::execute();
 #if !PICO_RP2040
         if (Config::dma_mode) Z80DMA::handleDMA();
+        if (ZiFi::cdcNicActive && tstates >= zifi_pump_due) {
+            zifi_pump_due = tstates + 3500;
+            ZiFi::cdcPump();
+        }
 #endif
         BREAKPOINTS
     }
-    VIDEO::EndFrame();
+    {
+        uint64_t _ef_t0 = time_us_64();
+        VIDEO::EndFrame();
+        endframe_us = (uint32_t)(time_us_64() - _ef_t0);
+    }
 
     CPU::tstates_diff += CPU::tstates - CPU::prev_tstates;
 
@@ -386,7 +409,7 @@ IRAM_ATTR uint8_t Z80Ops::fetchOpcode() {
         if (pg == 0 && MemESP::divmmc_mapped) {
             opCode = (pc < 0x2000) ? MemESP::page0_lo[pc] : MemESP::page0_hi[pc & 0x1FFF];
         } else {
-            opCode = MemESP::ramCurrent[pg][pc & 0x3fff];
+            opCode = MemESP::romPeek(pg, MemESP::ramCurrent[pg], pc & 0x3fff);
         }
         DivMMC::postOpcFetch();
         return opCode;
@@ -396,7 +419,7 @@ IRAM_ATTR uint8_t Z80Ops::fetchOpcode() {
         return (pc < 0x2000) ? MemESP::page0_lo[pc] : MemESP::page0_hi[pc & 0x1FFF];
     }
 #endif
-    return MemESP::ramCurrent[pg][pc & 0x3fff];
+    return MemESP::romPeek(pg, MemESP::ramCurrent[pg], pc & 0x3fff);
 }
 
 // // Write byte to RAM

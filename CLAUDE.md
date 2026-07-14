@@ -60,6 +60,60 @@ Flattened from CSAAFreq, CSAANoise, CSAAEnv, CSAAAmp, CSAADevice into a single c
 - `cmake --build build` from project root
 - SAASound.cpp compiled with `-O3 -ffast-math -funroll-loops`
 
+## SPI PSRAM driver (drivers/psram/psram_spi.*)
+
+- **Two PSRAM back-ends, not abstracted**: PIO SPI PSRAM (accessor API, active
+  **only on MURM1**) vs "butter" QSPI on RP2350 XIP CS1 (memory-mapped
+  `PSRAM_DATA @0x11000000`, hardware QMI, quad 0xEB/0x38, XIP cache —
+  `src/main.cpp psram_init/psram_retiming`). Higher layers branch on
+  `psram_size()` vs `butter_psram_size()`.
+- **PIO-QSPI (`qspi_psram` program) is intentionally unused**: no board routes 4
+  SIO lines to the SPI PSRAM (MURM1 wires only MOSI/MISO); RP2350 quad goes via
+  QMI. Kept with a "what enabling takes" note in psram_spi.pio.
+- **Burst API**: `psram_read_range`/`psram_write_range` (any length; ≥32 bytes →
+  single-CS transfers via the 32-bit-counter PIO program, chunked to
+  `PSRAM_TCEM_MAX`=56 bytes per CS to honor the APS6404 tCEM spec (CS low ≤8µs
+  — refresh is suspended while CS is asserted); smaller → 8-bit program
+  31/27-byte chunks). `readpsram`/`writepsram` are aliases of the range calls
+  (were per-byte loops — never reintroduce per-byte PSRAM loops: one SPI byte
+  transaction costs ~57 SCK cycles + 2 DMA setups). `psram_read_page`/`write_page`
+  = 16KB wrappers over the chunked range calls (used by MemESP from_vram/to_vram);
+  `psram_write_page_async` is now a synchronous alias — the fire-and-forget
+  single-CS 16KB write was retired with the tCEM cap.
+- **Cross-core safety (hw-confirmed 2026-07-06; root cause of the GS "504 MHz
+  sound lottery" — see gs_spi_tcem_read_glitch memory). Three invariants, all
+  load-bearing, never regress:**
+  (1) command scratch buffers in psram_spi.h are PER-CORE (`[get_core_num()]`)
+  — they are filled BEFORE the lock, and a shared buffer let core0/core1 tear
+  each other's address/data bytes;
+  (2) `psram_write` sends header+payload under ONE lock — splitting them lets
+  the other core's bytes be consumed as this write's payload (PIO byte-stream
+  desync, arbitrary-address corruption both ways);
+  (3) `psram_sm_switch` / `psram_update_clkdiv` DRAIN the SM (TX FIFO empty +
+  TXSTALL) before clear/restart/re-clock — DMA-blocking writes return at
+  DMA-finish while the SM is still clocking out the tail, and `clear_fifos`
+  truncated cross-core writes mid-CS (GS firmware RAM test: 1-4 of 63 pages
+  under swap load before the fix, 63/63 after; audible as garbled/absent GS
+  sound scaling with sys_clk).
+- **SCK (MURM1)**: target `PSRAM_MAX_SCK_MHZ=94` → clkdiv 2.0 at sys 378 → SCK
+  94.5 MHz (integer divider, clean waveform; fractional divider = jitter =
+  corruption on APS6404 — never allow one; `psram_update_clkdiv()` rounds to
+  int). `init_psram()` runs an at-speed write/verify memtest and drops to
+  `PSRAM_FALLBACK_SCK_MHZ=63` automatically if the chip fails. At >83 MHz the
+  fudge PIO program (falling-edge sampling) is auto-selected.
+- **Locking**: all transfers take the `PSRAM_SPINLOCK` (cross-core, GS on
+  core1). Long single-CS bursts use the IRQ-PRESERVING lock — never hold IRQs
+  off during a 16KB transfer (VGA DMA IRQ starves → monitor loses signal).
+- **tCEM**: fixed 2026-07-06 — all bursts are now ≤56 bytes per CS (≤8µs at
+  SCK 63). The old single-CS 16KB transfers (~2ms CS low) are gone; page swaps
+  are correspondingly somewhat slower (re-optimizing chunk size / restoring
+  async on top of tCEM-sized chunks is a possible follow-up).
+- **MemESP snapshot paths** (`from_file/to_file/from_mem/cleanup`) transfer via
+  a malloc'd 1KB bounce (gated on `getLargestAllocatable()`, per-byte fallback
+  on tight heap — pico malloc panics on OOM).
+- On-hardware benchmark: OSD → Memory Info measures SPI PSRAM MB/s via the
+  range functions (`OSDMain.cpp`).
+
 ## RP2040 Memory Constraints (ZERO target)
 
 ### Key facts
@@ -292,6 +346,140 @@ Port low byte `0xEF`; high address byte = register. Gated by `Config::zifi_enabl
 - **Per-board candidate pairs** + defaults live in `BoardPins.cpp` (`#if PICO_DV/MURM2/PICO_PC/ZERO2/#else MURM1_P2`). Defaults: PICO_DV 0/1, MURM2 20/21, PICO_PC 20/21, ZERO2 24/25, MURM1_P2 16/17.
 - **Picker**: Network → first row `GPIO x/y` (or `GPIO Off`, `(def)` suffix when unset) → submenu listing `Off` + each board pair with a note (what it displaces, e.g. "off: NESPAD"). On select: save + `ZiFi::deinit()/init()` if NIC on. `BoardPins` is the reusable home for board pin-maps (extend for MIDI etc.).
 - **Yield-at-boot**: when a chosen pair shares pins with a peripheral (non-empty note), ZiFi has priority — at boot each conflicting peripheral calls `BoardPins::zifiOwnsPin(pin)` and **skips its own init** if ZiFi owns it: NESPAD (`main.cpp`, moved after `Config::load`, gated by `nespad_active`), MIDI (`ESPectrum.cpp` `Midi::enabled=0`), WAV (`pwm_audio.cpp` skip `inInit`), PCM5122 (`pwm_audio.cpp` skip I2S), AY-clock (`PinSerialData_595.c` via `extern "C" board_zifi_owns_pin`). The displaced peripheral only releases pins at boot, so selecting a conflicting pair **or** enabling the NIC with a conflicting default prompts `OSD_DLG_APPLYREBOOT` (`BoardPins::zifiActiveNote()` non-empty). Defaults that conflict by design: MURM2/PICO_PC 20/21 = NESPAD, MURM1_P2 16/17 = NESPAD.
+
+### Baud ceilings (transport-dependent, `src/ZiFi.cpp`)
+
+- Menu (Network → Baud) offers 115200/230400/460800/921600; the link idles at
+  `nicSafeBaud()` and paused host sessions (FTP/HTTPS/SSH) `boostBaud()` to the
+  configured rate.
+- **GPIO UART**: NIC (live Z80) ceiling `ZIFI_NIC_MAX_BAUD=230400` (hw-found: RX-IRQ
+  starvation above). Boost unclamped — 921600 (~92 KB/s) hw-verified.
+- **USB-CDC** (`Config::zifi_transport==1`): boost ceiling `ZIFI_CDC_MAX_BAUD` is
+  **921600** since the vendored TinyUSB 0.21 (host bulk drain ~0.9 MB/s — the old
+  ≤0.20 driver drained ~64 KB/s, which overran the CH340's ~256 B internals above
+  460800 and was the original clamp reason; 460800 hw-confirmed working, incl. FTP
+  download). 921600-over-CDC pending hw-confirm — a CH340 drop shows as Ftp::get
+  rx_dropped/short-transfer retries; revert to 460800 if it flakes. NIC (live Z80)
+  ceiling on CDC = **230400, same as UART** (`ZIFI_NIC_MAX_BAUD_USB`) — the
+  hw-proven value; higher untested since cdcPump landed (possible follow-up).
+- **Live NIC over CDC requires `ZiFi::cdcPump()` (hw-confirmed 2026-07-06, fixed
+  "MRF hangs on USB")**: CDC has no RX IRQ — every 64 B IN transfer needs a
+  tuh_task() pass to re-arm the endpoint, and the CH340 holds only ~256 B ≈ 11 ms
+  at 230400. With only the per-frame ZiFi::tick (20 ms) MRF's AT handshake missed
+  every poll window and +IPD bursts were truncated. cdcPump (~1 kHz,
+  self-rate-limited) has THREE call sites and **ALL THREE are load-bearing**
+  (removing any one re-broke MRF on hw):
+  (1) guest ZiFi port reads (`ZiFi::read`/`uart16550Read`) — the ONLY pump inside
+  `Z80::exec_nocheck()`, which runs MOST of each frame with no per-instruction
+  checks (removing this as "redundant with the CPU::loop hook" was exactly the
+  regression);
+  (2) CPU::loop every ~3500 T-states (`cdcNicActive`) — covers the checked
+  while-loops (INT window + frame tail) where exec_nocheck doesn't run;
+  (3) ESPectrum::loop frame-pacing waits (v-sync spin / idle delay, up to ~13 ms).
+  No-op on GPIO UART and RP2040.
+- **Do NOT raise `CFG_TUH_CDC_RX_EPSIZE` above 64 for serial dongles**
+  (hw 2026-07-06): 512 made multi-packet IN transfers chain through the
+  double-buffered EPX, but the CH340's constant SHORT packets through the
+  ping-pong buffers delivered CORRUPTED data (MRF page = garbage, counters
+  clean — no drops, wrong bytes). Multi-packet RX is for full-packet sources
+  (MSC) only.
+- FTP **upload** over CDC is much slower than download at the same baud — that's
+  not the link rate: `sock_send`/chanSend pays an AT+CIPSEND `>`-prompt +
+  "SEND OK" round-trip per ~2 KB chunk, so upload is handshake-bound. Raising
+  baud barely moves it; fixing it means bigger send chunks or pipelining CIPSEND.
+
+## USB flash stick (MSC host → FatFs volume "USB:")
+
+RP2350-only (`CFG_TUH_MSC` gated on `PICO_RP2350` in tusb_config.h; RP2040 keeps
+MSC off + `CFG_TUH_DEVICE_MAX 5`). NOT hw-confirmed yet.
+
+- **FatFs two volumes**: `FF_VOLUMES=2`, `FF_STR_VOLUME_ID=1`, `VolumeStr {"SD","USB"}`
+  (ffconf.h). Unprefixed paths → current volume (normally SD) — zero changes for
+  existing code; `"USB:/..."` paths flow through `fopen2`/`f_open` everywhere
+  (TAP/TRD/SNA/ROM/ZIP loaders work from the stick untouched).
+- **USB-as-root fallback**: no SD card at boot → `FileUtils::initFileSystem` waits
+  up to 3 s for a stick (`UsbMsc::waitReady` pumps tuh_task — nothing else pumps
+  that early) then `f_chdrive("USB:")` + `FileUtils::usbRoot=true` — all unprefixed
+  paths (CONFIG_DIR, /tmp, /spec, storage.nvs) transparently land on the stick.
+  SD always wins when a card is present. Requires `FF_FS_RPATH=1` +
+  `FF_PATH_DEPTH=16`. **exFAT depth trap** (hw-confirmed, was "video-mode switch
+  fails only on USB"): with RPATH on, FatFs's follow_path() on an **exFAT** volume
+  records every descended sub-dir into a `tbl[FF_PATH_DEPTH+1]` chain and returns
+  `FR_NOT_ENOUGH_CORE` once the path is deeper — so FF_PATH_DEPTH caps EVERY
+  absolute path on exFAT, not just f_chdir. `FF_PATH_DEPTH=1` broke every write to
+  a big (exFAT) USB stick: the 4-deep config dir couldn't be created, so
+  `Config::save()` silently fell back to a RAM buffer and nothing persisted (SD is
+  usually FAT32, where this code never runs — hence "USB only"). Keep it ≥ the
+  deepest path (config tree is 4; 16 also covers deep browsing).
+  **CAUTION**: with RPATH a volume name without a colon parses as "no prefix" =
+  current volume — always spell `"SD:"`/`"USB:"` in f_mount/f_unmount. In usbRoot
+  mode the F5 chooser hides the USB row and relabels Local→"USB Drive"; stick
+  unplug/replug toggles `fsMount` (menus degrade like no-SD); `remountSD()` skips
+  the SD reinit and just re-verifies `UsbMsc::ready()`.
+- **Boot-race guard for remembered "USB:/..." paths**: boot-time reopeners
+  (`Config::loadDiskMounts`, `Tape::LoadRemembered`, DivMMC/IDE image opens) run
+  in `ESPectrum::setup` BEFORE anything pumps tuh_task — the stick hasn't
+  enumerated, the open fails, and the next `Config::save()` would persist the
+  empty live state (paths "not saved"). Every such site calls
+  `FileUtils::waitVolumeReady(path)` first (pumps up to 3 s for "USB:" paths,
+  no-op otherwise). Stick truly absent → reopen skipped, like a deleted SD file.
+- **Throughput: ~64 KB/s cap SOLVED by TinyUSB 0.21 (hw-confirmed 2026-07-06,
+  PICO_DV)**. The old cap: TinyUSB ≤0.20 (SDK 2.2.0 bundles 0.18) moves bulk data
+  at ~1 packet (64 B) per 1 ms SOF frame → USB MSC hard-capped at 0.05–0.06 MB/s
+  regardless of block size (one 32 KB read10 = 558 ms ≈ 64 single-sector reads;
+  not the block size / FatFs / stick — the HCD). TinyUSB **0.21.0** reworked the
+  RP2 HCD ("EPX for non-interrupt endpoints + ping-pong double buffering") and
+  Speed Test jumped to **0.89 MB/s rd / 0.75 MB/s wr** (~15×, near the FS-bulk
+  theoretical ≈1.2 MB/s). TinyUSB 0.21 is **vendored at `external/tinyusb`**
+  (subset: LICENSE, src/, hw/bsp/rp2040 + family_support) and is the default via
+  `PICO_TINYUSB_PATH` set before `pico_sdk_init` — every build gets the fast HCD.
+  **The vendored copy DIVERGES from the 0.21.0 tag — grep `PICO-SPEC PATCH` and
+  read this before re-vendoring/upgrading!**
+  (a) `hcd_rp2040.c` + `rp2040_usb.c` are REPLACED with Rumbledethumps' rewritten
+  host driver from picocomputer/rp6502 (`vendor/tinyusb_rp6502`, the author of
+  upstream issue #3533) — fixes the silicon quirk family the stock 0.21 driver
+  panics on: shared EPX/interrupt-EP handshake latches (false RX_TIMEOUT /
+  DATA_SEQ_ERROR while a keyboard poll is in flight → `panic("Data Seq Error")`
+  and dongle re-enumeration loops), interrupt-poll suppression around EPX
+  transactions, DATA_SEQ-before-BUFF_STATUS ordering, working abort/close, EP0
+  MPS tracking per device. Both hw-hit here as whole-firmware panics with ZiFi
+  CDC streaming + machine reset + keyboard.
+  (b) On top, `rp2040_usb.c` `bufctrl_write32/16` are patched to
+  disarm-and-continue in HOST mode on a stale AVAILABLE (leftover of an
+  errored/aborted EPX transfer, upstream #3533/#3602 — was
+  `panic("buf_ctrl ... already available")`, whole firmware down);
+  `rp2usb_stale_avail_fixups` counts, device mode keeps the panic.
+  (c) TU_ASSERT's bkpt is routed to a counting no-op (`CFG_TUSB_DEBUG_BREAKPOINT`
+  in tusb_config.h → `g_tusb_assert_count` in main.cpp) — otherwise every
+  recoverable assert freezes attached-debugger sessions.
+  Diagnostics: the ZiFi 1 Hz `ZiFi CDC:` console line reports tx/rx/drop/queues +
+  the stale/assert counters.
+  Source compat: `usbh_class_driver_t::open` returns consumed length on 0.21+
+  (version-gated shim in `xinput_host.h`) and `ps2kbd_mrmltr.cpp` needs its own
+  `<cstdio>` (printf leaked transitively from ≤0.18 tusb headers). Still pending:
+  long-run regression keyboard+pad+CDC together (the `usbService` pumping model
+  was tuned on the old driver); revisiting `ZIFI_CDC_MAX_BAUD=460800` — the
+  host-side ~64 KB/s drain limit is gone, but the CH340's own sustained-RX
+  ceiling is a separate constraint, so re-test before raising.
+- **diskio dispatch**: `drivers/sdcard/sdcard.c` routes `pdrv==1` to `usb_disk_*`
+  in `src/UsbMsc.cpp` (TinyUSB `tuh_msc_read10/write10` made synchronous by pumping
+  a guarded `tuh_task()` — same re-entrancy rules as ZiFi's `usbService()`; NEVER
+  pump from a tuh callback). Odd-aligned FatFs buffers bounce per-sector.
+- **Mount flow**: `tuh_msc_mount_cb` does NO bus traffic — capacity is cached by
+  the host stack at enumeration; it lazily heap-allocs `UsbFsMem` (FATFS + 512B
+  bounce, ~1.1KB, `getLargestAllocatable()` gated, never freed) and registers a
+  deferred `f_mount("USB:", 0)`. First real FS access initializes from main-loop
+  context. Sticks with sector size ≠512 are ignored. `umount_cb` resets a stale
+  `ALL_Path` to `/`.
+- **UI**: F5 locations chooser gains a "USB Drive" row while a stick is enumerated
+  (`f5HasChooser()` = WiFi OR `UsbMsc::ready()`, so it works without a saved SSID);
+  SD⇄USB each remember their last dir (`s_f5_sd_dir`/`s_f5_usb_dir`, ALL_Path holds
+  the active one and is the one persisted). Per-type paths (TAP_Path etc.) inherit
+  USB paths naturally; in their dialogs ".." at `USB:/` exits to the SD root, in F5
+  it returns to the chooser. `sorted_files::init` replaces ':' in .idx names (the
+  index always lives on SD `/tmp`, so a read-only/removed stick can't break it).
+- Stale `"USB:/..."` in NVS self-heals: fileDialog's entry `f_opendir` check resets
+  fdir to `/`.
 
 ## Internet archive downloader (WIP — TR-DOS/tape images over HTTPS to SD)
 

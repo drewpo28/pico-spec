@@ -91,6 +91,12 @@ extern size_t getFreeHeap(void);
 extern "C" void hdmi_set_profi_ds80_mode(bool active, const uint32_t *palette16, const uint8_t *pair_lut);
 extern "C" volatile bool profi_ds80_active;
 #endif
+#ifdef KBDUSB
+// C-linkage query from hid_app.cpp; declared at file scope because a linkage
+// specification ("C") is not permitted at block scope. ALL platforms — the
+// factory-reset probe uses it on RP2040 (MURM/ZERO) KBDUSB builds too.
+extern "C" bool usb_keyboard_mounted(void);
+#endif
 
 //=======================================================================================
 // KEYBOARD
@@ -103,6 +109,12 @@ void joyPushData(fabgl::VirtualKey virtualKey, bool down) {
     kbd->injectVirtualKey(virtualKey, down);
   }
 }
+
+// Last pwm_audio_write() duration — [NEG2] attribution (it can block waiting
+// for DMA-ring space, which shows up as el−cpu time).
+volatile uint32_t g_aud_write_us = 0;
+volatile uint32_t g_kbd_us = 0;        // processKeyboard() per frame ([NEG2])
+volatile uint32_t g_mix_us = 0;        // audio synth+mix block per frame ([NEG2])
 
 volatile static uint32_t tickKbdRep = 0;
 volatile static fabgl::VirtualKey last_key_pressed = fabgl::VirtualKey::VK_NONE;
@@ -136,10 +148,8 @@ void kbdPushData(fabgl::VirtualKey virtualKey, bool down) {
            virtualKey == fabgl::VirtualKey::VK_KP_PERIOD)
     delPressed = down;
   if (ctrlPressed && altPressed && delPressed) {
-    close_all();
-    watchdog_enable(1, true);
-    while (true)
-      ;
+    // Single reboot choke point (logs the caller, handles the 595 latch).
+    OSD::esp_hard_reset();
   }
   if (down) {
     if (ctrlPressed && virtualKey == fabgl::VirtualKey::VK_J) {
@@ -235,8 +245,6 @@ unsigned char ESPectrum::audioSampleDivider;
 unsigned char ESPectrum::audioAYDivider;
 unsigned char ESPectrum::audioCOVOXDivider;
 unsigned char ESPectrum::audioOverSampleDivider;
-static int audioBitBuf = 0;
-static unsigned char audioBitbufCount = 0;
 /// QueueHandle_t audioTaskQueue;
 /// TaskHandle_t ESPectrum::audioTaskHandle;
 uint8_t *param;
@@ -576,20 +584,23 @@ static void assign_ram(int i) {
   // Page 61 left UNPINNED so it stays in the evictable pool ({56,58,61}).
   // 1024K BIOS test stays correct (the earlier 160K was the buggy 32-bit
   // write_page truncating writes, not force_sram).
-  // butter/QSPI-XIP boards are excluded: forcing these into SRAM there gave no
-  // IDL gain (the bottleneck is the whole Z80 working set in XIP, not the color
-  // pages), so don't waste 48KB SRAM.
+  // butter/QSPI-XIP boards are excluded: direct XIP pointers serve all pages
+  // there, and per the 2026-07-07 A/B ([NEG2] cpu, HC idle + CP/M disk) the
+  // pool/accessor layout brought no cpu gain once the platform-independent
+  // costs were fixed — the real killers were AY/SAA synth, WD flash path and
+  // per-poll FDC stepping, all fixed separately.
   //
-  // +2 extra LRU pool buffers (60, 40 = 32KB): during DS80 only one slot is
-  // otherwise evictable (56/58 pinned, 61 free), so HC's CP/M bank-switch
-  // trampoline (OUT 0x7FFD/0xDFFD) ping-pongs read-only code banks through it
-  // → ~70 SPI reloads/frame.  These two unpinned SRAM buffers join the pool as
-  // extra LRU lines (sync/_sync reuse them across pages, every page's data is
-  // preserved in PSRAM on evict → no loss of the 1024K capacity).  Drops the
-  // thrash to ~1.4/frame.  Page indices must be MID-range: forcing the TOP
-  // pages (62/63) corrupts Profi-1024K boot (system data lives there); 40/60
-  // are safe.  The initial index is otherwise irrelevant — the LRU repurposes
-  // the buffer for whatever working set is hot.
+  // +1 extra LRU pool buffer (60 = 16KB): HC's CP/M bank-switch trampoline
+  // (OUT 0x7FFD/0xDFFD) ping-pongs read-only code banks; historically that
+  // needed +2..3 forced SRAM buffers here (40/41, ~70 SPI reloads/frame with
+  // fewer).  The ACCESSOR-MODE bank window (mem_desc_t::sync/MemESP::accessor*)
+  // now serves those short bank visits per-byte over SPI without any 16KB
+  // load — hw showed 85-100% of trampoline visits touch <128 bytes — so pages
+  // 40/41 went back to the heap (+32KB).  Every page's data is preserved in
+  // PSRAM on evict → no loss of the 1024K capacity.  Page indices must be
+  // MID-range: forcing the TOP pages (62/63) corrupts Profi-1024K boot
+  // (system data lives there); 60 is safe.  The initial index is otherwise
+  // irrelevant — the LRU repurposes the buffer for whatever working set is hot.
   //
   // Pages 56 and 58 are the DS80 color-attribute pages (videoLatch=0 → 56,
   // videoLatch=1 → 58).  They must be permanently SRAM-resident (locked=true,
@@ -602,9 +613,9 @@ static void assign_ram(int i) {
   // HDMI/VGA renderer never stalls on SPI DMA → no sync loss.
   //
   // Profi CP/M pool layout (RP2350, SPI-PSRAM only):
-  //   Locked SRAM (pinned, never evicted): pages 58, 59 — DS80 colour/pixel data
-  //   LRU pool (3 evictable slots):        pages 40, 60, 61 — CP/M working set
-  //   All other pages:                     SPI PSRAM (loaded on demand)
+  //   Locked SRAM (never evicted): pages 56, 58 — DS80 colour-attribute data
+  //   LRU pool (evictable):        pages 1, 2, 3, 60, 61 — CP/M working set
+  //   All other pages:             SPI PSRAM, on demand via accessor window
   //
   // RP2040 (ZERO/MURM): DS80 not available; heap budget ~181KB with MEM_REMAIN=96KB
   // reserved for framebuffer. Use 3-page set {56,58,61} on RP2040.
@@ -614,11 +625,18 @@ static void assign_ram(int i) {
                     && (i == 56 || i == 58 || i == 61)
                     && (butter_psram_size() == 0);
 #else
+  // butter/QSPI boards keep the direct-XIP-pointer scheme for ALL Profi pages
+  // (56/58 included — the DS80 renderer reads them via the ds80_clr_sram
+  // vblank snapshot, see Video.cpp).  An A/B test (2026-07-07, [NEG2] cpu on
+  // HC idle + CP/M disk activity) showed the pool/accessor layout gave no cpu
+  // gain on butter once the platform-independent costs were fixed (AY/SAA
+  // silent paths, WD step path in SRAM, FDDStep fast exit, strcmp removal,
+  // idle-window track loads) — the forced-SRAM pages only spent ~64 KB heap.
   bool force_sram_locked = (Config::arch == "Profi")
                            && (i == 56 || i == 58)
                            && (butter_psram_size() == 0);
   bool force_sram = (Config::arch == "Profi")
-                    && (i == 61 || i == 60 || i == 40 || i == 41)
+                    && (i == 61 || i == 60)
                     && (butter_psram_size() == 0);
 #endif
   if (force_sram_locked) {
@@ -664,6 +682,15 @@ void ESPectrum::setup() {
   Config::initHotkeys(); // fill hotkey defaults even without SD
   if (FileUtils::fsMount)
     Config::load();
+#if !PICO_RP2040
+  // Mount the ALF cartridge from SD (served lazily on demand like a wd1793 disk),
+  // per Config::alfCartPath. Empty drive if none is set or the SD file is missing —
+  // there is no built-in cart. Must run before ALF banking can read it.
+  { extern void alfBindCart(); alfBindCart(); }
+  // NOTE: the GM.DLS bank (MidiSynth::provisionAtBoot) is set up later — after
+  // Buffer::initPools() so the butter PSRAM arena exists — but still before
+  // VIDEO::Init() (flash erase must precede the live HDMI DMA over XIP).
+#endif
   sdcard_set_led_blink(Config::sdLedBlink); // onboard LED blink on SD access
   VIDEO::loadCustomPalettes();
   Debug::log("setup: Config loaded");
@@ -690,7 +717,7 @@ void ESPectrum::setup() {
         else
           Config::romSet = Config::romSet48;
       }
-#if !NO_ALF
+#if !PICO_RP2040
       else if (Config::arch == "ALF") {
         Config::romSet = "ALF";
       }
@@ -931,21 +958,34 @@ void ESPectrum::setup() {
     DivMMC::zc_init();
   }
 #endif
+  // Tiered buffer pools: carve PSRAM/SD-swap arenas from whatever the existing
+  // consumers above (MemESP/Profi pages, DivMMC) have NOT claimed, reserving GS's
+  // sample-RAM region via GS::configuredRamBytes(). Must run after those so the
+  // boundaries are final, and BEFORE GS::init so GS's work/ring buffers can draw
+  // from the butter arena. See Buffer.cpp.
+  Buffer::initPools();
+
 #ifdef USE_GS
+  // AFTER initPools: GS::init allocates its work RAM + DAC rings from the butter
+  // arena (NEED_POINTER|PREFER_PSRAM), freeing ~32 KB SRAM on PSRAM boards. The
+  // sample-RAM region it claims at the PSRAM top was already excluded from the arena.
   if (Config::gs_enabled) {
-    uint32_t gs_ram = 2u << 20;
-    if (Config::gs_ram_size == 0) gs_ram = 512u << 10;
-    else if (Config::gs_ram_size == 1) gs_ram = 1u << 20;
+    uint32_t gs_ram = GS::configuredRamBytes();
     Debug::log2SD("setup: GS::init ram=%u", (unsigned)gs_ram);
     GS::init(gs_ram);
     Debug::log2SD("setup: GS::init done, freeHeap=%u", (unsigned)getFreeHeap());
   }
 #endif
 
-  // Tiered buffer pools: carve PSRAM/SD-swap arenas from whatever the existing
-  // consumers above (MemESP/Profi pages, DivMMC, GS) have NOT claimed. Must run
-  // after all of them so the boundaries are final. See Buffer.cpp.
-  Buffer::initPools();
+#if !PICO_RP2040
+  // GM.DLS MIDI bank: load into butter PSRAM (preferred) or provision the flash
+  // partition from SD. MUST be here — AFTER initPools() (the PSRAM arena is now
+  // final) and BEFORE VIDEO::Init(): a flash erase disables XIP for the whole QMI
+  // (flash CS0 + PSRAM CS1), so once the HDMI engine streams the framebuffer out of
+  // XIP-PSRAM it would stall the bus and hang. Still single core (core1 launches
+  // later in main()). No-op unless GM.DLS mode (Config::midi==4) is selected.
+  if (FileUtils::fsMount) MidiSynth::provisionAtBoot();
+#endif
 
   //=======================================================================================
   // VIDEO
@@ -1002,7 +1042,9 @@ void ESPectrum::setup() {
     // Profi forces ~80 KB of SRAM pages and OOMs at VIDEO::Init if the NIC's heap
     // rings (~12 KB) are also up — so never bring ZiFi up on Profi, regardless of a
     // stale zifi_enabled. (The menu also turns the NIC off when switching to Profi.)
-    ZiFi::enabled = Config::zifi_enabled && Config::arch != "Profi";
+    // The NIC also requires WiFi to be enabled — it is purely the guest-port
+    // emulation layer on top of WiFi, never a standalone networking switch.
+    ZiFi::enabled = Config::zifi_enabled && Config::wifi_enabled && Config::arch != "Profi";
     if (ZiFi::enabled)
         ZiFi::init();
 #endif
@@ -1080,8 +1122,10 @@ void ESPectrum::setup() {
   PitSubsys::request(Z80Ops::isByte);
   SaaSubsys::request(!Config::tape_player && Config::SAA1099);
   MidiSubsys::request(Config::midi != 0);
+  DmaSubsys::request(Config::dma_mode != 0);
   Mb02Subsys::syncFromState();
   DivMmcSubsys::syncFromState();
+  IdeSubsys::syncFromState();   // IDE::init() already ran above
 #endif
   Debug::log2SD("setup: Subsystems::applyPending begin, freeHeap=%u", (unsigned)getFreeHeap());
   Subsystems::applyPending();
@@ -1305,6 +1349,7 @@ void ESPectrum::reset(uint8_t romInUse) {
 #endif
   lastCovoxVal = lastCovoxValR = lastaudioBit = 0;
   memset(Ports::sndriveLatch, 0, sizeof(Ports::sndriveLatch));
+  Ports::sndriveUsed = 0;
 
   AY_emu = Config::AY48;
 #if !PICO_RP2040
@@ -1315,7 +1360,11 @@ void ESPectrum::reset(uint8_t romInUse) {
 #endif
 
   // Set samples per frame and AY_emu flag depending on arch
-  if (Config::arch == "48K") {
+  // Profi shares the 48K frame timing (69888 T / 624 samples) — it MUST take the
+  // 48K branch here, exactly like setup() does. Otherwise it falls through to the
+  // Pentagon branch (640 samples/frame) and over-feeds the 31250 Hz DAC by ~2.6%
+  // (640*50.08fps = 32051 > 31250), causing ring overrun → periodic clicks/buzz.
+  if (Config::arch == "48K" || Config::arch == "Profi") {
     samplesPerFrame = ESP_AUDIO_SAMPLES_48;
     audioOverSampleDivider = ESP_AUDIO_OVERSAMPLES_DIV_48;
     audioAYDivider = ESP_AUDIO_AY_DIV_48;
@@ -1365,6 +1414,7 @@ void ESPectrum::reset(uint8_t romInUse) {
   PitSubsys::request(Z80Ops::isByte);
   SaaSubsys::request(!Config::tape_player && Config::SAA1099);
   MidiSubsys::request(Config::midi != 0);
+  DmaSubsys::request(Config::dma_mode != 0);
 #endif
   Subsystems::applyPending();
 
@@ -2053,9 +2103,15 @@ void ESPectrum::FDDGenSound() {
         for (int c = 0; c < clicks; c++) {
             fddSound.click_pos[c] = spacing * (c + 1);
         }
-    } else if (LED::readActive(LED::FDD) || LED::writeActive(LED::FDD)) {
-        // Motor hum while the drive is being accessed (recent FDC port activity).
-        // Replaces the removed rvmWD1793::led flag, which could stick on.
+    } else if (ctrl->fdd_active_decay) {
+        // Motor hum while the drive is genuinely spinning/transferring (head-load,
+        // header search, real sector/track data movement — see wd1793.cpp). NOT
+        // driven by LED::readActive/writeActive(FDD): those also fire on bare
+        // WD1793 *command* writes (Ports.cpp counts reg 0 on write for LED colour
+        // purposes), so bus-probing software that issues commands without ever
+        // moving a real byte would otherwise keep the hum going with no disk
+        // rotation/transfer actually happening. Decays once per frame in
+        // LED::decay() — shared with the corner lamp and LED indicator glyph.
         fddSound.click_count = 0;
         fddSound.motor_noise = true;
     } else {
@@ -2143,6 +2199,93 @@ void ESPectrum::loop() {
       }
   }
 
+  // Factory reset: hold R at boot -> confirm -> wipe storage.nvs (+ skip the
+  // user's default.nvs this boot) -> reboot to compiled-in defaults.
+  // My-Default reset: hold M at boot -> confirm -> wipe storage.nvs only
+  // (default.nvs kept) -> reboot, which then falls back to it.
+  // Pump the keyboard at FULL SPEED here, BEFORE the emulation for(;;)
+  // starts: once it runs, a thrashing machine (Profi DS80 on SPI-PSRAM, ~4 FPS)
+  // pumps tuh_task too rarely for USB to even enumerate, so a per-frame check inside
+  // the loop never saw the key. R/M read as VK_R/VK_r or VK_M/VK_m depending on CAPSLOCK.
+  //
+  // Reliability (was ~50/50): the window is now guided and keyboard-aware.
+  //  - We poll until the keyboard is actually READY (PS/2: instant; USB: mounted),
+  //    then a short grace, instead of a blind fixed timeout that closed before a
+  //    slow USB keyboard finished enumerating. Hard cap FR_MAX_US if none appears.
+  //  - After FR_PROMPT_DELAY_US we draw a centered "Hold R / Hold M" hint
+  //    so the user knows the window is open and holds long enough. A fast PS/2 hold
+  //    is caught before the delay, so a normal reset never flashes the prompt.
+  {
+      extern void repeat_me_for_input();
+      auto Kbd = PS2Controller.keyboard();
+
+      // R/M state can't survive a reset (crt0 zeroes .bss, incl. the keyboard's
+      // "currently down" bitmap, on every boot) and PS/2 has no "what's held
+      // right now" query — only a fresh down-edge after this point sets it.
+      // So the window below is the only chance to catch it; keep it generous.
+      const uint32_t FR_PROMPT_DELAY_US = 400000;   // fast key-hold skips the prompt
+      const uint32_t FR_GRACE_US        = 1000000;   // poll this long once kbd is ready
+      const uint32_t FR_MAX_US          = 3500000;   // hard cap if no keyboard appears
+
+      uint32_t fr_t0 = time_us_32();
+      uint32_t fr_ready_at = 0;        // elapsed us when the keyboard became available
+      bool rHeld = false;
+      bool mHeld = false;
+      bool promptShown = false;
+      Debug::log("factory-reset: probing for held R/M (guided window)");
+      for (;;) {
+          uint32_t el = (uint32_t)(time_us_32() - fr_t0);
+          repeat_me_for_input();       // pump USB (tuh_task) + PS/2 at full speed
+          if (Kbd && (Kbd->isVKDown(fabgl::VK_R) || Kbd->isVKDown(fabgl::VK_r))) { rHeld = true; break; }
+          if (Kbd && (Kbd->isVKDown(fabgl::VK_M) || Kbd->isVKDown(fabgl::VK_m))) { mHeld = true; break; }
+
+          if (!fr_ready_at) {
+#ifdef KBDUSB
+              bool ready = usb_keyboard_mounted();
+#else
+              bool ready = true;       // PS/2 keyboard state is available immediately
+#endif
+              if (ready) fr_ready_at = el ? el : 1;
+          }
+
+          if (!promptShown && el >= FR_PROMPT_DELAY_US) {
+              OSD::osdCenteredMsg(MSG_FACTORY_RESET_HOLD[Config::lang], LEVEL_INFO, 0);
+              promptShown = true;      // persistent draw; emulation repaint erases it
+          }
+
+          if (el >= FR_MAX_US) break;                             // no keyboard ever seen
+          if (fr_ready_at && (el - fr_ready_at) >= FR_GRACE_US) break;  // ready + grace, no R/M
+          sleep_ms(2);
+      }
+      if (rHeld) {
+          Debug::log("factory-reset: R held -> confirm");
+          if (OSD::msgDialog(MSG_FACTORY_RESET_TITLE[Config::lang],
+                             MSG_FACTORY_RESET_Q[Config::lang]) == DLG_YES) {
+              bool ok = false;
+              if (FileUtils::fsMount) {
+                  FIL* flag = fopen2(SKIP_DEFAULT_FLAG, FA_WRITE | FA_CREATE_ALWAYS);
+                  if (flag) fclose2(flag);
+                  ok = (f_unlink(STORAGE_NVS) == FR_OK);
+              }
+              Debug::log("factory-reset: unlink %s -> reboot", ok ? "OK" : "FAIL");
+              OSD::esp_hard_reset();   // never returns; Config::load() then uses compiled defaults
+          }
+          Debug::log("factory-reset: declined");
+      } else if (mHeld) {
+          Debug::log("my-default-reset: M held -> confirm");
+          if (OSD::msgDialog(MSG_MYDEFAULT_RESET_TITLE[Config::lang],
+                             MSG_MYDEFAULT_RESET_Q[Config::lang]) == DLG_YES) {
+              bool ok = false;
+              if (FileUtils::fsMount) ok = (f_unlink(STORAGE_NVS) == FR_OK);
+              Debug::log("my-default-reset: unlink %s -> reboot", ok ? "OK" : "FAIL");
+              OSD::esp_hard_reset();   // never returns; Config::load() then falls back to default.nvs
+          }
+          Debug::log("my-default-reset: declined");
+      } else {
+          Debug::log("factory-reset: no R/M (continue)");
+      }
+  }
+
 #if !PICO_RP2040
   // Profi DS80 (hires) on SPI-PSRAM-only boards (no fast butter/QSPI-XIP PSRAM)
   // loads slowly through the slow SPI bus.  When DS80 mode turns on we want a
@@ -2168,9 +2311,13 @@ void ESPectrum::loop() {
     }
     ts_start = time_us_64();
 
-    if (!CPU::paused)
+    if (!CPU::paused) {
+      uint64_t _aud_t0 = time_us_64();
       pwm_audio_write((uint8_t *)audioBuffer_L, (uint8_t *)audioBuffer_R,
                       maxSpeed ? 1 : samplesPerFrame, 0, 0);
+      g_aud_write_us = (uint32_t)(time_us_64() - _aud_t0);
+    } else
+      g_aud_write_us = 0;
 
     // Send audioBuffer to pwmaudio
     audbufcnt = 0;
@@ -2216,7 +2363,7 @@ void ESPectrum::loop() {
           VIDEO::profi_ds80_osd_active = true;
           VIDEO::applyProfiOSDPalette();
         }
-        OSD::osdCenteredMsg(OSD_PROFI_LOADING[Config::lang], LEVEL_WARN, 2500);
+        //OSD::osdCenteredMsg(OSD_PROFI_LOADING[Config::lang], LEVEL_WARN, 2500);
         if (ds80) {
           VIDEO::profi_ds80_osd_active = false;
           if (profi_ds80_active) {
@@ -2238,12 +2385,12 @@ void ESPectrum::loop() {
     // the run so the ESP has time to auto-reconnect; then stepped each loop tick.
     static bool     rtc_autosync_begun = false;
     static uint32_t rtc_autosync_at    = 0;
-    // Reconnect WiFi at boot whenever the user left it connected (wifi_autoconnect),
-    // independent of the RTC — otherwise the only reconnect path was the SNTP sync,
-    // so with RTC off the link stayed down and the menu always showed "WiFi Off".
-    // The background state machine also runs SNTP, which is harmless when RTC is off.
-    if (!Config::wifi_ssid.empty() && Config::arch != "Profi" &&
-        (Config::wifi_autoconnect || (ZiFi::enabled && Config::rtc_enabled))) {
+    // Reconnect WiFi at boot whenever WiFi is enabled and an SSID is saved. This is
+    // driven ONLY by the WiFi switch — the NIC is no longer a trigger (it used to
+    // pull WiFi up as a side effect via `ZiFi::enabled && rtc_enabled`, which is
+    // exactly the leak that made FTP/SSH work only with the NIC on). The background
+    // state machine also runs SNTP, harmless when RTC is off.
+    if (!Config::wifi_ssid.empty() && Config::arch != "Profi" && Config::wifi_enabled) {
         if (!rtc_autosync_begun) {
             uint32_t now = to_ms_since_boot(get_absolute_time());
             if (rtc_autosync_at == 0) rtc_autosync_at = now + 4000;
@@ -2257,6 +2404,26 @@ void ESPectrum::loop() {
     }
 #endif
 
+    // SD automount: when the machine booted with no card (fsMount==false, and no
+    // USB stick took over as root), probe periodically for one being inserted.
+    // On the tick it comes online we mount it live — the OSD menus and file
+    // dialogs gate on fsMount at render time, so they light up without a reboot.
+    // We deliberately DON'T reload Config here: video-mode / arch settings from
+    // the card can only be applied by a reboot, so live use keeps the RAM
+    // defaults and only enables file access + the remembered disk mounts.
+    if (!FileUtils::fsMount && !FileUtils::usbRoot) {
+        static uint64_t sd_probe_at = 0;   // next allowed probe (throttle)
+        uint64_t now = time_us_64();
+        if (now >= sd_probe_at) {
+            sd_probe_at = now + 2000000ull; // ~2 s between probes (each is a few ms)
+            if (FileUtils::automountSD()) {
+                Config::loadDiskMounts();   // restore remembered disk images
+                Tape::LoadRemembered();     // and the remembered tape
+                OSD::osdCenteredMsg(MSG_SD_AUTOMOUNT[Config::lang], LEVEL_INFO, 1500);
+            }
+        }
+    }
+
     // GS-Z80 runs on core1 alongside pcm_call(); core0 only reads the ring.
 
     // Профилирование AY (только для отладки - закомментируйте после)
@@ -2264,6 +2431,7 @@ void ESPectrum::loop() {
     // uint64_t ay_start = time_us_64();
 
     // Process audio buffer
+    uint64_t _mix_t0 = time_us_64();
     faudbufcnt = audbufcnt;
     faudioBit = lastaudioBit;
     faudbufcntAY = audbufcntAY;
@@ -2431,7 +2599,12 @@ void ESPectrum::loop() {
         }
       }
     }
-    processKeyboard();
+    g_mix_us = (uint32_t)(time_us_64() - _mix_t0);
+    {
+      uint64_t _kbd_t0 = time_us_64();
+      processKeyboard();
+      g_kbd_us = (uint32_t)(time_us_64() - _kbd_t0);
+    }
 #ifdef USE_GS
     GS::pollPerf();
 #endif
@@ -2517,6 +2690,11 @@ void ESPectrum::loop() {
     // they persist.  (Normal modes draw into the static border area, no flicker.)
     if (profi_ds80_active && (VIDEO::OSD & 0x03) && (VIDEO::OSD & 0x04) == 0 && !CPU::paused)
       OSD::drawStats();
+    // Same flicker as above, but for the F9/F10 volume box (OSD bit 0x04):
+    // it's only (re)drawn on key-press/timeout, so DS80's per-frame repaint
+    // erases it after a single frame. Keep it pinned while it's showing.
+    if (profi_ds80_active && (VIDEO::OSD & 0x04))
+      OSD::drawVolumeBox();
 #endif
     // Flashing flag change (disabled when ULA+ palette is active)
 #if !PICO_RP2040
@@ -2542,16 +2720,17 @@ void ESPectrum::loop() {
 #if !PICO_RP2040
     if (profi_ds80_active) led_off_col = (uint8_t)(~VIDEO::borderColor) & 0x07;
 #endif
-    // Corner FDD lamp. ON/OFF follows LEDIndicators' decaying FDC-access state (it
-    // auto-clears, unlike the old rvmWD1793::led which could stick on with no disk
-    // access). COLOUR by the actual WD1793 command — write-sector/track → red, else
-    // (read/seek) → blue — because touchR/touchW track port I/O *direction* (a read
-    // command is issued by an OUT, so it would otherwise show red during loading).
+    // Corner FDD lamp. ON/OFF follows rvmWD1793::fdd_active_decay — genuine
+    // head-load/header-search/data-transfer activity, decremented once per frame by
+    // LED::decay() (auto-clears; unlike the old rvmWD1793::led it can't stick on, and
+    // unlike LED::readActive/writeActive(FDD) it isn't fooled by a bare command write
+    // with no real disk access — see wd1793.h). COLOUR by the actual WD1793 command —
+    // write-sector/track → red, else (read/seek) → blue.
     rvmWD1793 *fctrl = &fdd;
 #if !PICO_RP2040
     if (MB02::enabled) fctrl = &mb02_fdd;
 #endif
-    bool fdd_active = LED::readActive(LED::FDD) || LED::writeActive(LED::FDD);
+    bool fdd_active = fctrl->fdd_active_decay != 0;
     bool fdd_write  = ((fctrl->command & 0xE0) == 0xA0) ||   // Write Sector (0xA_/0xB_)
                       ((fctrl->command & 0xF0) == 0xF0);     // Write Track  (0xF_)
     // Foreground = lamp colour when active, else the border colour so the diskette
@@ -2595,18 +2774,111 @@ void ESPectrum::loop() {
     }
 #endif
 
+#if !PICO_RP2040
+    // Negative-IDL attribution (Profi): track the worst frame of every
+    // 60-frame window and, when at least one frame overran the target, log a
+    // breakdown of where its time went.  Counter deltas are robust to the
+    // per-frame resets a PERF_TRACE build performs (cur < prev → external
+    // reset → the current value IS the delta).
+    if (Z80Ops::isProfi) {
+      extern volatile uint32_t cpu_frame_us, fdd_step_us, endframe_us;
+      extern volatile uint32_t g_frame_swap_us, g_frame_swap_idle_us, g_frame_accb;
+      extern volatile uint32_t g_aud_write_us;
+      static uint32_t p_cpu = 0, p_fdd = 0, p_ports = 0, p_pcalls = 0;
+      uint32_t c;
+      c = cpu_frame_us;        uint32_t d_cpu   = (c >= p_cpu)   ? c - p_cpu   : c; p_cpu = c;
+      c = fdd_step_us;         uint32_t d_fdd   = (c >= p_fdd)   ? c - p_fdd   : c; p_fdd = c;
+      c = Ports::fdd_ports_us; uint32_t d_ports = (c >= p_ports) ? c - p_ports : c; p_ports = c;
+      c = Ports::fdd_ports_calls; uint32_t d_pcalls = (c >= p_pcalls) ? c - p_pcalls : c; p_pcalls = c;
+      uint32_t pmax_win = Ports::fdd_ports_max; Ports::fdd_ports_max = 0;
+      static uint32_t neg_cnt = 0, frame_cnt = 0;
+      static int32_t  w_idle = INT32_MAX;
+      static uint32_t w_el = 0, w_cpu = 0, w_fdd = 0, w_ports = 0, w_pcalls = 0;
+      static uint32_t w_swap = 0, w_swapidle = 0, w_accb = 0;
+      static uint32_t w_ef = 0, w_aud = 0, w_kbd = 0, w_pmax = 0, w_mix = 0;
+      if ((int32_t)idle < w_idle) {
+        w_idle = (int32_t)idle;   w_el = (uint32_t)elapsed;
+        w_cpu = d_cpu;            w_fdd = d_fdd;   w_ports = d_ports;
+        w_pcalls = d_pcalls;
+        w_swap = g_frame_swap_us; w_swapidle = g_frame_swap_idle_us;
+        w_accb = g_frame_accb;
+        w_ef = endframe_us;       w_aud = g_aud_write_us;
+        w_kbd = g_kbd_us;         w_mix = g_mix_us;
+      }
+      if (pmax_win > w_pmax) w_pmax = pmax_win;
+      if (idle < 0) neg_cnt++;
+      if (++frame_cnt >= 60) {
+        // ef is inside cpu (EndFrame: DS80 border flush + the [SPI] print —
+        // Debug::log over USB-CDC can cost ms, so a worst frame with big ef
+        // and zero everything else is usually the diagnostics frame itself);
+        // aud = pwm_audio_write DMA wait; kbd = processKeyboard;
+        // post = el - cpu - aud - kbd (OSD stats/LED/ZiFi/RTC…);
+        // pmax = longest single WD stepping call in the window.
+        if (neg_cnt)
+          Debug::log("[NEG2] 60f: neg=%u worst: idle=%d el=%u cpu=%u ef=%u aud=%u mix=%u kbd=%u post=%d fdd=%u ports=%u/%u pmax=%u swap=%u(idle %u) accb=%u",
+                     neg_cnt, w_idle, w_el, w_cpu, w_ef, w_aud, w_mix, w_kbd,
+                     (int)(w_el - w_cpu - w_aud - w_mix - w_kbd),
+                     w_fdd, w_ports, w_pcalls, w_pmax,
+                     w_swap, w_swapidle, w_accb);
+        frame_cnt = 0; neg_cnt = 0; w_idle = INT32_MAX; w_pmax = 0;
+      }
+    }
+    // Deferred WD1793 SD I/O (track loads, PRO flush/f_sync) runs inside this
+    // frame's idle window, so disk operations stop eating frame time (negative
+    // IDL on Profi CP/M disk ops).  g_wdDeferLoads is refreshed EVERY frame,
+    // including maxSpeed ones — a stale 'true' with no idle runner would leave
+    // every track load waiting for wdTrackReady's in-frame fallback.
+    g_wdDeferLoads = !maxSpeed && Z80Ops::isProfi;
+    // Deferred pool promotions (butter accessor banks): allow 1 inline
+    // promotion per frame; the rest queue for the idle window below.  On
+    // maxSpeed there is no idle window — run everything inline as before.
+    MemESP::promoFrameReset(maxSpeed ? 255 : 1);
+    // Run the I/O hook also when a deferred track load is pending even with
+    // no idle budget: in negative-IDL streaks the guest is FROZEN on that
+    // load, and wdIdleIO's overdue escape must get a chance to run it (else
+    // it waits for the 100 ms in-frame fallback — long stall AND the same
+    // blocking cost).
+    if (!maxSpeed && (idle > 3000 || fdd.trackLoadPending)) {
+      uint64_t io_deadline = (uint64_t)(ts_start + target - 1200);
+      wdIdleIO(&fdd, io_deadline);
+      if (idle > 3000) MemESP::idleService(io_deadline);
+      // The I/O consumed part of the wait budget — re-derive the remaining
+      // idle for the pacing below (stats above keep the pre-I/O values).
+      int64_t rem = target - (int64_t)(time_us_64() - ts_start);
+      idle = rem > 0 ? rem : 0;
+    }
+#endif
+
     totalsecondsnodelay += elapsed;
 
     if (!maxSpeed) {
+      // ZiFi over USB-CDC: the frame-pacing waits below are the longest no-pump
+      // windows in the whole loop (up to ~13 ms busy-NOP) — long enough for a
+      // mid-burst +IPD to overflow the CH340's ~256 B internals (hw: MRF's gopher
+      // page truncated at the same offset every run). Keep servicing the host
+      // stack while we wait; cdcPump() self-limits to ~1 kHz and is a no-op on
+      // the GPIO UART transport.
       if (Config::v_sync_enabled) {
-        for (;;)
+        for (;;) {
+#if !PICO_RP2040
+          if (ZiFi::cdcNicActive) ZiFi::cdcPump();
+#endif
           if (v_sync) {
             v_sync = false;
             break;
           }
+        }
       } else {
         if (idle > 0) {
-          delayMicroseconds(idle);
+#if !PICO_RP2040
+          if (ZiFi::cdcNicActive) {
+            int64_t e = (int64_t)time_us_64() + idle;
+            while ((int64_t)time_us_64() < e) ZiFi::cdcPump();
+          } else
+#endif
+          {
+            delayMicroseconds(idle);
+          }
         }
       }
     }

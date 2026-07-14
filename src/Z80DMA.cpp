@@ -68,13 +68,24 @@ bool     Z80DMA::read_sequence_active = false;
 bool     Z80DMA::dma_in_progress = false;
 bool     Z80DMA::mb02_deferred = false;
 
-// Per-scanline attr shadow buffer (heap, allocated while DMA mode is on)
-uint8_t* Z80DMA::dma_attr_shadow = nullptr;
-bool     Z80DMA::dma_attr_valid[192];
-bool     Z80DMA::dma_charrow_active[24];
-static uint8_t charrow_write_cnt[24];
-static uint8_t prev_attrs[24][32];
-static bool    prev_attrs_saved[24];
+// Per-scanline DMA attr tracking. ALL of it lives in one heap block that is
+// allocated only while Config::dma_mode != 0 and freed when DMA is switched off,
+// so the feature reserves ZERO SRAM when disabled (only the pointers below, which
+// are null when off). dma_attr_shadow/valid/charrow_active are public because the
+// video renderer (Video.cpp) and captureAttrAfterTransfer() index into them.
+struct DmaAttrBuf {
+    uint8_t shadow[Z80DMA::DMA_ATTR_SHADOW_SZ];  // 6144 — per-scanline attr snapshot
+    bool    valid[192];
+    bool    charrow_active[24];
+    uint8_t charrow_write_cnt[24];
+    uint8_t prev_attrs[24][32];
+    bool    prev_attrs_saved[24];
+};
+static DmaAttrBuf* g_dma_buf = nullptr;
+
+uint8_t* Z80DMA::dma_attr_shadow    = nullptr;
+bool*    Z80DMA::dma_attr_valid     = nullptr;
+bool*    Z80DMA::dma_charrow_active = nullptr;
 
 // Decode WR1/WR2 address increment from bits 4:3
 static inline int8_t decodeIncrement(uint8_t bits) {
@@ -136,32 +147,41 @@ void Z80DMA::reset() {
     dma_in_progress = false;
 
     if (Config::dma_mode) ensureAttrShadow();
-    if (dma_attr_shadow) memset(dma_attr_shadow, 0, DMA_ATTR_SHADOW_SZ);
-    memset(dma_attr_valid, 0, sizeof(dma_attr_valid));
-    memset(dma_charrow_active, 0, sizeof(dma_charrow_active));
-    memset(charrow_write_cnt, 0, sizeof(charrow_write_cnt));
-    memset(prev_attrs_saved, 0, sizeof(prev_attrs_saved));
+    if (g_dma_buf) memset(g_dma_buf, 0, sizeof(DmaAttrBuf));
 }
 
 void Z80DMA::resetAttrShadow() {
-    memset(dma_attr_valid, 0, sizeof(dma_attr_valid));
-    memset(dma_charrow_active, 0, sizeof(dma_charrow_active));
-    memset(charrow_write_cnt, 0, sizeof(charrow_write_cnt));
-    memset(prev_attrs_saved, 0, sizeof(prev_attrs_saved));
+    if (!g_dma_buf) return;
+    memset(g_dma_buf->valid, 0, sizeof(g_dma_buf->valid));
+    memset(g_dma_buf->charrow_active, 0, sizeof(g_dma_buf->charrow_active));
+    memset(g_dma_buf->charrow_write_cnt, 0, sizeof(g_dma_buf->charrow_write_cnt));
+    memset(g_dma_buf->prev_attrs_saved, 0, sizeof(g_dma_buf->prev_attrs_saved));
 }
 
 bool Z80DMA::ensureAttrShadow() {
-    if (!dma_attr_shadow)
-        dma_attr_shadow = (uint8_t*)calloc(DMA_ATTR_SHADOW_SZ, 1);
-    return dma_attr_shadow != nullptr;
+    if (!g_dma_buf) {
+        g_dma_buf = (DmaAttrBuf*)calloc(1, sizeof(DmaAttrBuf));
+        if (!g_dma_buf) {
+            dma_attr_shadow = nullptr;
+            dma_attr_valid = nullptr;
+            dma_charrow_active = nullptr;
+            return false;
+        }
+        dma_attr_shadow    = g_dma_buf->shadow;
+        dma_attr_valid     = g_dma_buf->valid;
+        dma_charrow_active = g_dma_buf->charrow_active;
+    }
+    return true;
 }
 
 void Z80DMA::freeAttrShadow() {
-    if (dma_attr_shadow) {
-        free(dma_attr_shadow);
-        dma_attr_shadow = nullptr;
+    if (g_dma_buf) {
+        free(g_dma_buf);
+        g_dma_buf = nullptr;
     }
-    memset(dma_attr_valid, 0, sizeof(dma_attr_valid));
+    dma_attr_shadow    = nullptr;
+    dma_attr_valid     = nullptr;
+    dma_charrow_active = nullptr;
 }
 
 IRAM_ATTR void Z80DMA::writePort(uint8_t data) {
@@ -475,9 +495,9 @@ static IRAM_ATTR void captureAttrAfterTransfer(uint16_t dest_start) {
     uint8_t charrow = (dest_start - 0x5800) >> 5;
     if (charrow >= 24) return;
 
-    uint8_t sub = charrow_write_cnt[charrow];
+    uint8_t sub = g_dma_buf->charrow_write_cnt[charrow];
     if (sub >= 8) return;
-    charrow_write_cnt[charrow] = sub + 1;
+    g_dma_buf->charrow_write_cnt[charrow] = sub + 1;
 
     int scanline = charrow * 8 + sub;
     if (scanline >= 192) return;
@@ -486,38 +506,38 @@ static IRAM_ATTR void captureAttrAfterTransfer(uint16_t dest_start) {
 
     if (sub == 0) {
         // First write: save as reference
-        memcpy(prev_attrs[charrow], &VIDEO::grmem[attr_base], 32);
-        prev_attrs_saved[charrow] = true;
+        memcpy(g_dma_buf->prev_attrs[charrow], &VIDEO::grmem[attr_base], 32);
+        g_dma_buf->prev_attrs_saved[charrow] = true;
         return;
     }
 
-    if (!prev_attrs_saved[charrow]) return;
+    if (!g_dma_buf->prev_attrs_saved[charrow]) return;
 
     // Once confirmed active, skip compare for remaining writes
     if (!Z80DMA::dma_charrow_active[charrow]) {
         // Check if attrs changed
-        if (memcmp(&VIDEO::grmem[attr_base], prev_attrs[charrow], 32) == 0) {
-            memcpy(prev_attrs[charrow], &VIDEO::grmem[attr_base], 32);
+        if (memcmp(&VIDEO::grmem[attr_base], g_dma_buf->prev_attrs[charrow], 32) == 0) {
+            memcpy(g_dma_buf->prev_attrs[charrow], &VIDEO::grmem[attr_base], 32);
             return;
         }
         // Confirmed per-scanline effect — mark active
         Z80DMA::dma_charrow_active[charrow] = true;
         // Shadow sub=0 retroactively
-        memcpy(&Z80DMA::dma_attr_shadow[charrow * 8 * 32], prev_attrs[charrow], 32);
+        memcpy(&Z80DMA::dma_attr_shadow[charrow * 8 * 32], g_dma_buf->prev_attrs[charrow], 32);
         Z80DMA::dma_attr_valid[charrow * 8] = true;
     }
 
     // Shadow previous scanline with prev_attrs (before DMA overwrote)
     int prev_scanline = charrow * 8 + sub - 1;
     if (prev_scanline >= 0 && prev_scanline < 192) {
-        memcpy(&Z80DMA::dma_attr_shadow[prev_scanline * 32], prev_attrs[charrow], 32);
+        memcpy(&Z80DMA::dma_attr_shadow[prev_scanline * 32], g_dma_buf->prev_attrs[charrow], 32);
         Z80DMA::dma_attr_valid[prev_scanline] = true;
     }
     // Also shadow current scanline with current grmem (may be overwritten by next DMA)
     memcpy(&Z80DMA::dma_attr_shadow[scanline * 32], &VIDEO::grmem[attr_base], 32);
     Z80DMA::dma_attr_valid[scanline] = true;
 
-    memcpy(prev_attrs[charrow], &VIDEO::grmem[attr_base], 32);
+    memcpy(g_dma_buf->prev_attrs[charrow], &VIDEO::grmem[attr_base], 32);
 }
 
 IRAM_ATTR void Z80DMA::executeTransfer() {

@@ -12,8 +12,13 @@ extern "C" {
 #endif
 
 // Validate + bind a packed GM bank blob (must stay resident while playing).
-// Returns 1 on success, 0 if the blob has a bad magic/version.
+// Allocates the ~5 KB voice array on first bind (lazy; out of .bss otherwise).
+// Returns 1 on success, 0 if the blob has a bad magic/version or voices OOM.
 int  midi_wt_bind(const void *blob);
+
+// Release the lazily-allocated voice array (~5 KB). The bank itself stays in flash
+// (XIP). Call when GM.DLS MIDI is turned off (MidiSynth::deinit / MidiSubsys).
+void midi_wt_unbind(void);
 
 // Feed one complete MIDI channel-voice message (status + up to 2 data bytes).
 void midi_wt_message(uint8_t status, uint8_t d1, uint8_t d2);

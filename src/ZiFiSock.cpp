@@ -21,6 +21,18 @@ bool    ZiFiSock::closed[ZiFiSock::N_LINKS]  = {false};
 bool    ZiFiSock::opened[ZiFiSock::N_LINKS]  = {false};
 static uint32_t g_rx_buf_drops = 0;   // per-link ring overflow bytes lost (diagnostic)
 uint32_t ZiFiSock::rxBufDropped() { return g_rx_buf_drops; }
+
+// Demux accounting (see ZiFiSock.h). Bytes are counted at header-parse time —
+// i.e. what the ESP delivered INTO the parser for that link — so a transfer's
+// delta pinpoints the losing layer: ipdBytes short of the wire total = loss
+// upstream (ESP/UART/CDC or a malformed header), ipdBytes complete but the
+// consumer short = loss downstream (ring overflow, sock_recv logic).
+static uint32_t g_ipd_bytes[ZiFiSock::N_LINKS]  = {0};
+static uint32_t g_ipd_frames[ZiFiSock::N_LINKS] = {0};
+static uint32_t g_ipd_malformed = 0;
+uint32_t ZiFiSock::ipdBytes(int id)  { return (id >= 0 && id < N_LINKS) ? g_ipd_bytes[id]  : 0; }
+uint32_t ZiFiSock::ipdFrames(int id) { return (id >= 0 && id < N_LINKS) ? g_ipd_frames[id] : 0; }
+uint32_t ZiFiSock::ipdMalformed()    { return g_ipd_malformed; }
 bool    ZiFiSock::mux_mode = false;
 bool    ZiFiSock::is_ready = false;
 int     ZiFiSock::accepted_link = -1;
@@ -61,14 +73,31 @@ char     last_line[96];    // last completed status line
 bool     flag_prompt = false; // saw the CIPSEND '>' prompt
 bool     flag_send_ok= false;
 bool     flag_error  = false;
+bool     flag_send_fail = false; // saw "SEND FAIL" — TCP buffer full, bytes NOT queued (retry-safe)
 int      pending_close = -1;  // link id seen as CLOSED on the last status line, else -1
 int      pending_connect = -1; // link id seen as "<id>,CONNECT" (server accept), else -1
+
+// ── Passive receive (AT+CIPRECVMODE=1) ──────────────────────────────────────
+// In passive mode the ESP buffers inbound TCP internally (TCP window closes when
+// full → end-to-end backpressure to the server) and we PULL with AT+CIPRECVDATA
+// when ready. This removes the active-mode +IPD firehose entirely: no bytes can
+// be lost during SD writes / TLS work / OSD redraws (the USB-CDC transport has no
+// IRQ drain — see ZiFi.cpp), and — the tail-loss killer — data still buffered at
+// peer-close time REMAINS readable, where active mode discards it and prints
+// CLOSED (hw-observed: last ~3-8 frames + the FTP "226" vanished every transfer).
+bool     g_passive = false;        // CIPRECVMODE=1 acked (old AT firmware → false)
+int      g_recvdata_link = 0;      // link a pending AT+CIPRECVDATA was issued for
+bool     g_hdr_recvdata = false;   // parsing a "+CIPRECVDATA,<len>:" header
+bool     g_drained[ZiFiSock::N_LINKS] = {false, false}; // post-CLOSED pull came back empty
+bool     g_trace_quiet = false;    // suppress ZIFI_TRACE for high-rate pull chatter
 
 void reset_parser() {
     st = ST_SCAN; linelen = 0; ipd_len = 0; ipd_link = 0;
     ipd_field = 0; ipd_nfld = 0; ipd_tmp_id = 0;
+    g_hdr_recvdata = false;
     last_line[0] = '\0';
     flag_prompt = flag_send_ok = flag_error = false;
+    flag_send_fail = false;
     pending_close = -1;
     pending_connect = -1;
 }
@@ -95,7 +124,11 @@ static void process_status_line(const char* L) {
     last_line[sizeof(last_line) - 1] = '\0';
     if (strstr(L, "SEND OK"))      flag_send_ok = true;
     if (strstr(L, "ERROR"))        flag_error   = true;
-    if (strstr(L, "SEND FAIL"))    flag_error   = true;
+    // "SEND FAIL" = the ESP's TCP send buffer was full and it dropped this CIPSEND
+    // payload (it was NOT queued). Kept distinct from flag_error so sock_send can
+    // safely retry the same chunk under backpressure instead of aborting the whole
+    // upload — large STOR/put transfers over the slow ESP link hit this routinely.
+    if (strstr(L, "SEND FAIL"))    flag_send_fail = true;
     // "<id>,CLOSED" (mux) or "CLOSED" (single). pump() applies it to closed[].
     if (strstr(L, "CLOSED")) {
         int id = 0;
@@ -151,6 +184,16 @@ void ZiFiSock::pump(uint32_t budget_ms) {
                 // Detect the "+IPD," prefix anywhere it appears.
                 if (linelen >= 5 && memcmp(linebuf + linelen - 5, "+IPD,", 5) == 0) {
                     st = ST_IPD_HDR; ipd_field = 0; ipd_nfld = 0; ipd_link = 0; ipd_tmp_id = 0;
+                    g_hdr_recvdata = false;
+                    linelen = 0; linebuf[0] = '\0';
+                }
+                // Passive-mode pull response: "+CIPRECVDATA,<actual_len>:<data>".
+                // No link id in the response — it belongs to whichever link the
+                // AT+CIPRECVDATA we just issued named (g_recvdata_link).
+                else if (linelen >= 13 && memcmp(linebuf + linelen - 13, "+CIPRECVDATA,", 13) == 0) {
+                    st = ST_IPD_HDR; ipd_field = 0; ipd_nfld = 0; ipd_tmp_id = 0;
+                    g_hdr_recvdata = true;
+                    ipd_link = g_recvdata_link;
                     linelen = 0; linebuf[0] = '\0';
                 }
                 break;
@@ -163,14 +206,26 @@ void ZiFiSock::pump(uint32_t budget_ms) {
                 } else if (b == ':') {
                     // Last field is length; if a comma preceded it, ipd_tmp_id is the link.
                     ipd_len  = ipd_field;
-                    ipd_link = (ipd_nfld >= 1) ? ipd_tmp_id : 0;
-                    if (ipd_link < 0 || ipd_link >= N_LINKS) ipd_link = 0;
+                    if (!g_hdr_recvdata) {
+                        ipd_link = (ipd_nfld >= 1) ? ipd_tmp_id : 0;
+                        if (ipd_link < 0 || ipd_link >= N_LINKS) ipd_link = 0;
+                    } // else: +CIPRECVDATA response — ipd_link already = g_recvdata_link
+                    g_ipd_frames[ipd_link]++;
+                    g_ipd_bytes[ipd_link] += (uint32_t)ipd_len;
 #if ZIFI_NET_VERBOSE
                     Debug::log("ZiFiSock +IPD link=%d len=%d", ipd_link, ipd_len);
 #endif
                     st = (ipd_len > 0) ? ST_IPD_PAYLOAD : ST_SCAN;
+                } else if (b == '\r' || b == '\n') {
+                    // Passive mode: "+IPD,<id>,<len>" is a bare data-arrived
+                    // notification (no ':payload' follows). Nothing to consume —
+                    // the data is pulled via AT+CIPRECVDATA. Not a malformed header.
+                    st = ST_SCAN; linelen = 0;
                 } else {
-                    // Malformed header — bail back to SCAN.
+                    // Malformed header — bail back to SCAN. The frame's payload will
+                    // stream through SCAN as garbage "lines" and is effectively lost;
+                    // count it so transfer post-mortems can see the desync.
+                    g_ipd_malformed++;
                     st = ST_SCAN; linelen = 0;
                 }
                 break;
@@ -201,7 +256,9 @@ bool ZiFiSock::atCmd(const char* cmd, const char* expect, uint32_t timeout_ms) {
     const uint8_t crlf[2] = {'\r', '\n'};
     ZiFi::sendRaw(crlf, 2);
 #if ZIFI_TRACE
-    Debug::log("ZiFiSock tx: %s", cmd);
+    // Pull-mode CIPRECVDATA fires ~once per 2 KB of payload — tracing it floods
+    // the console and stalls the main loop (see the ZIFI_TRACE memory note).
+    if (!g_trace_quiet) Debug::log("ZiFiSock tx: %s", cmd);
 #endif
     if (!expect) return true;
 
@@ -210,7 +267,7 @@ bool ZiFiSock::atCmd(const char* cmd, const char* expect, uint32_t timeout_ms) {
         pump(50);
         if (last_line[0]) {
 #if ZIFI_TRACE
-            Debug::log("ZiFiSock rx: %s", last_line);
+            if (!g_trace_quiet) Debug::log("ZiFiSock rx: %s", last_line);
 #endif
             if (strstr(last_line, expect)) return true;
             if (flag_error) return false;
@@ -256,6 +313,9 @@ bool ZiFiSock::begin(bool mux) {
     // Wait out any residual flood from a prior (possibly aborted) session before
     // issuing the mode command, so its "OK" isn't buried in stale +IPD bytes.
     drainQuiet(80, 2000);
+    // Host session with the Z80 paused → drive the full configured rate (the NIC's
+    // live-emulation baud ceiling doesn't apply here). Restored in end().
+    ZiFi::boostBaud();
 
     const char* cmd = mux ? "AT+CIPMUX=1" : "AT+CIPMUX=0";
     is_ready = atCmd(cmd, "OK", 2000);
@@ -264,6 +324,16 @@ bool ZiFiSock::begin(bool mux) {
         drainQuiet(150, 2500);
         is_ready = atCmd(cmd, "OK", 2000);
     }
+    if (is_ready) {
+        // Prefer passive (pull) receive — see the g_passive block comment. Old AT
+        // firmware without CIPRECVMODE answers ERROR → stay on the active path.
+        g_passive = atCmd("AT+CIPRECVMODE=1", "OK", 2000);
+        for (int i = 0; i < N_LINKS; i++) g_drained[i] = false;
+        Debug::log("ZiFiSock: receive mode = %s", g_passive ? "passive (CIPRECVMODE=1)" : "active (+IPD push)");
+    }
+    // Failed begin() → callers return without end(); undo the boost so the link
+    // doesn't idle above the NIC-safe ceiling.
+    if (!is_ready) ZiFi::restoreBaud();
     return is_ready;
 }
 
@@ -271,6 +341,10 @@ bool ZiFiSock::ready() { return is_ready; }
 
 bool ZiFiSock::isClosed(int id) {
     if (id < 0 || id >= N_LINKS) return true;
+    // Passive mode: after CLOSED the ESP can still hold buffered tail data we
+    // haven't pulled yet — only a post-CLOSED pull that came back empty
+    // (g_drained, set in sock_recv) proves real EOF.
+    if (g_passive) return closed[id] && ringFill(id) == 0 && g_drained[id];
     return closed[id] && ringFill(id) == 0;
 }
 
@@ -281,8 +355,24 @@ int ZiFiSock::sock_open(const char* host, uint16_t port, bool tls, uint32_t time
         for (id = 0; id < N_LINKS; id++) if (!opened[id]) break;
         if (id >= N_LINKS) return -1; // no free link
     }
+    // Drain everything a PREVIOUS connection on this id left in flight before
+    // resetting the ring. The raw pipe (ZiFi ring + PSRAM spill) can still hold
+    // unparsed +IPD frames of the old link — e.g. tail data that arrived during
+    // the post-transfer readReply — and the parser may even be PARKED mid-payload
+    // by the ring-full backpressure. Without this, those stale bytes get demuxed
+    // into the fresh connection's ring during the CIPSTART atCmd below and are
+    // handed to the new consumer first: a retried FTP download starts with the
+    // old transfer's bytes (seen on hw as done > ipdData by exactly one frame,
+    // and a corrupt file). Repeatedly flush THIS link's ring so a parked payload
+    // can't stall the drain; other links' payloads are preserved.
+    for (int i = 0; i < 64; i++) {                    // bound ≈ 64×RX_SZ of backlog
+        rx_head[id] = rx_tail[id] = 0;
+        pump(0);
+        if (!ZiFi::rxAvailable() && (st != ST_IPD_PAYLOAD || ipd_link != id)) break;
+    }
     rx_head[id] = rx_tail[id] = 0;
     closed[id] = false;
+    g_drained[id] = false;
 
     char cmd[160];
     const char* proto = tls ? "SSL" : "TCP";
@@ -306,35 +396,55 @@ int ZiFiSock::sock_send(int id, const uint8_t* buf, size_t len, uint32_t timeout
         size_t chunk = len - sent;
         if (chunk > 2048) chunk = 2048; // ESP-AT default CIPSEND cap
 
-        char cmd[32];
-        if (mux_mode) snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%d,%u", id, (unsigned)chunk);
-        else          snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%u", (unsigned)chunk);
+        // Retry the SAME chunk while the ESP reports it could not queue the bytes
+        // (no '>' prompt → busy; "SEND FAIL" → TCP buffer full). Both mean nothing
+        // was transmitted, so resending is safe and never duplicates data. Without
+        // this, a single backpressure stall mid-stream aborted the whole transfer —
+        // why large uploads (2.5 MB firmware over the slow ESP link) "failed" and
+        // left a short file on the server. A real ERROR or an ambiguous missing
+        // SEND OK (bytes maybe queued) still aborts: retrying those could duplicate.
+        const int MAX_RETRY = 8;
+        int attempt = 0;
+        for (;;) {
+            char cmd[32];
+            if (mux_mode) snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%d,%u", id, (unsigned)chunk);
+            else          snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%u", (unsigned)chunk);
 
-        flag_prompt = flag_send_ok = flag_error = false; last_line[0] = '\0';
-        ZiFi::sendRaw((const uint8_t*)cmd, strlen(cmd));
-        const uint8_t crlf[2] = {'\r', '\n'};
-        ZiFi::sendRaw(crlf, 2);
+            flag_prompt = flag_send_ok = flag_error = flag_send_fail = false; last_line[0] = '\0';
+            ZiFi::sendRaw((const uint8_t*)cmd, strlen(cmd));
+            const uint8_t crlf[2] = {'\r', '\n'};
+            ZiFi::sendRaw(crlf, 2);
 
-        // Wait for the '>' prompt.
-        absolute_time_t pdl = make_timeout_time_ms(timeout_ms);
-        while (!flag_prompt && !flag_error && !time_reached(pdl)) pump(20);
-        if (!flag_prompt) {
+            // Wait for the '>' prompt.
+            absolute_time_t pdl = make_timeout_time_ms(timeout_ms);
+            while (!flag_prompt && !flag_error && !time_reached(pdl)) pump(20);
+            if (!flag_prompt) {
+                if (!flag_error && ++attempt < MAX_RETRY) { // busy → let it drain, retry chunk
+                    absolute_time_t bk = make_timeout_time_ms(200);
+                    while (!time_reached(bk)) pump(20);
+                    continue;
+                }
 #if ZIFI_TRACE
-            Debug::log("sock_send: NO '>' prompt (id=%d chunk=%u err=%d last=%s)",
-                       id, (unsigned)chunk, flag_error, last_line);
+                Debug::log("sock_send: NO '>' prompt (id=%d chunk=%u err=%d try=%d last=%s)",
+                           id, (unsigned)chunk, flag_error, attempt, last_line);
 #endif
-            return sent ? (int)sent : -1;
-        }
+                return sent ? (int)sent : -1;
+            }
 
-        // Send the payload bytes verbatim, then wait for SEND OK.
-        ZiFi::sendRaw(buf + sent, chunk);
-        flag_send_ok = flag_error = false;
-        absolute_time_t sdl = make_timeout_time_ms(timeout_ms);
-        while (!flag_send_ok && !flag_error && !time_reached(sdl)) pump(20);
-        if (!flag_send_ok) {
+            // Send the payload bytes verbatim, then wait for SEND OK / SEND FAIL.
+            ZiFi::sendRaw(buf + sent, chunk);
+            flag_send_ok = flag_error = flag_send_fail = false;
+            absolute_time_t sdl = make_timeout_time_ms(timeout_ms);
+            while (!flag_send_ok && !flag_error && !flag_send_fail && !time_reached(sdl)) pump(20);
+            if (flag_send_ok) break;                 // chunk accepted
+            if (flag_send_fail && ++attempt < MAX_RETRY) { // TCP buffer full → retry whole chunk
+                absolute_time_t bk = make_timeout_time_ms(200);
+                while (!time_reached(bk)) pump(20);
+                continue;
+            }
 #if ZIFI_TRACE
-            Debug::log("sock_send: NO 'SEND OK' (id=%d chunk=%u err=%d last=%s)",
-                       id, (unsigned)chunk, flag_error, last_line);
+            Debug::log("sock_send: NO 'SEND OK' (id=%d chunk=%u err=%d fail=%d try=%d last=%s)",
+                       id, (unsigned)chunk, flag_error, flag_send_fail, attempt, last_line);
 #endif
             return sent ? (int)sent : -1;
         }
@@ -355,6 +465,32 @@ int ZiFiSock::sock_recv(int id, uint8_t* buf, size_t maxlen, uint32_t timeout_ms
     if (ringFill(id) > 0) return ringPop(id, buf, maxlen);
 
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+
+    if (g_passive) {
+        // Pull model: ask the ESP for a ring-sized chunk; the "+CIPRECVDATA,<n>:"
+        // response payload is demuxed into our ring by pump() inside atCmd. An
+        // empty answer / ERROR just means no data buffered yet. After a peer
+        // close the ESP's buffer stays readable — keep pulling until it comes
+        // back empty, and only THEN report EOF (g_drained gates isClosed too).
+        char cmd[40];
+        const unsigned want = RX_SZ - 64;   // fits the just-emptied ring
+        if (mux_mode) snprintf(cmd, sizeof(cmd), "AT+CIPRECVDATA=%d,%u", id, want);
+        else          snprintf(cmd, sizeof(cmd), "AT+CIPRECVDATA=%u", want);
+        for (;;) {
+            bool was_closed = closed[id];
+            g_recvdata_link = id;
+            g_trace_quiet = true;           // ~1 pull per 2 KB — don't flood the log
+            atCmd(cmd, "OK", 2000);
+            g_trace_quiet = false;
+            ZiFi::rxSpill();
+            pump(0);
+            if (ringFill(id) > 0) return ringPop(id, buf, maxlen);
+            if (was_closed) { g_drained[id] = true; return 0; }  // buffer drained → EOF
+            if (time_reached(deadline)) return 0;                // transient empty read
+            pump(50);                        // wait for an +IPD notification / more data
+        }
+    }
+
     while (!time_reached(deadline)) {
         ZiFi::rxSpill();
         pump(50);
@@ -426,11 +562,26 @@ bool ZiFiSock::server_listen(uint16_t port) {
     accepted_link = -1;
     uint8_t junk[64];
     while (ZiFi::recvRaw(junk, sizeof(junk)) > 0) {}
+    // FTP server runs with the Z80 paused → drive the full configured rate. Restored
+    // in server_stop().
+    ZiFi::boostBaud();
 
-    if (!atCmd("AT+CIPMUX=1", "OK", 2000)) { is_ready = false; return false; }
+    if (!atCmd("AT+CIPMUX=1", "OK", 2000)) { is_ready = false; ZiFi::restoreBaud(); return false; }
+    // Passive receive (CIPRECVMODE=1) for STOR: a client upload is bulk data flowing
+    // client→server, and while a blocking f_write stalls the core the active-mode
+    // +IPD firehose overflows the rings → dropped bytes → the transfer fails (large
+    // uploads died where small ones squeaked through). In passive mode the ESP holds
+    // the data and its TCP window closes → end-to-end backpressure, we pull at our
+    // own pace with CIPRECVDATA. Old AT firmware without CIPRECVMODE answers ERROR →
+    // transparently stay on the active path. RETR (send) is unaffected either way.
+    g_passive = atCmd("AT+CIPRECVMODE=1", "OK", 2000);
+    for (int i = 0; i < N_LINKS; i++) g_drained[i] = false;
+    Debug::log("ZiFiSock: FTP server receive mode = %s",
+               g_passive ? "passive (CIPRECVMODE=1)" : "active (+IPD push)");
     char cmd[40];
     snprintf(cmd, sizeof(cmd), "AT+CIPSERVER=1,%u", (unsigned)port);
     is_ready = atCmd(cmd, "OK", 3000);
+    if (!is_ready) ZiFi::restoreBaud();   // failed listen → callers skip server_stop()
     return is_ready;
 }
 
@@ -456,10 +607,12 @@ void ZiFiSock::server_stop() {
     for (int i = 0; i < N_LINKS; i++)
         if (opened[i]) sock_close(i);
     atCmd("AT+CIPSERVER=0", "OK", 2000);          // these still pump() → need rx_buf
+    if (g_passive) { atCmd("AT+CIPRECVMODE=0", "OK", 1000); g_passive = false; }
     if (mux_mode) atCmd("AT+CIPMUX=0", "OK", 1000);
     reset_parser();
     accepted_link = -1;
     is_ready = false;
+    ZiFi::restoreBaud();                          // back to the NIC-safe idle rate
     // Symmetric with server_listen()'s alloc (and end() on the client paths): return
     // the 4 KB demux ring to its tier so it isn't leaked after the FTP server closes.
     // The emulated ZiFi NIC uses its own buffers, so this is safe; ZiFi UART stays up.
@@ -469,10 +622,12 @@ void ZiFiSock::server_stop() {
 void ZiFiSock::end() {
     for (int i = 0; i < N_LINKS; i++)
         if (opened[i]) sock_close(i);
+    if (g_passive) { atCmd("AT+CIPRECVMODE=0", "OK", 1000); g_passive = false; }
     if (mux_mode) atCmd("AT+CIPMUX=0", "OK", 1000);
     reset_parser();
     is_ready = false;
     freeRxBuf();                      // return the 4 KB to its tier
+    ZiFi::restoreBaud();              // back to the NIC-safe idle rate
 }
 
 #endif // !PICO_RP2040 && ZIFI_NET_CLIENT

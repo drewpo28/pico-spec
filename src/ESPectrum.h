@@ -160,7 +160,14 @@ public:
             fddSound.fdd_lfsr ^= fddSound.fdd_lfsr >> 7;
             fddSound.fdd_lfsr ^= fddSound.fdd_lfsr << 9;
             fddSound.fdd_lfsr ^= fddSound.fdd_lfsr >> 13;
-            return fddSound.fdd_lfsr & 0xF;
+            // Faint motor hum (0..1). Must stay tiny: it's summed on top of the
+            // MIDI/AY mix (which already uses the full 0..255 range), so a bigger
+            // value would push their peaks over 255 → clipping = the "distortion"
+            // heard on MIDI/AY while the drive motor lingers active. Also kept
+            // well below the head-step click peak (24): the hum is continuous
+            // while a click lasts only ~12 samples, so even a small amplitude
+            // dominates perceptually.
+            return fddSound.fdd_lfsr & 0x1;
         }
         if (fddSound.click_count > 0) {
             if (fddSound.click_idx < fddSound.click_count && i >= fddSound.click_pos[fddSound.click_idx]) {
@@ -168,7 +175,7 @@ public:
                 fddSound.decay_pos = 0;
             }
             if (fddSound.decay_pos < 12)
-                return fdd_click_decay[fddSound.decay_pos++];
+                return fdd_click_decay[fddSound.decay_pos++] >> 1; // quieter head-step click
         }
         return 0;
     }

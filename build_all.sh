@@ -109,10 +109,6 @@ for TARGET in $TARGETS; do
             break
         fi
     done
-    # ALF-enabled (NO_ALF=0) variants: m1p2 (MURM_P2) and z0p2 (ZERO2)
-    if [ "$TARGET" = "MURM2_P2" ] || [ "$TARGET" = "MURM_P2" ] || [ "$TARGET" = "ZERO2" ]; then
-        BUILD_PAIRS+=("${TARGET}:VGA_HDMI:ALF")
-    fi
 done
 
 echo "=== pico-spec multi-target build ==="
@@ -130,21 +126,19 @@ LOG_DIR="$SCRIPT_DIR/build-logs"
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 
 build_dir_for() {
-    local target="$1" display="$2" alf="$3"
-    local suffix=""
-    [ "$alf" = "ALF" ] && suffix="-ALF"
+    local target="$1" display="$2"
     if [ "$display" = "VGA_HDMI" ]; then
-        echo "$SCRIPT_DIR/build-${target}${suffix}"
+        echo "$SCRIPT_DIR/build-${target}"
     else
-        echo "$SCRIPT_DIR/build-${target}-${display}${suffix}"
+        echo "$SCRIPT_DIR/build-${target}-${display}"
     fi
 }
 
 # Optional clean
 if $CLEAN; then
     for PAIR in "${BUILD_PAIRS[@]}"; do
-        IFS=':' read -r TARGET DISPLAY ALF <<<"$PAIR"
-        BUILD_DIR="$(build_dir_for "$TARGET" "$DISPLAY" "$ALF")"
+        IFS=':' read -r TARGET DISPLAY <<<"$PAIR"
+        BUILD_DIR="$(build_dir_for "$TARGET" "$DISPLAY")"
         if [ -d "$BUILD_DIR" ]; then
             echo "Cleaning $BUILD_DIR ..."
             rm -rf "$BUILD_DIR"
@@ -157,12 +151,12 @@ fi
 # Exits 0 on success, non-zero on failure.
 build_one() {
     local pair="$1"
-    local target display alf
-    IFS=':' read -r target display alf <<<"$pair"
+    local target display
+    IFS=':' read -r target display <<<"$pair"
     local build_dir label log
-    build_dir="$(build_dir_for "$target" "$display" "$alf")"
-    label="$target ($display${alf:+ +ALF})"
-    log="$LOG_DIR/${target}-${display}${alf:+-ALF}.log"
+    build_dir="$(build_dir_for "$target" "$display")"
+    label="$target ($display)"
+    log="$LOG_DIR/${target}-${display}.log"
 
     {
         echo "========================================"
@@ -210,9 +204,6 @@ build_one() {
             target_flags+=(-DTFT=ON -DST7789=ON -DVGA_HDMI=OFF)
         elif [ "$display" = "SOFTTV" ]; then
             target_flags+=(-DSOFTTV=ON -DVGA_HDMI=OFF)
-        fi
-        if [ "$alf" = "ALF" ]; then
-            target_flags+=(-DNO_ALF=0)
         fi
 
         local cmake_args=(
@@ -282,9 +273,9 @@ if [ ${#SUCCEEDED[@]} -gt 0 ]; then
     echo "Succeeded (${#SUCCEEDED[@]}):"
     for ENTRY in "${SUCCEEDED[@]}"; do
         PAIR="${ENTRY%% (*}"
-        IFS=':' read -r TARGET DISPLAY ALF <<<"$PAIR"
-        BUILD_DIR="$(build_dir_for "$TARGET" "$DISPLAY" "$ALF")"
-        LOG="$LOG_DIR/${TARGET}-${DISPLAY}${ALF:+-ALF}.log"
+        IFS=':' read -r TARGET DISPLAY <<<"$PAIR"
+        BUILD_DIR="$(build_dir_for "$TARGET" "$DISPLAY")"
+        LOG="$LOG_DIR/${TARGET}-${DISPLAY}.log"
         echo "  $ENTRY"
         # Copy only the uf2 from THIS run's CMake config (BUILD_NAME embeds the
         # current PORT_VERSION), not every stale *.uf2 left in the bin dir from
@@ -311,8 +302,8 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     echo "Failed (${#FAILED[@]}):"
     for ENTRY in "${FAILED[@]}"; do
         PAIR="${ENTRY%% (*}"
-        IFS=':' read -r TARGET DISPLAY ALF <<<"$PAIR"
-        echo "  $ENTRY    (see $LOG_DIR/${TARGET}-${DISPLAY}${ALF:+-ALF}.log)"
+        IFS=':' read -r TARGET DISPLAY <<<"$PAIR"
+        echo "  $ENTRY    (see $LOG_DIR/${TARGET}-${DISPLAY}.log)"
     done
     exit 1
 fi

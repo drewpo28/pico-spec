@@ -23,6 +23,14 @@ public:
     // Drain ZIFI-out FIFO → UART TX; call from main loop / emulator tick
     static void tick();
 
+    // USB-CDC transport only: true while the NIC link runs over the CDC dongle.
+    // CPU::loop polls it per instruction (same cost class as Config::dma_mode) to
+    // drive cdcPump() — the CDC path has no RX IRQ, so without a fine-grained
+    // tuh_task pump a mid-frame +IPD burst overflows the CH340's ~256 B internals
+    // whenever the guest stops touching the ZiFi ports (e.g. MRF rendering text).
+    static volatile bool cdcNicActive;
+    static void cdcPump();   // rate-limited (~1 kHz) tuh_task pump + TX drain
+
     static uint8_t enabled; // 0=Off 1=On (mirrors Config::zifi_enabled at runtime)
 
     // Expose for ZiFiAT raw access (bypasses FIFO, direct UART)
@@ -49,11 +57,33 @@ public:
 
     // Current UART rate the Pico+ESP are (supposedly) on.
     static uint32_t currentBaud();
+
+    // Baud split between the emulated NIC (live emulation) and paused host sessions.
+    // The NIC bridges bytes while the Z80 is RUNNING — core0 can't drain the RX IRQ
+    // fast enough above ~230 kbaud, so the link idles at the NIC-safe ceiling. A
+    // host session (FTP/HTTPS/SSH) runs with the Z80 PAUSED and can push the full
+    // configured rate: boostBaud() lifts the link for the session, restoreBaud()
+    // drops it back. No-ops when the configured rate is already NIC-safe.
+    static void boostBaud();
+    static void restoreBaud();
+
+    // USB-CDC transport hooks (Config::zifi_transport==1). The TinyUSB weak
+    // callbacks tuh_cdc_mount_cb/umount_cb/rx_cb in ZiFi.cpp forward here; these
+    // touch the private RX ring so they're members. No-ops on the UART path / when
+    // CDC is compiled out. Called from main-loop (tuh_task) context.
+    static void usbCdcMount(int idx);
+    static void usbCdcUnmount(int idx);
+    static void usbCdcRx(int idx);
     // Diagnostic: temporarily switch the UART to `baud`, send "AT", and report
     // whether the ESP answers "OK". Restores the prior baud + RX IRQ. Used to
     // detect a baud desync (ESP power-sagged back to its 115200 default while we
     // stayed at the raised rate → every AT fails until a manual reboot).
     static bool probeBaud(uint32_t baud);
+
+    // Any RX byte ready in the pipe (IRQ ring | spill | staging)? Public so
+    // ZiFiSock::sock_open can verify the pipe is fully drained before flushing
+    // a link's ring (stale +IPD frames of a previous connection).
+    static bool rxAvailable();
 
 private:
     // RX ring: IRQ landing zone. 8 KB so it absorbs SD-write/decrypt latency spikes
@@ -86,7 +116,6 @@ private:
     // traffic so the handshake isn't slowed. rxSpillTick() (per frame) drives
     // spill/mode; rxPop() is the single byte source for all read paths.
     static int  rxPop();              // next RX byte, or -1 if none available
-    static bool rxAvailable();        // any RX byte ready (ring | SD | out_buf)?
     static void rxSpillTick();        // per-frame: spill ring → SD, manage SD mode
     static void rxReset();            // CLRFIFO / deinit: drop everything, close swap
 

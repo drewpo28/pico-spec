@@ -10,8 +10,11 @@
 #include <hardware/i2c.h>
 #include <hardware/vreg.h>
 #include <hardware/sync.h>
+#include <hardware/xip_cache.h>   // xip_cache_invalidate_all (clock/flash-timing fix-up)
 #include <hardware/flash.h>
 #include <hardware/clocks.h>
+#include <hardware/uart.h>
+#include <hardware/watchdog.h>    // watchdog_caused_reboot (boot breadcrumb)
 
 #include <hardware/pll.h>
 
@@ -62,8 +65,6 @@ struct semaphore vga_start_semaphore;
 struct semaphore graphics_init_done_semaphore;
 #endif
 #include "Video.h"
-
-static FATFS fs;
 
 struct input_bits_t {
     bool a: true;
@@ -852,7 +853,9 @@ extern "C" void refresh_lcd(void);
 
 void __scratch_x("render") render_core() {
     multicore_lockout_victim_init();
+    { extern size_t getFreeHeap(void); Debug::log("render: graphics_init begin, freeHeap=%u", (unsigned)getFreeHeap()); }
     graphics_init();
+    { extern size_t getFreeHeap(void); Debug::log("render: graphics_init done, freeHeap=%u", (unsigned)getFreeHeap()); }
 #if SOFTTV
     sem_release(&graphics_init_done_semaphore);
 #endif
@@ -1019,6 +1022,18 @@ static bool __no_inline_not_in_flash_func(psram_detect)() {
 void __no_inline_not_in_flash_func(psram_init)(uint cs_pin) {
     gpio_set_function(cs_pin, GPIO_FUNC_XIP_CS1);
 
+    // DIRECT-MODE WINDOW — strict discipline (root cause of the intermittent
+    // post-reset boot hang, hw-traced 2026-07-07): while DIRECT_CSR.EN is set,
+    // ANY flash (CS0) fetch stalls the core forever. That includes (a) calls
+    // into flash-resident code — psram_retiming() used to run inside this
+    // window and its clock_get_hz() is flash code, so the boot hung whenever
+    // that line wasn't already XIP-cache-resident — and (b) any IRQ whose
+    // handler lives in flash (USB is live here: tuh_init ran before us). So:
+    // IRQs off for the whole window, nothing but RAM code inside, and the
+    // window ends BEFORE psram_retiming/format setup (plain register writes
+    // that don't need direct mode).
+    const uint32_t ints = save_and_disable_interrupts();
+
     // Enable direct mode (manual CS for the ID probe), clkdiv of 30.
     qmi_hw->direct_csr = 30 << QMI_DIRECT_CSR_CLKDIV_LSB | QMI_DIRECT_CSR_EN_BITS;
     while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
@@ -1029,6 +1044,7 @@ void __no_inline_not_in_flash_func(psram_init)(uint cs_pin) {
     // return a consistent garbage value and report a chip that is not there.
     if (!psram_detect()) {
         qmi_hw->direct_csr = 0;
+        restore_interrupts(ints);
         BUTTER_PSRAM_SIZE = 0;
         return;
     }
@@ -1046,6 +1062,10 @@ void __no_inline_not_in_flash_func(psram_init)(uint cs_pin) {
 
     while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
         ;
+
+    // END of the direct-mode window — flash code is safe again from here on.
+    qmi_hw->direct_csr = 0;
+    restore_interrupts(ints);
 
     psram_retiming();
 
@@ -1070,9 +1090,6 @@ void __no_inline_not_in_flash_func(psram_init)(uint cs_pin) {
         QMI_M0_WFMT_PREFIX_LEN_VALUE_8   << QMI_M0_WFMT_PREFIX_LEN_LSB;
 
     qmi_hw->m[1].wcmd = 0x38;
-
-    // Disable direct mode
-    qmi_hw->direct_csr = 0;
 
     // Enable writes to PSRAM
     hw_set_bits(&xip_ctrl_hw->ctrl, XIP_CTRL_WRITABLE_M1_BITS);
@@ -1230,12 +1247,49 @@ static bool __not_in_flash_func(try_set_sys_clock_khz)(uint32_t freq_khz) {
     return false;
 }
 
+#if !PICO_RP2040
+// Switch clk_sys to `mhz` and re-tune QMI flash (+ PSRAM) timing to match it — IRQs
+// off and entirely from RAM — then drop the XIP cache. After a flash erase/program the
+// bootrom leaves XIP at a conservative DEFAULT timing; reading flash at the overclock
+// with that stale timing faults intermittently (same QMI hazard as the clock-switch
+// block in main()). Buffer's flash-write window calls this to drop to 252 MHz for the
+// write and to restore the running clock + correct timing afterwards.
+void __not_in_flash_func(board_set_clock_and_timing)(uint32_t mhz) {
+    const uint32_t ints = save_and_disable_interrupts();
+    if (!try_set_sys_clock_khz(mhz * KHZ))
+        set_sys_clock_khz(mhz * KHZ, true);
+    flash_timings((int)mhz);
+#if defined(BUTTER_PSRAM_GPIO) && BUTTER_PSRAM_GPIO != 255
+    psram_retiming();
+#endif
+    xip_cache_invalidate_all();
+    restore_interrupts(ints);
+}
+#endif
+
 #ifdef VGA_HDMI
 extern "C" uint8_t linkVGA01;
 #endif
 extern "C" int testPins(uint32_t pin0, uint32_t pin1);
 
+// TinyUSB routes failed TU_ASSERTs here instead of a bkpt instruction (see
+// CFG_TUSB_DEBUG_BREAKPOINT in tusb_config.h) — a bkpt freezes every debug
+// session on recoverable asserts (dongle re-enumeration). Count and move on.
+volatile uint32_t g_tusb_assert_count = 0;
+extern "C" void picospec_tusb_assert_hook(void) { g_tusb_assert_count++; }
+
 int main() {
+#if defined(DBG_UART_ENABLED) && defined(PICO_DEFAULT_UART)
+    // Early console at the boot clock: proves bootrom/crt0 completed and logs the
+    // reset reason before any flash/clock/PSRAM bring-up (the pre-stdio window
+    // used to be silent, which made early-boot hangs undebuggable). The UART
+    // divider goes stale after set_sys_clock; stdio_init_all below re-inits it,
+    // so no prints in between.
+    uart_init(uart_default, 115200);
+    gpio_set_function(PICO_DEFAULT_UART_TX_PIN, GPIO_FUNC_UART);
+    Debug::log("main: entry, wd_reboot=%d", (int)watchdog_caused_reboot());
+    uart_tx_wait_blocking(uart_default);   // drain before the clock switch garbles it
+#endif
     flash_info();
 #ifdef PICO_RP2040
     vreg_set_voltage(VREG_VOLTAGE_MAX); // 1.30V — max for RP2040
@@ -1294,8 +1348,10 @@ int main() {
         psram_pin = 255;   // PSRAM disabled via CMake kill-switch (set(PSRAM OFF))
     #else
         psram_pin = chip_is_rp2350a() ? BUTTER_PSRAM_GPIO : 47;
+        Debug::log("main: psram_init begin");
         psram_init(psram_pin);
         butter_psram_size();
+        Debug::log("main: butter=%u KB", butter_psram_size() >> 10);
     #endif
     #endif
     exception_set_exclusive_handler(HARDFAULT_EXCEPTION, sigbus);
@@ -1310,6 +1366,7 @@ int main() {
     if (butter_psram_size() == 0 || psram_pin != PSRAM_PIN_SCK) {
 #endif
     #ifndef MURM2
+        Debug::log("main: init_psram begin");
         init_psram();
     #endif
 #if PICO_RP2350
@@ -1333,12 +1390,10 @@ int main() {
     Debug::log("main: after ESPectrum::setup()");
     Debug::log2SD("main: after ESPectrum::setup()");
 
-#if !PICO_RP2040
-    // Install the GM.DLS wavetable bank from SD into flash here — single core,
-    // BEFORE core1/video starts (no HDMI ISR, no multicore_lockout, no freeze).
-    // No-op unless GM.DLS MIDI is selected and the SD bank differs from flash.
-    MidiSynth::provisionAtBoot();
-#endif
+    // NOTE: GM.DLS bank + pending ALF cartridge flash provisioning now runs inside
+    // ESPectrum::setup(), right after Config::load() and BEFORE VIDEO::Init(). It must
+    // precede VIDEO::Init() or the live HDMI engine stalls the QMI bus during the flash
+    // erase (XIP-PSRAM goes away with XIP-flash) and hangs the board. See ESPectrum.cpp.
 
 #if USE_NESPAD
     // Bring up the NES gamepad now that Config is loaded — unless ZiFi (RP2350)
@@ -1472,6 +1527,7 @@ int main() {
 #if SOFTTV
     sem_init(&graphics_init_done_semaphore, 0, 1);
 #endif
+    { extern size_t getFreeHeap(void); Debug::log("main: launching core1, freeHeap=%u", (unsigned)getFreeHeap()); }
     Debug::log2SD("main: launching core1");
     multicore_launch_core1(render_core);
 #if SOFTTV
@@ -1483,6 +1539,7 @@ int main() {
 #endif
     Debug::log2SD("main: releasing vga_start_semaphore");
     sem_release(&vga_start_semaphore);
+    { extern size_t getFreeHeap(void); Debug::log("main: entering ESPectrum::loop(), freeHeap=%u", (unsigned)getFreeHeap()); }
     Debug::log2SD("main: entering ESPectrum::loop()");
     ESPectrum::loop();
     __unreachable();

@@ -62,10 +62,17 @@ visit https://zxespectrum.speccy.org/contacto
 using namespace std;
 
 // Change running snapshot
+// Path of the snapshot currently being loaded (set around the dispatch below).
+// Read by Config::requestMachine's Profi-boundary reboot: when the arch change
+// requires a memory re-layout (reboot), the in-flight load is persisted into
+// Config::ram_file and resumed by setup() after the reboot.
+std::string g_snapshot_loading_path;
+
 bool LoadSnapshot(const string& filename, const string& force_arch, const string& force_romset) {
     if (!FileUtils::fsMount) return false;
     bool res = false;
     uint8_t OSDprev = VIDEO::OSD;
+    g_snapshot_loading_path = filename;
     if (FileUtils::hasSNAextension(filename)) {
         res = FileSNA::load(filename, force_arch, force_romset);
     } else if (FileUtils::hasZ80extension(filename)) {
@@ -73,6 +80,7 @@ bool LoadSnapshot(const string& filename, const string& force_arch, const string
     } else if (FileUtils::hasPextension(filename)) {
         res = FileP::load(filename);
     }
+    g_snapshot_loading_path.clear();
     if (res && OSDprev) {
         VIDEO::OSD = OSDprev;
         if (Config::aspect_16_9)
@@ -1188,6 +1196,7 @@ bool FileP::load(const string& p_fn) {
 
     uint16_t address = 16393;
     uint8_t page = address >> 14;
+    MemESP::ensureResident(page); // accessor bank → real frame before raw fread
     fread(&MemESP::ramCurrent[page][address & 0x3fff], p_size, 1, *file);
 
     fclose2(file);

@@ -23,6 +23,12 @@
 
 // ── Symmetric crypto (SSH transport cipher) ─────────────────────────────────
 #define MBEDTLS_AES_C
+// Keep the AES forward/reverse tables (FT0-3/RT0-3 + fsb, ~8 KB) in flash instead
+// of recomputing them into RAM at first use. On m1p2 (SPI-PSRAM, no butter XIP) the
+// heap arena is the binding constraint for Profi; these 8 KB of BSS are pure waste
+// there (mbedTLS/ZiFi is disabled on Profi anyway). Flash is XIP-cached so AES speed
+// is unchanged; costs ~8 KB flash (we have 31% used of 4/16 MB).
+#define MBEDTLS_AES_ROM_TABLES
 #define MBEDTLS_CIPHER_C
 #define MBEDTLS_CIPHER_MODE_CTR            // aes256-ctr (SSH default we negotiate)
 

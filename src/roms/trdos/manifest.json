@@ -1,0 +1,26 @@
+{
+  "id": "trdos",
+  "base": "trdos_505d",
+  "base_sym": "gb_rom_4_trdos_505d",
+  "base_len": 16384,
+  "variants": [
+    {
+      "sel": 0,
+      "name": "5.03",
+      "sym": "gb_rom_4_trdos_503",
+      "overlay_sym": "gb_overlay_trdos_503",
+      "len": 855,
+      "runs": 31,
+      "diff_bytes": 657
+    },
+    {
+      "sel": 1,
+      "name": "5.04TM",
+      "sym": "gb_rom_4_trdos_504tm",
+      "overlay_sym": "gb_overlay_trdos_504tm",
+      "len": 454,
+      "runs": 23,
+      "diff_bytes": 304
+    }
+  ]
+}

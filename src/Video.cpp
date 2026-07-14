@@ -36,6 +36,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Video.h"
 #include "Debug.h"
 #include "Subsystem.h"
+#include "Buffer.h"
 #include "Tape.h"
 #include "FileUtils.h"
 #include "VidPrecalc.h"
@@ -52,6 +53,8 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Ports.h"
 #if !PICO_RP2040
 #include "Z80DMA.h"
+#include "hardware/xip_cache.h"
+#include "hardware/regs/addressmap.h"
 #endif
 extern "C" void graphics_set_palette(uint8_t i, uint32_t color888);
 extern "C" void vga_set_palette_entry_solid(uint8_t i, uint32_t color888);
@@ -196,21 +199,28 @@ uint32_t VIDEO::profi_palette_live[16] = {
     0x000000, 0x0000FF, 0xFF0000, 0xFF00FF, 0x00FF00, 0x00FFFF, 0xFFFF00, 0xFFFFFF
 };
 
-// Convert Profi palette byte to RGB888.
-// Format: GGGRRRBb — bits[7:5]=G (3-bit), bits[4:2]=R (3-bit), bits[1:0]=B (2-bit).
-// 256 distinct colors (8×8×4). Confirmed by ZX-Profi hardware docs (habr.com/ru/articles/836836/).
-// G/R: 3-bit scale — levels 0..6 map to 0,43,85,128,170,213,255; level 7 clamps to 255.
-// B:   2-bit scale — level × 85 (blue "has implicit LSB=0", equivalent to 3-bit value×2).
-// Standard palette bytes (bit5=bit2=0) decode identically to ZXMAK2: dim=170 (0xAA), bright=255.
-static inline uint32_t profi_color_to_rgb888(uint8_t c) {
+// Convert a Profi DS80 palette write to RGB888.
+// Byte written via the #7E-style port trick: bits[7:5]=GX2:0, bits[4:2]=RX2:0,
+// bits[1:0]=BX2:1. bx0 is the separate BX0 latch (port #FE bit7) — real DS80
+// hardware combines it with BX2:1 to form a full 3-bit blue component, giving a
+// genuine 3:3:3 (512-color) palette instead of the 3:3:2 (256-color) subset that
+// bx0=0 software (which never touches #FE bit7) reduces to.
+// G/R/B: 3-bit scale — levels 0..6 map to 0,43,85,128,170,213,255; level 7 clamps
+// to 255. Standard palette bytes (bit5=bit2=0, bx0=0) decode identically to the
+// old 3:3:2-only table: dim=170 (0xAA), bright=255.
+static inline uint32_t profi_color_to_rgb888(uint8_t c, uint8_t bx0) {
     static const uint8_t gr[8] = {0, 43, 85, 128, 170, 213, 255, 255};
-    static const uint8_t bl[4] = {0, 85, 170, 255};
-    uint8_t R = gr[(c >> 2) & 0x07];   // bits[4:2]
-    uint8_t G = gr[(c >> 5) & 0x07];   // bits[7:5]
-    uint8_t B = bl[c & 0x03];           // bits[1:0]
+    uint8_t R = gr[(c >> 2) & 0x07];                 // bits[4:2] = RX2:0
+    uint8_t G = gr[(c >> 5) & 0x07];                 // bits[7:5] = GX2:0
+    uint8_t B = gr[((c & 0x03) << 1) | (bx0 & 1)];   // BX2:1 (bits[1:0]) + BX0
     return ((uint32_t)R << 16) | ((uint32_t)G << 8) | B;
 }
 
+// Per-frame swap/accessor snapshot for [NEG] attribution (see EndFrame).
+volatile uint32_t g_frame_swap_us = 0, g_frame_swap_idle_us = 0, g_frame_accb = 0;
+
+uint8_t VIDEO::profi_bx0_latch = 0;
+uint8_t VIDEO::profi_gx0_latch = 0;
 volatile bool VIDEO::profi_palette_dirty = false;
 volatile bool VIDEO::profi_ds80_activate_pending   = false;
 volatile bool VIDEO::profi_ds80_deactivate_pending = false;
@@ -337,7 +347,7 @@ void VIDEO::profiPaletteWrite(uint8_t index, uint8_t profi_color) {
     // defaults from incidental port-0x7E writes during BIOS startup setup.
     if (!profi_ds80_active) return;
     uint8_t idx = index & 0x0F;
-    uint32_t newRgb = profi_color_to_rgb888(profi_color);
+    uint32_t newRgb = profi_color_to_rgb888(profi_color, profi_bx0_latch);
     profi_palette_live[idx] = newRgb;
     // Defer HDMI refresh to HDMI ISR vblank (set dirty flag, applied in EndFrame).
     profi_palette_dirty = true;
@@ -507,7 +517,6 @@ static int brdlin_cnt = 0;
 static unsigned int lin_end, lin_end2 /*, lin_end3*/;
 
 static unsigned int coldraw_cnt;
-static unsigned int col_end;
 static unsigned int video_rest;
 static unsigned int video_opcode_rest;
 static unsigned int curline;
@@ -525,8 +534,9 @@ static uint8_t* ds80_frame_grmem  = nullptr;
 static uint8_t* ds80_frame_clrmem = nullptr;
 // SRAM snapshot of the 16 KB clrmem page (pages 56/58).  Lives at file scope so
 // EndFrame (vblank) can populate it before the rasterizer runs.  Allocated from
-// heap only when arch==Profi (see VIDEO::Reset) so non-Profi machines reclaim the
-// 16 KB; freed when leaving Profi.
+// heap only when arch==Profi on butter/QSPI boards (see VIDEO::Reset), where
+// pages 56/58 are plain XIP butter pointers; on SPI-PSRAM/SWAP boards those
+// pages are force_sram_locked heap SRAM and no snapshot is needed.
 #define DS80_CLR_SRAM_SIZE 16384
 static uint8_t* ds80_clr_sram = nullptr;
 #endif
@@ -1140,14 +1150,25 @@ void VIDEO::ulaPlusDisable() {
 // High byte = RIGHT pixel = (bit7 << 3) | (bits 5..3) = (I, GRB)
 // 512 bytes in SRAM, hot in cache. Reading one byte from a Pentagon plane
 // becomes a single LDRH from this table — no shift/mask in the inner loop.
-static uint16_t mode16col_decode_lut[256] __attribute__((aligned(4)));
+// 512 B heap LUT, allocated only while 16col is enabled (Config::mode16col_onoff)
+// and freed when off — so the feature costs ZERO SRAM when disabled.
+static uint16_t* mode16col_decode_lut = nullptr;
 
-static void init_mode16col_decode_lut() {
+void VIDEO::ensure16colLut() {
+    if (!mode16col_decode_lut) {
+        mode16col_decode_lut = (uint16_t*)malloc(256 * sizeof(uint16_t));
+        if (!mode16col_decode_lut) return;
+    }
     for (int x = 0; x < 256; x++) {
         uint8_t L = (uint8_t)((((x) >> 3) & 0x08) | ((x) & 0x07));
         uint8_t R = (uint8_t)((((x) >> 4) & 0x08) | (((x) >> 3) & 0x07));
         mode16col_decode_lut[x] = (uint16_t)L | ((uint16_t)R << 8);
     }
+}
+
+void VIDEO::free16colLut() {
+    free(mode16col_decode_lut);
+    mode16col_decode_lut = nullptr;
 }
 
 void VIDEO::mode16colUpdatePlanes() {
@@ -1295,6 +1316,11 @@ static uint8_t *sharedFB_main = nullptr;  // sized for current mode
 static uint8_t *sharedFB_prev = nullptr;  // sized for current mode (Gigascreen only)
 static size_t sharedFB_main_size = 0;     // actual byte capacity of sharedFB_main
 static size_t sharedFB_prev_size = 0;     // actual byte capacity of sharedFB_prev
+// Backing store for sharedFB_prev. Tiered: butter PSRAM (XIP-addressable) is
+// preferred so the ~52 KB prev-FB no longer eats SRAM on PSRAM boards; falls back
+// to the heap when no butter PSRAM is present. NEED_POINTER keeps it addressable
+// for the per-pixel blend hot path (SPI PSRAM/SD-swap are never selected).
+static Buffer sharedFB_prevBuf;
 static void **sharedFB_arr1 = nullptr;    // pointer array for frameBuffer (FB_MAX_LINES slots)
 static void **sharedFB_arr2 = nullptr;    // pointer array for prevFrameBuffer
 
@@ -1302,6 +1328,15 @@ static void **sharedFB_arr2 = nullptr;    // pointer array for prevFrameBuffer
 // without reaching back into vidmodes[].
 static int sharedFB_lines = 0;
 static int sharedFB_stride = 0;
+
+// prevFB DMA scanline window (defined below, butter-PSRAM boards only).
+#if !PICO_RP2040
+static void pwShutdown();
+static void pwDrop();
+#else
+static inline void pwShutdown() {}
+static inline void pwDrop() {}
+#endif
 
 static inline size_t fbMainBytes(int lines, int stride) {
     return (size_t)lines * (size_t)stride;
@@ -1329,25 +1364,25 @@ static bool ensurePrevFB(int lines, int stride) {
     if (Config::arch == "Profi") return true; // Gigascreen not available for Profi
     size_t want = fbPrevBytes(lines, stride);
     if (sharedFB_prev && sharedFB_prev_size == want) return true;
-    if (sharedFB_prev) { free(sharedFB_prev); sharedFB_prev = nullptr; sharedFB_prev_size = 0; }
-    // Heap-headroom guard. prevFB (~52 KB) is the biggest *optional* buffer. On a
-    // butter-less board it collides with other big SRAM users that landed on the
-    // heap before us (General Sound's ~36 KB work/cache/rings; the framebuffer),
-    // and a bare malloc-succeeds check isn't enough — the 52 KB fits *now* but
-    // starves the rest of boot (WD1793/Z80/DivMMC/ZiFi) → OOM panic loop. Only take
-    // it if enough heap remains afterwards; otherwise decline and the caller
-    // (GsSubsys::apply) cleanly disables Gigascreen for the session.
-    extern size_t getFreeHeap(void);
-    if (getFreeHeap() < want + GIGASCREEN_PREVFB_HEADROOM) {
-        Debug::log("VIDEO: prevFB declined (freeHeap=%u < %u+%u) — Gigascreen off this session",
-                   (unsigned)getFreeHeap(), (unsigned)want, (unsigned)GIGASCREEN_PREVFB_HEADROOM);
+    if (sharedFB_prev) {
+        pwShutdown();  // stop window DMA / drop cached state before freeing
+        sharedFB_prevBuf.free(); sharedFB_prev = nullptr; sharedFB_prev_size = 0;
+    }
+    // Memory policy lives in Subsystem: can this prevFB be allocated without starving
+    // the heap on a butter-less board? (Butter-PSRAM boards always pass — it goes to
+    // XIP.) Decline → GsSubsys::apply() cleanly disables Gigascreen for the session.
+    if (!Subsystems::gigascreenPrevFBAffordable(want)) return false;
+    // Butter PSRAM first (frees SRAM), heap fallback. NEED_POINTER keeps it
+    // addressable for the per-pixel blend; SPI PSRAM / SD-swap are never picked.
+    if (!sharedFB_prevBuf.alloc(want, Buffer::NEED_POINTER | Buffer::PREFER_PSRAM)) {
+        Debug::log("VIDEO: prevFB alloc failed (want=%u) — Gigascreen off this session", (unsigned)want);
         return false;
     }
-    uint8_t *p = (uint8_t*)malloc(want);
-    if (!p) return false;
+    uint8_t *p = sharedFB_prevBuf.data();
     memset(p, 0, want);
     sharedFB_prev = p;
     sharedFB_prev_size = want;
+    Debug::log("VIDEO: prevFB %uKB on %s", (unsigned)(want >> 10), sharedFB_prevBuf.tierName());
     return true;
 }
 
@@ -1368,6 +1403,260 @@ static void setupSharedFBPointers(Graphics<unsigned char> &vga, int lines, int s
         vga.prevFrameBuffer = nullptr;
     }
 }
+
+// ── Gigascreen prevFB scanline window (butter/XIP PSRAM boards) ──────────────
+// On butter boards the prev-FB lives in XIP PSRAM. Direct CACHED access there
+// is memory-bound: the per-frame full sweep (52 KB > 16 KB XIP cache) stalls
+// the CPU on every read miss AND on every dirty-line writeback eviction.
+// This window keeps the render hot path in SRAM: the blend/border code
+// reads/writes small SRAM row buffers, and rows are staged to/from the PSRAM
+// prev-FB through the UNCACHED XIP alias (+PW_UNCACHED) by tight RAM-resident
+// CPU copy loops. Sequential accesses merge into linear QMI bursts (COOLDOWN),
+// and the XIP cache never holds prev-FB lines while the window is active.
+//
+// Transport history (important — do not "optimize" back):
+//  • CPU cached memcpy window: measured WORSE than direct access (cache thrash
+//    + writeback storms) — see m1p2 notes.
+//  • DMA chains through the uncached alias: passed all functional self-tests
+//    but KILLED the video output — all DMA channels share one read and one
+//    write bus manager, and a single in-flight beat to the slow QMI PSRAM
+//    blocks the manager for tens of cycles while the HDMI scanout DMA needs a
+//    beat every ~14 cycles. HIGH_PRIORITY cannot preempt an in-flight beat →
+//    PIO FIFO underrun → no sync. (16-bit DMA beats to QMI also stalled
+//    outright on non-word-aligned segment starts.)
+//  • CPU uncached copies (this code): the CPU uses its own bus port, so the
+//    DMA managers — and therefore HDMI — never see this traffic at all.
+//
+// Two independent raster-ordered streams, each with 2 row buffers:
+//   • content — MainScreen blend loop rows [lin_end, lin_end2)
+//   • border  — Update_Border rows [0, yres), possibly swept in bursts
+// Both may hold the SAME row concurrently; writebacks are restricted to the
+// byte segments each stream owns (content: [lineptr_offset*2, +128); border:
+// the complement), so they never clobber each other. Prefetches read the full
+// row — reads are harmless.
+//
+// Gate: prev-FB in butter PSRAM + geometry where border/content segments line
+// up on even offsets (all 4:3 and fullborder modes; 16:9 Pentagon falls back
+// to the direct cached-XIP path). Cache coherence across gate transitions is
+// handled with xip_cache_clean_range / invalidate_range.
+#if !PICO_RP2040
+
+#define PW_ROW_MAX 184  // largest prev row: 360 px / 2 = 180 B, rounded up
+// Cached XIP (0x1x......) → uncached, non-allocating alias (0x1(x+4)......)
+#define PW_UNCACHED (XIP_NOCACHE_NOALLOC_BASE - XIP_BASE)
+
+struct PrevWin {
+    uint8_t buf[2][PW_ROW_MAX] __attribute__((aligned(4)));
+    int     row[2];             // prev-FB row each buffer holds (-1 = invalid)
+    int     cur;                // buffer the CPU currently owns
+    bool    isBorder;
+};
+static PrevWin pwCont = { {}, {-1, -1}, 0, false };
+static PrevWin pwBrd  = { {}, {-1, -1}, 0, true  };
+static bool     pw_gate = false;
+static bool     pw_failed = false;      // self-test failed — window disabled for good
+static uint32_t pw_geom_sig = 0;
+
+static inline bool pwPrevInButter() {
+    uintptr_t p = (uintptr_t)sharedFB_prev;
+    return p >= (XIP_BASE + 0x01000000u) && p < XIP_NOCACHE_NOALLOC_BASE;
+}
+
+static inline uint8_t* pwUncachedRow(int row) {
+    return sharedFB_prev + (size_t)row * (sharedFB_stride / 2) + PW_UNCACHED;
+}
+
+// Byte segments of a prev row owned by a stream (writeback scope). Boundaries
+// are even but not always word-aligned (Pentagon fullborder: 26/154): the
+// copy runs words over the aligned interior and halfwords at the ragged edges.
+static int __not_in_flash_func(pwSegs)(bool isBorder, int row, int* off, int* len) {
+    if (!isBorder) { off[0] = (int)lineptr_offset * 2; len[0] = 128; return 1; }
+    if (row >= (int)lin_end && row < (int)lin_end2) {
+        off[0] = 0;                len[0] = brdcol_end1;
+        off[1] = brdcol_end1 + 128; len[1] = brdcol_end - off[1];
+        return (len[1] > 0) ? 2 : 1;
+    }
+    off[0] = 0; len[0] = brdcol_end;  // top/bottom border rows: full width
+    return 1;
+}
+
+// Stage buffer b to/from PSRAM: writeback wbRow's owned segments (if >= 0),
+// then prefetch rdRow's owned segments (if >= 0). Synchronous CPU copies
+// through the uncached alias — see the transport note above.
+static void __not_in_flash_func(pwKick)(PrevWin& w, int b, int wbRow, int rdRow) {
+    if (wbRow >= 0) {
+        int off[2], len[2];
+        int nw = pwSegs(w.isBorder, wbRow, off, len);
+        uint8_t* rowU = pwUncachedRow(wbRow);
+        for (int s = 0; s < nw; s++) {
+            int a = off[s], e = off[s] + len[s];
+            if (e <= a) continue;
+            if (a & 2) { *(uint16_t*)(rowU + a) = *(uint16_t*)(w.buf[b] + a); a += 2; }
+            if ((e & 2) && e > a) { e -= 2; *(uint16_t*)(rowU + e) = *(uint16_t*)(w.buf[b] + e); }
+            uint32_t*       d   = (uint32_t*)(rowU + a);
+            const uint32_t* s32 = (const uint32_t*)(w.buf[b] + a);
+            for (int n = (e - a) >> 2; n > 0; n--) *d++ = *s32++;
+        }
+    }
+    if (rdRow >= 0) {
+        // Prefetch only the owned segments — uncached reads are the expensive
+        // half of the staging cost (writes are posted). Reads round outward to
+        // word boundaries: overreading a couple of foreign bytes is harmless
+        // (they are never consumed nor written back).
+        int off[2], len[2];
+        int nr = pwSegs(w.isBorder, rdRow, off, len);
+        const uint8_t* rowU = pwUncachedRow(rdRow);
+        for (int s = 0; s < nr; s++) {
+            if (len[s] <= 0) continue;
+            int a = off[s] & ~3;
+            int e = (off[s] + len[s] + 3) & ~3;
+            const uint32_t* s32 = (const uint32_t*)(rowU + a);
+            uint32_t*       d   = (uint32_t*)(w.buf[b] + a);
+            for (int n = (e - a) >> 2; n > 0; n--) *d++ = *s32++;
+        }
+    }
+}
+
+// Per-row entry point: returns the SRAM buffer holding prev row `row`
+// (full-row layout, so existing pointer math applies unchanged).
+static uint8_t* __not_in_flash_func(pwFetch)(PrevWin& w, int row) {
+    if (row == w.row[w.cur]) return w.buf[w.cur];
+    const int maxRow = w.isBorder ? (int)VIDEO::vga.yres : (int)lin_end2;
+    int other = w.cur ^ 1;
+    if (w.row[other] == row) {
+        // Advance: flush the old current row, prefetch row+1 behind it.
+        int old = w.cur, wbRow = w.row[old];
+        w.cur = other;
+        int nxt = (row + 1 < maxRow) ? row + 1 : -1;
+        w.row[old] = nxt;
+        pwKick(w, old, wbRow, nxt);
+        return w.buf[w.cur];
+    }
+    // Resync (frame start / skipped frames): flush + fetch.
+    pwKick(w, w.cur, w.row[w.cur], row);
+    w.row[w.cur] = row;
+    int nxt = row + 1;
+    if (nxt < maxRow) { pwKick(w, other, -1, nxt); w.row[other] = nxt; }
+    else w.row[other] = -1;
+    return w.buf[w.cur];
+}
+
+// Discard all buffered rows WITHOUT writeback — for callers about to rewrite
+// or free the whole prev-FB (InitPrevBuffer, geometry change, shutdown).
+static void pwDrop() {
+    pwCont.row[0] = pwCont.row[1] = -1;
+    pwBrd.row[0]  = pwBrd.row[1]  = -1;
+}
+
+// Disable the window and restore the cached-access regime (before freeing
+// prev-FB or when the gate closes). Must run while sharedFB_prev is valid.
+static void pwShutdown() {
+    pwDrop();
+    if (pw_gate && sharedFB_prev)
+        xip_cache_invalidate_range((uintptr_t)sharedFB_prev - XIP_BASE, sharedFB_prev_size);
+    pw_gate = false;
+}
+
+static bool pwSelfTest();  // one-shot data-integrity probe, defined below
+
+// Re-evaluate the gate. Called from Select_Update_Border() — i.e. on every
+// geometry/arch change and once per frame (cheap compare on the steady path).
+static void pwRefreshGate() {
+    const int W = sharedFB_stride / 2;
+    bool want = sharedFB_prev != nullptr
+        && !pw_failed
+        && ((uintptr_t)sharedFB_prev & 3) == 0
+        && pwPrevInButter()
+        && !ds80_border_geom
+        && brdcol_start == 0
+        && (brdcol_end1 & 1) == 0
+        && (int)lineptr_offset * 2 == brdcol_end1
+        && brdcol_retrace == brdcol_end
+        && brdcol_end == W
+        && W > 0 && W <= PW_ROW_MAX && (W & 3) == 0;
+    uint32_t sig = (uint32_t)brdcol_end1 | ((uint32_t)brdcol_end << 8)
+                 | ((uint32_t)lin_end << 16) | ((uint32_t)lin_end2 << 24);
+    if (want == pw_gate) {
+        if (pw_gate && sig != pw_geom_sig) { pwDrop(); pw_geom_sig = sig; }
+        return;
+    }
+    if (want) {
+        pwDrop();
+        pw_geom_sig = sig;
+        // Push any dirty prev-FB lines (alloc-time memset, pre-gate CPU writes)
+        // out of the XIP cache so the uncached-alias copies see current data.
+        xip_cache_clean_range((uintptr_t)sharedFB_prev - XIP_BASE, sharedFB_prev_size);
+        pwCont.cur = 0; pwBrd.cur = 0;
+        bool st_ok = pwSelfTest();
+        pwDrop();
+        if (!st_ok) {
+            pw_failed = true;
+            Debug::log("VIDEO: prevFB window self-test FAILED — disabled");
+            return;
+        }
+        pw_gate = true;
+        Debug::log("VIDEO: prevFB window ON (W=%d content=[%d,%d))", W, brdcol_end1, brdcol_end1 + 128);
+    } else {
+        pwShutdown();
+        Debug::log("VIDEO: prevFB window OFF");
+    }
+}
+
+static inline bool pwOn() { return pw_gate && VIDEO::gigascreen_enabled; }
+
+// ── Self-test ────────────────────────────────────────────────────────────────
+// Runs once before the window is allowed into the render path; drives the
+// production pwKick machinery and verifies data integrity through the uncached
+// alias. Each stage logs BEFORE executing so a wedge is identifiable from UART.
+static bool pwSelfTest() {
+    const int W = sharedFB_stride / 2;
+    uint8_t* unc = pwUncachedRow(0);
+    const int coff = (int)lineptr_offset * 2;
+    const int mid = (int)lin_end;      // first middle row (2-segment border shape)
+    Debug::log("PW st: prev=%p unc=%p W=%d cont=[%d,%d) end1=%d mid=%d",
+               sharedFB_prev, unc, W, coff, coff + 128, brdcol_end1, mid);
+    Debug::log("PW st0: cpu uncached read");
+    volatile uint32_t* u32 = (volatile uint32_t*)unc;
+    uint32_t v = u32[0];
+    Debug::log("PW st0: ok val=%08x cached=%08x", (unsigned)v, (unsigned)*(uint32_t*)sharedFB_prev);
+    Debug::log("PW st1: cpu uncached write");
+    u32[0] = v;                       // same value — harmless wherever it lands
+    uint32_t v2 = u32[0];
+    Debug::log("PW st1: ok readback=%08x", (unsigned)v2);
+    // Prefetch row 0 and verify against the cached view (coherent post-clean).
+    Debug::log("PW st2: prefetch row0 + verify");
+    pwKick(pwCont, 0, -1, 0);
+    // Content-stream prefetch stages only the owned segment — compare that.
+    bool match = memcmp((void*)(pwCont.buf[0] + coff), sharedFB_prev + coff, 128) == 0;
+    Debug::log("PW st2: done match=%d", (int)match);
+    if (!match) {
+        Debug::log("PW st2: buf=%02x%02x%02x%02x prev=%02x%02x%02x%02x",
+                   pwCont.buf[0][coff], pwCont.buf[0][coff + 1], pwCont.buf[0][coff + 2], pwCont.buf[0][coff + 3],
+                   sharedFB_prev[coff], sharedFB_prev[coff + 1], sharedFB_prev[coff + 2], sharedFB_prev[coff + 3]);
+        return false;
+    }
+    // Advance shape: writeback row0 (its own data) + prefetch row1.
+    Debug::log("PW st3: advance (wb0+rd1)");
+    pwKick(pwCont, 0, 0, 1);
+    // Border shape on a middle row: prefetch, then 2-segment writeback + rd.
+    Debug::log("PW st4: border wb+rd (mid row)");
+    pwKick(pwBrd, 0, -1, mid);
+    pwKick(pwBrd, 0, mid, mid + 1);
+    // 64-row sweep of production advance kicks (runtime cadence), then verify
+    // a row survived the round-trip intact.
+    Debug::log("PW st5: 64-row sweep");
+    pwKick(pwCont, 0, -1, 0);
+    pwKick(pwCont, 1, -1, 1);
+    for (int r = 0; r + 2 < 64; r++)
+        pwKick(pwCont, r & 1, r, r + 2);   // buf holds row r → clean writeback
+    pwKick(pwCont, 0, -1, 5);              // re-read a swept row
+    match = memcmp((void*)(pwCont.buf[0] + coff), sharedFB_prev + (size_t)5 * W + coff, 128) == 0;
+    Debug::log("PW st5: done match=%d", (int)match);
+    if (!match) return false;
+    return true;
+}
+
+#endif // !PICO_RP2040
 
 // GsSubsys storage and apply() — implemented here so it can touch the
 // sharedFB_* internals directly. Declared in Subsystem.h.
@@ -1396,7 +1685,7 @@ bool GsSubsys::apply() {
         if (!sharedFB_arr2) {
             sharedFB_arr2 = (void**)malloc(FB_MAX_LINES * sizeof(void*));
             if (!sharedFB_arr2) {
-                free(sharedFB_prev); sharedFB_prev = nullptr; sharedFB_prev_size = 0;
+                sharedFB_prevBuf.free(); sharedFB_prev = nullptr; sharedFB_prev_size = 0;
                 wanted = false;
                 Config::gigascreen_enabled = false;
                 VIDEO::gigascreen_enabled = false;
@@ -1416,8 +1705,9 @@ bool GsSubsys::apply() {
         // (see MainScreen_Snow*); border path already had a null-guard.
         VIDEO::vga.prevFrameBuffer = nullptr;
         enabled = false;
+        pwShutdown();  // wait out window DMA before the backing store goes away
         free(sharedFB_arr2);  sharedFB_arr2  = nullptr;
-        free(sharedFB_prev);  sharedFB_prev  = nullptr;
+        sharedFB_prevBuf.free();  sharedFB_prev  = nullptr;
         sharedFB_prev_size = 0;
     }
     return true;
@@ -1475,6 +1765,23 @@ void VIDEO::disableGigascreenForProfi() {
 void VIDEO::disableGigascreenForProfi() {} // RP2040: Gigascreen never allocated, Profi hidden
 #endif
 
+// Row accessors used by the render hot paths. Window active → SRAM buffer;
+// otherwise the direct prev-FB pointer (heap SRAM, or cached XIP fallback).
+// Callers already guard on vga.prevFrameBuffer != nullptr.
+static inline uint16_t* prevRowContent(int row) {
+#if !PICO_RP2040
+    if (pwOn()) return (uint16_t*)pwFetch(pwCont, row);
+#endif
+    return (uint16_t*)(VIDEO::vga.prevFrameBuffer[row]);
+}
+
+static inline uint8_t* prevRowBorder(int row) {
+#if !PICO_RP2040
+    if (pwOn()) return pwFetch(pwBrd, row);
+#endif
+    return (uint8_t*)(VIDEO::vga.prevFrameBuffer[row]);
+}
+
 void VIDEO::Init() {
     int Mode;
 #ifdef VGA_HDMI
@@ -1529,8 +1836,10 @@ void VIDEO::Init() {
     initAluBytes();
 
 #if !PICO_RP2040
-    // Precompute 16col byte->2-pixel LUT (used by 16col rasterizer hot loop)
-    init_mode16col_decode_lut();
+    // 16col byte->2-pixel LUT: build it only when the mode is enabled, release
+    // it otherwise so a disabled 16col reserves no SRAM.
+    if (Config::mode16col_onoff) VIDEO::ensure16colLut();
+    else VIDEO::free16colLut();
 #endif
 
     precalcULASWAP();   // precalculate ULA SWAP values
@@ -1609,13 +1918,13 @@ void VIDEO::changeMode() {
     if (SELECT_VGA) {
         switch (Config::vga_video_mode) {
             case Config::VM_640x480_50:
-                if (Config::arch == "48K") video_mode = 2;
+                if (Config::arch == "48K" || Config::arch == "Profi") video_mode = 2;
                 else if (Config::arch == "128K" || Config::arch == "ALF") video_mode = 3;
                 else video_mode = 1;
                 break;
             case Config::VM_720x480_60: video_mode = 7; break;
             case Config::VM_720x576_50:
-                if (Config::arch == "48K") video_mode = 5;
+                if (Config::arch == "48K" || Config::arch == "Profi") video_mode = 5;
                 else if (Config::arch == "128K" || Config::arch == "ALF") video_mode = 6;
                 else video_mode = 4;
                 break;
@@ -1625,13 +1934,13 @@ void VIDEO::changeMode() {
         switch (Config::hdmi_video_mode) {
             case Config::VM_640x480_60: video_mode = 0; break;
             case Config::VM_640x480_50:
-                if (Config::arch == "48K") video_mode = 2;
+                if (Config::arch == "48K" || Config::arch == "Profi") video_mode = 2;
                 else if (Config::arch == "128K") video_mode = 3;
                 else video_mode = 1;
                 break;
             case Config::VM_720x480_60: video_mode = 7; break;
             case Config::VM_720x576_50:
-                if (Config::arch == "48K") video_mode = 5;
+                if (Config::arch == "48K" || Config::arch == "Profi") video_mode = 5;
                 else if (Config::arch == "128K" || Config::arch == "ALF") video_mode = 6;
                 else video_mode = 4;
                 break;
@@ -1874,13 +2183,13 @@ void VIDEO::Reset() {
         init_profi_pair_lookup();
         // Reset live palette to defaults on machine reset
         profiPaletteReset();
-        // DS80 clrmem snapshot: needed only when pages 56/58 live in XIP butter PSRAM.
-        // On those boards a direct ISR read hits the XIP cache and may stall hundreds of
-        // cycles on a miss — corrupting HDMI timing. The snapshot converts one sequential
-        // burst (vblank) into fast SRAM reads for every scanline.
-        // On SPI-PSRAM/SWAP boards pages 56/58 are force_sram_locked (regular heap SRAM),
-        // so ds80_frame_clrmem is already a plain SRAM pointer — no snapshot needed,
-        // saving 16 KB on the memory-constrained boards that need it most.
+        // DS80 clrmem snapshot: needed only when pages 56/58 live in XIP butter
+        // PSRAM (butter boards keep the whole Profi RAM as direct XIP pointers —
+        // per A/B measurement the SRAM pool gave no cpu gain there).  A direct
+        // per-scanline read would hit the XIP cache from the render path; the
+        // snapshot converts that into one sequential burst per frame.
+        // On SPI-PSRAM/SWAP boards pages 56/58 are force_sram_locked heap SRAM,
+        // so ds80_frame_clrmem is already a plain SRAM pointer — no snapshot.
         if (!ds80_clr_sram && butter_psram_size() > 0)
             ds80_clr_sram = (uint8_t*)malloc(DS80_CLR_SRAM_SIZE);
     } else if (ds80_clr_sram) {
@@ -1917,7 +2226,7 @@ void VIDEO::Reset() {
     {
         switch (Config::vga_video_mode) {
             case Config::VM_640x480_50:
-                if (Config::arch == "48K") video_mode = 2;
+                if (Config::arch == "48K" || Config::arch == "Profi") video_mode = 2;
                 else if (Config::arch == "128K" || Config::arch == "ALF") video_mode = 3;
                 else video_mode = 1; // Pentagon
                 break;
@@ -1925,7 +2234,7 @@ void VIDEO::Reset() {
                 video_mode = 7;
                 break;
             case Config::VM_720x576_50:
-                if (Config::arch == "48K") video_mode = 5;
+                if (Config::arch == "48K" || Config::arch == "Profi") video_mode = 5;
                 else if (Config::arch == "128K" || Config::arch == "ALF") video_mode = 6;
                 else video_mode = 4; // Pentagon
                 break;
@@ -1942,7 +2251,7 @@ void VIDEO::Reset() {
                 video_mode = 0;
                 break;
             case Config::VM_640x480_50:
-                if (Config::arch == "48K") video_mode = 2;
+                if (Config::arch == "48K" || Config::arch == "Profi") video_mode = 2;
                 else if (Config::arch == "128K") video_mode = 3;
                 else video_mode = 1; // Pentagon
                 break;
@@ -1950,7 +2259,7 @@ void VIDEO::Reset() {
                 video_mode = 7;
                 break;
             case Config::VM_720x576_50:
-                if (Config::arch == "48K") video_mode = 5;
+                if (Config::arch == "48K" || Config::arch == "Profi") video_mode = 5;
                 else if (Config::arch == "128K" || Config::arch == "ALF") video_mode = 6;
                 else video_mode = 4; // Pentagon
                 break;
@@ -2018,15 +2327,37 @@ void VIDEO::InitPrevBuffer() {
         GsSubsys::apply();
     }
     if (!vga.prevFrameBuffer) return;
+    // Whole prev-FB is being reseeded: discard any rows buffered by the DMA
+    // window (their pending writebacks would clobber the new seed).
+    pwDrop();
     const int h = VIDEO::vga.yres;
     const int w = VIDEO::vga.xres;
     for (int y = 0; y < h; ++y) {
         uint8_t *src = VIDEO::vga.frameBuffer[y];
         uint8_t *dst = VIDEO::vga.prevFrameBuffer[y];
         if (!src || !dst) continue;
+        // While the DMA window is active the prev-FB must never enter the XIP
+        // cache — write through the uncached alias instead.
+        if (pw_gate) dst += PW_UNCACHED;
         // Pack 2 src pixels (8-bit palette idx) into 1 dst byte (low+high nibble).
-        for (int x = 0; x < w; x += 2) {
-            dst[x >> 1] = (src[x] & 0x0F) | ((src[x + 1] & 0x0F) << 4);
+        if (((uintptr_t)dst & 3) == 0 && (w & 7) == 0) {
+            // Word-packed fast path — matters for uncached XIP (4 B per store).
+            uint32_t *dst32 = (uint32_t*)dst;
+            for (int x = 0; x < w; x += 8) {
+                uint32_t v =  (uint32_t)(src[x]     & 0x0F)
+                           | ((uint32_t)(src[x + 1] & 0x0F) << 4)
+                           | ((uint32_t)(src[x + 2] & 0x0F) << 8)
+                           | ((uint32_t)(src[x + 3] & 0x0F) << 12)
+                           | ((uint32_t)(src[x + 4] & 0x0F) << 16)
+                           | ((uint32_t)(src[x + 5] & 0x0F) << 20)
+                           | ((uint32_t)(src[x + 6] & 0x0F) << 24)
+                           | ((uint32_t)(src[x + 7] & 0x0F) << 28);
+                *dst32++ = v;
+            }
+        } else {
+            for (int x = 0; x < w; x += 2) {
+                dst[x >> 1] = (src[x] & 0x0F) | ((src[x + 1] & 0x0F) << 4);
+            }
         }
     }
 }
@@ -2043,7 +2374,7 @@ IRAM_ATTR void VIDEO::MainScreen_Blank(unsigned int statestoadd, bool contended)
 
         lineptr32 = (uint32_t *)(vga.frameBuffer[linedraw_cnt]) + lineptr_offset;
         prevLineptr16 = vga.prevFrameBuffer
-                          ? (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset
+                          ? prevRowContent(linedraw_cnt) + lineptr_offset
                           : (uint16_t *)lineptr32;
 
         coldraw_cnt = 0;
@@ -2083,7 +2414,8 @@ IRAM_ATTR void VIDEO::MainScreen_Blank(unsigned int statestoadd, bool contended)
 
 #if !PICO_RP2040
         // DMA per-scanline attr shadow: use snapshot if DMA wrote attrs for this scanline
-        if (Config::dma_mode && Z80DMA::dma_attr_valid[curline])
+        // (dma_attr_valid/shadow are null unless the DMA attr buffer is allocated)
+        if (Config::dma_mode && Z80DMA::dma_attr_valid && Z80DMA::dma_attr_valid[curline])
             dma_attr_override = &Z80DMA::dma_attr_shadow[curline * 32];
         else
             dma_attr_override = nullptr;
@@ -2112,7 +2444,7 @@ IRAM_ATTR void VIDEO::MainScreen_Blank_Snow(unsigned int statestoadd, bool conte
 
         lineptr32 = (uint32_t *)(vga.frameBuffer[linedraw_cnt]) + lineptr_offset;
         prevLineptr16 = vga.prevFrameBuffer
-                          ? (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset
+                          ? prevRowContent(linedraw_cnt) + lineptr_offset
                           : (uint16_t *)lineptr32;
 
         coldraw_cnt = 0;
@@ -2181,7 +2513,7 @@ IRAM_ATTR void VIDEO::MainScreen_Blank_Snow_Opcode(bool contended) {
 
         lineptr32 = (uint32_t *)(vga.frameBuffer[linedraw_cnt]) + lineptr_offset;
         prevLineptr16 = vga.prevFrameBuffer
-                          ? (uint16_t *)(vga.prevFrameBuffer[linedraw_cnt]) + lineptr_offset
+                          ? prevRowContent(linedraw_cnt) + lineptr_offset
                           : (uint16_t *)lineptr32;
 
         coldraw_cnt = 0;
@@ -2341,7 +2673,7 @@ IRAM_ATTR void VIDEO::MainScreen(unsigned int statestoadd, bool contended) {
             *lineptr32++ = AluByte[combined >> 4][hires_att];
             *lineptr32++ = AluByte[combined & 0xF][hires_att];
         }
-    } else if (VIDEO::mode16col_enabled) {
+    } else if (VIDEO::mode16col_enabled && mode16col_decode_lut) {
         // 16col (Pentagon, Alone Coder, ZXPress Inferno #08).
         // Byte layout: %IiGRBgrb. mode16col_decode_lut[] precomputes
         // (left_pixel | right_pixel<<8) for every input byte.
@@ -2978,20 +3310,84 @@ IRAM_ATTR void VIDEO::EndFrame() {
     }
 #endif // PERF_TRACE
 
+    // Per-frame swap/accessor snapshot for the [NEG] worst-frame attribution
+    // in ESPectrum::loop (this block resets the live counters every frame, so
+    // the loop tail could not read them otherwise).  swap_us includes the
+    // idle-window part accrued after the previous frame's pacing; the in-frame
+    // share is swap_us - swap_idle_us.
+    {
+        extern volatile uint32_t g_frame_swap_us, g_frame_swap_idle_us, g_frame_accb;
+        g_frame_swap_us      = mem_spi_swap_us;
+        g_frame_swap_idle_us = mem_spi_swap_idle_us;
+        g_frame_accb         = mem_spi_accb;
+    }
+
     // SPI PSRAM swap diagnostics: log eviction count once every 60 frames.
     {
         static uint32_t evict_log_frame = 0;
         static uint32_t evict_accum = 0;
         static uint32_t evict_last_page = 0;
+        static uint32_t skip_accum = 0;
+        static uint32_t wbskip_accum = 0;
+        static uint32_t swap_us_accum = 0;
+        static uint32_t accb_accum = 0;
+        static uint32_t promo_accum = 0;
+        static uint32_t promo_idle_accum = 0;
+        static uint32_t swap_idle_us_accum = 0;
         evict_accum  += mem_spi_evict_count;
+        skip_accum   += mem_spi_read_skip;
+        wbskip_accum += mem_spi_wb_skip;
+        swap_us_accum += mem_spi_swap_us;
+        accb_accum   += mem_spi_accb;
+        promo_accum  += mem_spi_promo;
+        promo_idle_accum   += mem_spi_promo_idle;
+        swap_idle_us_accum += mem_spi_swap_idle_us;
         evict_last_page = mem_spi_evict_page;
         mem_spi_evict_count = 0;
-        if (++evict_log_frame >= 60) {
+        mem_spi_read_skip = 0;
+        mem_spi_wb_skip = 0;
+        mem_spi_swap_us = 0;
+        mem_spi_accb = 0;
+        mem_spi_promo = 0;
+        mem_spi_promo_idle = 0;
+        mem_spi_swap_idle_us = 0;
+        // Every 300 frames (5 s): the Debug::log line itself costs ~6 ms over
+        // USB-CDC and was reliably the worst frame of every 60-frame window
+        // during disk/page activity — keep the diagnostic, shed 80% of its
+        // frame-time pollution.
+        if (++evict_log_frame >= 300) {
             evict_log_frame = 0;
-            if (evict_accum)
-                Debug::log("[SPI] evict/60f=%u last_pg=%u (%.1f/frame)",
-                           evict_accum, evict_last_page, evict_accum / 60.0f);
+            // swap=TOTALms(idle Xms): X of the total ran in the frame's idle
+            // window (MemESP::idleService) — only TOTAL−X ate emulation time.
+            if (evict_accum || skip_accum || accb_accum)
+                Debug::log("[SPI] evict/60f=%u skip=%u wbskip=%u accb=%u promo=%u(idle %u) swap=%ums(idle %u) last_pg=%u (%.1f/frame)",
+                           evict_accum, skip_accum, wbskip_accum, accb_accum, promo_accum,
+                           promo_idle_accum, swap_us_accum / 1000u,
+                           swap_idle_us_accum / 1000u, evict_last_page, evict_accum / 60.0f);
+            skip_accum = 0;
+            wbskip_accum = 0;
+            swap_us_accum = 0;
+            accb_accum = 0;
+            promo_accum = 0;
+            promo_idle_accum = 0;
+            swap_idle_us_accum = 0;
             evict_accum = 0;
+#if MEM_ACCESS_TRACE
+            // Accesses served per evicted-page load (accessor-mode feasibility):
+            // clean victims with <512 accesses would have been cheaper served
+            // per-byte over SPI than via the 16KB page load (~600 = breakeven).
+            if (mem_acc_clean_cnt || mem_acc_dirty_cnt) {
+                Debug::log("[ACC] clean n=%u avg=%u max=%u <128=%u <512=%u | dirty n=%u avg=%u",
+                           mem_acc_clean_cnt,
+                           mem_acc_clean_cnt ? mem_acc_clean_sum / mem_acc_clean_cnt : 0,
+                           mem_acc_clean_max, mem_acc_lo128, mem_acc_lo512,
+                           mem_acc_dirty_cnt,
+                           mem_acc_dirty_cnt ? mem_acc_dirty_sum / mem_acc_dirty_cnt : 0);
+                mem_acc_clean_cnt = mem_acc_clean_sum = mem_acc_clean_max = 0;
+                mem_acc_lo128 = mem_acc_lo512 = 0;
+                mem_acc_dirty_cnt = mem_acc_dirty_sum = 0;
+            }
+#endif
         }
     }
 
@@ -3171,8 +3567,8 @@ IRAM_ATTR static void Update_Border_Pair_Gig() {
     uint32_t packed32 = nib * 0x11111111u;
     uint32_t* prevWord = (uint32_t*)&prevBrdptr8[brdcol_cnt];
     uint32_t old_packed = prevWord[0];
-    prevWord[0] = packed32;
     if (old_packed != packed32) {
+        prevWord[0] = packed32;
         // Decompose old packed back to full uint32 per pair (low+high nibble identical
         // for border since prev was filled with uniform color)
         uint32_t old_lo_nib = old_packed & 0x0F; // single nibble suffices
@@ -3243,17 +3639,119 @@ IRAM_ATTR static void Update_Border_XOR_Gig() {
     }
 }
 
+//----------------------------------------------------------------------------------------------------------------
+// Span variants: paint n consecutive border columns starting at brdcol_cnt in
+// one call — semantically identical to n per-column Update_Border() calls (the
+// catch-up colour VIDEO::brd is constant across the whole span), but filled
+// with word stores instead of ~50 cycles of call+loop overhead per column.
+// This is what makes animated-border Gigascreen demos fit at 378 MHz: the
+// per-column machine alone cost ~7 of the ~9 ms/frame worst case.
+// Globals (brdcol_cnt/lastBrdTstate) are advanced by the caller.
+//----------------------------------------------------------------------------------------------------------------
+
+static void (*Update_Border_Span)(int n);
+
+IRAM_ATTR static void Update_Border_Span_Pair(int n) {
+    uint32_t color32 = VIDEO::brd | (VIDEO::brd << 16);
+    uint32_t* p = (uint32_t*)&brdptr16[brdcol_cnt];   // cnt aligned to 4 (step=4)
+    for (int k = 2 * n; k > 0; k--) *p++ = color32;   // n cols × 8 px = 2n words
+}
+
+IRAM_ATTR static void Update_Border_Span_Pair_Gig(int n) {
+    uint32_t color32 = VIDEO::brd | (VIDEO::brd << 16);
+    uint8_t  nib = VIDEO::brd & 0x0F;
+    uint32_t packed32 = nib * 0x11111111u;
+    uint32_t* prevW = (uint32_t*)&prevBrdptr8[brdcol_cnt];
+    uint32_t* fb    = (uint32_t*)&brdptr16[brdcol_cnt];
+    for (int k = 0; k < n; k++, prevW++, fb += 2) {
+        uint32_t old = *prevW;
+        if (old != packed32) {
+            *prevW = packed32;
+            uint32_t mixed = blendPixels32(color32, (old & 0x0F) * 0x01010101u);
+            fb[0] = mixed; fb[1] = mixed;
+            VIDEO::brdGigascreenChange = true;
+        } else {
+            fb[0] = color32; fb[1] = color32;
+        }
+    }
+}
+
+IRAM_ATTR static void Update_Border_Span_XOR(int n) {
+    // Display order is swapped within uint16 pairs (^1); a uniform fill over an
+    // even-aligned range is permutation-invariant, so only odd edges need care.
+    int c0 = brdcol_cnt, c1 = brdcol_cnt + n;
+    const uint16_t v = (uint16_t)VIDEO::brd;
+    if (c0 & 1) { brdptr16[c0 ^ 1] = v; c0++; }
+    if ((c1 & 1) && c1 > c0) { c1--; brdptr16[c1 ^ 1] = v; }
+    uint32_t vv = (uint32_t)v | ((uint32_t)v << 16);
+    uint32_t* p = (uint32_t*)&brdptr16[c0];
+    for (int k = (c1 - c0) >> 1; k > 0; k--) *p++ = vv;
+}
+
+// One column of the XOR_Gig shape at source column idx (target idx^1).
+static inline void xorGigOne(int idx, uint32_t newColor, uint8_t newPacked) {
+    int t = idx ^ 1;
+    uint8_t oldPacked = prevBrdptr8[t];
+    if (oldPacked != newPacked) {
+        prevBrdptr8[t] = newPacked;
+        brdptr16[t] = blendPixels32(newColor, (uint32_t)(oldPacked & 0x0F) * 0x01010101u);
+        VIDEO::brdGigascreenChange = true;
+    } else {
+        brdptr16[t] = (uint16_t)newColor;
+    }
+}
+
+IRAM_ATTR static void Update_Border_Span_XOR_Gig(int n) {
+    int c0 = brdcol_cnt, c1 = brdcol_cnt + n;
+    uint32_t newColor = VIDEO::brd;
+    uint8_t  nib = (uint8_t)(newColor & 0x0F);
+    uint8_t  newPacked = (uint8_t)(nib | (nib << 4));
+    if (c0 & 1) { xorGigOne(c0, newColor, newPacked); c0++; }
+    if ((c1 & 1) && c1 > c0) { c1--; xorGigOne(c1, newColor, newPacked); }
+    // Even-aligned middle: 2 cols per step (prev uint16, fb uint32). Uniform
+    // old pairs (the norm — prev was filled with runs of one colour) blend once.
+    const uint16_t new2 = (uint16_t)(newPacked | (newPacked << 8));
+    for (int c = c0; c < c1; c += 2) {
+        uint16_t old2 = *(uint16_t*)&prevBrdptr8[c];
+        if (old2 == new2) {
+            *(uint32_t*)&brdptr16[c] = newColor;
+        } else if ((uint8_t)(old2 & 0xFF) == (uint8_t)(old2 >> 8)) {
+            *(uint16_t*)&prevBrdptr8[c] = new2;
+            *(uint32_t*)&brdptr16[c] =
+                blendPixels32(newColor, (uint32_t)(old2 & 0x0F) * 0x01010101u);
+            VIDEO::brdGigascreenChange = true;
+        } else {
+            xorGigOne(c, newColor, newPacked);
+            xorGigOne(c + 1, newColor, newPacked);
+        }
+    }
+}
+
+#if !PICO_RP2040
+// Fallback for shapes without a fast span (DS80): n per-column calls.
+IRAM_ATTR static void Update_Border_Span_Generic(int n) {
+    int save = brdcol_cnt;
+    for (int k = 0; k < n; k++) { Update_Border(); brdcol_cnt += brdcol_step; }
+    brdcol_cnt = save;
+}
+#endif
+
 static void Select_Update_Border() {
 #if !PICO_RP2040
+    pwRefreshGate();  // geometry may have changed — re-evaluate the DMA window
     if (ds80_border_geom) {
         Update_Border = &Update_Border_DS80;  // Gigascreen incompatible with Profi
+        Update_Border_Span = &Update_Border_Span_Generic;
         return;
     }
 #endif
-    if (brdPairWrite)
+    if (brdPairWrite) {
         Update_Border = VIDEO::gigascreen_enabled ? &Update_Border_Pair_Gig : &Update_Border_Pair;
-    else
+        Update_Border_Span = VIDEO::gigascreen_enabled ? &Update_Border_Span_Pair_Gig : &Update_Border_Span_Pair;
+    } else {
         Update_Border = VIDEO::gigascreen_enabled ? &Update_Border_XOR_Gig : &Update_Border_XOR;
+        Update_Border_Span = VIDEO::gigascreen_enabled ? &Update_Border_Span_XOR_Gig : &Update_Border_Span_XOR;
+    }
 }
 
 //----------------------------------------------------------------------------------------------------------------
@@ -3275,7 +3773,7 @@ IRAM_ATTR void VIDEO::TopBorder_Blank() {
         brdcol_cnt = brdcol_start;
         brdlin_cnt = 0;
         brdptr16 = (uint16_t *)(vga.frameBuffer[0]);
-        prevBrdptr8 = vga.prevFrameBuffer ? (uint8_t *)(vga.prevFrameBuffer[0]) : (uint8_t *)brdptr16;
+        prevBrdptr8 = vga.prevFrameBuffer ? prevRowBorder(0) : (uint8_t *)brdptr16;
         // lin_end==0 (DS80 640×480): no top border rows — straight to side borders.
         // (TopBorder would otherwise paint row 0 full-width over the content.)
         DrawBorder = lin_end ? &TopBorder : &MiddleBorder;
@@ -3286,7 +3784,14 @@ IRAM_ATTR void VIDEO::TopBorder_Blank() {
 IRAM_ATTR void VIDEO::TopBorder() {
     while (lastBrdTstate <= CPU::tstates) {
         if (brdcol_cnt < brdcol_retrace) {
-            Update_Border();
+            // Paint every column this catch-up covers in the current row at
+            // once (the colour is constant across the span — see span fns).
+            int lim = (brdcol_retrace - brdcol_cnt) / brdcol_step;
+            unsigned int avail = (CPU::tstates - lastBrdTstate) / (unsigned)brdcol_step + 1;
+            int n = (avail < (unsigned)lim) ? (int)avail : lim;
+            Update_Border_Span(n);
+            lastBrdTstate += (n - 1) * brdcol_step;
+            brdcol_cnt += (n - 1) * brdcol_step;
         } else if (brdcol_retrace < brdcol_end) {
             int lastPair = (brdcol_retrace - 1) & ~1;
             int curPair = brdcol_cnt & ~1;
@@ -3300,7 +3805,7 @@ IRAM_ATTR void VIDEO::TopBorder() {
         if (brdcol_cnt >= brdcol_end) {
             brdlin_cnt++;
             brdptr16 = (uint16_t *)(vga.frameBuffer[brdlin_cnt]);
-            prevBrdptr8 = vga.prevFrameBuffer ? (uint8_t *)(vga.prevFrameBuffer[brdlin_cnt]) : (uint8_t *)brdptr16;
+            prevBrdptr8 = vga.prevFrameBuffer ? prevRowBorder(brdlin_cnt) : (uint8_t *)brdptr16;
             brdcol_cnt = brdcol_start;
             lastBrdTstate += tStatesPerLine - brdcol_end;
 
@@ -3316,7 +3821,15 @@ IRAM_ATTR void VIDEO::TopBorder() {
 IRAM_ATTR void VIDEO::MiddleBorder() {
     while (lastBrdTstate <= CPU::tstates) {
         if (brdcol_cnt < brdcol_retrace) {
-            Update_Border();
+            // Span must stop exactly at brdcol_end1 — the paper-skip check
+            // below fires on equality.
+            int stop = (brdcol_cnt < brdcol_end1) ? brdcol_end1 : brdcol_retrace;
+            int lim = (stop - brdcol_cnt) / brdcol_step;
+            unsigned int avail = (CPU::tstates - lastBrdTstate) / (unsigned)brdcol_step + 1;
+            int n = (avail < (unsigned)lim) ? (int)avail : lim;
+            Update_Border_Span(n);
+            lastBrdTstate += (n - 1) * brdcol_step;
+            brdcol_cnt += (n - 1) * brdcol_step;
         } else if (brdcol_retrace < brdcol_end) {
             int lastPair = (brdcol_retrace - 1) & ~1;
             int curPair = brdcol_cnt & ~1;
@@ -3341,7 +3854,7 @@ IRAM_ATTR void VIDEO::MiddleBorder() {
                     return;
                 }
                 brdptr16 = (uint16_t *)(vga.frameBuffer[brdlin_cnt]);
-                prevBrdptr8 = vga.prevFrameBuffer ? (uint8_t *)(vga.prevFrameBuffer[brdlin_cnt]) : (uint8_t *)brdptr16;
+                prevBrdptr8 = vga.prevFrameBuffer ? prevRowBorder(brdlin_cnt) : (uint8_t *)brdptr16;
 #if !PICO_RP2040
                 // DS80: BottomBorder_OSD carve coords are for std-fb layouts —
                 // Update_Border_DS80 carves the stats rect itself; use plain bottom.
@@ -3353,7 +3866,7 @@ IRAM_ATTR void VIDEO::MiddleBorder() {
                 return;
             }
             brdptr16 = (uint16_t *)(vga.frameBuffer[brdlin_cnt]);
-            prevBrdptr8 = vga.prevFrameBuffer ? (uint8_t *)(vga.prevFrameBuffer[brdlin_cnt]) : (uint8_t *)brdptr16;
+            prevBrdptr8 = vga.prevFrameBuffer ? prevRowBorder(brdlin_cnt) : (uint8_t *)brdptr16;
         }
     }
 }
@@ -3361,7 +3874,12 @@ IRAM_ATTR void VIDEO::MiddleBorder() {
 IRAM_ATTR void VIDEO::BottomBorder() {
     while (lastBrdTstate <= CPU::tstates) {
         if (brdcol_cnt < brdcol_retrace) {
-            Update_Border();
+            int lim = (brdcol_retrace - brdcol_cnt) / brdcol_step;
+            unsigned int avail = (CPU::tstates - lastBrdTstate) / (unsigned)brdcol_step + 1;
+            int n = (avail < (unsigned)lim) ? (int)avail : lim;
+            Update_Border_Span(n);
+            lastBrdTstate += (n - 1) * brdcol_step;
+            brdcol_cnt += (n - 1) * brdcol_step;
         } else if (brdcol_retrace < brdcol_end) {
             int lastPair = (brdcol_retrace - 1) & ~1;
             int curPair = brdcol_cnt & ~1;
@@ -3381,7 +3899,7 @@ IRAM_ATTR void VIDEO::BottomBorder() {
                 return;
             }
             brdptr16 = (uint16_t *)(vga.frameBuffer[brdlin_cnt]);
-            prevBrdptr8 = vga.prevFrameBuffer ? (uint8_t *)(vga.prevFrameBuffer[brdlin_cnt]) : (uint8_t *)brdptr16;
+            prevBrdptr8 = vga.prevFrameBuffer ? prevRowBorder(brdlin_cnt) : (uint8_t *)brdptr16;
         }
     }
 }
@@ -3420,7 +3938,7 @@ IRAM_ATTR void VIDEO::BottomBorder_OSD() {
                 return;
             }
             brdptr16 = (uint16_t *)(vga.frameBuffer[brdlin_cnt]);
-            prevBrdptr8 = vga.prevFrameBuffer ? (uint8_t *)(vga.prevFrameBuffer[brdlin_cnt]) : (uint8_t *)brdptr16;
+            prevBrdptr8 = vga.prevFrameBuffer ? prevRowBorder(brdlin_cnt) : (uint8_t *)brdptr16;
         }
     }
 }
@@ -3433,6 +3951,11 @@ static inline size_t saveRectShift() {
 }
 // Reserve up to this much SaveRect space; abort save if offset exceeds it.
 #define SAVE_RECT_PSRAM_MAX (256ul << 10)
+
+// Shared by save()/restore_last()/store_ram()/restore_ram(): each opens, uses
+// and closes it within a single synchronous call, on the same file, never
+// overlapping — so one static FIL (~600 B) replaces four (was one per method).
+static FIL s_saveRectFile;
 
 void SaveRectT::save(int16_t x, int16_t y, int16_t w, int16_t h) {
     if (offsets.empty()) {
@@ -3477,7 +4000,7 @@ void SaveRectT::save(int16_t x, int16_t y, int16_t w, int16_t h) {
         // overflows it and corrupts neighbouring memory (timer callbacks etc),
         // crashing later in alarm_pool_irq_handler. save() is synchronous
         // (open/write/close within one call) so a static FIL is safe even nested.
-        static FIL f;
+        FIL &f = s_saveRectFile;
         if (f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) {
             offsets.push_back(off); // open failed — dummy
             return;
@@ -3570,7 +4093,7 @@ void SaveRectT::restore_last() {
         // Static FIL: sizeof(FIL) ~= 580 B would overflow the tight ~2 KB OSD
         // stack from deep call chains (same fix as save()). restore is
         // synchronous (open/read/close in one call) so a static FIL is safe.
-        static FIL f;
+        FIL &f = s_saveRectFile;
         if (f_open(&f, "/tmp/save_rect.tmp", FA_READ) != FR_OK) {
             if (offsets.empty()) offsets.push_back(0);
             return;
@@ -3622,7 +4145,7 @@ void SaveRectT::store_ram(const void* p, size_t sz) {
         return;
     }
     // Static FIL: same 580-byte stack-overflow guard as save() / restore_last().
-    static FIL f;
+    FIL &f = s_saveRectFile;
     if (f_open(&f, "/tmp/save_rect.tmp", FA_WRITE | FA_OPEN_ALWAYS) != FR_OK) {
         offsets.push_back((size_t)-1);
         return;
@@ -3644,7 +4167,7 @@ void SaveRectT::restore_ram(void* p, size_t sz) {
     if (top == (size_t)-1) return; // store_ram skipped the write — nothing to restore
     size_t off = offsets.back();   // position where store_ram wrote the data
     if (getContiguousHeap() < FF_OPEN_HEAP_FLOOR) return;
-    static FIL f;
+    FIL &f = s_saveRectFile;
     if (f_open(&f, "/tmp/save_rect.tmp", FA_READ) != FR_OK) return;
     f_lseek(&f, off);
     UINT br;

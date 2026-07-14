@@ -55,6 +55,7 @@ using namespace std;
 #define DISK_ROMFILE 3
 #define DISK_IMGFILE 4
 #define DISK_ALLFILE 5
+#define DISK_DLSFILE 6   // GM.DLS soundbank picker (on-device .dls -> gm_bank.bin conversion)
 
 struct DISK_FTYPE {
     string fileExts;
@@ -76,6 +77,10 @@ class FileUtils
 {
 public:
     static bool fsMount;
+    // No SD card at boot and a USB stick took over as the default FatFs volume
+    // (f_chdrive "USB:") — all unprefixed paths (configs, /tmp, /spec) resolve
+    // on the stick. SD always wins when a card is present.
+    static bool usbRoot;
 
     static string getLCaseExt(const string& filename);
 
@@ -84,8 +89,19 @@ public:
     static DiskIface ifaceForExt(const string& lcExt);
 
     static void initFileSystem();
+    static void ensureBootDirs();
     static bool mountSDCard();
+    // Runtime automount: while the FS is offline (card-less boot, no USB root),
+    // probe for an inserted SD card; on the tick it comes online mount it,
+    // create the dir tree, set fsMount/SDReady and return true. Throttle calls.
+    static bool automountSD();
     static void unmountSDCard();
+    // Boot-time guard for remembered "USB:/..." paths (disk mounts, tape):
+    // they are reopened before the main loop ever pumps tuh_task, so the stick
+    // has not enumerated yet and the open would fail — and the failed mount
+    // would then be persisted as empty. Waits for the stick when the path
+    // needs it; true = volume is (now) available, false = skip the reopen.
+    static bool waitVolumeReady(const string& path);
     static bool mkdirParents(const char* path);
     static bool checkSDCard();
     static bool remountSD();
@@ -125,8 +141,9 @@ public:
     static string ROM_Path; // Current DSK path on the SD
     static string IMG_Path; // Current MMC/HDF image path on the SD
     static string ALL_Path; // Current path for unified file dialog
+    static string DLS_Path; // Current .dls path (GM.DLS soundbank conversion)
 
-    static DISK_FTYPE fileTypes[6];
+    static DISK_FTYPE fileTypes[7];
 
 private:
     friend class Config;
@@ -140,6 +157,16 @@ private:
 #define CONFIG_DIR_VER  CONFIG_DIR "/" PORT_VERSION
 #define CONFIG_DIR_BOARD CONFIG_DIR_VER "/" CONFIG_BOARD_TAG
 #define STORAGE_NVS     CONFIG_DIR_BOARD "/storage.nvs"
+// User-saved default config: unversioned but still per-board (deliberately
+// NOT a single cross-board file — a saved default can carry a forced
+// video_driver, or a feature combination that fits this board's RAM/PSRAM
+// budget but not a different board's, so it must never cross board families).
+// Used as the fallback base when no storage.nvs exists yet for the current
+// version on THIS board (fresh firmware, or after "Reset to my Default"). A
+// true factory reset ("Defaults" menu / Hold-R) bypasses this via SKIP_DEFAULT_FLAG.
+#define CONFIG_DIR_BOARD_ANYVER CONFIG_DIR "/" CONFIG_BOARD_TAG
+#define DEFAULT_NVS       CONFIG_DIR_BOARD_ANYVER "/default.nvs"
+#define SKIP_DEFAULT_FLAG CONFIG_DIR "/skip_default.flag"
 #define PALETTE_NVS     CONFIG_DIR "/palette.nvs"
 #define DEBUG_LOG_PATH  CONFIG_DIR "/debug.log"
 #define DUMP_LOG_PATH   CONFIG_DIR "/dump.log"

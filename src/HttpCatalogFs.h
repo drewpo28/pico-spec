@@ -55,6 +55,7 @@ public:
     bool utf8Names() const override { return true; }    // names are UTF-8 (→ CP1251 for display)
     bool cwd(const std::string& path) override;
     std::string cwdPath() const override { return cur_path.empty() ? "/" : ("/" + cur_path); }
+    std::string schemeLabel() const override { return "WEB:"; }
     bool get(const std::string& remote, const std::string& localSdPath, XferProgressCb cb) override;
     std::string downloadBasename(const std::string& displayName) override;
     bool put(const std::string&, const std::string&, XferProgressCb) override { return false; } // read-only

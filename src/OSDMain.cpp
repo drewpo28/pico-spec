@@ -33,6 +33,7 @@ visit https://zxespectrum.speccy.org/contacto
 */
 #include <malloc.h>
 #include <hardware/watchdog.h>
+#include <hardware/uart.h>
 #include <hardware/clocks.h>
 #include <hardware/flash.h>
 #include <hardware/vreg.h>
@@ -51,6 +52,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "Debug.h"
 #include "Snapshot.h"
 #include "MemESP.h"
+#include "AlfCart.h"
 #include "Buffer.h"
 #include "Tape.h"
 #include "LEDIndicators.h"
@@ -67,9 +69,11 @@ visit https://zxespectrum.speccy.org/contacto
 #include "AySound.h"
 #include "Midi.h"
 #include "MidiSynth.h"
+#include "dls_conv.h"
 #include "SoftSynth.h"
 #include "ZiFi.h"
 #include "ZiFiAT.h"
+#include "UsbMsc.h"
 #include "BoardPins.h"
 #if ZIFI_NET_CLIENT
 #include "ZiFiSock.h"
@@ -84,6 +88,54 @@ visit https://zxespectrum.speccy.org/contacto
 #include "HttpsGet.h"
 #endif
 #include "kbd_img.h"
+
+#if !PICO_RP2040
+// GM.DLS on-device .dls -> bank conversion progress: throttle OSD redraws to whole
+// percent steps so the long (~tens of s) encode shows life without flickering.
+static int s_dlsConvLastPct = -1;
+static void osdDlsConvProgress(int pct, void* /*user*/) {
+    if (pct == s_dlsConvLastPct) return;
+    s_dlsConvLastPct = pct;
+    OSD::osdCenteredMsg(string(MSG_MIDI_CONVERTING[Config::lang]) + " " + std::to_string(pct) + "%",
+                        LEVEL_INFO, 0);
+}
+
+// Convert a .dls (full SD path) to a GMWB bank named <stem>.bin in CONFIG_DIR, with
+// on-screen progress. Returns the bank path on success, or "" on failure / too-large-
+// for-flash (shows the matching message itself). Does NOT touch Config — the caller
+// selects the bank + drives provisioning. Shared by the MIDI menu and the F5 browser.
+static string osdConvertDlsToBank(const string& dlsPath) {
+    string base = dlsPath;
+    size_t slash = base.find_last_of('/');
+    if (slash != string::npos) base.erase(0, slash + 1);   // basename
+    size_t dot = base.rfind('.');
+    if (dot != string::npos) base.erase(dot);              // strip extension
+    string outBin = string(CONFIG_DIR) + "/" + base + ".bin";
+
+    s_dlsConvLastPct = -1;
+    OSD::osdCenteredMsg(string(MSG_MIDI_CONVERTING[Config::lang]) + " 0%", LEVEL_INFO, 0);
+    if (!DlsConv::convert(dlsPath.c_str(), outBin.c_str(), 31250, osdDlsConvProgress, nullptr)) {
+        OSD::osdCenteredMsg(MSG_MIDI_CONVERT_FAIL[Config::lang], LEVEL_WARN, 3000);
+        return "";
+    }
+    // A bank larger than the flash partition is written to SD but can never be
+    // installed (scanBanks/provision reject it) — delete it and warn, don't select it.
+    size_t bankSz = 0;
+    FIL* bf = fopen2(outBin.c_str(), FA_READ);
+    if (bf) { bankSz = (size_t)f_size(bf); fclose2(bf); }
+    size_t cap = MidiSynth::flashBankCapacity();
+    if (bankSz > cap) {
+        f_unlink(outBin.c_str());
+        OSD::osdCenteredMsg(string(MSG_MIDI_BANK_TOOBIG[Config::lang]) + " (" +
+                            std::to_string(bankSz >> 10) + " > " + std::to_string(cap >> 10) + " KB)",
+                            LEVEL_WARN, 4000);
+        return "";
+    }
+    OSD::osdCenteredMsg(MSG_MIDI_CONVERT_OK[Config::lang], LEVEL_OK, 1500);
+    return outBin;
+}
+#endif
+
 extern "C" void graphics_set_scanlines(uint8_t level);
 extern "C" void graphics_set_dither(bool enabled);
 #if !PICO_RP2040
@@ -94,6 +146,7 @@ extern "C" const uint32_t profi_default_palette16[16];
 #include "DivMMC.h"
 #include "IDE.h"
 #include "MB02.h"
+#include "GS/GS.h"
 #endif
 
 #include <malloc.h>
@@ -145,8 +198,15 @@ extern bool SELECT_VGA;
 
 extern int ram_pages, butter_pages, psram_pages, swap_pages;
 
-// Shared buffer for HWInfo/ChipInfo/BoardInfo/EmulatorInfo (never called concurrently)
+// Shared buffer for HWInfo/ChipInfo/BoardInfo/EmulatorInfo (never called concurrently).
+// RP2040 keeps only HWInfo (Alt+F1) — the Hardware menu (and its other, larger info
+// screens) is removed there — and HWInfo fills only ~500 B, so a 640 B buffer suffices
+// and saves ~900 B of the tight SRAM. RP2350 keeps 1536 for the bigger screens.
+#if PICO_RP2040
+#define OSD_INFO_BUF_SZ 640
+#else
 #define OSD_INFO_BUF_SZ 1536
+#endif
 static char osd_info_buf[OSD_INFO_BUF_SZ] __attribute__((aligned(4)));
 
 uint8_t OSD::cols;                     // Maximum columns
@@ -313,6 +373,10 @@ void OSD::esp_hard_reset() {
     Debug::log("esp_hard_reset called from %p", __builtin_return_address(0));
     if (Config::audio_driver == 3) send_to_595(LOW(AY_Enable));
     close_all();
+    Debug::log("ehr: close_all done, arming watchdog");
+#if defined(DBG_UART_ENABLED) && defined(PICO_DEFAULT_UART)
+    uart_tx_wait_blocking(uart_default);   // drain FIFO — 32B @115200 ≈ 3ms > watchdog delay
+#endif
     watchdog_enable(1, true);
     while (true);
 }
@@ -343,9 +407,18 @@ bool OSD::featureBudgetGate(int featureId) {
         return false;
     }
 
-    // BUDGET_NEEDS_FREE: multi-select popup of the freeable features.
+    // BUDGET_NEEDS_FREE: multi-select popup of the freeable features. Run it as a
+    // CHILD dialog (menu_level+1) so it uses its own prev_y slot — at the caller's
+    // level its menu_saverect draw would overwrite prev_y[level] with the popup's
+    // (lower) Y, and the parent menu's next saverect=false redraw (y=prev_y[level])
+    // would then draw shifted down, compounding each cycle.
+    int savedMenuLevel = menu_level;
+    if (menu_level < 4) menu_level++;
     bool sel[FEAT_COUNT] = { false };
     menu_saverect = true;
+    menu_curopt = 1;   // start focus at row 1 — the caller's menu_curopt (e.g. 5 for
+                       // GM.DLS, the 5th MIDI row) would be out of range for this small
+                       // popup → "Unknown menu row" + corrupted geometry/SaveRect → hang.
     bool result = false;
     while (1) {
         size_t freed = 0;
@@ -387,6 +460,11 @@ bool OSD::featureBudgetGate(int featureId) {
         esp_hard_reset();   // never returns
         result = true; break;
     }
+    // NOTE: do NOT restore_last() here — menuRun() already pops the popup's saved rect
+    // on its Esc/back path (OSDMenu.cpp, is_back → SaveRect.restore_last when level!=0).
+    // A manual restore here is a double-pop → SaveRect stack underflow → shifted menus
+    // and eventually a wild-pointer SIGBUS.
+    menu_level = savedMenuLevel;   // restore parent level (popup ran one level deeper)
     menu_saverect = false;
     return result;
 }
@@ -756,9 +834,26 @@ static void splitTabs(const string& s, std::vector<string>& out) {
 }
 
 // F5 location level — rendered IN the file-browser window (Open File + sidebar) as
-// 4 rows: Local (SD) / Remote (FTP/SFTP) / Web Archives / Add Remote. Returns true
-// only when the user chose Local (caller then opens the SD browser); false for Esc
-// or any network action (caller closes the OSD).
+// rows: Local (SD) / [USB Drive] / Remote (FTP/SFTP) / Web Archives / Add Remote.
+// The USB row appears only while a mass-storage stick is enumerated. Returns true
+// when the user chose a LOCAL source — SD or USB (caller then opens the browser at
+// FileUtils::ALL_Path, which this function points at the chosen volume); false for
+// Esc or any network action (caller closes the OSD).
+
+// The chooser is reachable when there's any location besides the SD card: a WiFi
+// link (or saved SSID) or a USB stick. With the stick AS the root volume (no SD
+// at boot) "Local" already browses it, so it adds no extra location.
+static inline bool f5HasChooser() {
+    return ZiFiAT::connected || !Config::wifi_ssid.empty() ||
+           (UsbMsc::ready() && !FileUtils::usbRoot);
+}
+
+// Last browse dir per local source, so switching SD⇄USB in the chooser returns to
+// where you were on each side. ALL_Path holds whichever is active (and is the one
+// persisted to NVS; a stale "USB:/..." with no stick self-heals in fileDialog).
+static string s_f5_sd_dir  = "/";
+static string s_f5_usb_dir = "USB:/";
+
 static bool f5Locations() {
     // One-time restore of the last browse location (across all sources), so F5 reopens
     // where you left off — Local stays at ALL_Path, Web/Remote reopen their last folder.
@@ -798,19 +893,39 @@ static bool f5Locations() {
     int lf = 2, lb = 2;                               // keep the cursor on the chosen location
     while (1) {
         if (OSD::net_launch_close) return false;      // a quick-start launched → close OSD
+        // Hide the USB row when the stick is the root volume — "Local" IS the stick.
+        const bool usb = UsbMsc::ready() && !FileUtils::usbRoot;
         std::vector<string> rows = {
-            string(1, (char)DIR_MARKER) + MSG_F5_LOCAL[Config::lang],
+            // USB-as-root: "Local" is the stick, not the (absent) SD card.
+            string(1, (char)DIR_MARKER) + (FileUtils::usbRoot ? MSG_F5_USB[Config::lang]
+                                                              : MSG_F5_LOCAL[Config::lang]),
             string(1, (char)DIR_MARKER) + MSG_F5_REMOTE[Config::lang],
             string(1, (char)DIR_MARKER) + MSG_F5_WEB[Config::lang],
             MSG_F5_ADD_REMOTE[Config::lang],
         };
+        if (usb)
+            rows.insert(rows.begin() + 1, string(1, (char)DIR_MARKER) + MSG_F5_USB[Config::lang]);
         OSD::menu_level = 0;
         int key;
         int loc = OSD::fdChromeList(rows, MENU_ALL_TITLE[Config::lang],
                                     MENU_F5_LOCATION[Config::lang],
                                     OSD::FD_SIDE_LOCATIONS, false, &key, &lf, &lb);
         if (loc < 0) return false;                    // Esc → close OSD
-        if (loc == 0) return true;                    // Local (SD) → caller opens SD browser
+        if (usb && loc == 1) {                        // USB Drive → browse the stick
+            if (FileUtils::ALL_Path.compare(0, 4, "USB:") != 0) {
+                s_f5_sd_dir = FileUtils::ALL_Path;
+                FileUtils::ALL_Path = s_f5_usb_dir;
+            }
+            return true;
+        }
+        if (usb && loc > 1) loc--;                    // fold the USB row out of the indices
+        if (loc == 0) {                               // Local (SD) → caller opens SD browser
+            if (FileUtils::ALL_Path.compare(0, 4, "USB:") == 0) {
+                s_f5_usb_dir = FileUtils::ALL_Path;
+                FileUtils::ALL_Path = s_f5_sd_dir;
+            }
+            return true;
+        }
         else if (loc == 1) remoteHostsBrowse();
         else if (loc == 2) netDownloadArchive();      // Web Archives (built-in catalog)
         else if (loc == 3) addRemoteForm();
@@ -1293,6 +1408,32 @@ void OSD::clearStats() {
     }
 }
 
+void OSD::drawVolumeBox() {
+
+    unsigned short x, y;
+    if (Config::aspect_16_9) {
+        x = 156;
+        y = 180;
+    } else if (VIDEO::isFullBorder288()) {
+        x = 188;
+        y = 272;
+    } else if (VIDEO::isFullBorder240()) {
+        x = 188;
+        y = 224;
+    } else {
+        x = 168;
+        y = 224;
+    }
+    VIDEO::vga.fillRect(x, y - 4, 24 * 6, 16, zxColor(1, 0));
+    VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
+    VIDEO::vga.setFont(Font6x8);
+    VIDEO::vga.setCursor(x + 4, y + 1);
+    VIDEO::vga.print(Config::tape_player ? "TAP" : "VOL");
+    for (int i = 0; i < ESPectrum::aud_volume + 16; i++) {
+        VIDEO::vga.fillRect(x + 26 + (i * 7), y + 1, 6, 7, zxColor(7, 0));
+    }
+}
+
 // Forward-declare the local f_gets wrapper (defined further below)
 static void f_gets(char* b, size_t sz, FIL& f);
 // Forward-declare slotInlineEdit (defined further below)
@@ -1726,7 +1867,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
         esp_hard_reset();
     } else
 #endif
-    if (hkIdx == Config::HK_HW_INFO) { // Show mem info
+    if (hkIdx == Config::HK_HW_INFO) { // Show mem info (Alt+F1)
+            // Kept on RP2040 too (useful for debugging the tight heap); uses the
+            // 640 B osd_info_buf there. The rest of the Hardware menu is still
+            // removed on RP2040 — HWInfo is the only remaining osd_info_buf user.
             OSD::HWInfo();
             if (VIDEO::OSD) OSD::drawStats(); // Redraw stats for 16:9 modes
         } else
@@ -1775,7 +1919,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 } else if (opt == 2) {
                     Config::byte_cobmect_mode = !Config::byte_cobmect_mode;
                     Config::save();
-                    MemESP::rom[0].assign_rom(Config::byte_cobmect_mode ? gb_rom_0_byte_sovmest_48k : gb_rom_0_byte_48k);
+                    // BYTE and BYTE-compat are both overlays over the Sinclair 48K base.
+                    MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+                    MemESP::registerOverlay(gb_rom_0_sinclair_48k,
+                        Config::byte_cobmect_mode ? gb_overlay_48k_byte_sovmest : gb_overlay_48k_byte);
                     MemESP::recoverPage0();
                     osdCenteredMsg(Config::byte_cobmect_mode ? OSD_COBMECT_ON[Config::lang] : OSD_COBMECT_OFF[Config::lang], LEVEL_INFO, 500);
                 }
@@ -2052,6 +2199,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
         }
         else if (hkIdx == Config::HK_GIGASCREEN) {
 #if !PICO_RP2040
+            // Profi is incompatible with Gigascreen (renderer geometry never
+            // touches the prev-FB coherently) — same guard as the Video menu;
+            // without it the Alt+PgUp toggle enabled it mid-Profi and the
+            // render path SIGBUS-stormed (hw, PICO_DV).
+            if (Z80Ops::isProfi) {
+                osdCenteredMsg("Gigascreen: not available on Profi", LEVEL_WARN, 1500);
+                return;
+            }
             Config::gigascreen_onoff = (Config::gigascreen_onoff + 1) % 3; // Off -> On -> Auto -> Off
             bool want_on = (Config::gigascreen_onoff != 0);
             if (want_on && !Config::gigascreen_enabled &&
@@ -2194,9 +2349,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             // rather than closing the OSD, so the locations chooser is always reachable.
             // On a fresh F5 press, restore the last browse location across all sources
             // (g_f5_restore); the goto re-entry skips it so back-out lands on the chooser.
-            if (ZiFiAT::connected || !Config::wifi_ssid.empty()) g_f5_restore = true;
+            if (f5HasChooser()) g_f5_restore = true;
             f5_locations:
-            if (ZiFiAT::connected || !Config::wifi_ssid.empty()) {
+            if (f5HasChooser()) {
                 if (!f5Locations()) {                // chose a non-Local action or cancelled
                     if (OSD::net_launch_close) OSD::net_launch_close = false;
                     OSD::net_close_all = false;      // Esc-close consumed → reset
@@ -2219,7 +2374,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             f5_retry:
 #if !PICO_RP2040 && ZIFI_NET_CLIENT
             // From locations: show a ".." even at the SD root → returns "" → locations.
-            OSD::fd_root_parent = (ZiFiAT::connected || !Config::wifi_ssid.empty());
+            OSD::fd_root_parent = f5HasChooser();
 #endif
             mFile = fileDialog(FileUtils::ALL_Path, MENU_ALL_TITLE[Config::lang], DISK_ALLFILE, 52, 22);
 #if !PICO_RP2040 && ZIFI_NET_CLIENT
@@ -2251,6 +2406,13 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 
                 // ZIP archive — extract and replace fname/ext/mFile
                 if (ext == "zip") {
+                    // Lend the dormant Gigascreen prevFB to the extract's inflate
+                    // buffers on butter-less boards (no-op on butter — palloc routes
+                    // them to XIP PSRAM). Released right after the extract. The lease
+                    // helper only exists where Gigascreen + the net arena do (RP2350).
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+                    NetArenaLease zipLease;
+#endif
                     string zipFname = ZipExtract::extract(fname, DISK_ALLFILE);
                     if (zipFname.empty()) {
                         OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN);
@@ -2340,6 +2502,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     }
                 }
 #if !PICO_RP2040
+                else if (ext == "rom" || ext == "bin") {
+                    // ALF cartridge — lazy-mount from SD (no flash) and switch into ALF in place.
+                    if (loadAlfCart(fname)) return;   // clean exit into the running machine
+                }
+#endif
+#if !PICO_RP2040
                 else if (ext == "mmc" || ext == "hdf") {
                     // DivMMC/DivIDE image — Enter loads into hd0 (slot 0); F5 opens
                     // the slot popup which mounts in-place and keeps the popup open.
@@ -2359,6 +2527,35 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         ESPectrum::reset();
                     } else {
                         OSD::osdCenteredMsg(OSD_IMG_NEEDS_ESXDOS[Config::lang], LEVEL_WARN);
+                    }
+                }
+#endif
+#if !PICO_RP2040
+                else if (ext == "dls") {
+                    // GM.DLS soundbank — convert to a GMWB bank in CONFIG_DIR and flash
+                    // it, the same pipeline as Audio→MIDI→GM.DLS→"Convert a .dls".
+                    if (!fromZip) FileUtils::DLS_Path = FileUtils::ALL_Path;
+                    string outBin = osdConvertDlsToBank(fname);
+                    if (!outBin.empty()) {
+                        // Enabling GM.DLS (mode 4) is the RAM-heavy engine → gate it
+                        // through the SRAM budget manager, like the MIDI menu does.
+                        if (Config::midi == 4 || OSD::featureBudgetGate(Subsystems::FEAT_MIDI)) {
+                            uint8_t prev_midi = Config::midi;
+                            Config::midi = 4;
+                            Config::midi_bank = outBin;
+                            Midi::enabled = prev_midi; Midi::deinit();
+                            Midi::enabled = 4; Midi::init();
+                            MidiSubsys::request(true);
+                            Config::save();
+                            // applyBankLive() loads THIS freshly-converted bank: live on PSRAM
+                            // (no reboot), else false → it must be written to flash at early boot.
+                            if (MidiSynth::applyBankLive()) {
+                                osdCenteredMsg(MSG_MIDI_BANK_OK[Config::lang], LEVEL_OK, 2000);
+                            } else if (OSD::msgDialog("DLS Wavetable", MSG_MIDI_BANK_INSTALL_Q[Config::lang]) == DLG_YES) {
+                                osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
+                                OSD::esp_hard_reset();   // no PSRAM: provisionAtBoot writes it pre-video
+                            }
+                        }
                     }
                 }
 #endif
@@ -2448,28 +2645,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 Config::aud_volume = ESPectrum::aud_volume;
                 ESPectrum::vol_changed = true;
             }
-            unsigned short x, y;
-            if (Config::aspect_16_9) {
-                x = 156;
-                y = 180;
-            } else if (VIDEO::isFullBorder288()) {
-                x = 188;
-                y = 272;
-            } else if (VIDEO::isFullBorder240()) {
-                x = 188;
-                y = 224;
-            } else {
-                x = 168;
-                y = 224;
-            }
-            VIDEO::vga.fillRect(x ,y - 4, 24 * 6, 16, zxColor(1, 0));
-            VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
-            VIDEO::vga.setFont(Font6x8);
-            VIDEO::vga.setCursor(x + 4,y + 1);
-            VIDEO::vga.print(Config::tape_player ? "TAP" : "VOL");
-            for (int i = 0; i < ESPectrum::aud_volume + 16; i++) {
-                VIDEO::vga.fillRect(x + 26 + (i * 7) , y + 1, 6, 7, zxColor( 7, 0));
-            }
+            OSD::drawVolumeBox();
         } else if (hkIdx == Config::HK_VOL_UP) {
             if (VIDEO::OSD == 0) {
                 if (Config::aspect_16_9)
@@ -2488,28 +2664,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 Config::aud_volume = ESPectrum::aud_volume;
                 ESPectrum::vol_changed = true;
             }
-            unsigned short x, y;
-            if (Config::aspect_16_9) {
-                x = 156;
-                y = 180;
-            } else if (VIDEO::isFullBorder288()) {
-                x = 188;
-                y = 272;
-            } else if (VIDEO::isFullBorder240()) {
-                x = 188;
-                y = 224;
-            } else {
-                x = 168;
-                y = 224;
-            }
-            VIDEO::vga.fillRect(x ,y - 4, 24 * 6, 16, zxColor(1, 0));
-            VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
-            VIDEO::vga.setFont(Font6x8);
-            VIDEO::vga.setCursor(x + 4,y + 1);
-            VIDEO::vga.print(Config::tape_player ? "TAP" : "VOL");
-            for (int i = 0; i < ESPectrum::aud_volume + 16; i++) {
-                VIDEO::vga.fillRect(x + 26 + (i * 7) , y + 1, 6, 7, zxColor( 7, 0));
-            }
+            OSD::drawVolumeBox();
         } else if (hkIdx == Config::HK_HARD_RESET) { // Hard reset
             if (Config::ram_file != NO_RAM_FILE) {
                 Config::ram_file = NO_RAM_FILE;
@@ -2551,22 +2706,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 ESPectrum::totalseconds = 0;
                 ESPectrum::totalsecondsnodelay = 0;
                 VIDEO::framecnt = 0;
-                unsigned short x, y;
-                if (Config::aspect_16_9) {
-                    x = 156;
-                    y = 180;
-                } else {
-                    x = 168;
-                    y = 224;
-                }
-                VIDEO::vga.fillRect(x ,y - 4, 24 * 6, 16, zxColor(1, 0));
-                VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
-                VIDEO::vga.setFont(Font6x8);
-                VIDEO::vga.setCursor(x + 4,y + 1);
-                VIDEO::vga.print(Config::tape_player ? "TAP" : "VOL");
-                for (int i = 0; i < ESPectrum::aud_volume + 16; i++) {
-                    VIDEO::vga.fillRect(x + 26 + (i * 7) , y + 1, 6, 7, zxColor( 7, 0));
-                }
+                OSD::drawVolumeBox();
                 click();
                 return;
             }
@@ -3050,12 +3190,19 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         Config::trdosBios = opt2 - 1;
                                         if (Config::trdosBios != prev) {
                                             Config::save();
+                                            // 5.03 / 5.04TM are read-only overlays over 5.05D applied on
+                                            // the fly by MemESP (RomOverlay.h) — bind immediately, no
+                                            // reboot, on every board.
+                                            const uint8_t* base = gb_rom_4_trdos_505d;
+                                            const uint8_t* ov = nullptr;
                                             switch (Config::trdosBios) {
-                                                case 0: MemESP::rom[4].assign_rom(gb_rom_4_trdos_503); break;
-                                                case 1: MemESP::rom[4].assign_rom(gb_rom_4_trdos_504tm); break;
-                                                case 3: MemESP::rom[4].assign_rom(gb_rom_4_trdos_custom); break;
-                                                default: MemESP::rom[4].assign_rom(gb_rom_4_trdos_505d); break;
+                                                case 0: ov = gb_overlay_trdos_503;   break;
+                                                case 1: ov = gb_overlay_trdos_504tm; break;
+                                                case 3: base = gb_rom_4_trdos_custom; break;
+                                                default: break;
                                             }
+                                            MemESP::rom[4].assign_rom(base);
+                                            MemESP::registerOverlay(gb_rom_4_trdos_505d, ov);
                                         }
                                         menu_curopt = opt2;
                                         menu_saverect = false;
@@ -3451,6 +3598,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 menu_saverect = false;
                                 continue;
                             }
+                            // Budget-gate when turning Z-Controller on (~0.5 KB sector buffer).
+                            if (newval && !OSD::featureBudgetGate(Subsystems::FEAT_ZCONTROLLER)) {
+                                menu_curopt = opt;
+                                menu_saverect = false;
+                                continue;   // declined to free → leave off
+                            }
                             Config::zcontroller = newval;
                             if (newval) {
                                 if (Config::esxdos) {
@@ -3608,6 +3761,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     if (sub) {
                                         uint8_t newval = sub - 1;
                                         if (newval != Config::ide_scheme) {
+                                            uint8_t prevScheme = Config::ide_scheme;
                                             // Mutually exclusive with esxDOS DivMMC/DivIDE
                                             // (shared ports 0xEB/0xE7/0xA3 etc.).
                                             if (newval && Config::esxdos) {
@@ -3616,8 +3770,19 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                                 OSD::osdCenteredMsg("esxDOS disabled", LEVEL_WARN, 2000);
                                             }
                                             Config::ide_scheme = newval;
-                                            IDE::init();
-                                            Config::save();
+                                            // Budget-gate when turning IDE on from off (~3.4 KB buffers).
+                                            // Set scheme first so the user's NEMO/PROFI choice survives
+                                            // a free-and-reboot inside the gate.
+                                            bool ok = true;
+                                            if (prevScheme == 0 && newval != 0)
+                                                ok = OSD::featureBudgetGate(Subsystems::FEAT_IDE);
+                                            if (!ok) {
+                                                Config::ide_scheme = prevScheme;   // declined → stay off
+                                            } else {
+                                                IDE::init();
+                                                IdeSubsys::syncFromState();
+                                                Config::save();
+                                            }
                                             menu_curopt = sub;
                                             menu_saverect = false;
                                         }
@@ -3654,8 +3819,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         uint16_t oc=Config::ide_chs[slot][0], oh=Config::ide_chs[slot][1], os=Config::ide_chs[slot][2];
                                         uint16_t C=IDE::geomC(slot), H=IDE::geomH(slot), S=IDE::geomS(slot);
                                         bool over = (oc&&oh&&os);
+                                        bool profi = (IDE::scheme == IDE::PROFI);
                                         if (C && H && S)
-                                            snprintf(geo, sizeof(geo), "CHS\t%u/%u/%u%s\n", C, H, S, over?"":" (auto)");
+                                            // Profi locks H=16/S=16 (BIOS CHS addressing); only C is user-editable.
+                                            snprintf(geo, sizeof(geo), "CHS\t%u/%u/%u%s\n", C, H, S,
+                                                     profi ? " (Profi: C only)" : (over?"":" (auto)"));
                                         else
                                             snprintf(geo, sizeof(geo), "CHS\t<empty>\n");
                                         drvmenu += geo;
@@ -3692,6 +3860,35 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     } else if (opt2 == 3 && !IDE::isCD(slot)) {
                                         // Edit CHS override. Empty input = auto-detect (0/0/0).
                                         // (Skipped for ATAPI CD-ROM — geometry N/A.)
+                                        // Inline-edit on the CHS row (row index 3 within submenu).
+                                        int ex = OSD::x + (1 + 4) * OSD_FONT_W;     // after "CHS\t"
+                                        int ey = OSD::y + 1 + 3 * OSD_FONT_H;
+                                        if (IDE::scheme == IDE::PROFI) {
+                                            // Profi locks H=16/S=16 for BIOS CHS addressing; only the
+                                            // cylinder count is meaningful. Edit C alone (empty = auto).
+                                            char cur[8];
+                                            snprintf(cur, sizeof(cur), "%u", IDE::geomC(slot));
+                                            string in = OSD::inlineTextEdit(ex, ey, 6, string(cur));
+                                            if (in != "\x1B") {
+                                                unsigned c=0;
+                                                if (in.empty()) { c=0; }   // auto
+                                                if (in.empty() || sscanf(in.c_str(), "%u", &c)==1) {
+                                                    if (c==0) {            // auto-detect
+                                                        Config::ide_chs[slot][0]=0;
+                                                        Config::ide_chs[slot][1]=0;
+                                                        Config::ide_chs[slot][2]=0;
+                                                    } else {               // keep H=16 S=16
+                                                        Config::ide_chs[slot][0]=(uint16_t)c;
+                                                        Config::ide_chs[slot][1]=16;
+                                                        Config::ide_chs[slot][2]=16;
+                                                    }
+                                                    IDE::init();
+                                                    Config::save();
+                                                } else {
+                                                    OSD::osdCenteredMsg("Cylinders: number or empty", LEVEL_WARN, 2000);
+                                                }
+                                            }
+                                        } else {
                                         char cur[20];
                                         if (Config::ide_chs[slot][0] && Config::ide_chs[slot][1] && Config::ide_chs[slot][2])
                                             snprintf(cur, sizeof(cur), "%u/%u/%u",
@@ -3699,10 +3896,6 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         else
                                             snprintf(cur, sizeof(cur), "%u/%u/%u",
                                                      IDE::geomC(slot), IDE::geomH(slot), IDE::geomS(slot));
-                                        // Inline-edit on the CHS row (row index 3 within submenu).
-                                        uint8_t vrow = (uint8_t)(3 - OSD::begin_row + 1);
-                                        int ex = OSD::x + (1 + 4) * OSD_FONT_W;     // after "CHS\t"
-                                        int ey = OSD::y + 1 + 3 * OSD_FONT_H;
                                         string in = OSD::inlineTextEdit(ex, ey, 14, string(cur));
                                         if (in != "\x1B") {
                                             unsigned c=0,h=0,s=0;
@@ -3721,6 +3914,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             } else {
                                                 OSD::osdCenteredMsg("Format: C/H/S", LEVEL_WARN, 2000);
                                             }
+                                        }
                                         }
                                         menu_saverect = false;
                                         menu_curopt = 3;
@@ -3973,7 +4167,18 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                                 uint8_t opt2 = menuRun(menu);
                                 if (opt2) {
+                                    bool wasOn = (prev != 0 || Config::soundriveEnabled());
                                     Config::covox = opt2 - 1;
+                                    bool nowOn = (Config::covox != 0 || Config::soundriveEnabled());
+                                    // Budget-gate when the shared Covox/SounDrive buffer (~2 KB)
+                                    // transitions from not-needed to needed. No budget
+                                    // manager on RP2040 — enable directly.
+#if !PICO_RP2040
+                                    if (!wasOn && nowOn &&
+                                        !OSD::featureBudgetGate(Subsystems::FEAT_COVOX)) {
+                                        Config::covox = prev;   // declined → revert
+                                    } else
+#endif
                                     if (Config::covox != prev) {
                                         Config::save();
                                         CovoxSubsys::request(Config::covox != 0 || Config::soundriveEnabled());
@@ -4000,7 +4205,17 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 uint8_t opt2 = menuRun(menu);
                                 if (opt2) {
                                     static const uint8_t sd_map[3] = {2, 1, 0}; // menu row → mode
+                                    bool wasOn = (Config::covox != 0 || Config::soundriveEnabled());
                                     Config::soundrive = (opt2 <= 3) ? sd_map[opt2 - 1] : prev;
+                                    bool nowOn = (Config::covox != 0 || Config::soundriveEnabled());
+                                    // Shared Covox/SounDrive buffer (~2 KB): gate on off→on.
+                                    // No budget manager on RP2040 — enable directly.
+#if !PICO_RP2040
+                                    if (!wasOn && nowOn &&
+                                        !OSD::featureBudgetGate(Subsystems::FEAT_COVOX)) {
+                                        Config::soundrive = prev;   // declined → revert
+                                    } else
+#endif
                                     if (Config::soundrive != prev) {
                                         Config::save();
                                         CovoxSubsys::request(Config::covox != 0 || Config::soundriveEnabled());
@@ -4032,22 +4247,25 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                                 uint8_t opt2 = menuRun(saa_menu);
                                 if (opt2) {
-                                    if (opt2 == 1)
-                                        Config::SAA1099 = true;
-                                    else
-                                        Config::SAA1099 = false;
-
-                                    if (Config::SAA1099 != prev_saa) {
-                                        ESPectrum::SAA_emu = Config::SAA1099;
-                                        if (Config::SAA1099 && Config::timex_video) {
-                                            Config::timex_video = false;
-                                            VIDEO::timex_port_ff = 0;
-                                            VIDEO::timex_mode = 0;
-                                            VIDEO::timex_hires_ink = 0;
-                                            OSD::osdCenteredMsg("Timex disabled", LEVEL_WARN, 2000);
+                                    bool want_saa = (opt2 == 1);
+                                    // Budget-gate when turning SAA1099 on from off (~2 KB).
+                                    if (want_saa && !prev_saa &&
+                                        !OSD::featureBudgetGate(Subsystems::FEAT_SAA)) {
+                                        // declined to free → leave SAA off
+                                    } else {
+                                        Config::SAA1099 = want_saa;
+                                        if (Config::SAA1099 != prev_saa) {
+                                            ESPectrum::SAA_emu = Config::SAA1099;
+                                            if (Config::SAA1099 && Config::timex_video) {
+                                                Config::timex_video = false;
+                                                VIDEO::timex_port_ff = 0;
+                                                VIDEO::timex_mode = 0;
+                                                VIDEO::timex_hires_ink = 0;
+                                                OSD::osdCenteredMsg("Timex disabled", LEVEL_WARN, 2000);
+                                            }
+                                            Config::save();
+                                            SaaSubsys::request(Config::SAA1099);
                                         }
-                                        Config::save();
-                                        SaaSubsys::request(Config::SAA1099);
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -4061,8 +4279,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         else if (options_num == 7) {
                             menu_level = 2;
                             menu_curopt = 1;
-                            menu_saverect = true;
-                            while (1) {
+                            bool midiFirstDraw = true;   // save the rect only on the first draw;
+                            while (1) {                  // redraws (after gate/submenu) must NOT re-save → no duplicate menu
+                                menu_level = 2;
                                 string midi_menu = MENU_MIDI[Config::lang];
                                 uint8_t prev_midi = Config::midi;
                                 midi_menu.replace(midi_menu.find("[O",0),2, prev_midi == 0 ? "[*" : "[ ");
@@ -4070,8 +4289,23 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 midi_menu.replace(midi_menu.find("[S",0),2, prev_midi == 2 ? "[*" : "[ ");
                                 midi_menu.replace(midi_menu.find("[W",0),2, prev_midi == 3 ? "[*" : "[ ");
                                 midi_menu.replace(midi_menu.find("[G",0),2, prev_midi == 4 ? "[*" : "[ ");
+                                menu_saverect = midiFirstDraw;
                                 uint8_t opt2 = menuRun(midi_menu);
+                                midiFirstDraw = false;
                                 if (opt2 >= 1 && opt2 <= 5) {
+#if !PICO_RP2040
+                                    // GM.DLS (mode 4) is the RAM-heavy MIDI engine: gate it through
+                                    // the SRAM budget manager so a tight machine (Profi/m1p2) offers
+                                    // heavy features to free — including Profi itself (→ Pentagon) —
+                                    // instead of OOMing at allocation time. ALLOW → true (fits as-is);
+                                    // user frees + applies → reboots (never returns); decline → false.
+                                    if ((opt2 - 1) == 4 && Config::midi != 4 &&
+                                        !OSD::featureBudgetGate(Subsystems::FEAT_MIDI)) {
+                                        menu_curopt = opt2;
+                                        menu_saverect = false;
+                                        continue;   // declined / not enough — leave MIDI unchanged
+                                    }
+#endif
                                     Config::midi = opt2 - 1;
                                     if (Config::midi != prev_midi) {
                                         Midi::enabled = prev_midi;
@@ -4115,24 +4349,80 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     // here, where core1/HDMI would freeze. So any flash
                                     // write is triggered by REBOOT; the boot path does it.
                                     if (Config::midi == 4) {
-                                        if (MidiSynth::needsProvision()) {
-                                            // missing / changed bank -> reboot to install
-                                            osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
-                                            OSD::esp_hard_reset();
-                                        } else if (MidiSynth::bankReady()) {
-                                            // already loaded — offer reinstall (recovers a
-                                            // broken/partial bank). Only when SD has a bank,
-                                            // so we never wipe flash with nothing to restore.
-                                            if (MidiSynth::sdBankAvailable() &&
-                                                OSD::msgDialog("GM.DLS Wavetable",
-                                                               MSG_MIDI_BANK_REINSTALL_Q[Config::lang]) == DLG_YES) {
-                                                MidiSynth::requestReflash();   // invalidate header
-                                                osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
-                                                OSD::esp_hard_reset();         // boot rewrites from SD
+                                        // ALF cartridges stream from SD (AlfCart) and no longer occupy
+                                        // this flash region, so GM.DLS and a loaded cart coexist — no
+                                        // unload prompt needed.
+                                        {
+                                            // Let the user pick which instrument set (.bin bank) to use
+                                            // when SD holds more than one. The choice is applied to
+                                            // Config::midi_bank only TENTATIVELY: it is committed (saved)
+                                            // only if the user confirms the flash below, and reverted to
+                                            // `prevBank` otherwise — so declining never changes the bank
+                                            // (and never triggers a flash on the next boot).
+                                            std::vector<std::string> bankPaths, bankNames;
+                                            size_t nBanks = MidiSynth::scanBanks(bankPaths, bankNames);
+                                            string prevBank = Config::midi_bank;
+                                            // Always show the picker: row 1 converts any .dls on the card
+                                            // into a bank (gm_bank.bin in CONFIG_DIR), the rest are the
+                                            // banks already present. The choice is applied to
+                                            // Config::midi_bank only TENTATIVELY: committed on flash-confirm
+                                            // below, reverted to `prevBank` otherwise.
+                                            menu_level = 3;
+                                            menu_curopt = 1;
+                                            menu_saverect = true;
+                                            string bankMenu = MENU_MIDI_BANK_TITLE[Config::lang];
+                                            bankMenu += string(MENU_MIDI_CONVERT_DLS[Config::lang]) + "\n";  // row 1
+                                            for (size_t b = 0; b < nBanks; b++) {
+                                                bool cur = (Config::midi_bank == bankPaths[b]);
+                                                bankMenu += string(cur ? "[*] " : "[ ] ") + bankNames[b] + "\n";
                                             }
-                                            osdCenteredMsg(MSG_MIDI_BANK_OK[Config::lang], LEVEL_OK, 2000);
-                                        } else {
-                                            osdCenteredMsg(MSG_MIDI_BANK_MISSING[Config::lang], LEVEL_WARN, 3000);
+                                            uint8_t optB = menuRun(bankMenu);
+                                            menu_level = 2;
+                                            menu_curopt = opt2;
+                                            menu_saverect = false;
+                                            VIDEO::SaveRect.restore_last();
+                                            if (optB == 1) {
+                                                // Convert a .dls -> <stem>.bin in CONFIG_DIR, then select it.
+                                                // Streams the .dls from SD (no big RAM buffer); runs on core0
+                                                // at runtime — the actual flash install still happens at the
+                                                // next boot via MidiSynth::provisionAtBoot().
+                                                string mFile = fileDialog(FileUtils::DLS_Path, MENU_DLS_TITLE[Config::lang], DISK_DLSFILE, 51, 22);
+                                                if (mFile != "") {
+                                                    mFile.erase(0, 1);
+                                                    string outBin = osdConvertDlsToBank(FileUtils::DLS_Path + mFile);
+                                                    if (!outBin.empty())
+                                                        Config::midi_bank = outBin;   // tentative; committed on flash-confirm below
+                                                }
+                                            } else if (optB >= 2 && (size_t)(optB - 1) <= nBanks) {
+                                                Config::midi_bank = bankPaths[optB - 2];   // tentative
+                                            }
+
+                                            bool haveSd = MidiSynth::sdBankAvailable();
+                                            if (!haveSd) {
+                                                // No SD bank: keep an already-bound (flash) bank, else nothing.
+                                                if (MidiSynth::bankReady()) {
+                                                    if (Config::midi_bank != prevBank) Config::save();
+                                                    osdCenteredMsg(MSG_MIDI_BANK_OK[Config::lang], LEVEL_OK, 2000);
+                                                } else {
+                                                    Config::midi_bank = prevBank;
+                                                    osdCenteredMsg(MSG_MIDI_BANK_MISSING[Config::lang], LEVEL_WARN, 3000);
+                                                }
+                                            } else if (MidiSynth::applyBankLive()) {
+                                                // Applied without a reboot: PSRAM boards load the bank live,
+                                                // and a flash bank that is already current just rebinds.
+                                                Config::save();
+                                                osdCenteredMsg(MSG_MIDI_BANK_OK[Config::lang], LEVEL_OK, 2000);
+                                            } else if (OSD::msgDialog("DLS Wavetable",
+                                                                      MSG_MIDI_BANK_INSTALL_Q[Config::lang]) == DLG_YES) {
+                                                // No PSRAM and the flash bank differs → it must be written at
+                                                // EARLY BOOT (single core, pre-video). Commit + reboot.
+                                                Config::save();
+                                                osdCenteredMsg(MSG_MIDI_BANK_FLASHING[Config::lang], LEVEL_INFO, 3000);
+                                                OSD::esp_hard_reset();
+                                            } else {
+                                                Config::midi_bank = prevBank;   // declined -> revert + restore
+                                                MidiSynth::init();
+                                            }
                                         }
                                     }
                                     menu_curopt = opt2;
@@ -4205,13 +4495,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         if (opt2) {
                                             uint8_t newclock = opt2 - 1;
                                             if (newclock != prev_clock) {
+                                                // Clock only feeds pump()/step() timing constants
+                                                // (no allocation) — apply live, no reboot needed.
                                                 Config::gs_clock = newclock;
-                                                if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
-                                                    Config::save();
-                                                    esp_hard_reset();
-                                                } else {
-                                                    Config::gs_clock = prev_clock;
-                                                }
+                                                GS::setClock();
+                                                Config::save();
                                             }
                                             ci = Config::gs_clock < 5 ? Config::gs_clock : 1;
                                             menu_curopt = ci + 1;
@@ -4284,6 +4572,15 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     static const uint8_t driver_map_size = sizeof(driver_map);
                                     Config::audio_driver = (opt2 <= driver_map_size) ? driver_map[opt2 - 1] : prev;
                                     if (Config::audio_driver != prev) {
+#if !PICO_RP2040 && defined(VGA_HDMI)
+                                        // Budget-gate when switching to HDMI audio (~8.5 KB ring/queue).
+                                        // The gate reboots itself if the user frees features; otherwise
+                                        // fall through to the normal confirm+reboot.
+                                        if (Config::audio_driver == 4 &&
+                                            !OSD::featureBudgetGate(Subsystems::FEAT_HDMI_AUDIO)) {
+                                            Config::audio_driver = prev;   // declined → keep current driver
+                                        } else
+#endif
                                         if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
                                             Config::save();
                                             esp_hard_reset();
@@ -4604,6 +4901,19 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::gigascreen_onoff = opt2 - 1; // 0=Off, 1=On, 2=Auto
                                     if (Config::gigascreen_onoff != prev_onoff) {
                                         bool want_on = (Config::gigascreen_onoff != 0);
+                                        // Profi is incompatible with Gigascreen (its renderer
+                                        // geometry never touches the prev-FB coherently) —
+                                        // arch switches INTO Profi already force it off
+                                        // (disableGigascreenForProfi), but enabling it FROM
+                                        // this menu while Profi is running crashed with a
+                                        // SIGBUS storm in the render path (hw, PICO_DV).
+                                        if (want_on && Z80Ops::isProfi) {
+                                            OSD::osdCenteredMsg("Gigascreen: not available on Profi", LEVEL_WARN, 1500);
+                                            Config::gigascreen_onoff = prev_onoff;
+                                            menu_curopt = prev_onoff + 1;
+                                            menu_saverect = false;
+                                            continue;
+                                        }
                                         if (want_on && !OSD::featureBudgetGate(Subsystems::FEAT_GIGASCREEN)) {
                                             // Denied / cancelled (a freeing reboot never returns here).
                                             Config::gigascreen_onoff = prev_onoff;
@@ -4664,16 +4974,20 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                                 uint8_t opt2 = menuRun(ula_menu);
                                 if (opt2) {
-                                    if (opt2 == 1)
-                                        Config::ulaplus = true;
-                                    else
-                                        Config::ulaplus = false;
-
-                                    if (Config::ulaplus != prev_ula) {
-                                        if (!Config::ulaplus && VIDEO::ulaplus_enabled) {
-                                            VIDEO::ulaPlusDisable();
+                                    bool want_ula = (opt2 == 1);
+                                    // Budget-gate for uniformity (ULA+ costs 0 SRAM — table in
+                                    // flash — so this always allows; keeps the toggle shape identical).
+                                    if (want_ula && !prev_ula &&
+                                        !OSD::featureBudgetGate(Subsystems::FEAT_ULAPLUS)) {
+                                        // declined → leave off
+                                    } else {
+                                        Config::ulaplus = want_ula;
+                                        if (Config::ulaplus != prev_ula) {
+                                            if (!Config::ulaplus && VIDEO::ulaplus_enabled) {
+                                                VIDEO::ulaPlusDisable();
+                                            }
+                                            Config::save();
                                         }
-                                        Config::save();
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -4702,21 +5016,28 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                                 uint8_t opt2 = menuRun(tmx_menu);
                                 if (opt2) {
-                                    if (opt2 == 1)
-                                        Config::timex_video = true;
-                                    else {
-                                        Config::timex_video = false;
-                                        VIDEO::timex_port_ff = 0;
-                                        VIDEO::timex_mode = 0;
-                                        VIDEO::timex_hires_ink = 0;
-                                    }
-                                    if (Config::timex_video != prev) {
-                                        if (Config::timex_video && Config::SAA1099) {
-                                            Config::SAA1099 = false;
-                                            ESPectrum::SAA_emu = false;
-                                            OSD::osdCenteredMsg("SAA1099 disabled", LEVEL_WARN, 2000);
+                                    bool want_tmx = (opt2 == 1);
+                                    // Budget-gate for uniformity (Timex costs 0 SRAM → always allows).
+                                    if (want_tmx && !prev &&
+                                        !OSD::featureBudgetGate(Subsystems::FEAT_TIMEX)) {
+                                        // declined → leave off
+                                    } else {
+                                        if (want_tmx)
+                                            Config::timex_video = true;
+                                        else {
+                                            Config::timex_video = false;
+                                            VIDEO::timex_port_ff = 0;
+                                            VIDEO::timex_mode = 0;
+                                            VIDEO::timex_hires_ink = 0;
                                         }
-                                        Config::save();
+                                        if (Config::timex_video != prev) {
+                                            if (Config::timex_video && Config::SAA1099) {
+                                                Config::SAA1099 = false;
+                                                ESPectrum::SAA_emu = false;
+                                                OSD::osdCenteredMsg("SAA1099 disabled", LEVEL_WARN, 2000);
+                                            }
+                                            Config::save();
+                                        }
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -4743,11 +5064,20 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     Config::dma_mode = opt2 - 1;
                                     if (Config::dma_mode != prev) {
 #if !PICO_RP2040
-                                        // Attr shadow lives on heap only while DMA mode is on
-                                        if (Config::dma_mode) Z80DMA::ensureAttrShadow();
-                                        else Z80DMA::freeAttrShadow();
-#endif
+                                        // Budget-gate when turning DMA on from off (~7 KB attr shadow).
+                                        if (prev == 0 && Config::dma_mode != 0 &&
+                                            !OSD::featureBudgetGate(Subsystems::FEAT_DMA)) {
+                                            Config::dma_mode = prev;   // declined to free → stay off
+                                        } else {
+                                            // Apply now: emulation is paused in the OSD, so the attr
+                                            // shadow alloc/free is consistent for the renderer.
+                                            DmaSubsys::request(Config::dma_mode != 0);
+                                            DmaSubsys::apply();
+                                            Config::save();
+                                        }
+#else
                                         Config::save();
+#endif
                                     }
                                     menu_curopt = opt2;
                                     menu_saverect = false;
@@ -4820,12 +5150,20 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     bool want = (opt2 == 1);
                                     if (want && !(Z80Ops::isPentagon || Z80Ops::isProfi)) {
                                         OSD::osdCenteredMsg(OSD_16COL_NEEDS_PENTAGON[Config::lang], LEVEL_WARN, 1500);
+                                    } else if (want && !prev &&
+                                               !OSD::featureBudgetGate(Subsystems::FEAT_16COL)) {
+                                        // declined to free → leave 16col off (~0.5 KB LUT)
                                     } else {
                                         Config::mode16col_onoff = want;
-                                        if (!Config::mode16col_onoff && VIDEO::mode16col_enabled) {
+                                        if (Config::mode16col_onoff) {
+                                            // Build the decode LUT now so the rasterizer is ready
+                                            // even before the next machine reset.
+                                            VIDEO::ensure16colLut();
+                                        } else if (VIDEO::mode16col_enabled) {
                                             // Disabling globally also drops the runtime latch.
                                             VIDEO::mode16col_enabled = false;
                                         }
+                                        if (!Config::mode16col_onoff) VIDEO::free16colLut();
                                         if (Config::mode16col_onoff != prev) Config::save();
                                     }
                                     menu_curopt = opt2;
@@ -5061,7 +5399,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 
                                                 if (Config::byte_cobmect_mode != prev_opt) {
                                                     Config::save();
-                                                    MemESP::rom[0].assign_rom(Config::byte_cobmect_mode ? gb_rom_0_byte_sovmest_48k : gb_rom_0_byte_48k);
+                                                    // BYTE and BYTE-compat are both overlays over Sinclair 48K.
+                                                    MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+                                                    MemESP::registerOverlay(gb_rom_0_sinclair_48k,
+                                                        Config::byte_cobmect_mode ? gb_overlay_48k_byte_sovmest : gb_overlay_48k_byte);
                                                     MemESP::recoverPage0();
                                                 }
                                                 menu_curopt = opt2;
@@ -5262,15 +5603,32 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                             }
                         }
-#if !NO_ALF
+#if !PICO_RP2040
                         else if (arch_num == 9 || (ext_ram && !show_profi && arch_num == 8) || !ext_ram) { // ALF TV GAME (shifts to 8 when Profi hidden)
                             arch = "ALF";
                             romset = "ALF1";
                             menu_curopt = opt2;
                             menu_saverect = false;
                             Config::romSet = romset;
+                            // (ALF carts stream from SD now, not the GM.DLS flash region, so
+                            // GM.DLS may stay enabled when entering ALF — no disable needed.)
                             click();
                             if (VIDEO::OSD) OSD::drawStats(); // Redraw stats for 16:9 modes
+#if !PICO_RP2040
+                            // Leaving Profi's forced-SRAM layout (no butter PSRAM) MUST reboot:
+                            // ESPectrum::reset() does NOT free the ~96 KB Profi pages + DS80
+                            // framebuffer (only setup() re-lays out memory), so a soft reset
+                            // here leaves them allocated and ALF OOMs (SPI-PSRAM thrash → panic).
+                            // Persist arch=ALF so the reboot lands on ALF, not the old Profi arch.
+                            if (butter_psram_size() == 0 &&
+                                MemESP::ram[56].memType() == mem_type_t::POINTER) {
+                                Config::arch = "ALF";
+                                if (Config::pref_arch == "Profi") Config::pref_arch = "Last";
+                                Config::save();
+                                OSD::esp_hard_reset();   // never returns; setup() re-lays out for ALF
+                                return;
+                            }
+#endif
                             Config::save();
                             Config::requestMachine(arch, romset);
                             ESPectrum::reset();
@@ -5279,8 +5637,29 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #endif
 
                         if (opt2) {
-                            if (arch != Config::arch || romset != Config::romSet) {
 #if !PICO_RP2040
+                            // Leaving ALF for another machine. loadAlfCart() pinned
+                            // pref_arch="ALF" so the cart machine survives the flash-reboot; that
+                            // pin also makes setup() force ALF back at every boot and blocks the
+                            // menu from committing a new Config::arch (it only does so when
+                            // pref_arch=="Last"). Detect the switch-away here, BEFORE the
+                            // "did anything change?" gate below — because ALF entered via this
+                            // menu (the early branch) runs requestMachine() without writing
+                            // Config::arch, so arch==Config::arch can look unchanged and the gate
+                            // would skip the un-pin + save, leaving pref_arch="ALF" → F12 = ALF.
+                            bool leavingAlf = (arch != "ALF" &&
+                                (Config::pref_arch == "ALF" || Config::alfCartBanks > 0));
+#else
+                            bool leavingAlf = false;
+#endif
+                            if (arch != Config::arch || romset != Config::romSet || leavingAlf) {
+#if !PICO_RP2040
+                                if (leavingAlf) {
+                                    if (Config::pref_arch == "ALF") Config::pref_arch = "Last";
+                                    Config::alfCartBanks = 0;   // unmount cart (empty drive)
+                                    Config::alfCartPath  = "";
+                                    AlfCart::unmount();         // close the SD cart file
+                                }
                                 // Entering Profi needs ~96 KB SRAM on butter-less boards.
                                 // Gate it: the popup frees room (Gigascreen/ZiFi/DivMMC
                                 // auto-handled by the code below; offers GS) or refuses. A freeing
@@ -5333,6 +5712,22 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         Config::arch = arch;
                                     }
                                 }
+                                // The per-arch romset slot above is only written when the
+                                // romset itself changed. Switching arch while the same romset
+                                // stays active (e.g. P512+Gluk → P1024 — Config::romSet is
+                                // already "128Kpg") leaves the destination arch's slot at its
+                                // default, so a cold boot reloads the wrong ROM: Gluk works
+                                // while running (romSet carries over across the switch) but
+                                // reverts to the 128 menu after a restart. Sync the active
+                                // arch's slot to the running romSet so it survives reboot
+                                // (mirrors the pref=="Last" gating of the romset block above;
+                                // when a pref is pinned, cold boot loads from that pref instead).
+                                if (Config::arch == "Pentagon" && Config::pref_romSetPent == "Last") Config::romSetPent = Config::romSet;
+                                else if (Config::arch == "P512" && Config::pref_romSetP512 == "Last") Config::romSetP512 = Config::romSet;
+                                else if (Config::arch == "P1024" && Config::pref_romSetP1M == "Last") Config::romSetP1M = Config::romSet;
+                                else if (Config::arch == "128K" && Config::pref_romSet_128 == "Last") Config::romSet128 = Config::romSet;
+                                else if (Config::arch == "48K" && Config::pref_romSet_48 == "Last") Config::romSet48 = Config::romSet;
+                                else if (Config::arch == "Profi" && Config::pref_romSetProfi == "Last") Config::romSetProfi = Config::romSet;
                                 // Mutual exclusivity
 #if !PICO_RP2040
                                 bool isByte = (romset == "48Kby" || romset == "128Kby");
@@ -5353,6 +5748,15 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 if ((arch == "Pentagon" || arch == "P512" || arch == "P1024" || arch == "Profi") && !Config::betadisk) {
                                     Config::betadisk = true;
                                     OSD::osdCenteredMsg("Betadisk enabled", LEVEL_WARN, 1500);
+                                }
+                                // Byte 48K has no Beta Disk interface — force it off on entry.
+                                if (romset == "48Kby" && Config::betadisk) {
+                                    Config::betadisk = false;
+                                    if (ESPectrum::trdos) {
+                                        ESPectrum::trdos = false;
+                                        MemESP::recoverPage0();
+                                    }
+                                    OSD::osdCenteredMsg("Betadisk disabled", LEVEL_WARN, 1500);
                                 }
 #if !PICO_RP2040
                                 // Switching into Profi: Gigascreen is incompatible —
@@ -5381,6 +5785,9 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     DivMMC::init();   // teardown path frees buffers
                                     OSD::osdCenteredMsg("DivMMC disabled", LEVEL_WARN, 1500);
                                 }
+                                // NOTE: GM.DLS MIDI is NOT auto-disabled on Profi entry anymore.
+                                // On tight butter-less boards the featureBudgetGate popup offers
+                                // MIDI as a manual free candidate instead (user decides).
 #endif
                                 Config::save();
 #if !PICO_RP2040
@@ -5462,16 +5869,50 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             Config::save();
                             esp_hard_reset();
                         }
+                        // Declined: redraw same submenu in place, same item focused
+                        menu_curopt = opt2;
+                        menu_saverect = false;
                     } else if (mos && opt2 == 4) {
                         if (confirmReboot(OSD_DLG_REBOOT)) {
                             f_unlink(MOS_FILE);
                             esp_hard_reset();
                         }
+                        menu_curopt = opt2;
+                        menu_saverect = false;
                     } else if ((mos && opt2 == 5) || (!mos && opt2 == 4)) {
+                        // True factory reset: wipe storage.nvs AND skip the
+                        // user's saved default.nvs on the next load() (see
+                        // SKIP_DEFAULT_FLAG in Config::load()).
                         if (confirmReboot(OSD_DLG_LOADDEFAULTS)) {
+                            FIL* flag = fopen2(SKIP_DEFAULT_FLAG, FA_WRITE | FA_CREATE_ALWAYS);
+                            if (flag) fclose2(flag);
                             f_unlink(STORAGE_NVS);
                             esp_hard_reset();
                         }
+                        menu_curopt = opt2;
+                        menu_saverect = false;
+                    } else if ((mos && opt2 == 6) || (!mos && opt2 == 5)) {
+                        // Save as Default: snapshot current live config as the
+                        // fallback used whenever no storage.nvs exists yet for
+                        // this board (fresh firmware version, or "My Default"
+                        // reset below). Per-board on purpose — never crosses
+                        // to a different board (video wiring / RAM budget).
+                        if (confirmReboot(OSD_DLG_SAVEDEFAULT)) {
+                            Config::save(DEFAULT_NVS);
+                            osdCenteredMsg(MSG_DEFAULT_SAVED[Config::lang], LEVEL_INFO, 500);
+                        }
+                        // Redraw same submenu in place either way, same item focused
+                        menu_curopt = opt2;
+                        menu_saverect = false;
+                    } else if ((mos && opt2 == 7) || (!mos && opt2 == 6)) {
+                        // My Default: wipe storage.nvs only — default.nvs is
+                        // left intact, so the next load() falls back to it.
+                        if (confirmReboot(OSD_DLG_LOADMYDEFAULT)) {
+                            f_unlink(STORAGE_NVS);
+                            esp_hard_reset();
+                        }
+                        menu_curopt = opt2;
+                        menu_saverect = false;
                     } else {
                         menu_curopt = 6;
                         break;
@@ -6402,14 +6843,25 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     //close_all()
                                     reset_usb_boot(0, 0);
                                     while(1);
-                                } else {
+                                }
+                                else {
                                     string mFile = fileDialog(FileUtils::ROM_Path, MENU_ROM_TITLE[Config::lang], DISK_ROMFILE, 26, 15);
                                     if (mFile != "") {
                                         mFile.erase(0, 1);
                                         string fname = FileUtils::ROM_Path + mFile;
-                                        bool res = updateROM(fname, opt2 - 1);
-                                        if (res) {
-                                            return;
+                                        // ALF cartridges (and ROMs) ship zipped (zxbyte.org) — extract
+                                        // the .rom/.bin inside before flashing.
+                                        if (FileUtils::getLCaseExt(fname) == "zip") {
+                                            string zf = ZipExtract::extract(fname, DISK_ROMFILE);
+                                            if (zf.empty()) { OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN); fname.clear(); }
+                                            else if (zf != "\x1b") fname = zf;
+                                            else fname.clear();
+                                        }
+                                        if (!fname.empty()) {
+                                            bool res = updateROM(fname, opt2 - 1);
+                                            if (res) {
+                                                return;
+                                            }
                                         }
                                     }
                                     menu_curopt = 1;
@@ -6490,6 +6942,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     }
                 }
             }
+#if !PICO_RP2040
             else if (opt == 9) { // Hardware
                 // ***********************************************************************************
                 // HARDWARE MENU
@@ -6512,18 +6965,24 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         menu_saverect = false;
                     }
                     else if (hw_opt == 3) {
-                        // Emulator Info
-                        OSD::EmulatorInfo();
+                        // Memory Info
+                        OSD::MemoryInfo();
                         menu_curopt = 3;
                         menu_saverect = false;
                     }
                     else if (hw_opt == 4) {
-                        // HID devices
-                        OSD::HIDDevices();
+                        // Emulator Info
+                        OSD::EmulatorInfo();
                         menu_curopt = 4;
                         menu_saverect = false;
                     }
-                    else if (hw_opt == 6) {
+                    else if (hw_opt == 5) {
+                        // HID devices
+                        OSD::HIDDevices();
+                        menu_curopt = 5;
+                        menu_saverect = false;
+                    }
+                    else if (hw_opt == 7) {
                         // Overclock submenu — warn user
                         osdCenteredMsg(Config::lang ? "Peligroso! Puede no arrancar!" : "Dangerous! Board may not boot!", LEVEL_WARN, 2000);
                         menu_level = 2;
@@ -6709,10 +7168,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             }
                         }
                     }
-                    else if (hw_opt == 5) {
+                    else if (hw_opt == 6) {
                         // Speed Test
                         OSD::SpeedTest();
-                        menu_curopt = 5;
+                        menu_curopt = 6;
                         menu_saverect = false;
                     }
                     else {
@@ -6721,6 +7180,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     }
                 }
             }
+#endif
 #if !PICO_RP2040
             else if (opt == 10) { // Network
                 menu_saverect = true;
@@ -6731,53 +7191,86 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 string st_ssid, st_ip;
                 auto refreshNetStatus = [&]() {
                     st_ssid.clear(); st_ip.clear();
-                    // Query when the ESP is in use — NIC on, or already connected (e.g.
-                    // the boot SNTP auto-connect, or a connect from the WiFi menu while
-                    // the NIC toggle is off). Avoids powering up the ESP just by opening
-                    // the menu when networking was never started.
-                    st_conn = (Config::zifi_enabled || ZiFiAT::connected)
+                    // Query when WiFi is in use — WiFi enabled, or already connected (e.g.
+                    // the boot SNTP auto-connect still settling). Keyed on WiFi, not the
+                    // NIC: the NIC is a layer on top and never the reason networking is up.
+                    // Avoids powering up the ESP just by opening the menu when WiFi is off.
+                    st_conn = (Config::wifi_enabled || ZiFiAT::connected)
                               && ZiFiAT::getStatus(st_ssid, st_ip);
+                };
+                // After a transport/baud change re-established the UART link, make sure WiFi
+                // is associated again. Normally the ESP keeps its association across a host
+                // UART reconfigure and getStatus() above confirms it — but if the change
+                // dropped the link, re-associate from the saved credentials. We're in menu
+                // context with the Z80 paused, so a blocking connect is safe.
+                auto reconnectWifiIfNeeded = [&]() {
+                    if (Config::wifi_enabled && !ZiFiAT::connected && !Config::wifi_ssid.empty()) {
+                        ZiFiAT::connect(Config::wifi_ssid, Config::wifi_pass);
+                        refreshNetStatus();
+                    }
                 };
 
                 // ── ESP-01S hardware/config pickers (level 3, under the ESP01 submenu) ──
-                auto pickGpio = [&]() {
+                // ESP-01 transport picker: Off / USB (CH340) / per-board GPIO pairs.
+                // Merges the old GPIO picker with the USB-CDC choice. The USB row only
+                // exists in host-stack builds (#ifdef KBDUSB) — without it the host
+                // never enumerates a dongle, so USB transport can't work. usbRow shifts
+                // the dense GPIO-pair indices (zifiPair()/zifiPairCount() are already a
+                // contiguous, package-filtered view) by one when the USB row is present.
+                auto pickTransport = [&]() {
                     menu_level = 3; menu_saverect = true;
-                    string m = string(MENU_ZIFI_GPIO_TITLE[Config::lang]) + "\n";
+                    int usbRow = 0;
+#if defined(KBDUSB)
+                    usbRow = 1;
+#endif
+                    string m = string(MENU_ZIFI_TRANSPORT_TITLE[Config::lang]) + "\n";
                     m += "Off\n";
+                    if (usbRow) m += string(MENU_ZIFI_USB_LABEL[Config::lang]) + "\n";
                     int nopt = BoardPins::zifiPairCount();
                     for (int i = 0; i < nopt; i++) {
                         const BoardPins::UartPair* p = BoardPins::zifiPair(i);
                         char b[48];
-                        snprintf(b, sizeof(b), "%u/%u%s%s\n", p->tx, p->rx, p->note[0] ? "  " : "", p->note);
+                        snprintf(b, sizeof(b), "GPIO %u/%u%s%s\n", p->tx, p->rx, p->note[0] ? "  " : "", p->note);
                         m += b;
                     }
-                    if (Config::zifi_tx_pin == BoardPins::PIN_OFF) menu_curopt = 1;
+                    bool usbT = usbRow && (Config::zifi_transport == 1);
+                    if (usbT) menu_curopt = 2;
+                    else if (Config::zifi_tx_pin == BoardPins::PIN_OFF) menu_curopt = 1;
                     else {
                         uint8_t rtx, rrx;
                         BoardPins::resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, rtx, rrx);
-                        menu_curopt = 2;
+                        menu_curopt = 2 + usbRow;
                         for (int i = 0; i < nopt; i++)
-                            if (BoardPins::zifiPair(i)->tx == rtx) { menu_curopt = i + 2; break; }
+                            if (BoardPins::zifiPair(i)->tx == rtx) { menu_curopt = i + 2 + usbRow; break; }
                     }
                     uint8_t sel = menuRun(m);
                     if (sel > 0) {
                         VIDEO::SaveRect.restore_last();
                         bool conflict = false;
-                        if (sel == 1) Config::zifi_tx_pin = Config::zifi_rx_pin = BoardPins::PIN_OFF;
-                        else {
-                            const BoardPins::UartPair* p = BoardPins::zifiPair(sel - 2);
-                            if (p) { Config::zifi_tx_pin = p->tx; Config::zifi_rx_pin = p->rx; conflict = p->note[0] != 0; }
+                        bool wasUsb = (Config::zifi_transport == 1);
+                        if (sel == 1) {                       // Off
+                            Config::zifi_transport = 0;
+                            Config::zifi_tx_pin = Config::zifi_rx_pin = BoardPins::PIN_OFF;
+                        } else if (usbRow && sel == 2) {      // USB (CH340)
+                            Config::zifi_transport = 1;
+                        } else {                              // a GPIO pair
+                            const BoardPins::UartPair* p = BoardPins::zifiPair(sel - 2 - usbRow);
+                            if (p) { Config::zifi_transport = 0; Config::zifi_tx_pin = p->tx; Config::zifi_rx_pin = p->rx; conflict = p->note[0] != 0; }
                         }
                         Config::save();
-                        // Re-apply the pins now whenever the link is up — for the NIC
-                        // *or* for WiFi (they're independent users of the shared UART).
-                        // Was gated on zifi_enabled, so with the NIC off a pin change
-                        // only took effect after a reboot.
+                        // Re-apply now whenever the link is up — for the NIC *or* WiFi
+                        // (independent users of the shared transport).
                         if (ZiFi::linkUp()) { ZiFi::deinit(); ZiFi::init(); }
                         refreshNetStatus();
-                        if (conflict && OSD::msgDialog(MENU_ZIFI_GPIO_TITLE[Config::lang],
-                                                       OSD_DLG_APPLYREBOOT[Config::lang]) == DLG_YES)
-                            OSD::esp_hard_reset();
+                        // A conflicting GPIO pair, or any switch into/out of USB, wants
+                        // a reboot so displaced peripherals release/grab their pins.
+                        bool nowUsb = (Config::zifi_transport == 1);
+                        if ((conflict || wasUsb != nowUsb) &&
+                            OSD::msgDialog(MENU_ZIFI_TRANSPORT_TITLE[Config::lang],
+                                           OSD_DLG_APPLYREBOOT[Config::lang]) == DLG_YES)
+                            OSD::esp_hard_reset();  // never returns
+                        // No reboot (or declined) → recover the WiFi link on the new transport.
+                        reconnectWifiIfNeeded();
                     }
                 };
                 auto pickBaud = [&]() {
@@ -6799,6 +7292,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             // Apply now whenever the link is up (NIC or WiFi), not just for the NIC.
                             if (ZiFi::linkUp()) { ZiFi::deinit(); ZiFi::init(); }
                             refreshNetStatus();
+                            reconnectWifiIfNeeded();  // recover the link if the baud switch dropped it
                         }
                     }
                 };
@@ -6822,18 +7316,25 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     else
                         OSD::osdCenteredMsg(MSG_RTC_SYNC_ERR[Config::lang], LEVEL_WARN, 3000);
                 };
-                // ── ESP01 submenu (level 2): GPIO / Baud / Time zone / Sync time ──
+                // ── ESP01 submenu (level 2): Transport / Baud / Time zone / Sync time ──
                 auto esp01Menu = [&]() {
                     menu_saverect = true; menu_curopt = 1;
                     while (1) {
                         menu_level = 2;
-                        char gpio[40];
-                        if (Config::zifi_tx_pin == BoardPins::PIN_OFF)
-                            snprintf(gpio, sizeof(gpio), "GPIO Off\t>");
+                        // First row shows the current transport: USB, Off, or GPIO pins.
+                        char gpio[44];
+                        bool usbT = false;
+#if defined(KBDUSB)
+                        usbT = (Config::zifi_transport == 1);
+#endif
+                        if (usbT)
+                            snprintf(gpio, sizeof(gpio), "Transport: %s\t>", MENU_ZIFI_USB_LABEL[Config::lang]);
+                        else if (Config::zifi_tx_pin == BoardPins::PIN_OFF)
+                            snprintf(gpio, sizeof(gpio), "Transport: Off\t>");
                         else {
                             uint8_t dtx, drx;
                             BoardPins::resolveZifiPins(Config::zifi_tx_pin, Config::zifi_rx_pin, dtx, drx);
-                            snprintf(gpio, sizeof(gpio), "GPIO %u/%u%s\t>", dtx, drx,
+                            snprintf(gpio, sizeof(gpio), "Transport: %u/%u%s\t>", dtx, drx,
                                      Config::zifi_tx_pin == BoardPins::PIN_DEFAULT ? " (def)" : "");
                         }
                         char baud[32]; snprintf(baud, sizeof(baud), "Baud %u\t>", (unsigned)Config::zifi_baud);
@@ -6843,7 +7344,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                  + (Config::lang ? "Sincronizar hora\n" : "Sync time (SNTP)\n");
                         uint8_t e = menuRun(m);
                         if (e == 0) break; // Esc → back to Network (menuRun popped our rect)
-                        if      (e == 1) pickGpio();
+                        if      (e == 1) pickTransport();
                         else if (e == 2) pickBaud();
                         else if (e == 3) pickTz();
                         else if (e == 4) doSync();
@@ -6853,10 +7354,26 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 };
                 // ── WiFi connect/disconnect (level 2 list) ──
                 auto doWifi = [&]() {
-                    if (st_conn) {
-                        string msg = st_ip + "  " + string(MSG_WIFI_DISCONNECT_Q[Config::lang]);
-                        if (OSD::msgDialog(st_ssid, msg) == DLG_YES) {
+                    if (Config::wifi_enabled) {
+                        // WiFi is on → this row turns it off. Show the live IP when the ESP
+                        // is associated; otherwise just confirm the switch-off (enabled but
+                        // offline — e.g. autoconnect hasn't finished / AP out of range).
+                        string title = st_conn ? st_ssid : string("WiFi");
+                        string msg   = (st_conn ? st_ip + "  " : string())
+                                     + string(MSG_WIFI_DISCONNECT_Q[Config::lang]);
+                        if (OSD::msgDialog(title, msg) == DLG_YES) {
                             ZiFiAT::disconnect();
+                            Config::wifi_enabled = false;
+                            // The NIC is purely a layer on top of WiFi — it cannot stay on
+                            // once WiFi is off. Drop it too (NVS-persisted separately).
+                            if (Config::zifi_enabled) {
+                                Config::zifi_enabled = 0;
+                                ZiFi::enabled = 0;
+                                Config::save();
+                            }
+                            // Nobody left using the shared UART link → tear it down.
+                            if (!ZiFiAT::connected) ZiFi::deinit();
+                            Config::saveWifiConfig();
                             OSD::osdCenteredMsg(MSG_WIFI_DISCONNECTED[Config::lang], LEVEL_INFO, 1500);
                         }
                     } else {
@@ -6912,7 +7429,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                             ZiFiAT::syncTime(Config::wifi_tz, when); // streamed too
                         ZiFiAT::log_cb = nullptr;
                         if (cst == ZiFiAT::OK) {
-                            Config::wifi_ssid = chosen; Config::wifi_pass = pass; Config::wifi_autoconnect = true;
+                            Config::wifi_ssid = chosen; Config::wifi_pass = pass; Config::wifi_enabled = true;
                             Config::saveWifiConfig();
                             wifiLogLine(MSG_WIFI_CONNECTED[Config::lang]);
                             sleep_ms(900);                   // brief, then auto-close on success
@@ -6928,6 +7445,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 };
                 // ── ZiFi NIC on/off (level 2) ──
                 auto doNic = [&]() {
+                    // The NIC is only the guest-port (0xEF/16550) emulation layered on top
+                    // of WiFi — it can't be enabled while WiFi is off (and WiFi-off already
+                    // forces it off), so there's nothing to toggle. Point the user at WiFi.
+                    if (!Config::wifi_enabled) {
+                        OSD::osdCenteredMsg(Config::lang ? "Active WiFi primero"
+                                                         : "Enable WiFi first", LEVEL_WARN, 2500);
+                        return;
+                    }
                     menu_level = 2; menu_saverect = true; menu_curopt = Config::zifi_enabled + 1;
                     uint8_t zn = menuRun(MENU_ZIFI_NIC[Config::lang]);
                     if (zn > 0) {
@@ -6976,6 +7501,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     } else if (ZiFiAT::autoSyncBusy()) {
                         // Boot auto-connect (CWJAP→SNTP) still running — don't claim "Off".
                         st = "WiFi connecting...";
+                    } else if (Config::wifi_enabled) {
+                        // Enabled by the user but not currently associated (out of range /
+                        // autoconnect not run yet). Still "on" — selecting the row turns it off.
+                        st = "WiFi On (offline)";
                     } else st = "WiFi Off";
                     if (st.size() < 32) st.append(32 - st.size(), ' '); else st.resize(32);
 
@@ -7014,7 +7543,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if !PICO_RP2040
             else if (opt == 11) { // ZX Keyboard — bitmap overlay
 #else
-            else if (opt == 10) { // ZX Keyboard — bitmap overlay
+            else if (opt == 9) { // ZX Keyboard (RP2040: Network+Hardware removed)
 #endif
                 // Protect OSD area from Z80 video renderer overwrite
                 bool kbd_osd_enabled = (VIDEO::OSD != 0);
@@ -7036,11 +7565,14 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 VIDEO::vga.setTextColor(zxColor(0, 0), zxColor(7, 0));
                 VIDEO::vga.setCursor(kbd_x + 4, kbd_y - 10);
                 VIDEO::vga.print(Config::lang ? "Teclado ZX" : "ZX Keyboard");
-                // Draw bitmap: byte = ZX palette index (0..15), 0xFF and other non-palette values = transparent
+                // Draw bitmap: packed 4 bits/pixel, palette index 1..7 (0 = skip).
+                // Black (idx 0) and transparent pixels are not drawn — the area is
+                // already filled with paper black above, so the result is identical.
                 for (int y = 0; y < kbd_h; y++) {
                     for (int x = 0; x < kbd_w; x++) {
-                        uint8_t idx = kbd_img[x + y * kbd_w];
-                        if (idx >= 0x10) continue; // skip transparent and out-of-range
+                        int i = x + y * kbd_w;
+                        uint8_t idx = (kbd_img[i >> 1] >> ((i & 1) << 2)) & 0x0F;
+                        if (!idx) continue;
                         VIDEO::vga.dotFast(kbd_x + x, kbd_y + y, zxColor(idx & 7, (idx >> 3) & 1));
                     }
                 }
@@ -7070,7 +7602,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if !PICO_RP2040
             else if (opt == 12) { // Help — dynamic from hotkeys
 #else
-            else if (opt == 11) { // Help — dynamic from hotkeys
+            else if (opt == 10) { // Help — dynamic from hotkeys (RP2040 shifted)
 #endif
                 // Build index of visible hotkeys (no large buffer needed)
                 auto descs = Config::lang ? hkDescES : hkDescEN;
@@ -7167,7 +7699,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #if !PICO_RP2040
             else if (opt == 13) { // About
 #else
-            else if (opt == 12) { // About
+            else if (opt == 11) { // About (RP2040 shifted)
 #endif
                 // About
                 // Protect OSD area from Z80 video renderer overwrite
@@ -7289,7 +7821,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 return;
             }
 #if TFT
+            // TFT: RP2350 opt 13; RP2040-TFT opt 12 (Hardware removed, no Network row).
+#if PICO_RP2040
+            else if (FileUtils::fsMount && opt == 12) { // TFT
+#else
             else if (FileUtils::fsMount && opt == 13) { // TFT
+#endif
                 menu_saverect = true;
                 menu_curopt = 1;
                 while(1) {
@@ -8941,7 +9478,7 @@ c:
     VIDEO::vga.print("-Pages-----------");
     {
         char pb0[20], pb1[20], pb2[20], pb3[20];
-        if (MemESP::ramCurrent[0] < (uint8_t*)0x11000000)
+        if (MemESP::ramCurrent[0] && MemESP::ramCurrent[0] < (uint8_t*)0x11000000)
             snprintf(pb0, 20, "PAGE0 -> ROM#%d", MemESP::romInUse);
         else if (MemESP::newSRAM)
             snprintf(pb0, 20, "PAGE0 -> SRAM#%d", MemESP::romLatch);
@@ -9277,7 +9814,7 @@ c:
                         MemESP::ramCurrent[0] = MemESP::rom[MemESP::romInUse].direct();
                     } else if (pagesCursorRow == 1) { // PAGE3: RAM bank
                         MemESP::bankLatch = (MemESP::bankLatch - 1) & 7;
-                        MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(MemESP::bankLatch);
+                        MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(3); // slot 3, not bankLatch
                     } else if (pagesCursorRow == 2) { // VIDEO
                         MemESP::videoLatch = MemESP::videoLatch ? 0 : 1;
                     } else if (pagesCursorRow == 3) { // PAGING LOCK
@@ -9300,7 +9837,7 @@ c:
                         MemESP::ramCurrent[0] = MemESP::rom[MemESP::romInUse].direct();
                     } else if (pagesCursorRow == 1) {
                         MemESP::bankLatch = (MemESP::bankLatch + 1) & 7;
-                        MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(MemESP::bankLatch);
+                        MemESP::ramCurrent[3] = MemESP::ram[MemESP::bankLatch].sync(3); // slot 3, not bankLatch
                     } else if (pagesCursorRow == 2) {
                         MemESP::videoLatch = MemESP::videoLatch ? 0 : 1;
                     } else if (pagesCursorRow == 3) {
@@ -9595,6 +10132,29 @@ size_t getFreeHeap(void) {
 size_t getContiguousHeap(void) {
     char *brk = (char *)sbrk(0);
     return (brk < &__HeapLimit) ? (size_t)(&__HeapLimit - brk) : 0;
+}
+
+// Largest single block that malloc() can actually satisfy RIGHT NOW, without
+// triggering the SDK's panic-on-OOM. getContiguousHeap() only measures the sbrk
+// top gap and is blind to freed blocks in the allocator's free-list (e.g. a 38 KB
+// prevFB freed when Gigascreen was turned off), so it badly under-reports after a
+// disable→re-enable. getFreeHeap() (total free) over-reports on a fragmented heap.
+// This probes the real (non-panicking) allocator by binary search: the only metric
+// that reflects what a single allocation can really get.
+extern "C" void* __real_malloc(size_t);
+extern "C" void  __real_free(void*);
+extern "C" size_t getLargestAllocatable(void) {
+    extern size_t getFreeHeap(void);
+    size_t hi = getFreeHeap();          // a single block can't exceed total free
+    if (hi == 0) return 0;
+    size_t lo = 0;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo + 1) / 2;
+        void* p = __real_malloc(mid);
+        if (p) { __real_free(p); lo = mid; } // fits → search higher
+        else   { hi = mid - 1; }             // too big → search lower
+    }
+    return lo;
 }
 
 // Generic read-only text dialog with vertical scroll
@@ -10125,6 +10685,102 @@ void OSD::BoardInfo() {
     showTextDialog("Board Info", buf);
 }
 
+// Memory Info — overall FLASH/SRAM/PSRAM occupancy plus the Buffer tier pools and the
+// SRAM cost of the features currently enabled via the Subsystem budget manager. Data
+// sources: linker symbols (firmware/static/heap extents), getFreeHeap/getLargestAllocatable,
+// butter_psram_size/psram_size + page counters, Buffer::poolStat() and Subsystems::feature*.
+void OSD::MemoryInfo() {
+    extern char __flash_binary_start, __flash_binary_end;  // pico-sdk linker symbols
+    extern char end, __HeapLimit;                          // heap arena [end, __HeapLimit)
+
+    char (&buf)[OSD_INFO_BUF_SZ] = osd_info_buf;
+    int pos = 0;
+    const int KB = 1024;
+
+    // ── SRAM ───────────────────────────────────────────────────────────────────
+    size_t sram_total  = (size_t)((uintptr_t)&__HeapLimit - SRAM_BASE);  // up to stack top
+    size_t sram_static = (size_t)((uintptr_t)&end - SRAM_BASE);          // data + bss
+    size_t heap_total  = (size_t)((uintptr_t)&__HeapLimit - (uintptr_t)&end);
+    size_t heap_free   = getFreeHeap();
+    size_t heap_used   = heap_total > heap_free ? heap_total - heap_free : 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, " SRAM (%d KB usable):\n", (int)(sram_total / KB));
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Static bss+data: %d KB\n", (int)(sram_static / KB));
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Heap used/total: %d/%d KB\n", (int)(heap_used / KB), (int)(heap_total / KB));
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Heap free      : %d KB\n", (int)(heap_free / KB));
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Largest block  : %d KB\n", (int)(getLargestAllocatable() / KB));
+
+    // ── FLASH ──────────────────────────────────────────────────────────────────
+    size_t fw = (size_t)((uintptr_t)&__flash_binary_end - (uintptr_t)&__flash_binary_start);
+    uint32_t flash_total = (1u << rx[3]);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, " FLASH (%d MB):\n", (int)(flash_total >> 20));
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Firmware       : %d KB\n", (int)(fw / KB));
+    Buffer::PoolStat fp = Buffer::poolStat(Buffer::TIER_FLASH);
+    if (fp.total)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Buffer pool    : %d/%d KB\n", (int)(fp.used / KB), (int)(fp.total / KB));
+
+    // ── PSRAM ──────────────────────────────────────────────────────────────────
+#ifdef BUTTER_PSRAM_GPIO
+    if (butter_psram_size()) {
+        uint32_t bsz = butter_psram_size();
+        size_t emu = (size_t)butter_pages * MEM_PG_SZ;
+        Buffer::PoolStat bp = Buffer::poolStat(Buffer::TIER_BUTTER);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, " Butter PSRAM (%d.%d MB):\n",
+            (int)(bsz >> 20), (int)(((bsz & 0xFFFFF) * 10) >> 20));
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Emu RAM pages  : %d KB\n", (int)(emu / KB));
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Buffer arena   : %d/%d KB\n", (int)(bp.used / KB), (int)(bp.total / KB));
+    }
+#endif
+    if (psram_size()) {
+        uint32_t psz = psram_size();
+        size_t emu = (size_t)psram_pages * MEM_PG_SZ;
+        Buffer::PoolStat sp = Buffer::poolStat(Buffer::TIER_SPI);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, " SPI PSRAM (%d.%d MB):\n",
+            (int)(psz >> 20), (int)(((psz & 0xFFFFF) * 10) >> 20));
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Emu RAM pages  : %d KB\n", (int)(emu / KB));
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Buffer arena   : %d/%d KB\n", (int)(sp.used / KB), (int)(sp.total / KB));
+    }
+    Buffer::PoolStat swp = Buffer::poolStat(Buffer::TIER_SWAP);
+    if (swp.total)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, " SD swap pool   : %d/%d KB\n", (int)(swp.used / KB), (int)(swp.total / KB));
+
+#if !PICO_RP2040
+    // ── Enabled features (Subsystem SRAM budget) ────────────────────────────────
+    using namespace Subsystems;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n Enabled features (SRAM):\n");
+    size_t feat_total = 0;
+    for (int i = 0; i < FEAT_COUNT; i++) {
+        FeatureId f = (FeatureId)i;
+        if (!featureEnabled(f)) continue;
+        size_t c = featureCost(f);
+        feat_total += c;
+        // Round up so a sub-KB feature (e.g. 512 B Z-Controller) isn't shown as 0 KB;
+        // a genuinely-zero cost (Gigascreen on butter, ULA+/Timex) stays 0.
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  %-14s : %d KB\n", featureName(f), (int)((c + KB - 1) / KB));
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  %-14s : %d KB\n", "TOTAL", (int)((feat_total + KB - 1) / KB));
+
+    // ── PSRAM by feature ────────────────────────────────────────────────────────
+    // The big tiered buffers (GM.DLS bank, GS sample RAM, prevFB, DivMMC banks) live
+    // in PSRAM, not the heap — invisible in the SRAM list above. List the PSRAM users.
+    size_t psram_feat_total = 0;
+    int psram_feat_n = 0;
+    for (int i = 0; i < FEAT_COUNT; i++) {
+        FeatureId f = (FeatureId)i;
+        if (!featureEnabled(f)) continue;
+        size_t pc = featurePsramCost(f);
+        if (!pc) continue;
+        if (!psram_feat_n++)
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "\n PSRAM by feature:\n");
+        psram_feat_total += pc;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  %-14s : %d KB\n", featureName(f), (int)((pc + KB - 1) / KB));
+    }
+    if (psram_feat_n)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  %-14s : %d KB\n", "TOTAL", (int)((psram_feat_total + KB - 1) / KB));
+#endif
+
+    showTextDialog("Memory Info", buf);
+}
+
 // Helper: append just the filename part of a path, truncated to maxlen chars
 static int appendFilename(char* buf, int pos, int bufsize, const string& path, int maxlen) {
     if (path.empty()) return snprintf(buf + pos, bufsize - pos, "(none)");
@@ -10258,7 +10914,7 @@ void OSD::EmulatorInfo() {
                 " MIDI           : Software (%s)\n", presets[pi]);
         } else if (Config::midi == 4) {
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                " MIDI           : GM.DLS (%s)\n",
+                " MIDI           : DLS (%s)\n",
                 MidiSynth::bankReady() ? "bank OK" : "no bank");
         } else {
             pos += snprintf(buf + pos, sizeof(buf) - pos,
@@ -10520,6 +11176,10 @@ void OSD::HIDDevices() {
     VIDEO::SaveRect.restore_last();
 }
 
+#if !PICO_RP2040
+extern "C" uint8_t __gm_bank_start[];   // shared flash region (RP2350) — ALF cart load target
+#endif
+
 static void __not_in_flash_func(flash_block)(const uint8_t* buffer, size_t flash_target_offset) {
     // ensure it is required to write block (may be, it is already the same)
     for (size_t i = 0; i < 512; ++i) {
@@ -10545,6 +11205,65 @@ flash_it:
     #endif
 }
 
+#if !PICO_RP2040
+bool OSD::loadAlfCart(const string& fname) {
+    FIL* f = fopen2(fname.c_str(), FA_READ);
+    if (!f) { OSD::osdCenteredMsg(OSD_NOROMFILE_ERR[Config::lang], LEVEL_WARN, 2000); return false; }
+    size_t size = (size_t)f_size(f);
+    fclose2(f);
+    if (size == 0) {
+        OSD::osdCenteredMsg("Unsupported file (by size)", LEVEL_WARN, 2000);
+        return false;
+    }
+    // Some distributions append a small text footer (e.g. "filename=.../size=.../crc32=...")
+    // after the 1MB cart image. Clamp to 1MB; only the cart data is served, the tail ignored.
+    if (size > (1ul << 20)) size = (1ul << 20);
+    // Lazy load: the cart is served from SD on demand (like a wd1793 disk) — NO 1MB
+    // flash write; banks fault in via #5F as the guest pages them (see AlfCart / Ports).
+    // Switch into ALF IN PLACE (no reboot), the same way the Hardware menu and snapshot
+    // loads switch machines: mount the cart, requestMachine + reset, then return so the
+    // OSD closes cleanly into the running machine. GM.DLS no longer conflicts (the cart
+    // does not use the shared flash region), so it is left untouched.
+    Config::alfCartBanks = (uint8_t)((size + (16ul << 10) - 1) >> 14);   // ceil to 16K banks
+    Config::alfCartPath  = fname;
+    Config::arch = "ALF"; Config::romSet = "ALF1"; Config::pref_arch = "ALF";
+    Config::save();
+    // Mount FRESH every load — open a new FIL on the file as it is NOW. ZIP carts always
+    // extract to the same temp path (/tmp/.zip_extract.rom), so reloading would otherwise
+    // keep a stale handle open on a file that was unlinked+rewritten underneath it
+    // (progressively empty catalog until a reboot). mount() closes any previous handle.
+    if (!AlfCart::mount(fname)) {
+        OSD::osdCenteredMsg("ALF cart mount failed", LEVEL_WARN, 2000);
+        return false;
+    }
+    Config::alfCartBanks = (uint8_t)AlfCart::bankCount();
+#if !PICO_RP2040
+    // ALF uses neither General Sound nor Gigascreen — free their SRAM so the cart +
+    // machine have headroom. Gigascreen frees live (prevFB via GsSubsys); General
+    // Sound only frees across a reboot (no live deinit), so if it was on we reboot
+    // into ALF clean (the cart path is persisted → boot re-mounts it).
+    bool needGsReboot = (Config::gs_enabled != 0);
+    Config::gs_enabled = 0;
+    Config::gigascreen_enabled = false;
+    Config::gigascreen_onoff   = 0;
+    GsSubsys::request(false);     // release prevFB (applied at reset/reboot below)
+    Config::save();
+    // Reboot when GS was on (to actually reclaim it) OR when leaving Profi's forced-
+    // SRAM layout (no butter PSRAM) — an in-place reset() frees neither the ~96 KB
+    // Profi pages nor GS, and ALF would OOM. Boot re-mounts the cart from SD.
+    if (needGsReboot ||
+        (butter_psram_size() == 0 &&
+         MemESP::ram[56].memType() == mem_type_t::POINTER)) {
+        OSD::esp_hard_reset();   // never returns
+        return true;
+    }
+#endif
+    Config::requestMachine("ALF", "ALF1");   // in-place machine switch (no reboot)
+    ESPectrum::reset();
+    return true;
+}
+#endif
+
 bool OSD::updateROM(const string& fname, uint8_t arch) {
     FIL* f = fopen2(fname.c_str(), FA_READ);
     if (!f) {
@@ -10557,7 +11276,7 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
     string dlgTitle = OSD_ROM[Config::lang];
     // Flash custom ROM 48K
     if ( arch == 1 ) {
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
         if( bytesfirmware > 0x4000 ) {
             osdCenteredMsg("Too long file", LEVEL_WARN, 2000);
             fclose2(f);
@@ -10587,7 +11306,7 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
     }
     // Flash custom ROM 128K
     else if ( arch == 2 ) {
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
         if( bytesfirmware > 0x8000 ) {
             osdCenteredMsg("Unsupported file (by size)", LEVEL_WARN, 2000);
             fclose2(f);
@@ -10622,7 +11341,7 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
         Config::pref_romSet_128 = "128Kcs";
     }
     else if ( arch == 3 ) {
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
         if( bytesfirmware > 0x8000 ) {
             osdCenteredMsg("Unsupported file (by size)", LEVEL_WARN, 2000);
             fclose2(f);
@@ -10656,7 +11375,7 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
         Config::pref_arch = "Pentagon";
         Config::pref_romSetPent = "128Kcs";
     }
-#if !NO_ALF
+#if !PICO_RP2040
     else if ( arch == 4 ) {
         if( bytesfirmware > (256ul << 10) ) {
             osdCenteredMsg("Unsupported file (by size)", LEVEL_WARN, 2000);
@@ -10671,17 +11390,11 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
         Config::pref_arch = "ALF";
     }
     else if ( arch == 5 ) {
-        if( (size_t)((bytesfirmware >> 10) & 0xFFFFFFFF) > (1ul << 10) ) {
-            char b[40];
-            snprintf(b, 40, "Unsupported file (by size: %d KB)", (size_t)((bytesfirmware >> 10) & 0xFFFFFFFF));
-            osdCenteredMsg(b, LEVEL_WARN, 2000);
-            fclose2(f);
-            return false;
-        }
-        rom = gb_rom_Alf_cart;
-        max_rom_size = 1ul << 20;
-        dlgTitle += " ALF Cartridge ";
-        Config::arch = "ALF";
+        // Load an ALF cartridge (up to 1MB) served lazily from SD on demand (like a
+        // wd1793 disk — see AlfCart). No 1MB flash write; the file stays on SD and 16K
+        // banks fault in as the guest pages them. Switches into ALF in place (no reboot).
+        fclose2(f);
+        return loadAlfCart(fname);   // lazy-mount from SD + switch into ALF in place
     }
 #endif
     else if ( arch == 6 ) {
@@ -10709,14 +11422,21 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
             fclose2(f);
             return false;
         }
-        rom = gb_rom_pentagon_128k;
+        // Custom Pentagon ROM: the factory Pentagon is now a 101-byte overlay over the
+        // Sinclair 128K base (no 32K blob), so a user ROM flashes into the shared 128K
+        // custom slot and the machine switches to the "128Kcs" romset.
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
+        rom = gb_rom_0_128k_custom;
+#else
+        rom = gb_rom_Alf_cart;
+#endif
         max_rom_size = bytesfirmware > (16ul << 10) ? (32ul << 10) : (16ul << 10);
         dlgTitle += " Pentagon#0 ";
         Config::arch = "Pentagon";
-        Config::romSet = "128Kp";
-        Config::romSetPent = "128Kp";
+        Config::romSet = "128Kcs";
+        Config::romSetPent = "128Kcs";
         Config::pref_arch = "Pentagon";
-        Config::pref_romSetPent = "128Kp";
+        Config::pref_romSetPent = "128Kcs";
     }
     else if ( arch == 8 ) {
         if( bytesfirmware > (16 << 10) ) {
@@ -10724,14 +11444,18 @@ bool OSD::updateROM(const string& fname, uint8_t arch) {
             fclose2(f);
             return false;
         }
-        rom = gb_rom_pentagon_128k;
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
+        rom = gb_rom_0_128k_custom;
+#else
+        rom = gb_rom_Alf_cart;
+#endif
         max_rom_size = 16 << 10;
         dlgTitle += " Pentagon#1 ";
         Config::arch = "Pentagon";
-        Config::romSet = "128Kp";
-        Config::romSetPent = "128Kp";
+        Config::romSet = "128Kcs";
+        Config::romSetPent = "128Kcs";
         Config::pref_arch = "Pentagon";
-        Config::pref_romSetPent = "128Kp";
+        Config::pref_romSetPent = "128Kcs";
     }
     else {
         osdCenteredMsg("Unexpected ROM type: " + to_string(arch), LEVEL_WARN, 2000);
@@ -10861,6 +11585,144 @@ progressDialog(OSD_FIRMW[Config::lang],OSD_FIRMW_END[Config::lang],100,1);
 // ---------------------------------------------------------------------------
 // Speed Test
 // ---------------------------------------------------------------------------
+
+// Sequential file R/W benchmark on one FatFs volume — measures the same
+// FatFs+diskio path the emulator's own file I/O uses. benchPath selects the
+// volume ("/bench.tmp" = SD, "USB:/..." = stick).
+//
+// NOTE on USB: block size does NOT change USB throughput. The RP2350 native
+// USB host transfers bulk data at ~1 packet (64 B) per 1 ms SOF frame, so USB
+// MSC is hard-capped near ~64 KB/s regardless of transfer size — measured a
+// single 32 KB (64-sector) read10 at 558 ms, identical to 64 single-sector
+// reads. It's a host-controller limit, not this code. See CLAUDE.md.
+static bool benchFsSpeed(const char* benchPath, const char* volName,
+                         const char* title, float& rd, float& wr) {
+    static uint8_t io_buf[512];
+    static FIL f;    // 2KB core stack — never put a FIL on it
+    UINT bw, br;
+    bool ok = false;
+    char msg[24];
+
+    snprintf(msg, sizeof(msg), "%s write...", volName);
+    OSD::progressDialog(title, msg, 0, 0);
+    memset(io_buf, 0x55, sizeof(io_buf));
+    if (f_open(&f, benchPath, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+        uint64_t t0 = time_us_64();
+        uint32_t total = 0;
+        while (time_us_64() - t0 < 2000000ULL && total < 512u * 1024u) {
+            if (f_write(&f, io_buf, sizeof(io_buf), &bw) != FR_OK) break;
+            total += bw;
+        }
+        uint64_t elapsed = time_us_64() - t0;
+        f_close(&f);
+        if (elapsed > 0 && total > 0) {
+            wr = (float)total / (float)elapsed;
+            ok = true;
+        }
+    }
+
+    snprintf(msg, sizeof(msg), "%s read...", volName);
+    OSD::progressDialog(title, msg, 50, 1);
+    if (f_open(&f, benchPath, FA_READ) == FR_OK) {
+        uint64_t t0 = time_us_64();
+        uint32_t total = 0;
+        while (f_read(&f, io_buf, sizeof(io_buf), &br) == FR_OK && br > 0)
+            total += br;
+        uint64_t elapsed = time_us_64() - t0;
+        f_close(&f);
+        if (elapsed > 0 && total > 0)
+            rd = (float)total / (float)elapsed;
+    }
+    f_unlink(benchPath);
+
+    OSD::progressDialog(title, "", 100, 1);
+    OSD::progressDialog("", "", 0, 2);
+    return ok;
+}
+
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+// NET download benchmark — GET the catalog's speedtest blob (512 KB of
+// incompressible bytes published by gen_static.py) and count body bytes.
+// Always the built-in Pages URL: a Config::catalog_host override may point at
+// a dynamic /v1 proxy that doesn't serve the blob, and the point is to measure
+// the device's real HTTPS-download path, not a LAN server.
+// TLS handshake time and body throughput are reported separately — on a
+// ~100 KB/s link the multi-second mbedTLS handshake would swamp the KB/s
+// figure otherwise. Nothing is written to SD. ZiFiSock::sock_open already
+// boostBaud()s the link, same as FTP/archive sessions.
+#define SPEEDTEST_NET_URL "https://drewpo28.github.io/pico-spec-catalog/speedtest.bin"
+
+struct NetBenchCtx {
+    uint64_t t_start;      // just before HttpsGet::get
+    uint64_t t_first;      // first body byte
+    uint64_t t_end;        // last body byte
+    uint64_t ui_last;      // progress-redraw rate limit
+    uint32_t bytes;
+    HttpsGet::Result r;
+};
+
+// Body cap: stop after this much measured time — a slow link (115200 baud)
+// would otherwise take ~45 s for the full 512 KB. Aborting via the sink is
+// fine: speed is computed from what arrived.
+static const uint64_t NET_BENCH_BODY_US = 8 * 1000000ULL;
+
+static bool netBenchSink(void* ctx, const uint8_t* data, size_t len) {
+    (void)data;
+    NetBenchCtx* c = (NetBenchCtx*)ctx;
+    uint64_t now = time_us_64();
+    if (!c->bytes) c->t_first = now;
+    c->bytes += len;
+    c->t_end = now;
+    return now - c->t_first < NET_BENCH_BODY_US;
+}
+
+// Progress by bytes, rate-limited: the redraw runs between recv chunks and
+// would otherwise eat into the measured throughput.
+static bool netBenchProgress(void* ctx, uint32_t done, uint32_t total) {
+    NetBenchCtx* c = (NetBenchCtx*)ctx;
+    uint64_t now = time_us_64();
+    if (total > 0 && now - c->ui_last > 250000ULL) {
+        c->ui_last = now;
+        OSD::progressDialog("", "", (int)((uint64_t)done * 100 / total), 1);
+    }
+    return true;
+}
+
+static void netBenchRun(void* p) {
+    NetBenchCtx* c = (NetBenchCtx*)p;
+    c->t_start = time_us_64();
+    c->r = HttpsGet::get(SPEEDTEST_NET_URL, netBenchSink, c,
+                         CONFIG_DIR "/cacert.pem", netBenchProgress, c);
+    if (!c->t_end) c->t_end = time_us_64();
+}
+
+// Runs the GET on the big heap alt-stack (mbedTLS handshake doesn't fit the
+// core stack). Returns false when no alt-stack could be allocated; success of
+// the transfer itself is judged from ctx (2xx + bytes received — an abort by
+// the time cap clears r.ok, but the sample is still valid).
+static bool benchNetSpeed(NetBenchCtx& ctx, const char* title) {
+    memset(&ctx, 0, sizeof(ctx));
+    OSD::progressDialog(title, "NET download...", 0, 0);
+    NetArenaLease lease;   // borrow the dormant Gigascreen prevFB if available
+    size_t stksz = 12 * 1024;
+    uint8_t* stk = netAltStackAlloc(stksz);
+    if (!stk) {
+        OSD::progressDialog("", "", 0, 2);
+        return false;
+    }
+    void* top = (void*)(((uintptr_t)stk + stksz) & ~(uintptr_t)7);
+    net_call_on_stack(top, netBenchRun, &ctx);
+    Buffer::pfree(stk);
+    OSD::progressDialog(title, "", 100, 1);
+    OSD::progressDialog("", "", 0, 2);
+    Debug::log("SpeedTest NET: status=%d bytes=%lu hs_us=%lu body_us=%lu",
+               ctx.r.status, (unsigned long)ctx.bytes,
+               (unsigned long)(ctx.bytes ? ctx.t_first - ctx.t_start : 0),
+               (unsigned long)(ctx.bytes ? ctx.t_end - ctx.t_first : 0));
+    return true;
+}
+#endif // !PICO_RP2040 && ZIFI_NET_CLIENT
+
 void OSD::SpeedTest() {
     menu_level = 2;
     menu_curopt = 1;
@@ -10870,10 +11732,18 @@ void OSD::SpeedTest() {
         uint8_t st_opt = menuRun(MENU_SPEEDTEST[Config::lang]);
         if (st_opt == 0) break;
 
-        const bool do_cpu   = (st_opt == 1 || st_opt == 5);
-        const bool do_sram  = (st_opt == 2 || st_opt == 5);
-        const bool do_psram = (st_opt == 3 || st_opt == 5);
-        const bool do_sd    = (st_opt == 4 || st_opt == 5);
+        // With the net client built in, row 6 is NET and "All tests" shifts to 7.
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+        const uint8_t all_opt = 7;
+        const bool do_net   = (st_opt == 6 || st_opt == all_opt);
+#else
+        const uint8_t all_opt = 6;
+#endif
+        const bool do_cpu   = (st_opt == 1 || st_opt == all_opt);
+        const bool do_sram  = (st_opt == 2 || st_opt == all_opt);
+        const bool do_psram = (st_opt == 3 || st_opt == all_opt);
+        const bool do_sd    = (st_opt == 4 || st_opt == all_opt);
+        const bool do_usb   = (st_opt == 5 || st_opt == all_opt);
 
         const char* title = Config::lang ? "Test velocidad" : "Speed Test";
 
@@ -10882,7 +11752,12 @@ void OSD::SpeedTest() {
         float spi_rd = 0.0f, spi_wr = 0.0f;
         float qspi_rd = 0.0f, qspi_wr = 0.0f;
         float sd_rd = 0.0f, sd_wr = 0.0f;
-        bool sd_ok = false;
+        float usb_rd = 0.0f, usb_wr = 0.0f;
+        bool sd_ok = false, usb_ok = false;
+        // usbRoot: there is no SD — the unprefixed volume IS the stick, so the
+        // SD test would silently benchmark USB; report "No card" instead.
+        const bool sd_present  = FileUtils::fsMount && !FileUtils::usbRoot;
+        const bool usb_present = UsbMsc::ready();
 
         const bool has_spi  = psram_size() > 0;
         const bool has_qspi = butter_psram_size() > 0;
@@ -11016,47 +11891,24 @@ void OSD::SpeedTest() {
         }
 
         // --- SD Card ---
-        if (do_sd) {
-            if (FileUtils::fsMount) {
-                static uint8_t sd_buf[512];
-                const char* BENCH_FILE = "/bench.tmp";
-                FIL f;
-                UINT bw, br;
+        if (do_sd && sd_present)
+            sd_ok = benchFsSpeed("/bench.tmp", "SD", title, sd_rd, sd_wr);
 
-                progressDialog(title, "SD write...", 0, 0);
-                memset(sd_buf, 0x55, sizeof(sd_buf));
-                if (f_open(&f, BENCH_FILE, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
-                    uint64_t t0 = time_us_64();
-                    uint32_t total = 0;
-                    while (time_us_64() - t0 < 2000000ULL && total < 512u * 1024u) {
-                        if (f_write(&f, sd_buf, sizeof(sd_buf), &bw) != FR_OK) break;
-                        total += bw;
-                    }
-                    uint64_t elapsed = time_us_64() - t0;
-                    f_close(&f);
-                    if (elapsed > 0 && total > 0) {
-                        sd_wr = (float)total / (float)elapsed;
-                        sd_ok = true;
-                    }
-                }
+        // --- USB flash stick ---
+        if (do_usb && usb_present)
+            usb_ok = benchFsSpeed("USB:/bench.tmp", "USB", title, usb_rd, usb_wr);
 
-                progressDialog(title, "SD read...", 50, 1);
-                if (f_open(&f, BENCH_FILE, FA_READ) == FR_OK) {
-                    uint64_t t0 = time_us_64();
-                    uint32_t total = 0;
-                    while (f_read(&f, sd_buf, sizeof(sd_buf), &br) == FR_OK && br > 0)
-                        total += br;
-                    uint64_t elapsed = time_us_64() - t0;
-                    f_close(&f);
-                    if (elapsed > 0 && total > 0)
-                        sd_rd = (float)total / (float)elapsed;
-                }
-                f_unlink(BENCH_FILE);
-
-                progressDialog(title, "", 100, 1);
-                progressDialog("", "", 0, 2);
-            }
+        // --- NET (HTTPS download from the catalog Pages) ---
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+        NetBenchCtx net_ctx = {};
+        bool net_wifi = false, net_ran = false;
+        if (do_net) {
+            string ssid, ip;
+            net_wifi = ZiFiAT::getStatus(ssid, ip);
+            if (net_wifi)
+                net_ran = benchNetSpeed(net_ctx, title);
         }
+#endif
 
         // --- Build result text ---
         char (&buf)[OSD_INFO_BUF_SZ] = osd_info_buf;
@@ -11094,7 +11946,7 @@ void OSD::SpeedTest() {
             }
         }
         if (do_sd) {
-            if (!FileUtils::fsMount) {
+            if (!sd_present) {
                 pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
                     " SD      : No card\n\n");
             } else if (sd_ok) {
@@ -11107,6 +11959,41 @@ void OSD::SpeedTest() {
                     " SD      : Error\n\n");
             }
         }
+        if (do_usb) {
+            if (!usb_present) {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " USB     : No stick\n\n");
+            } else if (usb_ok) {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " USB rd  : %.2f MB/s\n"
+                    " USB wr  : %.2f MB/s\n\n",
+                    usb_rd, usb_wr);
+            } else {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " USB     : Error\n\n");
+            }
+        }
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+        if (do_net) {
+            // 2xx + bytes counts as success even when r.ok was cleared by the
+            // sink's time cap — the sample is what we measure.
+            if (!net_wifi) {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " NET     : No WiFi\n\n");
+            } else if (net_ran && net_ctx.r.status >= 200 && net_ctx.r.status < 300 &&
+                       net_ctx.bytes > 0 && net_ctx.t_end > net_ctx.t_first) {
+                float kbs = (float)net_ctx.bytes * (1000000.0f / 1024.0f)
+                          / (float)(net_ctx.t_end - net_ctx.t_first);
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " NET rd  : %.1f KB/s\n"
+                    " TLS hshk: %lu ms\n\n",
+                    kbs, (unsigned long)((net_ctx.t_first - net_ctx.t_start) / 1000));
+            } else {
+                pos += snprintf(buf + pos, OSD_INFO_BUF_SZ - pos,
+                    " NET     : Error (%d)\n\n", net_ctx.r.status);
+            }
+        }
+#endif
 
         showTextDialog(title, buf);
         menu_curopt = st_opt;
@@ -12613,7 +13500,7 @@ void OSD::pokeDialog() {
     snprintf(tmp1, 8, "%04X", address);
     char* tmp2 = tmp1 + 5;
     uint8_t page = address >> 14;
-    snprintf(tmp2, 8, "%02X", MemESP::ramCurrent[page][address & 0x3fff]);
+    snprintf(tmp2, 8, "%02X", MemESP::romPeek(page, MemESP::ramCurrent[page], address & 0x3fff));
 
     string dlgValues[5] = {
         "   -   ", // Bank
@@ -12844,6 +13731,7 @@ void OSD::pokeDialog() {
                     if (dlgValues[0] == "   -   ") {
                         // Poke address between 16384 and 65535
                         uint8_t page = address >> 14;
+                        MemESP::ensureResident(page); // accessor bank → real frame
                         MemESP::ramCurrent[page][address & 0x3fff] = value;
                     } else {
                         // Poke address in bank

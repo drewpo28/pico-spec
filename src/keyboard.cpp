@@ -42,7 +42,6 @@ namespace fabgl {
 
 Keyboard::Keyboard()
   : m_keyboardAvailable(false),
-    m_virtualKeyQueue(),
     m_lastDeadKey(VK_NONE),
     m_codepage(nullptr)
 {
@@ -168,15 +167,13 @@ void Keyboard::injectVirtualKey(VirtualKeyItem const & item, bool insert)
   else
     m_VKMap[(int)item.vk >> 3] &= ~(1 << ((int)item.vk & 7));
 
-  // has VK queue? Insert VK into it.
-///  if (m_virtualKeyQueue) {
-///    auto ticksToWait = (m_uiApp ? 0 : portMAX_DELAY);  // 0, and not portMAX_DELAY to avoid uiApp locks
-    m_virtualKeyQueue.push(item);
-///    if (insert)
-///      xQueueSendToFront(m_virtualKeyQueue, &item, ticksToWait);
-///    else
-///      xQueueSendToBack(m_virtualKeyQueue, &item, ticksToWait);
-///  }
+  // Enqueue into the fixed ring buffer — never allocates (see keyboard.h). Drained
+  // every frame by processKeyboard(), so it never fills under human input; on
+  // overflow drop the newest event (key STATE already recorded in m_VKMap above).
+  if (m_vkCount < VK_QUEUE_CAP) {
+    m_vkRing[(m_vkHead + m_vkCount) % VK_QUEUE_CAP] = item;
+    ++m_vkCount;
+  }
 }
 
 
@@ -458,22 +455,16 @@ inline static void joyMap(const VirtualKeyItem& it) {
   }
 }
 
-static bool xQueueReceive(std::queue<VirtualKeyItem>& q, VirtualKeyItem* item) {
-    if ( !q.empty() ) {
-        *item = q.front();
-        q.pop();
-        joyMap(*item);
-        return true;
-    }
-    return false;
-}
-
 bool Keyboard::getNextVirtualKey(VirtualKeyItem* item, int timeOutMS)
 {
-  bool r = item && xQueueReceive(m_virtualKeyQueue, item);
-  if (r && m_scancodeSet == 1) /// TODO: ???
+  if (!item || m_vkCount == 0) return false;
+  *item = m_vkRing[m_vkHead];
+  m_vkHead = (m_vkHead + 1) % VK_QUEUE_CAP;
+  --m_vkCount;
+  joyMap(*item);
+  if (m_scancodeSet == 1) /// TODO: ???
     convertScancode2to1(item);
-  return r;
+  return true;
 }
 
 VirtualKey Keyboard::getNextVirtualKey(bool * keyDown, int timeOutMS)
@@ -489,15 +480,14 @@ VirtualKey Keyboard::getNextVirtualKey(bool * keyDown, int timeOutMS)
 
 int Keyboard::virtualKeyAvailable() {
     repeat_me_for_input();
-    return m_virtualKeyQueue.size();
+    return m_vkCount;
 }
 
 
 void Keyboard::emptyVirtualKeyQueue()
 {
-  while ( !m_virtualKeyQueue.empty() ) {
-    m_virtualKeyQueue.pop();
-  }
+  m_vkHead  = 0;
+  m_vkCount = 0;
 }
 
 void Keyboard::convertScancode2to1(VirtualKeyItem * item)

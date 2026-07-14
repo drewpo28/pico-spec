@@ -37,6 +37,7 @@ option(RTC_PORT_TRACE "Enable MC146818 Mr Gluk RTC port access tracing" OFF)
 option(PROFI_PORT_TRACE "Enable 0x7FFD/0xDFFD paging-port write tracing" OFF)
 option(SND_PORT_TRACE "Enable per-port I/O histogram (sound-DAC port hunting)" OFF)
 option(PERF_TRACE "Enable per-60-frame CPU/HDMI/FPS performance logging" OFF)
+option(MEM_ACCESS_TRACE "Count Z80 accesses per RAM page between load and eviction (accessor-mode feasibility study; slows readbyte/writebyte)" OFF)
 option(GS_PERF_TRACE "Enable General Sound per-second perf counters (GS.cpp)" OFF)
 option(GS_DEBUG_TRACE "Enable General Sound port-IO trace ring + auto-dumps (~50 KB SRAM)" OFF)
 option(ZIFI_TRACE "Enable ZiFi (ESP-01S WiFi NIC) port/UART tracing" OFF)
@@ -66,12 +67,12 @@ set(ZERO2_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO
 if(NOT VGA_HDMI AND NOT SOFTTV AND NOT TFT AND NOT ILI9341 AND NOT TV)
     set(VGA_HDMI ON)
 endif()
-if(NOT DEFINED NO_ALF)
-    set(NO_ALF 1)
-endif()
+# ALF is always available on RP2350 (4MB) — small 256KB default cart + shared flash
+# region — but excluded on flash-constrained 2MB RP2040 builds via the SDK's
+# PICO_RP2040 macro directly in the source guards (no separate define needed).
 
 set(CPU_MHZ 378)
-set (PORT_VERSION "1.2.24")
+set (PORT_VERSION "1.2.27")
 string(LENGTH "${PORT_VERSION}" PORT_VERSION_LEN)
 
 # Target board (default: PICO_PC; override with -D flags, e.g. cmake -DMURM2=ON)
@@ -186,6 +187,13 @@ add_compile_definitions(PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x800)
 if (ZIFI_NET_CLIENT AND NOT PICO_PLATFORM STREQUAL "rp2040")
     set(PICO_MBEDTLS_CONFIG_FILE "${CMAKE_CURRENT_LIST_DIR}/src/mbedtls_config_picospec.h")
 endif ()
+
+# TinyUSB 0.21.0 vendored at external/tinyusb (subset: LICENSE, src/, hw/bsp/
+# rp2040 + family_support — what the SDK's tinyusb glue consumes). Must be set
+# BEFORE pico_sdk_init(): the SDK-bundled TinyUSB (0.18 in SDK 2.2.0) paces host
+# bulk at ~1 × 64 B packet per 1 ms frame, capping USB MSC/CDC near ~64 KB/s;
+# the 0.21 RP2 HCD rework lifts Speed Test to 0.89/0.75 MB/s (hw-confirmed).
+set(PICO_TINYUSB_PATH ${CMAKE_CURRENT_LIST_DIR}/external/tinyusb)
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
@@ -343,6 +351,23 @@ else ()
     target_compile_definitions(${PROJECT_NAME} PRIVATE RTC_PORT_TRACE=0)
 endif ()
 
+# Per-60-frame CPU/HDMI/FPS performance logging (see Video.cpp `#if PERF_TRACE`).
+if (PERF_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PERF_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PERF_TRACE=0)
+endif ()
+
+# Per-page Z80 access counting between page load and eviction (see MemESP.h/.cpp
+# `#if MEM_ACCESS_TRACE`, [ACC] log in Video.cpp). Feasibility study for the
+# accessor-mode bank window idea: if evicted trampoline pages show only a few
+# hundred accesses, serving them per-byte over SPI beats the 16KB page load.
+if (MEM_ACCESS_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE MEM_ACCESS_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE MEM_ACCESS_TRACE=0)
+endif ()
+
 # General Sound perf counters toggle (see GS.cpp `GS_PERF()` / `#if GS_PERF_TRACE`).
 if (GS_PERF_TRACE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE GS_PERF_TRACE=1)
@@ -393,24 +418,16 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 #        NO_SEPARATE_48K_CUSTOM=1
 #        NO_SPAIN_ROM_48k=1
 #        NO_SPAIN_ROM_128k=1
-        CARTRIDGE_AS_CUSTOM=1
-        NO_ALF=1
 )
 ENDIF()
 
-if(NO_ALF)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE NO_ALF=1)
-endif()
-
-# ALF builds (RP2350 only) carry an extra ROM that pushes the firmware past the
-# top-of-flash GM.DLS wavetable partition (gm_bank, 1.625 MB) reserved in
-# rp2350-memmap.ld. Drop the partition for ALF so the whole flash is available,
-# and disable the GM.DLS wavetable feature in code (NO_GM_DLS). RP2040 has no
-# gm_bank/MIDI, so this only matters for RP2350.
-if(NOT NO_ALF AND NOT PICO_PLATFORM STREQUAL "rp2040")
-    target_compile_definitions(${PROJECT_NAME} PRIVATE NO_GM_DLS=1)
-    target_link_options(${PROJECT_NAME} PRIVATE -Wl,--defsym=__no_gm_bank=1)
-endif()
+# ALF is now a standard runtime machine (256KB default cart "Elf-1" in flash; bigger
+# cartridges load into the shared flash region from SD/Web). CARTRIDGE_AS_CUSTOM is
+# gone — custom ROMs use their own dedicated slots. ALF is excluded on 2MB RP2040
+# builds via the PICO_RP2040 macro in the source guards.
+# ALF no longer carries a 1.6MB cartridge in the image, so the GM.DLS gm_bank
+# partition stays available alongside ALF on RP2350 (they share the region at
+# runtime — one occupant at a time; see SharedFlash/RomManager).
 
 IF(KBDUSB)
     add_subdirectory(drivers/ps2kbd)
@@ -895,8 +912,12 @@ ELSE()
         # SPI clock ceiling. At 126 MHz (default) sys_clk=378 gives clkdiv=1.5 —
         # a fractional divider that makes SCK jitter and corrupts this board's
         # APS6404 8 MB chip (~930 KB/1 MB bad at boot, size probe flaps 8M↔1M).
-        # 63 MHz forces clkdiv=3.0 (integer, clean waveform) — zero corruption.
-        # psram_update_clkdiv() keeps it at 63 MHz after CPU overclock too.
+        # 94 MHz targets clkdiv=2.0 at 378 MHz (round(378/188)=2 → SCK=94.5 MHz,
+        # still an integer divider with a clean waveform — same reason 63 MHz /
+        # clkdiv=3.0 was safe, one step faster: +50% bandwidth). init_psram()
+        # runs an at-speed write/verify memtest and drops the target back to
+        # PSRAM_FALLBACK_SCK_MHZ (63) if this chip fails at 94.5 MHz;
+        # psram_update_clkdiv() keeps the chosen target after CPU overclock too.
         PSRAM_MAX_SCK_MHZ=63
 
         PSRAM_PIN_CS=18
@@ -960,8 +981,10 @@ ENDIF()
 
 SET(BUILD_NAME "${BUILD_NAME}-${PORT_VERSION}")
 
-IF (NOT NO_ALF)
-    SET(BUILD_NAME "${BUILD_NAME}-ALF")
+# ALF is now a standard runtime machine on RP2350 (not a separate build), so no
+# "-ALF" suffix. The 2MB RP2040 builds exclude ALF (no room).
+IF (FLASH_SIZE_GREEN)
+    SET(BUILD_NAME "${BUILD_NAME}")
 ENDIF()
 
 IF(m1p2launcher)

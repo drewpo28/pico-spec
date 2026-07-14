@@ -187,6 +187,18 @@ static const char *OSD_DLG_REBOOT[2] = { OSD_DLG_REBOOT_EN, OSD_DLG_REBOOT_ES};
 #define OSD_DLG_LOADDEFAULTS_ES "\xA8" "Cargar defaults y reiniciar?"
 static const char *OSD_DLG_LOADDEFAULTS[2] = { OSD_DLG_LOADDEFAULTS_EN, OSD_DLG_LOADDEFAULTS_ES};
 
+#define OSD_DLG_SAVEDEFAULT_EN "Save current config as your Default?"
+#define OSD_DLG_SAVEDEFAULT_ES "\xA8" "Guardar config actual como Mis Defaults?"
+static const char *OSD_DLG_SAVEDEFAULT[2] = { OSD_DLG_SAVEDEFAULT_EN, OSD_DLG_SAVEDEFAULT_ES};
+
+#define OSD_DLG_LOADMYDEFAULT_EN "Load your Default and reboot?"
+#define OSD_DLG_LOADMYDEFAULT_ES "\xA8" "Cargar Mis Defaults y reiniciar?"
+static const char *OSD_DLG_LOADMYDEFAULT[2] = { OSD_DLG_LOADMYDEFAULT_EN, OSD_DLG_LOADMYDEFAULT_ES};
+
+#define MSG_DEFAULT_SAVED_EN " Default saved "
+#define MSG_DEFAULT_SAVED_ES " Guardado "
+static const char *MSG_DEFAULT_SAVED[2] = { MSG_DEFAULT_SAVED_EN, MSG_DEFAULT_SAVED_ES};
+
 #define OSD_DLG_USBBOOT_EN "Reboot to USB mode?"
 #define OSD_DLG_USBBOOT_ES "\xA8" "Reiniciar en modo USB?"
 static const char *OSD_DLG_USBBOOT[2] = { OSD_DLG_USBBOOT_EN, OSD_DLG_USBBOOT_ES};
@@ -206,6 +218,25 @@ static const char *OSD_DLG_JOYDISCARD[2] = { OSD_DLG_JOYDISCARD_EN, OSD_DLG_JOYD
 #define OSD_DLG_SETJOYMAPDEFAULTS_EN "Load joy type default map?"
 #define OSD_DLG_SETJOYMAPDEFAULTS_ES "\xA8" "Cargar mapeo por defecto?"
 static const char *OSD_DLG_SETJOYMAPDEFAULTS[2] = { OSD_DLG_SETJOYMAPDEFAULTS_EN, OSD_DLG_SETJOYMAPDEFAULTS_ES};
+
+// Factory reset: hold R at boot → confirm → wipe storage.nvs → reboot to defaults.
+static const char *MSG_FACTORY_RESET_TITLE[2] = { "Factory reset", "Reset de fabrica" };
+static const char *MSG_FACTORY_RESET_Q[2] = {
+    "Reset all settings to defaults?",
+    "Restablecer todos los ajustes?"
+};
+// "My Default" reset: hold M at boot → confirm → wipe storage.nvs (keeps
+// default.nvs) → reboot, which then falls back to the user's saved default.
+static const char *MSG_MYDEFAULT_RESET_TITLE[2] = { "Reset to my Default", "Restaurar Mis Defaults" };
+static const char *MSG_MYDEFAULT_RESET_Q[2] = {
+    "Reset settings to your saved Default?",
+    "Restablecer a Mis Defaults guardados?"
+};
+// Guided boot prompt shown while the "hold R / hold M" reset window is open.
+static const char *MSG_FACTORY_RESET_HOLD[2] = {
+    "Hold R: Factory Reset\nHold M: My Default",
+    "Manten R: Reset fabrica\nManten M: Mis Defaults"
+};
 
 #define OSD_FIRMW_EN "Updating firmware"
 #define OSD_FIRMW_ES "Actualizando firmware"
@@ -539,6 +570,16 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
 #define MENU_MAIN_NETWORK_ITEM ""
 #endif
 
+// Hardware menu — RP2350 only; removed on SRAM-tight RP2040. Dropping the whole
+// submenu lets --gc-sections reclaim the info screens + the 1.5 KB osd_info_buf
+// AND Speed Test's static FILs (~1.1 KB), which is what lets core1 graphics_init
+// fit its VGA tables on the ext_ram (PSRAM+SD) path. Overclock via config file.
+#if !PICO_RP2040
+#define MENU_MAIN_HARDWARE_ITEM "Hardware\t>\n"
+#else
+#define MENU_MAIN_HARDWARE_ITEM ""
+#endif
+
 #if TFT
 #define MENU_MAIN_EN \
 	"Volume\n"\
@@ -549,7 +590,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Reset\t>\n"\
     "Options\t>\n"\
     "Debug\t>\n"\
-    "Hardware\t>\n"\
+    MENU_MAIN_HARDWARE_ITEM \
     "ZX Keyboard\n"\
     "Help\n"\
     "About\n"\
@@ -563,7 +604,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Resetear\t>\n"\
     "Opciones\t>\n"\
 	"Depurar\t>\n"\
-    "Hardware\t>\n"\
+    MENU_MAIN_HARDWARE_ITEM \
     "Teclado ZX\n"\
     "Ayuda\n"\
     "Acerca de\n"\
@@ -578,7 +619,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Reset\t>\n"\
     "Options\t>\n"\
     "Debug\t>\n"\
-    "Hardware\t>\n"\
+    MENU_MAIN_HARDWARE_ITEM \
     MENU_MAIN_NETWORK_ITEM \
     "ZX Keyboard\n"\
     "Help\n"\
@@ -592,7 +633,7 @@ static const char *MENU_ESX_EJECT[2]     = { "Eject disk\n",     "Expulsar disco
     "Resetear\t>\n"\
     "Opciones\t>\n"\
 	"Depurar\t>\n"\
-    "Hardware\t>\n"\
+    MENU_MAIN_HARDWARE_ITEM \
     MENU_MAIN_NETWORK_ITEM \
     "Teclado ZX\n"\
     "Ayuda\n"\
@@ -609,7 +650,7 @@ static const char *MENU_MAIN[2] = { MENU_MAIN_EN, MENU_MAIN_ES };
     "Reset\t>\n"\
     "Options\t>\n"\
     "Debug\t>\n"\
-    "Hardware\t>\n"\
+    MENU_MAIN_HARDWARE_ITEM \
     MENU_MAIN_NETWORK_ITEM \
     "ZX Keyboard\n"\
     "Help\n"\
@@ -623,7 +664,7 @@ static const char *MENU_MAIN[2] = { MENU_MAIN_EN, MENU_MAIN_ES };
     "Resetear\t>\n"\
     "Opciones\t>\n"\
     "Depurar\t>\n"\
-    "Hardware\t>\n"\
+    MENU_MAIN_HARDWARE_ITEM \
     MENU_MAIN_NETWORK_ITEM \
     "Teclado ZX\n"\
     "Ayuda\n"\
@@ -816,26 +857,34 @@ static const char *MENU_GIGASCREEN_SEL[2] = { MENU_GIGASCREEN_SEL_EN, MENU_GIGAS
     "Soft reset\n"\
     "Hard reset\t{HK_HARD_RESET}\n"\
     "RP2350 reset\t{HK_REBOOT}\n"\
-    "Defaults\n"
+    "Factory Reset\n"\
+    "Save Config as Default\n"\
+    "Load My Default Config\n"
 #define MENU_RESET_ES \
     "Resetear\n"\
     "Reset parcial\n"\
     "Reset completo\t{HK_HARD_RESET}\n"\
     "Resetear RP2350\t{HK_REBOOT}\n"\
-	"Predeterminados\n"
+	"Reset de fabrica\n"\
+	"Guardar Config. como Mio\n"\
+	"Cargar Mi Config. Default\n"
 #else
 #define MENU_RESET_EN \
     "Reset Menu\n"\
     "Soft reset\n"\
     "Hard reset\t{HK_HARD_RESET}\n"\
     "RP2040 reset\t{HK_REBOOT}\n"\
-    "Defaults\n"
+    "Factory Reset\n"\
+    "Save Config as Default\n"\
+    "Load My Default Config\n"
 #define MENU_RESET_ES \
     "Resetear\n"\
     "Reset parcial\n"\
     "Reset completo\t{HK_HARD_RESET}\n"\
     "Resetear RP2040\t{HK_REBOOT}\n"\
-	"Predeterminados\n"
+	"Reset de fabrica\n"\
+	"Guardar Config. como Mio\n"\
+	"Cargar Mi Config. Default\n"
 #endif
 static const char *MENU_RESET[2] = { MENU_RESET_EN, MENU_RESET_ES };
 
@@ -858,14 +907,18 @@ static const char *MENU_DEBUG_LOG[2] = { "Write debug.log\n", "Escribir debug.lo
     "Hard reset\t{HK_HARD_RESET}\n"\
     "RP2350 reset\t{HK_REBOOT}\n"\
     "MurmulatorOS\n"\
-    "Defaults\n"
+    "Factory Reset\n"\
+    "Save Config as Default\n"\
+    "Load My Default Config\n"
 #define MENU_RESET_MOS_ES \
     "Resetear\n"\
     "Reset parcial\n"\
     "Reset completo\t{HK_HARD_RESET}\n"\
     "Resetear RP2350\t{HK_REBOOT}\n"\
     "MurmulatorOS\n"\
-	"Predeterminados\n"
+	"Reset de fabrica\n"\
+	"Guardar Config. como Mio\n"\
+	"Cargar Mi Config. Default\n"
 static const char *MENU_RESET_MOS[2] = { MENU_RESET_MOS_EN, MENU_RESET_MOS_ES };
 
 #define MENU_TFT_EN \
@@ -1005,6 +1058,7 @@ static const char *MENU_RTC[2]       = { "RTC + NVRAM\n",    "RTC + NVRAM\n" };
     "Hardware\n"\
     "Chip Info\n"\
     "Board Info\n"\
+    "Memory Info\n"\
     "Emulator Info\n"\
     "HID devices\n"\
     "Speed Test\t>\n"\
@@ -1013,18 +1067,29 @@ static const char *MENU_RTC[2]       = { "RTC + NVRAM\n",    "RTC + NVRAM\n" };
     "Hardware\n"\
     "Chip Info\n"\
     "Info placa\n"\
+    "Info memoria\n"\
     "Info emulador\n"\
     "Disp. HID\n"\
     "Test velocidad\t>\n"\
     "Overclock (!)\t>\n"
 static const char *MENU_HARDWARE[2] = { MENU_HARDWARE_EN, MENU_HARDWARE_ES };
 
+// NET row (HTTPS download benchmark) only exists where the net client is built.
+#if !PICO_RP2040 && ZIFI_NET_CLIENT
+#define MENU_SPEEDTEST_NET_EN "Network\n"
+#define MENU_SPEEDTEST_NET_ES "Red\n"
+#else
+#define MENU_SPEEDTEST_NET_EN ""
+#define MENU_SPEEDTEST_NET_ES ""
+#endif
 #define MENU_SPEEDTEST_EN \
     "Speed Test\n"\
     "CPU MIPS\n"\
     "SRAM R/W\n"\
     "PSRAM\n"\
     "SD Card\n"\
+    "USB Drive\n"\
+    MENU_SPEEDTEST_NET_EN \
     "All tests\n"
 #define MENU_SPEEDTEST_ES \
     "Test velocidad\n"\
@@ -1032,6 +1097,8 @@ static const char *MENU_HARDWARE[2] = { MENU_HARDWARE_EN, MENU_HARDWARE_ES };
     "SRAM L/E\n"\
     "PSRAM\n"\
     "Tarjeta SD\n"\
+    "Unidad USB\n"\
+    MENU_SPEEDTEST_NET_ES \
     "Todos\n"
 static const char *MENU_SPEEDTEST[2] = { MENU_SPEEDTEST_EN, MENU_SPEEDTEST_ES };
 
@@ -1099,14 +1166,14 @@ static const char *MENU_AY48[2] = { "Turned on?\n" , "Turned on?\n"};
 
 #if !PICO_RP2040
 static const char *MENU_SAA1099[2] = { "Turned on?\n" , "Turned on?\n"};
-// GM.DLS wavetable (mode 4) needs the top-of-flash bank partition, which ALF
+// DLS wavetable (mode 4) needs the top-of-flash bank partition, which ALF
 // builds reclaim for firmware (NO_GM_DLS). Drop the menu row in that case.
 #if NO_GM_DLS
 #define MENU_MIDI_GMDLS_EN ""
 #define MENU_MIDI_GMDLS_ES ""
 #else
-#define MENU_MIDI_GMDLS_EN "GM.DLS Wavetable\t[G]\n"
-#define MENU_MIDI_GMDLS_ES "GM.DLS Wavetable\t[G]\n"
+#define MENU_MIDI_GMDLS_EN "DLS Wavetable\t[G]\n"
+#define MENU_MIDI_GMDLS_ES "DLS Wavetable\t[G]\n"
 #endif
 #define MENU_MIDI_EN "MIDI(Ext:P" _PIN_XSTR(MIDI_TX_PIN) ")\n"\
     "OFF             \t[O]\n"\
@@ -1133,25 +1200,65 @@ static const char *MENU_MIDI[2] = { MENU_MIDI_EN, MENU_MIDI_ES };
     "Synth    \t[Y]\n"
 #define MENU_MIDI_PRESET_ES MENU_MIDI_PRESET_EN
 static const char *MENU_MIDI_PRESET[2] = { MENU_MIDI_PRESET_EN, MENU_MIDI_PRESET_ES };
-// GM.DLS wavetable mode (4): a user-supplied bank (gm_bank.bin) is provisioned
+// DLS wavetable mode (4): a user-supplied bank (gm_bank.bin) is provisioned
 // once from SD into a flash partition, then read via XIP (no PSRAM, persistent).
 static const char *MSG_MIDI_BANK_OK[2] = {
-    "GM wavetable bank loaded.",
-    "Banco wavetable GM cargado."
+    "DLS wavetable bank loaded.",
+    "Banco wavetable DLS cargado."
+};
+// Title of the "instrument set" (.bin bank) picker, shown when SD holds >1 bank.
+static const char *MENU_MIDI_BANK_TITLE[2] = {
+    "Instrument set\n",
+    "Set de instrumentos\n"
 };
 static const char *MSG_MIDI_BANK_MISSING[2] = {
-    "No bank in flash and no gm_bank.bin\non SD. MIDI will be silent.",
-    "Sin banco en flash y sin gm_bank.bin\nen SD. MIDI sin sonido."
+    "No DLS bank in flash or on SD.\nConvert a .dls first. MIDI silent.",
+    "Sin banco DLS en flash ni en SD.\nConvierte un .dls. MIDI sin sonido."
 };
 // msgDialog sizes its width to the message length and is single-line only — keep
 // this to ONE short line (a multi-line string makes the box span the whole screen).
 static const char *MSG_MIDI_BANK_REINSTALL_Q[2] = {
-    "Reinstall GM bank from SD?",
-    "Reinstalar banco GM de SD?"
+    "Reinstall DLS bank from SD?",
+    "Reinstalar banco DLS de SD?"
+};
+// Shown when a newly picked bank differs from flash: confirm the (reboot-to-)flash
+// so the user can decline and keep the current bank. Single short line.
+static const char *MSG_MIDI_BANK_INSTALL_Q[2] = {
+    "Install this bank? (reboots)",
+    "Instalar este banco? (reinicia)"
 };
 static const char *MSG_MIDI_BANK_FLASHING[2] = {
-    "Restarting to install GM bank...\nBoot takes ~20-30s (LED blinks). Do\nNOT power off until it comes back.",
-    "Reiniciando para instalar banco GM...\nArranque ~20-30s (LED parpadea). NO\napague hasta que vuelva."
+    "Restarting to install DLS bank...\nBoot takes ~20-30s (LED blinks). Do\nNOT power off until it comes back.",
+    "Reiniciando para instalar banco DLS...\nArranque ~20-30s (LED parpadea). NO\napague hasta que vuelva."
+};
+// On-device .dls -> gm_bank.bin conversion (RP2350). Title of the .dls file
+// picker, the bank-picker row that opens it, and the convert progress/result.
+static const char *MENU_DLS_TITLE[2] = {
+    "Select .dls soundbank\n",
+    "Elegir banco .dls\n"
+};
+static const char *MENU_MIDI_CONVERT_DLS[2] = {
+    "[+] Convert a .dls...",
+    "[+] Convertir un .dls..."
+};
+static const char *MSG_MIDI_CONVERTING[2] = {
+    "Converting .dls to bank...",
+    "Convirtiendo .dls a banco..."
+};
+static const char *MSG_MIDI_CONVERT_OK[2] = {
+    "Soundbank created.",
+    "Banco creado."
+};
+static const char *MSG_MIDI_CONVERT_FAIL[2] = {
+    "Conversion failed (bad .dls or low\nspace). See debug log.",
+    "Conversion fallida (.dls invalido o\npoco espacio). Ver log."
+};
+// A converted bank can exceed the fixed flash partition (~1.6 MB) — it is then
+// written to SD but cannot be installed, so the picker hides it. Tell the user
+// (the actual KB sizes are appended at runtime). Single short line for msgDialog.
+static const char *MSG_MIDI_BANK_TOOBIG[2] = {
+    "Bank too big for flash",
+    "Banco muy grande para flash"
 };
 #if defined(MIDI_TX_PIN) && defined(LOAD_WAV_PIO) && (LOAD_WAV_PIO == MIDI_TX_PIN)
 static const char *MSG_MIDI_PIN_CONFLICT[2] = {
@@ -1292,7 +1399,7 @@ static const char *MENU_ISSUE2[2] = { "48K Issue 2\n", "48K Issue 2\n"};
 
 #define MENU_ARCH_ES "Elija modelo\n"
 
-#if NO_ALF
+#if PICO_RP2040
 #define MENU_ARCHS \
     "Spectrum 48K\t>\n"\
     "Spectrum 128K\t>\n"\
@@ -1320,27 +1427,14 @@ static const char *MENU_ARCH[2] = { MENU_ARCH_EN MENU_ARCHS, MENU_ARCH_ES MENU_A
 // RP2040 without SD/PSRAM/butter has no backing for ram[0], ram[4], ram[6] —
 // 48K boots by luck (writes to 0xC000-0xFFFF silently drop, reads from bootrom).
 // 128K/Pentagon do real paging → NULL deref → Z80 loops on junk → hang.
-#if NO_ALF
 #define MENU_ARCHS_NO_SD \
     "Spectrum 48K\t>\n"
-#else
-#define MENU_ARCHS_NO_SD \
-    "Spectrum 48K\t>\n"\
-	"ALF TV GAME\n"
-#endif
-#else
-#if NO_ALF
-#define MENU_ARCHS_NO_SD \
-    "Spectrum 48K\t>\n"\
-    "Spectrum 128K\t>\n"\
-	"Pentagon 128K\t>\n"
 #else
 #define MENU_ARCHS_NO_SD \
     "Spectrum 48K\t>\n"\
     "Spectrum 128K\t>\n"\
 	"Pentagon 128K\t>\n"\
 	"ALF TV GAME\n"
-#endif
 #endif
 static const char *MENU_ARCH_NO_SD[2] = { MENU_ARCH_EN MENU_ARCHS_NO_SD, MENU_ARCH_ES MENU_ARCHS_NO_SD };
 
@@ -2285,6 +2379,10 @@ const uint8_t ESPectrum_logo[] = {
 };
 
 
+// Runtime SD automount toast — ALL platforms (the probe runs on RP2040 too, so
+// this must live OUTSIDE the RP2350-only network block below).
+static const char *MSG_SD_AUTOMOUNT[2]       = { "SD card mounted",  "Tarjeta SD montada" };
+
 // ─── ZiFi / Network menu strings ─────────────────────────────────────────────
 #if !PICO_RP2040
 
@@ -2326,6 +2424,8 @@ static const char *MSG_WIFI_DISCONNECT_Q[2]  = { "Disconnect?",       "\xA8" "De
 static const char *MENU_WIFI_LIST_TITLE[2]   = { "Wi-Fi networks",    "Redes Wi-Fi"        };
 static const char *MENU_TZ_TITLE[2]          = { "Time zone (UTC)",   "Zona horaria (UTC)" };
 static const char *MENU_ZIFI_GPIO_TITLE[2]   = { "ZiFi UART GPIO",    "ZiFi UART GPIO"     };
+static const char *MENU_ZIFI_TRANSPORT_TITLE[2] = { "ESP-01 transport", "ESP-01 transporte" };
+static const char *MENU_ZIFI_USB_LABEL[2]    = { "USB (CH340)",       "USB (CH340)"        };
 static const char *MENU_ESP01_TITLE[2]       = { "ESP-01(S)",         "ESP-01(S)"          };
 static const char *MENU_BAUD_TITLE[2]        = { "UART baud rate",    "Velocidad UART"     };
 
@@ -2372,6 +2472,7 @@ static const char *MSG_NET_REFRESHING[2]     = { "Refreshing...",    "Actualizan
 // ─── F5 location picker + saved-remotes manager ─────────────────────────────
 static const char *MENU_F5_LOCATION[2]       = { "Open from",        "Abrir desde"        };
 static const char *MSG_F5_LOCAL[2]           = { "Local (SD)",       "Local (SD)"         };
+static const char *MSG_F5_USB[2]             = { "USB Drive",        "Unidad USB"         };
 static const char *MSG_F5_REMOTE[2]          = { "Remote (FTP/SFTP)","Remoto (FTP/SFTP)"  };
 static const char *MSG_F5_WEB[2]             = { "Web Archives",     "Archivos web"       };
 static const char *MSG_F5_ADD_REMOTE[2]      = { "Add Remote",       "Anadir remoto"      };

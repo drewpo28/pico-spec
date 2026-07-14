@@ -15,6 +15,7 @@ using namespace std;
 #include "FileUtils.h"
 #include "Buffer.h"
 #include "MemESP.h"
+#include "AlfCart.h"
 #include "Video.h"
 #include "OSDMain.h"
 #include "Config.h"
@@ -207,6 +208,12 @@ string ZipExtract::extract(const string& zipPath, uint8_t fileType) {
     extBuf[elen] = 0;
 
     string finalPath = string(TEMP_FILE) + "." + extBuf;
+#if !PICO_RP2040
+    // A lazily-mounted ALF cart may still hold this exact temp path open (we reuse one
+    // fixed name). Release it before unlink/rename so its FIL can't dangle onto freed/
+    // reused clusters when we overwrite the file. loadAlfCart re-mounts right after.
+    if (AlfCart::active() && AlfCart::path() == finalPath) AlfCart::unmount();
+#endif
     f_unlink(finalPath.c_str());
     f_rename(TEMP_FILE, finalPath.c_str());
     return finalPath;
@@ -267,7 +274,10 @@ bool ZipExtract::extractStored(FIL* zipFile, uint32_t size) {
 // what was OOM-ing on a big extract (e.g. SATISFAC.SCL, 204 KB) when Gigascreen's
 // prevFB had already eaten the heap.
 static void* zip_zalloc(void* /*opaque*/, size_t items, size_t size) {
-    return Buffer::palloc(items * size, Buffer::USE_NET_ARENA);
+    // PREFER_PSRAM: on butter boards route the inflate state to the huge XIP-PSRAM
+    // arena instead of the scarce SRAM heap (else a big extract OOMs when GS/
+    // Gigascreen hold SRAM). USE_NET_ARENA still wins first when a lease is active.
+    return Buffer::palloc(items * size, Buffer::USE_NET_ARENA | Buffer::PREFER_PSRAM);
 }
 static void zip_zfree(void* /*opaque*/, void* p) { Buffer::pfree(p); }
 
@@ -298,14 +308,26 @@ bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize) {
     uint32_t infile_remaining = compressedSize;
     bool in_eof = false;
 
-    // Borrow video RAM pages 5+7 as inflate dictionary (32KB contiguous).
-    // pages57 is a static 32KB array: ram[5]=pages57, ram[7]=pages57+16KB.
-    uint8_t *dict = MemESP::ram[5].direct();
-    VIDEO::SaveRect.store_ram(dict, TINFL_LZ_DICT_SIZE);
+    // Inflate dictionary (32KB LZ window). Draw it from the Buffer pool — lent
+    // Gigascreen prevFB arena → butter PSRAM (PREFER_PSRAM) → heap — so we do NOT
+    // clobber ZX RAM and do NOT starve the SRAM heap on butter boards. Borrowing
+    // screen pages 5+7 corrupted those banks when the extracted file was then run in
+    // place: an ALF cart from a ZIP showed a half-built catalog (blank game slots)
+    // until a manual reboot rebuilt RAM. Only when memory is too tight to allocate
+    // 32KB do we fall back to the page 5+7 borrow (saved/restored) — tightest boards.
+    uint8_t *dict = (uint8_t*)Buffer::palloc(TINFL_LZ_DICT_SIZE,
+                                             Buffer::NEED_POINTER | Buffer::USE_NET_ARENA | Buffer::PREFER_PSRAM);
+    bool dictBorrowedRam = false;
+    if (!dict) {
+        dict = MemESP::ram[5].direct();          // ram[5]=pages57, ram[7]=pages57+16KB (32KB static)
+        VIDEO::SaveRect.store_ram(dict, TINFL_LZ_DICT_SIZE);
+        dictBorrowedRam = true;
+    }
     memset(dict, 0, TINFL_LZ_DICT_SIZE);
 
     if (inflateInit2(&stream, -MZ_DEFAULT_WINDOW_BITS, dict)) {
-        VIDEO::SaveRect.restore_ram(dict, TINFL_LZ_DICT_SIZE);
+        if (dictBorrowedRam) VIDEO::SaveRect.restore_ram(dict, TINFL_LZ_DICT_SIZE);
+        else                 Buffer::pfree(dict);
         f_close(&outFile);
         return false;
     }
@@ -370,7 +392,8 @@ bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize) {
 
     inflateEnd(&stream);
     f_close(&outFile);
-    VIDEO::SaveRect.restore_ram(dict, TINFL_LZ_DICT_SIZE);
+    if (dictBorrowedRam) VIDEO::SaveRect.restore_ram(dict, TINFL_LZ_DICT_SIZE);
+    else                 Buffer::pfree(dict);
 
     return success;
 }

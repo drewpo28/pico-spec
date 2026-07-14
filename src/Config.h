@@ -58,7 +58,7 @@ public:
     static void load();           // load main settings before emulator init
     static void loadDiskMounts(); // mount disks from storage.nvs after FDD/MB02 init
     static void loadMb02DiskMounts(); // (re)mount only MB-02+ disks (on enable at runtime)
-    static void save();
+    static void save(const char* path = nullptr); // nullptr = STORAGE_NVS (normal path)
     static bool loaded;  // true after successful load() from file/RAM
 
     static void requestMachine(const string& newArch, const string& newRomSet);
@@ -99,6 +99,7 @@ public:
     static bool     SAA1099;
     static uint8_t  midi;  // 0=Off, 1=AY bitbang, 2=ShamaZX, 3=Software synth, 4=GM.DLS wavetable
     static uint8_t  midi_synth_preset; // Software synth preset: 0=GM,1=Piano,2=Chiptune,3=Strings,4=Rock,5=Organ,6=MusicBox,7=Synth
+    static string   midi_bank;    // GM.DLS wavetable: chosen bank .bin path on SD ("" = default gm_bank.bin)
     static bool     timex_video;  // Timex SCLD video modes (port 0xFF)
     static uint8_t  dma_mode;     // 0=Off, 1=Port #0B (Z80 DMA), 2=Port #6B (zxnDMA)
     static bool     mode16col_onoff; // Pentagon 16col video mode (port #EFF7 D0)
@@ -222,6 +223,14 @@ public:
     static bool trdosAutoBoot;  // inject a "boot" file into TRD/SCL images that lack one
     static uint8_t trdosSoundLed; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
     static uint8_t trdosBios; // 0=5.03, 1=5.04TM, 2=5.05D, 3=Custom (flashable)
+    // ALF cartridge: 0 = built-in default "Elf-1" (256KB, in flash); >0 = a cartridge
+    // loaded into the shared flash region (gm_bank region), value = size in 16K banks.
+    static uint8_t alfCartBanks;
+    // Pending ALF cartridge to flash into the shared region at next boot (set by the
+    // menu, reboot, then early-boot provisioner flashes it and clears this). Empty =
+    // nothing pending. Deferred to boot because a large synchronous flash with
+    // multicore_lockout deadlocks the HDMI ISR (same reason gm_bank is boot-flashed).
+    static string alfCartPath;
     static bool driveWP[4];   // TR-DOS per-slot write protect (Drive A..D)
 #if !PICO_RP2040
     static uint8_t esxdos;   // 0=OFF 1=DivMMC 2=DivIDE 3=DivSD
@@ -241,10 +250,17 @@ public:
     // (resolved via BoardPins). See BoardPins.h / Network → GPIO picker.
     static uint8_t zifi_tx_pin;
     static uint8_t zifi_rx_pin;
+    // ESP-01 transport: 0=GPIO UART (zifi_tx_pin/rx_pin), 1=USB-CDC (CH340/CP210x/
+    // FTDI dongle on the USB host port). RP2350 + KBDUSB only. See Network→ESP01.
+    static uint8_t zifi_transport;
     static uint32_t zifi_baud;  // ESP-01S UART rate (115200 default; raised via AT+UART_CUR)
     static string wifi_ssid;
     static string wifi_pass;
-    static bool wifi_autoconnect;
+    // WiFi master switch: owns host networking (FTP/SSH/WEB), is the prerequisite for
+    // the ZiFi NIC, and (with a saved SSID) triggers the boot auto-connect. Fully
+    // independent of the NIC — the NIC never brings WiFi up. Persisted in wifi.cfg
+    // under the legacy key "autoconnect" so pre-existing configs migrate for free.
+    static bool wifi_enabled;
     static signed char wifi_tz; // SNTP timezone offset in hours (wifi.cfg key "tz")
     // Network file-transfer client (Network → File transfer). Stored in wifi.cfg.
     // Passwords are NOT persisted (re-prompted each session).

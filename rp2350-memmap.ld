@@ -222,7 +222,7 @@ SECTIONS
     /* ALF builds carry an extra ROM and are too large to also reserve the bank.
      * The build passes --defsym=__no_gm_bank=1 to zero the partition so the whole
      * flash is available to the firmware; GM.DLS is disabled in code (NO_GM_DLS). */
-    __gm_bank_size  = DEFINED(__no_gm_bank) ? 0 : 0x1A0000;   /* 1.625 MB; multiple of 4 KB and > bank size (~1.59 MB) */
+    __gm_bank_size  = DEFINED(__no_gm_bank) ? 0 : 0x280000;   /* 2.5 MB; multiple of 4 KB. Holds larger converted .dls banks (gm.dls ~1.59 MB; bigger sets fit here). Start moves to FLASH_END-2.5MB; ASSERT below guards firmware overflow. */
     __gm_bank_start = ORIGIN(FLASH) + LENGTH(FLASH) - __gm_bank_size;
     __gm_bank_end   = ORIGIN(FLASH) + LENGTH(FLASH);
     ASSERT(__flash_binary_end <= __gm_bank_start,

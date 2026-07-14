@@ -195,7 +195,12 @@ typedef struct {
 } wt_channel_t;
 
 static gm_bank_view_t g_bank;
-static wt_voice_t  g_voices[WT_MAX_VOICES];
+// pico-spec: lazily heap-allocated (WT_MAX_VOICES * sizeof(wt_voice_t) ≈ 5 KB) so
+// the voice state stays out of permanent .bss for every non-GM.DLS configuration.
+// Allocated/freed by midi_wt_voices_alloc()/midi_wt_voices_free() in midi_wt.c,
+// driven by MidiSubsys. NULL until a GM.DLS bank is bound. Indexed access below is
+// unchanged (pointer indexing); the only spot that needed care is the sizeof().
+static wt_voice_t  *g_voices = (wt_voice_t *) 0;
 static wt_channel_t g_channels[WT_MIDI_CHANNELS];
 static uint32_t g_next_age;
 
@@ -344,7 +349,7 @@ static void wt_build_luts(void) {}
 static int16_t wt_ulaw_lut[256];
 
 static void wt_engine_reset(void) {
-    memset(g_voices, 0, sizeof(g_voices));
+    memset(g_voices, 0, WT_MAX_VOICES * sizeof(wt_voice_t)); // pico-spec: g_voices is a pointer now
     g_active_mask = 0;
     g_next_age = 0;
     wt_cache_reset();   // clear the RAM wave cache (no-op when compiled out)

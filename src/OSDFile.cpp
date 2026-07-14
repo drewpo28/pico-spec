@@ -42,6 +42,7 @@ using namespace std;
 
 #include "OSDMain.h"
 #include "FileUtils.h"
+#include "AlfCart.h"
 #include "Config.h"
 #include "ESPectrum.h"
 #include "CPU.h"
@@ -118,6 +119,7 @@ public:
         const char* prefix;
         std::string s = folder;
         std::replace( s.begin(), s.end(), '/', '_');
+        std::replace( s.begin(), s.end(), ':', '_');  // "USB:/..." — ':' is invalid in FAT names
         idx_file = "/tmp/." + s + ".idx";
         calc_sz();
     }
@@ -437,6 +439,14 @@ void fgets(char* b, size_t sz, FIL& f) {
 #define ftell(x) f_tell(&x)
 #define feof(x) f_eof(&x)
 
+// Display-only volume prefix for the dialog's path row: unprefixed paths live
+// on the default volume — "SD:" normally, "USB:" when the stick is the root
+// (booted without an SD card). "USB:/..." paths already carry their volume.
+static string fdDisplayPath(const string& fdir) {
+    if (fdir.find(':') != string::npos) return fdir;
+    return (FileUtils::usbRoot ? "USB:" : "SD:") + fdir;
+}
+
 // Run a new file menu
 string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t mfcols, uint8_t mfrows) {
     if (Config::audio_driver == 3) send_to_595(LOW(AY_Enable));
@@ -480,14 +490,16 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
     if (y + h > scrH) y = scrH - h;
 
     DIR f_dir;
-    bool res = f_opendir(&f_dir, fdir.c_str()) == FR_OK;
+    FRESULT fr = f_opendir(&f_dir, fdir.c_str());
+    bool res = fr == FR_OK;
     if (!res) {
+        Debug::log("fileDialog: f_opendir('%s') err=%d — falling back to /\n", fdir.c_str(), fr);
         fdir = "/";
     } else {
         f_closedir(&f_dir);
     }
 
-    menu = title + "\n" + fdir + "\n";
+    menu = title + "\n" + fdDisplayPath(fdir) + "\n";
     WindowDraw(); // Draw menu outline
     if (ftype == DISK_ALLFILE)
         fd_DrawSidebar(x, y, mf_rows);
@@ -523,7 +535,8 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
                 ++ndirs;
                 crc += ::crc(string(2, DIR_MARKER) + "..");
             }
-            while (f_readdir(&f_dir, &fileInfo) == FR_OK && fileInfo.fname[0] != '\0') {
+            FRESULT frd;
+            while ((frd = f_readdir(&f_dir, &fileInfo)) == FR_OK && fileInfo.fname[0] != '\0') {
                 if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
                    fabgl::VirtualKey lkp = get_last_key_pressed();
                    if (lkp == fabgl::VirtualKey::VK_F1) break;
@@ -540,6 +553,9 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
                         }
                 }
             }
+            if (frd != FR_OK)
+                Debug::log("fileDialog: f_readdir('%s') err=%d after %u items\n",
+                           fdir.c_str(), frd, (unsigned)(elements + ndirs));
 
             f_closedir(&f_dir);
             uint32_t rcrc = filenames.crc();
@@ -941,7 +957,16 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
                                 click();
                             }
                         } else {
-                            if (fdir != "/") {
+                            if (fdir == "USB:/") {
+                                // Backspace at the USB root → out to the SD root (a plain
+                                // ascend would truncate the volume prefix into "").
+                                fdir = "/";
+                                if (!fd_pos_pop(FileUtils::fileTypes[ftype].begin_row,
+                                                FileUtils::fileTypes[ftype].focus))
+                                    FileUtils::fileTypes[ftype].begin_row = FileUtils::fileTypes[ftype].focus = 2;
+                                click();
+                                break;
+                            } else if (fdir != "/") {
                                 fdir.pop_back();
                                 fdir = fdir.substr(0,fdir.find_last_of("/") + 1);
                                 if (!fd_pos_pop(FileUtils::fileTypes[ftype].begin_row,
@@ -983,20 +1008,29 @@ string OSD::fileDialog(string &fdir, const string& title, uint8_t ftype, uint8_t
                         string filedir = rowGet(menu, FileUtils::fileTypes[ftype].focus);
                         if (filedir[0] == DIR_MARKER) {
                             if (filedir[1] == DIR_MARKER) {
-                                // ".." at the SD root → back to the locations chooser
+                                // ".." at the SD/USB root → back to the locations chooser
                                 // (distinct from Esc, which closes the OSD). "\x02UP".
-                                if (fd_root_parent && fdir == "/") {
+                                if (fd_root_parent && (fdir == "/" || fdir == "USB:/")) {
                                     if (menu_saverect) { VIDEO::SaveRect.restore_last(); menu_saverect = false; }
                                     click(); filenames.close(); string().swap(menu);
                                     if (Config::audio_driver == 3) send_to_595(HIGH(AY_Enable));
                                     return "\x02UP";
                                 }
+                                if (fdir == "USB:/") {
+                                    // ".." at the USB root without the chooser (a per-type
+                                    // dialog that landed on the stick) → out to the SD root.
+                                    fdir = "/";
+                                    if (!fd_pos_pop(FileUtils::fileTypes[ftype].begin_row,
+                                                    FileUtils::fileTypes[ftype].focus))
+                                        FileUtils::fileTypes[ftype].begin_row = FileUtils::fileTypes[ftype].focus = 2;
+                                } else {
                                 // Going up to parent dir — restore saved position
                                 fdir.pop_back();
                                 fdir = fdir.substr(0,fdir.find_last_of("/") + 1);
                                 if (!fd_pos_pop(FileUtils::fileTypes[ftype].begin_row,
                                                 FileUtils::fileTypes[ftype].focus))
                                     FileUtils::fileTypes[ftype].begin_row = FileUtils::fileTypes[ftype].focus = 2;
+                                }
                             } else {
                                 // Entering subdirectory — save current position
                                 fd_pos_push(FileUtils::fileTypes[ftype].begin_row,
@@ -1125,7 +1159,7 @@ void OSD::fd_Redraw(const string& title, const string& fdir, uint8_t ftype, cons
     if ((FileUtils::fileTypes[ftype].focus != last_focus) || (FileUtils::fileTypes[ftype].begin_row != last_begin_row)) {
         // printf("fd_Redraw\n");
         // Read bunch of rows
-        menu = title + "\n" + ( fdir.length() == 1 ? fdir : fdir.substr(0,fdir.length()-1)) + "\n";
+        menu = title + "\n" + fdDisplayPath(fdir.length() == 1 ? fdir : fdir.substr(0,fdir.length()-1)) + "\n";
         char buf[128];
         if (FileUtils::fileTypes[ftype].fdMode == 0 || FileUtils::fileTypes[ftype].fileSearch == "") {
             int pos = FileUtils::fileTypes[ftype].begin_row - 2;
@@ -1807,6 +1841,11 @@ static bool rfd_launch_tmp(string path) {
         OSD::bootTrdos();              // cold-boot into TR-DOS so the disk auto-runs
         return true;
     }
+#if !PICO_RP2040
+    if (ext == "rom" || ext == "bin") {
+        return OSD::loadAlfCart(path); // ALF cartridge — lazy-mount from SD + switch into ALF
+    }
+#endif
     OSD::osdCenteredMsg(string(MSG_NET_UNSUPPORTED[Config::lang]) + " (." + ext + ")",
                         LEVEL_WARN, 2200);
     return false;
@@ -1824,6 +1863,11 @@ static void rfd_release_tmp(const string& tmpp) {
     if (Tape::tapeFileType != TAPE_FTYPE_EMPTY &&
         FileUtils::TAP_Path + Tape::tapeFileName == tmpp)
         Tape::Init();   // closes the open tape FIL
+#if !PICO_RP2040
+    // An ALF cart mounted lazily from this temp path holds the FIL open; release it
+    // so the next quick-start can truncate/rewrite the same /tmp/_run.<ext> file.
+    if (AlfCart::active() && AlfCart::path() == tmpp) AlfCart::unmount();
+#endif
 }
 
 // ── Listing-index cache (Remote/Web) ─────────────────────────────────────────
@@ -1892,6 +1936,10 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
 
     while (1) {
         OSD::net_last_path = fs->cwdPath();   // remembered as the global last F5 location
+        // Path shown in the header: prefix the remote cwd with the scheme label
+        // ("FTP:"/"SSH:"/"WEB:") so fdDisplayPath() doesn't stamp it "SD:". Display
+        // only — cache key / net_last_path / cursor memory still use the raw cwdPath.
+        const string dispPath = fs->schemeLabel() + fs->cwdPath();
         // ── Open (or build) the per-folder listing index into the shared `filenames`
         // (so the SD render path can draw it). Reuse cache when known-fresh. ──
         uint32_t key = netHash(fs->cacheId() + "|" + fs->cwdPath());
@@ -1907,7 +1955,7 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
             reuse = (fs->revalidate("", stored, fresh) == RemoteFs::CACHE_FRESH);
         }
         if (!reuse) {
-            OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], fs->cwdPath(), 0, 0, fs->utf8Names());
+            OSD::progressDialog(MSG_NET_CONNECTING[Config::lang], dispPath, 0, 0, fs->utf8Names());
             filenames.unlink();          // truncate to empty (also (re)creates the file)
             // ".." row (double DIR_MARKER → sorts/renders first), like the SD browser:
             // select it to go up a level, and from the top it exits toward the root.
@@ -1921,7 +1969,7 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
         netSessAdd(key);
 
         int outKey = FDK_ESC;
-        int sel = fdChromeNav(title, fs->cwdPath(), side, fs->utf8Names(), &outKey, &curFocus, &curBegin);
+        int sel = fdChromeNav(title, dispPath, side, fs->utf8Names(), &outKey, &curFocus, &curBegin);
         // Remember this folder's cursor for the session (so F5 reopen restores it).
         g_net_cur_path = fs->cwdPath(); g_net_cur_focus = curFocus; g_net_cur_begin = curBegin;
 
@@ -2019,19 +2067,23 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
         // the file type). For a real filename, use F5 Save instead.
         rfd_xfer_title = MSG_NET_DOWNLOADING[Config::lang];
         OSD::progressDialog(rfd_xfer_title, nm, 0, 0, fs->utf8Names());
-        // Extension straight from the display name when it looks like a real file
-        // extension (short, alphanumeric) — avoids an extra request. Catalog titles can
-        // contain dots mid-name (e.g. "...3; Demo (SL+SSROM)"), so fall back to
-        // downloadBasename() (the real name from the locator) when the suffix isn't ext-like.
+        // Extension straight from the display name only when the suffix is a *known*
+        // launchable extension — avoids an extra request. Catalog titles routinely
+        // carry dots mid-name (version tags like "Z-Player v3.4", or "...3; Demo
+        // (SL+SSROM)"), and a bare "short alphanumeric suffix" test wrongly takes ".4"
+        // as the type. Anything unrecognised falls back to downloadBasename() (the real
+        // name from the locator), which is the authoritative source of the extension.
+        auto isLaunchExt = [](const string& lc) {
+            return lc == "tap" || lc == "tzx" || lc == "pzx" || lc == "wav" || lc == "mp3"
+                || lc == "sna" || lc == "z80" || lc == "p"   || lc == "zip"
+                || lc == "rom" || lc == "bin"
+                || FileUtils::ifaceForExt(lc) != IFACE_NONE; // trd/scl/fdi/udi/td0/pro/mbd/mmc/hdf
+        };
         string ext;
         size_t slash = nm.find_last_of('/'), dot = nm.find_last_of('.');
-        if (dot != string::npos && (slash == string::npos || dot > slash)) {
-            string e = nm.substr(dot);                 // includes the '.'
-            bool extLike = (e.size() >= 2 && e.size() <= 5);
-            for (size_t i = 1; extLike && i < e.size(); i++)
-                if (!isalnum((unsigned char)e[i])) extLike = false;
-            if (extLike) ext = e;
-        }
+        if (dot != string::npos && (slash == string::npos || dot > slash) &&
+            isLaunchExt(FileUtils::getLCaseExt(nm)))
+            ext = nm.substr(dot);                          // includes the '.'
         if (ext.empty()) {
             string base = fs->downloadBasename(nm);
             size_t d2 = base.find_last_of('.');

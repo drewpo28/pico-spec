@@ -227,7 +227,7 @@ bool isVisible(Id i) {
 #endif
         case ULAPLUS:    return Config::ulaplus;
         case GIGASCREEN: return Config::gigascreen_enabled;
-        case NET:        return Config::zifi_enabled != 0;
+        case NET:        return Config::wifi_enabled != 0; // networking is WiFi-driven (NIC requires it)
 #else
         case SD: case ZCTRL: case IDE: case MIDI:
         case SAA: case TIMEX: case DMA: case GS:
@@ -250,6 +250,12 @@ void decay() {
         if (rdec[i]) rdec[i]--;
         if (wdec[i]) wdec[i]--;
     }
+    // FDD lamp/glyph/hum run off rvmWD1793::fdd_active_decay instead of rdec/wdec
+    // (see wd1793.h) — decay it here too so it's a single per-frame tick site.
+    if (ESPectrum::fdd.fdd_active_decay) ESPectrum::fdd.fdd_active_decay--;
+#if !PICO_RP2040
+    if (ESPectrum::mb02_fdd.fdd_active_decay) ESPectrum::mb02_fdd.fdd_active_decay--;
+#endif
 }
 
 // Determine where to draw the strip given current video mode.
@@ -283,19 +289,26 @@ static inline uint8_t fgColor(Id i) {
     // Pick a 0..15 ZX colour index. ORANGE (16) has no DS80 palette slot, so use
     // BRI_YELLOW for the read+write state — keeps a valid index in both modes.
     uint8_t zx;
-    // FDD: colour by the actual WD1793 command, NOT raw port I/O direction. A disk
-    // READ still issues command/data-register *writes* (seek, read-sector cmd), so
+    // FDD: active state AND colour both come from fdd_active_decay (genuine
+    // head-load/header-search/data-transfer activity — see wd1793.h), not from
+    // rdec/wdec. Raw port I/O direction is wrong on both counts: a disk READ still
+    // issues command/data-register *writes* (seek, read-sector cmd), so
     // direction-based colouring lit touchW during every load → red blended with the
-    // data-read green → permanent yellow. The corner lamp already colours by command;
-    // do the same here. read/seek → green, write-sector/write-track → red.
-    if (i == FDD && (r || w)) {
+    // data-read green → permanent yellow; and a bare command write (bus-probing
+    // software) would light the glyph with no real disk activity at all. The corner
+    // lamp uses the same signal — see ESPectrum.cpp.
+    if (i == FDD) {
         rvmWD1793* f = &ESPectrum::fdd;
 #if !PICO_RP2040
         if (MB02::enabled) f = &ESPectrum::mb02_fdd;
 #endif
-        bool write = ((f->command & 0xE0) == 0xA0) ||   // Write Sector (0xA_/0xB_)
-                     ((f->command & 0xF0) == 0xF0);     // Write Track  (0xF_)
-        zx = write ? BRI_RED : BRI_GREEN;
+        if (f->fdd_active_decay) {
+            bool write = ((f->command & 0xE0) == 0xA0) ||   // Write Sector (0xA_/0xB_)
+                         ((f->command & 0xF0) == 0xF0);     // Write Track  (0xF_)
+            zx = write ? BRI_RED : BRI_GREEN;
+        } else {
+            zx = (VIDEO::borderColor == WHITE) ? BLUE : WHITE;
+        }
     }
     else if (r && w) zx = BRI_YELLOW;
     else if (r)      zx = BRI_GREEN;

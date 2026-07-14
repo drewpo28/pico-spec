@@ -23,9 +23,11 @@ public:
     // only while Config::dma_mode != 0 (DMA is off by default); freed when the
     // user switches DMA off in the OSD.
     static constexpr uint32_t DMA_ATTR_SHADOW_SZ = 192 * 32;
+    // All point into one heap block allocated only while Config::dma_mode != 0
+    // (see ensureAttrShadow) — the feature costs ZERO SRAM when disabled.
     static uint8_t* dma_attr_shadow;
-    static bool     dma_attr_valid[192];
-    static bool     dma_charrow_active[24];
+    static bool*    dma_attr_valid;
+    static bool*    dma_charrow_active;
     static void     resetAttrShadow();
     static bool     ensureAttrShadow();
     static void     freeAttrShadow();

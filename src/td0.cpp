@@ -7,6 +7,7 @@
 #include "td0.h"
 #include "ff.h"
 #include <string.h>
+#include <cstdlib>
 
 // ---------------------------------------------------------------- sectors
 
@@ -174,8 +175,6 @@ struct LzhState {
     unsigned char getlen;
 };
 
-static LzhState g_lzh; // ~10 KB; static keeps it off the stack (RP2350 SRAM ok)
-
 int readChar(LzhState &st)
 {
     if (st.packed_ptr < st.packed_end) return *st.packed_ptr++;
@@ -318,103 +317,43 @@ int DecodePosition(LzhState &st)
 
 } // namespace
 
-unsigned td0_unpack_lzh(const unsigned char *src, unsigned size, unsigned char *dst, unsigned dstCapacity)
+// ~9 KB. Only "packed" (LZH-compressed) TD0 images need this, and only once
+// per mount (whole-image decompress) — heap-lazy so most sessions/boards
+// never pay for it. Never freed once allocated (same idiom as
+// conv_color_std_snapshot/g_voices): TD0 mounts are rare enough that
+// malloc/free churn isn't worth the complexity.
+extern size_t getContiguousHeap(void);
+static LzhState *g_lzh_ptr = nullptr;
+static LzhState *getLzhState()
 {
-    LzhState &st = g_lzh;
-    st.packed_ptr = src;
-    st.packed_end = src + size;
-    st.packed_file = nullptr;
-    st.input_eof   = false;
-
-    int i, j, k, c;
-    unsigned count = 0;
-    StartHuff(st);
-
-    while (st.packed_ptr < st.packed_end && count < dstCapacity) {
-        c = DecodeChar(st);
-        if (c < 256) {
-            dst[count++] = (unsigned char)c;
-            st.text_buf[st.r++] = (unsigned char)c;
-            st.r &= (N - 1);
-        } else {
-            i = (st.r - DecodePosition(st) - 1) & (N - 1);
-            j = c - 255 + THRESHOLD;
-            for (k = 0; k < j && count < dstCapacity; k++) {
-                c = st.text_buf[(i + k) & (N - 1)];
-                dst[count++] = (unsigned char)c;
-                st.text_buf[st.r++] = (unsigned char)c;
-                st.r &= (N - 1);
-            }
-        }
+    if (!g_lzh_ptr) {
+        if (getContiguousHeap() < sizeof(LzhState) + 2048u) return nullptr;
+        g_lzh_ptr = (LzhState *)malloc(sizeof(LzhState));
     }
-    return count;
+    return g_lzh_ptr;
 }
 
-unsigned td0_unpack_lzh_stream(const unsigned char *src, unsigned size, td0_sink_fn sink, void *ctx)
-{
-    LzhState &st = g_lzh;
-    st.packed_ptr = src;
-    st.packed_end = src + size;
-    st.packed_file = nullptr;
-    st.input_eof   = false;
-
-    int i, j, k, c;
-    unsigned total = 0;
-    StartHuff(st);
-
-    // Small bounded staging buffer flushed through the sink; the full
-    // decompressed image never lives in RAM at once.
-    unsigned char out[2048];
-    unsigned op = 0;
-
-    while (st.packed_ptr < st.packed_end) {
-        c = DecodeChar(st);
-        if (c < 256) {
-            out[op++] = (unsigned char)c;
-            st.text_buf[st.r++] = (unsigned char)c;
-            st.r &= (N - 1);
-            total++;
-        } else {
-            i = (st.r - DecodePosition(st) - 1) & (N - 1);
-            j = c - 255 + THRESHOLD;
-            for (k = 0; k < j; k++) {
-                c = st.text_buf[(i + k) & (N - 1)];
-                out[op++] = (unsigned char)c;
-                st.text_buf[st.r++] = (unsigned char)c;
-                st.r &= (N - 1);
-                total++;
-                if (op == sizeof(out)) {
-                    if (!sink(ctx, out, op)) return total;
-                    op = 0;
-                }
-            }
-        }
-        if (op >= sizeof(out) - 1) {     // headroom for the literal branch
-            if (!sink(ctx, out, op)) return total;
-            op = 0;
-        }
-    }
-    if (op && !sink(ctx, out, op)) return total;
-    return total;
-}
-
-// File-streaming variant: decompress an LZH-packed TD0 payload reading
+// Decompress an LZH-packed TD0 payload reading
 // directly from `f` (positioned at the first byte of the packed data).
-// No malloc needed — the compressed data is consumed via a 512-byte staging
-// window inside g_lzh, eliminating the large rawLen allocation.
+// The compressed data is consumed via a 512-byte staging window inside
+// LzhState, eliminating the large rawLen allocation that would otherwise be
+// needed to buffer the whole packed stream.
 unsigned td0_unpack_lzh_from_file(FIL *f, td0_sink_fn sink, void *ctx)
 {
-    LzhState &st = g_lzh;
+    LzhState *st_ptr = getLzhState();
+    if (!st_ptr) return 0;
+    LzhState &st = *st_ptr;
     st.packed_ptr  = st.packed_filebuf; // empty staging buffer initially
     st.packed_end  = st.packed_filebuf;
     st.packed_file = f;
     st.input_eof   = false;
 
     // StartHuff initialises text_buf[0..N-F-1] with spaces but leaves the
-    // tail [N-F..N+F-2] untouched.  On the first call that tail is zero from
-    // BSS; on subsequent calls it holds data from the previous run.  The
-    // Teledisk compressor assumes zeros there (its own BSS), so mismatches
-    // corrupt the first few back-references → garbled first track → load fail.
+    // tail [N-F..N+F-2] untouched. The Teledisk compressor assumes zeros there
+    // (its own BSS), so it must be zeroed explicitly on every call — LzhState
+    // is heap-allocated (not BSS) and holds whatever the previous run left
+    // behind; a stale/garbage tail corrupts the first few back-references →
+    // garbled first track → load fail.
     memset(st.text_buf + (N - F), 0, sizeof(st.text_buf) - (N - F));
 
     int i, j, k, c;

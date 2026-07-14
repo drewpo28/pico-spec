@@ -9,6 +9,8 @@
 // https://wiki.osdev.org/PS/2_Keyboard
 //
 #include "ps2kbd_mrmltr.h"
+// printf came transitively from TinyUSB <=0.18 headers; 0.21 cleaned its includes up
+#include <cstdio>
 #if KBD_CLOCK_PIN == 2
 #include "ps2kbd_mrmltr2.pio.h"
 #elif KBD_CLOCK_PIN == 10

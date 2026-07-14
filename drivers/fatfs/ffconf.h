@@ -38,7 +38,11 @@
 /* This option switches fast seek function. (0:Disable or 1:Enable) */
 
 
+#if PICO_RP2040
 #define FF_USE_EXPAND	0
+#else
+#define FF_USE_EXPAND	1
+#endif
 /* This option switches f_expand function. (0:Disable or 1:Enable) */
 
 
@@ -153,7 +157,21 @@
 /  on character encoding. When LFN is not enabled, these options have no effect. */
 
 
+// 1: f_chdrive() support — when no SD card is present at boot, FileUtils
+// switches the default volume to a USB flash stick, so every unprefixed path
+// (configs, /tmp, /spec) transparently lands on the stick. CAUTION: with
+// RPATH enabled an unprefixed path resolves on the CURRENT volume (not
+// volume 0), so volume-level calls must always spell the volume out with a
+// colon ("SD:", "USB:") — a bare "SD" parses as "no prefix".
+// RP2040 has no USB MSC (CFG_TUH_MSC=0) so it needs only the single SD volume.
+// Reverting the multi-volume/USB config there (as in 1.2.24) reclaims ~2 KB of
+// its scarce SRAM (bigger FATFS + volume tables). RP2350 keeps the USB "USB:"
+// volume. FileUtils mounts with "" (default vol) on RP2040, "SD:" on RP2350.
+#if PICO_RP2040
 #define FF_FS_RPATH		0
+#else
+#define FF_FS_RPATH		1
+#endif
 /* This option configures support for relative path.
 /
 /   0: Disable relative path and remove related functions.
@@ -161,18 +179,39 @@
 /   2: f_getcwd() function is available in addition to 1.
 */
 
+// Max directory nesting FatFs can follow on an exFAT volume when RPATH is on.
+// NOT just for f_chdir: on exFAT (which has no ".." entries) follow_path()
+// records every descended sub-directory into a tbl[FF_PATH_DEPTH + 1] chain and
+// returns FR_NOT_ENOUGH_CORE the moment the path is deeper — so this caps EVERY
+// absolute path on an exFAT volume, not the cwd. 1 was far too small: the config
+// dir alone (/.config/pico-spec/<ver>/<board>) is 4 deep, so f_mkdir/f_open on a
+// 60 GB exFAT USB stick failed (SD is usually FAT32, where this code never runs
+// — that's why the bug looked "USB only"). 16 covers the config tree plus deep
+// user browsing; costs ~12 B per level in each FATFS (static SD + heap USB).
+#define FF_PATH_DEPTH	16
+
 
 /*---------------------------------------------------------------------------/
 / Drive/Volume Configurations
 /---------------------------------------------------------------------------*/
 
-// TODO: calulate really required volumes
+// Volume 0 = SD card (default drive: paths without a prefix), volume 1 = USB
+// mass-storage stick ("USB:/..." paths, RP2350 only). Physical drive mapping
+// lives in drivers/sdcard/sdcard.c (drv 0 = SD SPI, drv 1 = TinyUSB MSC).
+#if PICO_RP2040
 #define FF_VOLUMES		1
+#else
+#define FF_VOLUMES		2
+#endif
 /* Number of volumes (logical drives) to be used. (1-10) */
 
 
+#if PICO_RP2040
 #define FF_STR_VOLUME_ID	0
-#define FF_VOLUME_STRS		"RAM","NAND","CF","SD","SD2","USB","USB2","USB3"
+#else
+#define FF_STR_VOLUME_ID	1
+#define FF_VOLUME_STRS		"SD","USB"
+#endif
 /* FF_STR_VOLUME_ID switches support for volume ID in arbitrary strings.
 /  When FF_STR_VOLUME_ID is set to 1 or 2, arbitrary strings can be used as drive
 /  number in the path name. FF_VOLUME_STRS defines the volume ID strings for each
@@ -204,7 +243,9 @@
 /  GET_SECTOR_SIZE command. */
 
 
-#define FF_LBA64		0
+// 1: USB sticks partitioned with GPT (common on big/exFAT sticks) fail to mount
+// without 64-bit LBA support (find_volume can't parse the GPT header).
+#define FF_LBA64		1
 /* This option switches support for 64-bit LBA. (0:Disable or 1:Enable)
 /  To enable the 64-bit LBA, also exFAT needs to be enabled. (FF_FS_EXFAT == 1) */
 

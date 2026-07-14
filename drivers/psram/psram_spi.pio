@@ -74,6 +74,12 @@ readloop:
 readloop_mid:
     jmp y--, readloop   side 0b10
 
+; QUAD (4-bit SIO) variant — currently UNUSED. No shipped board routes SIO2/SIO3
+; to the SPI PSRAM (MURM1 wires only MOSI/MISO), and on RP2350 quad PSRAM goes
+; through the hardware QMI/XIP CS1 path ("butter", src/main.cpp) instead of PIO.
+; To use this on a future board: route 4 contiguous SIO pins, enter quad mode on
+; the chip (cmd 0x35), use quad commands (0xEB fast read / 0x38 write), and wire
+; up pio_qspi_psram_cs_init() in psram_spi.c.
 .program qspi_psram
 .side_set 2
 begin:

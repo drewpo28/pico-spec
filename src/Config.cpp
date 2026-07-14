@@ -46,6 +46,7 @@ bool     Config::AY48 = true;
 bool     Config::SAA1099 = false;
 uint8_t  Config::midi = 0;
 uint8_t  Config::midi_synth_preset = 0;
+string   Config::midi_bank = "";
 #endif
 uint16_t Config::cpu_mhz = CPU_MHZ;
 uint16_t Config::max_flash_freq = 66;
@@ -118,6 +119,8 @@ bool     Config::trdosFastMode = false;
 bool     Config::trdosAutoBoot = true;
 uint8_t  Config::trdosSoundLed = 0; // 0=Off, 1=Led, 2=Sound, 3=Sound+Led
 uint8_t  Config::trdosBios = 2; // Default: 5.05D
+uint8_t  Config::alfCartBanks = 0; // 0 = built-in Elf-1; >0 = loaded cart size in 16K banks
+string   Config::alfCartPath = ""; // pending cart to flash into the shared region at boot
 bool     Config::driveWP[4] = { true, true, true, true };
 #if !PICO_RP2040
 uint8_t  Config::esxdos = 0;
@@ -133,10 +136,11 @@ uint16_t Config::ide_chs[2][3] = {{0,0,0},{0,0,0}};
 uint8_t  Config::zifi_enabled = 0;
 uint8_t  Config::zifi_tx_pin = 0xFE; // 0xFE = board default (BoardPins)
 uint8_t  Config::zifi_rx_pin = 0xFE;
+uint8_t  Config::zifi_transport = 0; // 0=GPIO UART, 1=USB-CDC
 uint32_t Config::zifi_baud = 115200;
 string   Config::wifi_ssid;
 string   Config::wifi_pass;
-bool     Config::wifi_autoconnect = false;
+bool     Config::wifi_enabled = false;
 signed char Config::wifi_tz = 0;
 string   Config::net_host;
 string   Config::net_user;
@@ -212,14 +216,47 @@ void Config::initHotkeys() {
         hotkeys[i] = defaults[i];
 }
 
+extern std::string g_snapshot_loading_path;  // Snapshot.cpp — snapshot mid-load
+
 void Config::requestMachine(const string& newArch, const string& newRomSet)
 {
+#if !PICO_RP2040
+    // Profi boundary: setup() lays out the Profi memory once at boot —
+    // forced-SRAM pages (DS80 colour 56/58 + CP/M pool 60/61) on ALL RP2350
+    // boards, plus the pool/accessor-backed butter vram strip on butter/QSPI
+    // boards — and nothing frees or creates them at runtime, so ANY arch
+    // change crossing the Profi boundary must reboot so setup() re-lays out
+    // memory.  The OSD Machine menu checks this itself, but snapshot loaders
+    // call requestMachine directly: a Pentagon snapshot loaded on Profi left
+    // the layout allocated; a Profi snapshot loaded elsewhere got no DS80
+    // colour pages.  Persist the target arch and the in-flight snapshot —
+    // setup() resumes the load via Config::ram_file after the reboot (same
+    // pattern as savePendingVideoMode).  If the config write fails, nothing is
+    // persisted (NvsWriter is atomic) and the next boot comes up unchanged —
+    // no loop.
+    // butter/QSPI boards are exempt: there the Profi and non-Profi layouts are
+    // identical (all pages are direct XIP pointers, no forced-SRAM set), so no
+    // reboot is needed — and page 56 is a POINTER for every arch there, which
+    // would otherwise read as a false "Profi layout" marker.
+    bool profiSramLayout = (MemESP::ram[56].memType() == mem_type_t::POINTER);
+    if (butter_psram_size() == 0 && (newArch == "Profi") != profiSramLayout) {
+        arch = newArch;
+        if (!newRomSet.empty()) romSet = newRomSet;
+        if (!g_snapshot_loading_path.empty())
+            ram_file = g_snapshot_loading_path;
+        save();
+        OSD::esp_hard_reset();   // never returns; setup() re-lays out memory
+    }
+#endif
     arch = newArch;
+    // Re-bind ROM overlays from scratch for this machine (RomOverlay.h). Each romset
+    // below registers the overlays it needs; clearing first avoids stale entries.
+    MemESP::clearOverlays();
     if (arch == "48K") {
         if (newRomSet=="") romSet = "48K"; else romSet = newRomSet;
         if (newRomSet=="") romSet48 = "48K"; else romSet48 = newRomSet;
         if (romSet48 == "48Kcs") {
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
 #if NO_SEPARATE_48K_CUSTOM
             MemESP::rom[0].assign_rom(gb_rom_0_128k_custom);
 #else
@@ -228,22 +265,31 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
 #else
             MemESP::rom[0].assign_rom(gb_rom_Alf_cart);
 #endif
+            MemESP::registerOverlay(gb_rom_0_sinclair_48k, nullptr);
         } else
 #if !NO_SPAIN_ROM_48k
-        if (romSet48 == "48Kes")
-            MemESP::rom[0].assign_rom(gb_rom_0_48k_es);
-        else
-#endif
-        if (romSet48 == "48Kby")
-            MemESP::rom[0].assign_rom(Config::byte_cobmect_mode ? gb_rom_0_byte_sovmest_48k : gb_rom_0_byte_48k);
-        else
+        if (romSet48 == "48Kes") {
+            // 48K Spanish: read-only overlay over the Sinclair 48K base (RomOverlay.h)
             MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_48k, gb_overlay_48k_es);
+        } else
+#endif
+        if (romSet48 == "48Kby") {
+            // Both BYTE and BYTE-compat are overlays over the Sinclair 48K base.
+            MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_48k,
+                Config::byte_cobmect_mode ? gb_overlay_48k_byte_sovmest : gb_overlay_48k_byte);
+        } else {
+            MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_48k, nullptr);
+        }
     }
-#if !NO_ALF
+#if !PICO_RP2040
     else if (arch == "ALF") {
         const uint8_t* base = gb_rom_Alf;
+        // gb_rom_Alf is 32KB = 2 real banks; banks 2..63 → gb_rom_Alf_ep (zero page).
         for (int i = 0; i < 64; ++i) {
-            MemESP::rom[i].assign_rom(i >= 16 ? gb_rom_Alf_ep : base + ((16 * i) << 10));
+            MemESP::rom[i].assign_rom(i >= 2 ? gb_rom_Alf_ep : base + ((16 * i) << 10));
         }
         Config::kempstonPort = 0x1F; // TODO: ensure, save?
     }
@@ -252,7 +298,7 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
         if (newRomSet=="") romSet = "128K"; else romSet = newRomSet;
         if (newRomSet=="") romSet128 = "128K"; else romSet128 = newRomSet;
         if (romSet128 == "128Kcs") {
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
             MemESP::rom[0].assign_rom(gb_rom_0_128k_custom);
             MemESP::rom[1].assign_rom(gb_rom_0_128k_custom + (16 << 10)); /// 16392;
 #else
@@ -261,21 +307,29 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
 #endif
 #if !NO_SPAIN_ROM_128k
         } else if (romSet128 == "128Kes") {
+            // rom[0] (128K editor) differs too much positionally -> stays raw.
+            // rom[1] (BASIC) is an overlay over the Sinclair 128K second ROM half.
             MemESP::rom[0].assign_rom(gb_rom_0_128k_es);
-            MemESP::rom[1].assign_rom(gb_rom_1_128k_es);
+            MemESP::rom[1].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_128k_es);
         } else if (romSet128 == "+2es") {
             MemESP::rom[0].assign_rom(gb_rom_0_plus2_es);
-            MemESP::rom[1].assign_rom(gb_rom_1_plus2_es);
+            MemESP::rom[1].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_128k_plus2es);
         } else if (romSet128 == "+2") {
             MemESP::rom[0].assign_rom(gb_rom_0_plus2);
-            MemESP::rom[1].assign_rom(gb_rom_1_plus2);
+            MemESP::rom[1].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_128k_plus2);
         } else if (romSet128 == "ZX81+") {
             MemESP::rom[0].assign_rom(gb_rom_0_s128_zx81);
             MemESP::rom[1].assign_rom(gb_rom_1_sinclair_128k);
 #endif
         } else if (romSet128 == "128Kby" || romSet128 == "128Kbg") {
             MemESP::rom[0].assign_rom(gb_rom_0_sinclair_128k);
-            MemESP::rom[1].assign_rom(gb_rom_0_byte_48k);
+            // rom[1] = BYTE 48K, now a read-only overlay over the Sinclair 48K base
+            // (applied on the fly by MemESP when this bank is paged to page 0).
+            MemESP::rom[1].assign_rom(gb_rom_0_sinclair_48k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_48k, gb_overlay_48k_byte);
             if (romSet128 == "128Kbg") {
                 MemESP::rom[3].assign_rom(gb_rom_gluk);
             }
@@ -288,16 +342,20 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
     } else if (arch == "Profi") {
         if (newRomSet=="") romSet = "Profi"; else romSet = newRomSet;
         if (newRomSet=="") romSetProfi = "Profi"; else romSetProfi = newRomSet;
-        MemESP::rom[0].assign_rom(gb_rom_profi);
-        MemESP::rom[1].assign_rom(gb_rom_profi + (16 << 10));
-        MemESP::rom[2].assign_rom(gb_rom_profi + (32 << 10));
-        MemESP::rom[3].assign_rom(gb_rom_profi + (48 << 10));
+        // bank0 (service) + bank1 (Profi TR-DOS) stay raw; bank2/bank3 are overlays
+        // over the Sinclair 128K halves (rom[0]/rom[1]). See RomOverlay.h.
+        MemESP::rom[0].assign_rom(gb_rom_profi_bank0);
+        MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
+        MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
+        MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2);
+        MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
+        MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_profi_bank3);
 #endif
     } else { // Pentagon by default
         if (newRomSet=="") romSet = "128Kp"; else romSet = newRomSet;
         if (romSetPent=="") romSetPent = "128Kp"; else romSetPent = newRomSet;
         if (romSetPent == "128Kcs") {
-#if !CARTRIDGE_AS_CUSTOM || NO_ALF
+#if !CARTRIDGE_AS_CUSTOM || PICO_RP2040
             MemESP::rom[0].assign_rom(gb_rom_0_128k_custom);
             MemESP::rom[1].assign_rom(gb_rom_0_128k_custom + (16 << 10)); /// 16392;
 #else
@@ -305,18 +363,30 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
             MemESP::rom[1].assign_rom(gb_rom_Alf_cart + (16 << 10)); /// 16392;
 #endif
         } else {
-            MemESP::rom[0].assign_rom(gb_rom_pentagon_128k);
-            MemESP::rom[1].assign_rom(gb_rom_pentagon_128k + (16 << 10));
+            // Pentagon = Sinclair 128K with a 101-byte overlay on rom[0]; rom[1] is
+            // byte-identical to the Sinclair 128K second half (no overlay needed).
+            MemESP::rom[0].assign_rom(gb_rom_0_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_pentagon_rom0);
+            MemESP::rom[1].assign_rom(gb_rom_1_sinclair_128k);
             if (romSetPent == "128Kpg") {
                 MemESP::rom[3].assign_rom(gb_rom_gluk);
             }
         }
     }
-    switch (Config::trdosBios) {
-        case 0: MemESP::rom[4].assign_rom(gb_rom_4_trdos_503); break;
-        case 1: MemESP::rom[4].assign_rom(gb_rom_4_trdos_504tm); break;
-        case 3: MemESP::rom[4].assign_rom(gb_rom_4_trdos_custom); break;
-        default: MemESP::rom[4].assign_rom(gb_rom_4_trdos_505d); break;
+    // 5.03 / 5.04TM are small read-only overlays over the 5.05D base, applied on the
+    // fly by MemESP (RomOverlay.h): rom[4] points at the 5.05D base in flash, and the
+    // active overlay supplies the differing bytes. No slot, no flash write, no reboot.
+    {
+        const uint8_t* base = gb_rom_4_trdos_505d;
+        const uint8_t* ov = nullptr;
+        switch (Config::trdosBios) {
+            case 0: ov = gb_overlay_trdos_503;   break;  // 5.03
+            case 1: ov = gb_overlay_trdos_504tm; break;  // 5.04TM
+            case 3: base = gb_rom_4_trdos_custom; break; // user-uploaded custom (raw)
+            default: break;                              // 5.05D base
+        }
+        MemESP::rom[4].assign_rom(base);
+        MemESP::registerOverlay(gb_rom_4_trdos_505d, ov);
     }
 }
 
@@ -399,7 +469,10 @@ void Config::loadDiskMounts() {
                 size_t plen = strlen(prefix);
                 if (s.length() >= plen && s.compare(0, plen, prefix) == 0) {
                     std::string fn = s.substr(plen);
-                    if (!fn.empty()) {
+                    // A "USB:/..." disk must wait for the stick to enumerate
+                    // (we run before the first tuh_task pump) — inserting too
+                    // early fails and the next save() would erase the path.
+                    if (!fn.empty() && FileUtils::waitVolumeReady(fn)) {
                         rvmWD1793InsertDisk(&ESPectrum::fdd, i, fn);
                         if (ESPectrum::fdd.disk[i])
                             ESPectrum::fdd.disk[i]->writeprotect = driveWP[i];
@@ -423,7 +496,7 @@ void Config::loadDiskMounts() {
                     // boot (Profi never starts). Skipping the insert when !mb02 is
                     // safe: the path stays remembered and the disk reappears once
                     // MB-02+ is re-enabled (loadMb02DiskMounts) or on next boot.
-                    if (!fn.empty() && Config::mb02) {
+                    if (!fn.empty() && Config::mb02 && FileUtils::waitVolumeReady(fn)) {
                         rvmWD1793InsertDisk(&ESPectrum::mb02_fdd, i, fn);
                         if (ESPectrum::mb02_fdd.disk[i])
                             ESPectrum::mb02_fdd.disk[i]->writeprotect = mb02WP[i];
@@ -470,7 +543,7 @@ void Config::loadMb02DiskMounts() {
 void Config::loadWifiConfig() {
     wifi_ssid.clear();
     wifi_pass.clear();
-    wifi_autoconnect = false;
+    wifi_enabled = false;
     wifi_tz = 0;
     FIL* f = fopen2(WIFI_CFG_PATH, FA_READ);
     if (!f) f = fopen2(WIFI_CFG_PATH_OLD, FA_READ); // legacy location
@@ -487,7 +560,7 @@ void Config::loadWifiConfig() {
                 string val = line.substr(eq + 1);
                 if (key == "ssid")        wifi_ssid = val;
                 else if (key == "pass")   wifi_pass = val;
-                else if (key == "autoconnect") wifi_autoconnect = (val == "1" || val == "true");
+                else if (key == "autoconnect") wifi_enabled = (val == "1" || val == "true");
                 else if (key == "tz")     wifi_tz = (signed char)atoi(val.c_str());
                 else if (key == "net_host")  net_host = val;
                 else if (key == "net_user")  net_user = val;
@@ -520,7 +593,7 @@ void Config::saveWifiConfig() {
                      "net_host=%s\nnet_user=%s\nnet_port=%u\nnet_proto=%u\nbaud=%u\n"
                      "net_dl=%s\nnet_ul=%s\ncatalog_host=%s\ncatalog_port=%u\nlast_loc=%s\n",
                      wifi_ssid.c_str(), wifi_pass.c_str(),
-                     (int)wifi_tz, wifi_autoconnect ? 1 : 0,
+                     (int)wifi_tz, wifi_enabled ? 1 : 0,
                      net_host.c_str(), net_user.c_str(),
                      (unsigned)net_port, (unsigned)net_proto, (unsigned)zifi_baud,
                      net_dl_dir.c_str(), net_ul_dir.c_str(),
@@ -608,8 +681,15 @@ void Config::load() {
     initHotkeys(); // fill defaults before overriding from NVS
     vector<string> sts;
     if (FileUtils::fsMount) {
+        // One-shot marker set by a true factory reset (Hold-R / menu
+        // "Defaults"): consume it and skip the user's saved default.nvs this
+        // boot, falling straight through to compiled-in defaults.
+        bool skipDefault = (f_unlink(SKIP_DEFAULT_FLAG) == FR_OK);
         string nvs = STORAGE_NVS;
         FIL* handle = fopen2(nvs.c_str(), FA_READ);
+        if (!handle && !skipDefault) {
+            handle = fopen2(DEFAULT_NVS, FA_READ);
+        }
         if (!handle) {
             return;
         }
@@ -668,6 +748,7 @@ void Config::load() {
         nvs_get_b("SAA1099", SAA1099, sts);
         nvs_get_u8("midi", midi, sts);
         nvs_get_u8("midipreset", midi_synth_preset, sts);
+        nvs_get_str("midibank", midi_bank, sts);
 #if NO_GM_DLS
         // GM.DLS wavetable (mode 4) is unavailable in ALF builds (no bank
         // partition). Demote a stale NVS value so it never activates.
@@ -797,6 +878,8 @@ void Config::load() {
             trdosSoundLed = old ? 3 : 0;
         }
         nvs_get_u8("trdosBios", trdosBios, sts);
+        nvs_get_u8("alfCartBanks", alfCartBanks, sts);
+        nvs_get_str("alfcart", alfCartPath, sts);
         for (int i = 0; i < 4; i++) {
             char k[12]; snprintf(k, sizeof(k), "drive%d.wp", i);
             nvs_get_b(k, driveWP[i], sts);
@@ -837,6 +920,7 @@ void Config::load() {
         nvs_get_u8("zifi_enabled", zifi_enabled, sts);
         nvs_get_u8("zifi_tx_pin", zifi_tx_pin, sts);
         nvs_get_u8("zifi_rx_pin", zifi_rx_pin, sts);
+        nvs_get_u8("zifi_transport", zifi_transport, sts);
 #endif
         nvs_get_str("SNA_Path", FileUtils::SNA_Path, sts);
         nvs_get_str("TAP_Path", FileUtils::TAP_Path, sts);
@@ -977,13 +1061,19 @@ static void nvs_set_sc(NvsWriter& buf, const char* name, signed char val) {
     nvs_set_i(buf, name, val);
 }
 
-// Dump actual config to FS
-void Config::save() {
-    static const char* nvs_tmp = STORAGE_NVS ".tmp";
-    static const char* nvs_path = STORAGE_NVS;
+// Dump actual config to FS. path==nullptr writes the normal per-version/
+// per-board storage.nvs; a caller passes DEFAULT_NVS to snapshot the current
+// live settings as the user's own default (see "Save as Default").
+void Config::save(const char* path) {
+    const bool toDefault = (path != nullptr);
+    if (toDefault && !FileUtils::fsMount) return; // no SD: nothing to persist a default to
+    string nvs_path_s = toDefault ? path : STORAGE_NVS;
+    string nvs_tmp_s = nvs_path_s + ".tmp";
+    const char* nvs_tmp = nvs_tmp_s.c_str();
+    const char* nvs_path = nvs_path_s.c_str();
     FIL* handle = nullptr;
     if (FileUtils::fsMount) {
-        if (!loaded) {
+        if (!toDefault && !loaded) {
             // Config was never loaded from file — refuse to overwrite
             // existing storage.nvs with defaults
             FILINFO fi;
@@ -992,11 +1082,12 @@ void Config::save() {
                 return;
             }
         }
-        // Make sure /.config/pico-spec/<ver>/<board>/ exists before writing.
-        // If mkdir fails (broken/full SD), refuse to write — otherwise the
-        // following f_open would silently fail and we'd lose original state.
-        if (!FileUtils::mkdirParents(CONFIG_DIR_BOARD)) {
-            Debug::log("Config::save FAILED — cannot create %s", CONFIG_DIR_BOARD);
+        // Make sure the target directory exists before writing. If mkdir
+        // fails (broken/full SD), refuse to write — otherwise the following
+        // f_open would silently fail and we'd lose original state.
+        const char* dir = toDefault ? CONFIG_DIR_BOARD_ANYVER : CONFIG_DIR_BOARD;
+        if (!FileUtils::mkdirParents(dir)) {
+            Debug::log("Config::save FAILED — cannot create %s", dir);
         } else {
             // Atomic write: stream to .tmp, then rename over the original
             handle = fopen2(nvs_tmp, FA_WRITE | FA_CREATE_ALWAYS);
@@ -1069,9 +1160,11 @@ void Config::save() {
     nvs_set_str(buf,"SAA1099", SAA1099 ? "true" : "false");
     nvs_set_u8(buf,"midi", midi);
     nvs_set_u8(buf,"midipreset", midi_synth_preset);
+    nvs_set_str(buf,"midibank", midi_bank.c_str());
     nvs_set_u8(buf,"zifi_enabled", zifi_enabled);
     nvs_set_u8(buf,"zifi_tx_pin", zifi_tx_pin);
     nvs_set_u8(buf,"zifi_rx_pin", zifi_rx_pin);
+    nvs_set_u8(buf,"zifi_transport", zifi_transport);
 #endif
     nvs_set_u8(buf,"ayConfig", Config::ayConfig);
     nvs_set_u8(buf,"turbosound", Config::turbosound);
@@ -1131,6 +1224,8 @@ void Config::save() {
     nvs_set_str(buf,"trdosAutoBoot", trdosAutoBoot ? "true" : "false");
     nvs_set_u8(buf,"trdosSoundLedMode", trdosSoundLed);
     nvs_set_u8(buf,"trdosBios", trdosBios);
+    nvs_set_u8(buf,"alfCartBanks", alfCartBanks);
+    nvs_set_str(buf,"alfcart", alfCartPath.c_str());
     for (int i = 0; i < 4; i++) {
         char k[12]; snprintf(k, sizeof(k), "drive%d.wp", i);
         nvs_set_str(buf, k, driveWP[i] ? "true" : "false");
@@ -1245,7 +1340,7 @@ void Config::save() {
             if (rn != FR_OK) {
                 Debug::log("Config::save FAILED — rename error (rn=%d)", rn);
                 // Leave .tmp behind for manual recovery if needed.
-            } else {
+            } else if (!toDefault) {
                 // File is authoritative — drop any stale RAM copy
                 nvs_ram_buf.clear();
                 nvs_ram_buf.shrink_to_fit();

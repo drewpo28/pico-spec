@@ -1,0 +1,16 @@
+{
+  "id": "pentagon",
+  "base": "sinclair_128k_0",
+  "base_sym": "gb_rom_0_sinclair_128k",
+  "base_len": 16384,
+  "variants": [
+    {
+      "name": "Pentagon",
+      "sym": "gb_rom_0_pentagon_128k",
+      "overlay_sym": "gb_overlay_pentagon_rom0",
+      "len": 101,
+      "runs": 4,
+      "diff_bytes": 65
+    }
+  ]
+}

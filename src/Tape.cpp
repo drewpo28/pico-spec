@@ -421,6 +421,9 @@ void Tape::LoadRemembered() {
         !FileUtils::hasPZXextension(full)) return;
     size_t slash = full.rfind('/');
     if (slash == string::npos) return;
+    // A remembered "USB:/..." tape must wait for the stick to enumerate (boot
+    // runs this before the first tuh_task pump) or the probe fails early.
+    if (!FileUtils::waitVolumeReady(full)) return;
     // Verify the file still exists before handing it to LoadTape, which would
     // otherwise pop an OSD error during a silent boot/reset re-mount. Use the
     // heap-backed fopen2 (not a stack FIL — the core stack is only 2 KB).
@@ -1854,10 +1857,13 @@ bool Tape::FlashLoad() {
 
         if ((addr2 + nBytes) <= MEM_PG_SZ) {
             UINT br;
+            MemESP::ensureResident(page); // accessor bank → real frame before raw f_read
             uint8_t* p = MemESP::ramCurrent[page];
             if ( p < (uint8_t*)0x11000000 || (page == 0 && !MemESP::page0ram) ) {
                 f_lseek(tape, f_tell(tape) + nBytes);
             } else {
+                MemESP::ensureResident(page);
+                    mem_desc_t::mark_bank_dirty(page); // direct write past writebyte
                 f_read(tape, &p[addr2], nBytes, &br);
             }
             while ((count < nBytes) && (count < blockLen - 1)) {
@@ -1871,6 +1877,8 @@ bool Tape::FlashLoad() {
             do {
                 if ((page > 0) && (page < 4)) {
                     UINT br;
+                    MemESP::ensureResident(page);
+                    mem_desc_t::mark_bank_dirty(page); // direct write past writebyte
                     f_read(tape, &MemESP::ramCurrent[page][addr2], chunk1, &br);
                     for (int i=0; i < chunk1; i++) {
                         Z80::Xor(MemESP::readbyte(addr));
@@ -1994,10 +2002,13 @@ bool Tape::FlashLoad() {
 
         if ((addr2 + readLen) <= MEM_PG_SZ) {
             UINT br;
+            MemESP::ensureResident(page); // accessor bank → real frame before raw f_read
             uint8_t* p = MemESP::ramCurrent[page];
             if ( p < (uint8_t*)0x11000000 || (page == 0 && !MemESP::page0ram) ) {
                 f_lseek(tape, f_tell(tape) + readLen);
             } else {
+                MemESP::ensureResident(page);
+                    mem_desc_t::mark_bank_dirty(page); // direct write past writebyte
                 f_read(tape, &p[addr2], readLen, &br);
             }
             while (count < readLen) {
@@ -2012,6 +2023,8 @@ bool Tape::FlashLoad() {
                 if (chunk1 > chunkrest) chunk1 = chunkrest;
                 if ((page > 0) && (page < 4)) {
                     UINT br;
+                    MemESP::ensureResident(page);
+                    mem_desc_t::mark_bank_dirty(page); // direct write past writebyte
                     f_read(tape, &MemESP::ramCurrent[page][addr2], chunk1, &br);
                     for (int i=0; i < chunk1; i++) {
                         Z80::Xor(MemESP::readbyte(addr));
@@ -2130,10 +2143,13 @@ bool Tape::FlashLoad() {
 
         // printf("Case 1\n");
         UINT br;
+        MemESP::ensureResident(page); // accessor bank → real frame before raw f_read
         uint8_t* p = MemESP::ramCurrent[page];
         if ( p < (uint8_t*)0x11000000 || (page == 0 && !MemESP::page0ram) ) {
             f_lseek(tape, f_tell(tape) + nBytes);
         } else {
+            MemESP::ensureResident(page);
+                    mem_desc_t::mark_bank_dirty(page); // direct write past writebyte
             f_read(tape, &p[addr2], nBytes, &br);
         }
 
@@ -2154,6 +2170,8 @@ bool Tape::FlashLoad() {
 
             if ((page > 0) && (page < 4)) {
                 UINT br;
+                MemESP::ensureResident(page);
+                    mem_desc_t::mark_bank_dirty(page); // direct write past writebyte
                 f_read(tape, &MemESP::ramCurrent[page][addr2], chunk1, &br);
 
                 for (int i=0; i < chunk1; i++) {

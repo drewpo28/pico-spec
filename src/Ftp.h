@@ -20,6 +20,7 @@ public:
     std::string cacheId() const override { return "ftp_" + host_; }
     bool cwd(const std::string& path) override;
     std::string cwdPath() const override { return cur_dir; }
+    std::string schemeLabel() const override { return "FTP:"; }
     bool get(const std::string& remote, const std::string& localSdPath, XferProgressCb cb) override;
     bool put(const std::string& localSdPath, const std::string& remote, XferProgressCb cb) override;
     bool remove(const std::string& name, bool isDir) override;

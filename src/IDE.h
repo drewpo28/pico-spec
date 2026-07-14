@@ -81,8 +81,10 @@ private:
     static void atapi_start_data(int len); // begin data-in phase of `len` bytes from buffer
     static void atapi_check_condition(uint8_t sense, uint8_t asc, uint8_t ascq);
 
-    // Image files (independent from DivMMC's mmc_file[]).
-    static FIL  file[2];
+    // Image files (independent from DivMMC's mmc_file[]). Heap-allocated (2 FILs,
+    // ~1.1 KB) only while a scheme is active — freed in close() so IDE costs ZERO
+    // SRAM when disabled.
+    static FIL* file;
     static bool file_open[2];
 
     // Per-slot device type + post-reset signature validity (master/slave).
