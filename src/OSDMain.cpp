@@ -10275,7 +10275,19 @@ void OSD::showTextDialog(const char* title, const char* text, bool blocking, int
     if (blocking) VIDEO::SaveRect.restore_last();
 }
 
-void OSD::HWInfo() {
+// 0-based line index of the Uptime row in the info text — lets HWInfo's live
+// loop repaint just that one row between full redraws.
+static int s_hwinfo_uptime_line = -1;
+
+static int formatUptimeLine(char* out, int outsz) {
+    // Hardware timer counts µs since power-on — no separate counter needed
+    uint32_t up_s = (uint32_t)(time_us_64() / 1000000ULL);
+    return snprintf(out, outsz, " Uptime         : %dd %02d:%02d:%02d",
+        (int)(up_s / 86400), (int)(up_s / 3600 % 24),
+        (int)(up_s / 60 % 60), (int)(up_s % 60));
+}
+
+static void buildHWInfoText() {
     char (&hwtext)[OSD_INFO_BUF_SZ] = osd_info_buf;
     int pos = 0;
 
@@ -10334,8 +10346,11 @@ void OSD::HWInfo() {
     {
         uint32_t psram32 = psram_size();
         if (psram32) {
-            uint8_t rx8[8];
-            psram_id(rx8);
+            // ID is immutable — read once, not on every 1 Hz refresh (SPI
+            // transaction under PSRAM_SPINLOCK, GS may be running on core1)
+            static uint8_t rx8[8];
+            static bool rx8_valid = false;
+            if (!rx8_valid) { psram_id(rx8); rx8_valid = true; }
             pos += snprintf(hwtext + pos, sizeof(hwtext) - pos,
                 " PSRAM size     : %d MB\n"
                 " PSRAM MF ID/KGD: %02X/%02X\n"
@@ -10391,6 +10406,14 @@ void OSD::HWInfo() {
     }
 #endif
 
+    {
+        int ln = 0;
+        for (int i = 0; i < pos; i++) if (hwtext[i] == '\n') ln++;
+        s_hwinfo_uptime_line = ln;
+        pos += formatUptimeLine(hwtext + pos, sizeof(hwtext) - pos);
+        if (pos < (int)sizeof(hwtext) - 1) { hwtext[pos++] = '\n'; hwtext[pos] = '\0'; }
+    }
+
     pos += snprintf(hwtext + pos, sizeof(hwtext) - pos,
         "\n"
         " Built at %s %s\n"
@@ -10399,7 +10422,71 @@ void OSD::HWInfo() {
         " %s\n",
         __DATE__, __TIME__, PICO_GIT_BRANCH, PICO_GIT_COMMIT, PICO_BUILD_NAME);
 
-    showTextDialog("Hardware info", hwtext);
+}
+
+void OSD::HWInfo() {
+    // Live variant (same pattern as HIDDevices): rebuild text at 1 Hz so
+    // Uptime and Free RAM tick while the dialog is open.
+    unsigned short sx = scrAlignCenterX(OSD_W);
+    unsigned short sy = scrAlignCenterY(OSD_H);
+    VIDEO::SaveRect.save(sx, sy, OSD_W, OSD_H);
+
+    fabgl::VirtualKeyItem Nextkey;
+    uint32_t last_draw = 0;
+    int scroll = 0;
+
+    bool down = false;
+    bool full = true; // full redraw (initial + after scroll keys), else Uptime row only
+    while (true) {
+        // Non-blocking key check
+        if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
+            ESPectrum::PS2Controller.keyboard()->getNextVirtualKey(&Nextkey);
+            if (down && !Nextkey.down && (is_enter(Nextkey.vk) || is_back(Nextkey.vk))) {
+                click();
+                break;
+            }
+            if (Nextkey.down) {
+                down = (is_enter(Nextkey.vk) || is_back(Nextkey.vk));
+                if (Nextkey.vk == fabgl::VK_UP || Nextkey.vk == fabgl::VK_DOWN || Nextkey.vk == fabgl::VK_PAGEUP || Nextkey.vk == fabgl::VK_PAGEDOWN) {
+                    // Re-inject for showTextDialog's own scroll handling
+                    ESPectrum::PS2Controller.keyboard()->injectVirtualKey(Nextkey.vk, true);
+                }
+                last_draw = 0; // force redraw
+                full = true;
+            }
+        }
+
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if (now - last_draw < 1000) {
+            sleep_ms(5);
+            continue;
+        }
+        last_draw = now;
+
+        if (full) {
+            buildHWInfoText();
+            showTextDialog("Hardware info", osd_info_buf, false, &scroll);
+            full = false;
+        } else if (s_hwinfo_uptime_line >= 0) {
+            // Repaint only the Uptime row in place — no full-dialog redraw
+            int r = s_hwinfo_uptime_line - scroll;
+            const int visRows = osdMaxRows() - 4;
+            if (r >= 0 && r < visRows) {
+                const int visCols = osdMaxCols();
+                char row[42];
+                int len = formatUptimeLine(row, sizeof(row));
+                int w = visCols - 1; // keep last column intact (scrollbar lives there)
+                if (len > w) len = w;
+                memset(row + len, ' ', w - len);
+                row[w] = '\0';
+                osdAt(3 + r, 0);
+                VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
+                VIDEO::vga.print(row);
+            }
+        }
+    }
+
+    VIDEO::SaveRect.restore_last();
 }
 
 void OSD::ChipInfo() {
