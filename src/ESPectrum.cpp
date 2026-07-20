@@ -669,6 +669,9 @@ void ESPectrum::setup() {
   //=======================================================================================
   // INIT FILESYSTEM
   //=======================================================================================
+  // Build stamp — distinguishes freshly-flashed images during debug sessions
+  // (the version string alone doesn't change between local rebuilds).
+  Debug::log("build: " __DATE__ " " __TIME__);
   Debug::log("setup: initFileSystem begin");
   FileUtils::initFileSystem();
   Debug::log("setup: initFileSystem done, fsMount=%d", FileUtils::fsMount);

@@ -41,6 +41,8 @@ option(MEM_ACCESS_TRACE "Count Z80 accesses per RAM page between load and evicti
 option(GS_PERF_TRACE "Enable General Sound per-second perf counters (GS.cpp)" OFF)
 option(GS_DEBUG_TRACE "Enable General Sound port-IO trace ring + auto-dumps (~50 KB SRAM)" OFF)
 option(NGS_TRACE "Enable NeoGS 1 Hz health line (GS-Z80 PC / SD counters; ~2-4 ms UART stall per line)" OFF)
+option(ZC_PORT_TRACE "Enable Z-Controller/DivSD SPI-SD command tracing (CS edges + command frames)" OFF)
+option(NEO8_TRAP "Wild-jump hunter: log PC history + frame snapshot when execution enters screen memory (per-instruction hook; debug builds only)" OFF)
 option(ZIFI_TRACE "Enable ZiFi (ESP-01S WiFi NIC) port/UART tracing" OFF)
 option(ZIFI_NET_VERBOSE "Per-packet trace of the ZiFi net client (+IPD/chanSend); floods logs" OFF)
 
@@ -50,7 +52,7 @@ option(ZIFI_NET_VERBOSE "Per-packet trace of the ZiFi net client (+IPD/chanSend)
 # Each enables stdio over the board's Debug-Probe header — see the block for pins.
 set(MURM1_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART0 on GP0/GP1 (MURM1) — moves KBD to GP16/GP17, disables NESPAD")
 set(PICO_PC_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART0 on DBG1 header GP0/GP1 (PICO_PC)")
-set(PICO_DV_DBG_UART ON CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
+set(PICO_DV_DBG_UART OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (PICO_DV)")
 set(ZERO_DBG_UART    OFF CACHE BOOL "Enable Debug Probe UART0 on GP16/GP13 (ZERO)")
 set(ZERO2_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO2)")
 
@@ -390,6 +392,21 @@ if (NGS_TRACE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE NGS_TRACE=1)
 else ()
     target_compile_definitions(${PROJECT_NAME} PRIVATE NGS_TRACE=0)
+endif ()
+
+# Z-Controller/DivSD SPI-SD command tracing (DivMMC.cpp mmc engine).
+if (ZC_PORT_TRACE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ZC_PORT_TRACE=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ZC_PORT_TRACE=0)
+endif ()
+
+# TEMPORARY Neo8 wild-jump hunter (Debug.cpp / Z80_JLS.cpp) — per-instruction
+# hook, debug builds only.
+if (NEO8_TRAP)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NEO8_TRAP=1)
+else ()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NEO8_TRAP=0)
 endif ()
 
 # 0x7FFD/0xDFFD paging-port write tracing (see Ports.cpp `#if PROFI_PORT_TRACE`).

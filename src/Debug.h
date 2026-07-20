@@ -28,6 +28,14 @@ public:
 
     static void log(const char* fmt, ...);
 
+#if NEO8_TRAP
+    // Temporary wild-jump hunter (Neo8 SDz crash): call per executed
+    // instruction; logs the recent-PC history + frame/stack snapshot once
+    // when execution enters the screen area while the Pentagon page0-RAM
+    // overlay is active.
+    static void neo8TrapStep(uint16_t pc, uint16_t sp, uint16_t ix, uint16_t iy);
+#endif
+
     // Exception-safe variant for fault handlers: NO stdio/printf (the stdio
     // path takes print_mutex and WFEs — blocking in exception context; if the
     // other core died holding the mutex, the handler freezes the machine, and

@@ -49,8 +49,9 @@ static int     s_resp_len = 0, s_resp_pos = 0;
 static int     s_rd_idx = -1;           // CMD17/18 stream position (0 = token next)
 static bool    s_rd_multi = false;
 static uint32_t s_rd_sector = 0;
-static int     s_wr_idx = -1;           // CMD24: -1 idle, 0 = waiting token, 1..512 data, 513.. CRC
+static int     s_wr_idx = -1;           // CMD24/25: -1 idle, 0 = waiting token, 1..512 data, 513.. CRC
 static uint32_t s_wr_sector = 0;
+static bool    s_wr_multi = false;      // CMD25: 0xFC-token blocks until 0xFD stop-tran
 static bool    s_wr_busy = false;       // data accepted, waiting for core0 flush
 
 static void fsm_reset() {
@@ -59,6 +60,7 @@ static void fsm_reset() {
     s_rd_idx = -1;
     s_rd_multi = false;
     s_wr_idx = -1;
+    s_wr_multi = false;
     s_wr_busy = false;
 }
 
@@ -170,7 +172,18 @@ static void __not_in_flash_func(fsm_execute)() {
             static const uint8_t r[] = {0xFF, 0x00};
             queue_resp(r, sizeof(r));
             s_wr_sector = arg;
+            s_wr_multi = false;
             s_wr_idx = 0;                         // wait for data token
+            break;
+        }
+        case 0x59: {                              // CMD25 WRITE_MULTIPLE_BLOCK
+            // Neo8Tracker's NeoSD save path (ngsbios WRMULG): 0xFC-token
+            // blocks, 0xFD stop-tran, busy-poll between blocks.
+            static const uint8_t r[] = {0xFF, 0x00};
+            queue_resp(r, sizeof(r));
+            s_wr_sector = arg;
+            s_wr_multi = true;
+            s_wr_idx = 0;
             break;
         }
         case 0x77: {                              // CMD55 APP_CMD — R1 reflects idle state
@@ -237,7 +250,14 @@ static uint8_t __not_in_flash_func(fsm_out)() {
 static void __not_in_flash_func(fsm_in)(uint8_t v) {
     if (s_wr_idx >= 0) {
         if (s_wr_idx == 0) {
-            if (v == 0xFE) s_wr_idx = 1;          // data token (0xFF gaps skipped)
+            // Data token: 0xFE (single), 0xFC (multi block), 0xFD = stop tran;
+            // 0xFF gap bytes are skipped.
+            if (v == 0xFE || (s_wr_multi && v == 0xFC)) {
+                s_wr_idx = 1;
+            } else if (s_wr_multi && v == 0xFD) {
+                s_wr_multi = false;
+                s_wr_idx = -1;
+            }
             return;
         }
         if (s_wr_idx <= 512) {
@@ -248,9 +268,14 @@ static void __not_in_flash_func(fsm_in)(uint8_t v) {
         if (++s_wr_idx >= 515) {
             static const uint8_t r[] = {0x05};    // data accepted
             queue_resp(r, sizeof(r));
-            s_wr_idx = -1;
             s_wr_busy = true;
             post_write(s_wr_sector);
+            if (s_wr_multi) {
+                s_wr_sector++;
+                s_wr_idx = 0;                     // next 0xFC/0xFD token
+            } else {
+                s_wr_idx = -1;
+            }
         }
         return;
     }
@@ -298,7 +323,7 @@ void NgsSd::csEdge(bool cs_active) {
     // but an in-flight mailbox request is left to finish on core0.
     s_cmd_idx = 0;
     s_resp_len = s_resp_pos = 0;
-    if (!cs_active) { s_rd_idx = -1; s_rd_multi = false; s_wr_idx = -1; }
+    if (!cs_active) { s_rd_idx = -1; s_rd_multi = false; s_wr_idx = -1; s_wr_multi = false; }
 }
 
 uint8_t __not_in_flash_func(NgsSd::xfer)(uint8_t mosi) {

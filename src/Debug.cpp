@@ -83,6 +83,42 @@ void Debug::log(const char* fmt, ...)
 #endif
 }
 
+#if NEO8_TRAP
+#include "MemESP.h"
+static uint16_t s_n8_ring[64];
+static uint32_t s_n8_pos = 0;
+static bool     s_n8_fired = false;
+
+void __not_in_flash_func(Debug::neo8TrapStep)(uint16_t pc, uint16_t sp, uint16_t ix, uint16_t iy) {
+    s_n8_ring[s_n8_pos++ & 63] = pc;
+    if (s_n8_fired) return;
+    if (pc < 0x4000 || pc >= 0x5B00) return;
+    // No page0ram condition: the wild run can START before the overlay is
+    // mapped (previous capture caught only a RET back into already-wild code).
+    s_n8_fired = true;
+    Debug::log("NEO8v2: wild jump to %04X (page0ram=%d bank=%d SP=%04X IX=%04X IY=%04X) — last PCs:",
+               (unsigned)pc, (int)MemESP::page0ram, (int)MemESP::bankLatch,
+               (unsigned)sp, (unsigned)ix, (unsigned)iy);
+    for (int i = 63; i >= 0; i--) {
+        Debug::log("NEO8v2:   pc-%02d = %04X", i,
+                   (unsigned)s_n8_ring[(s_n8_pos - 1 - i) & 63]);
+    }
+    // Frame/stack snapshot: the epilogue thunk (0x026D) does LD SP,IX;
+    // POP IX; POP DE; INC SP; INC SP; RET — so the caller's return slot the
+    // RET consumed is at final-SP−2. Dump around both SP and IY (FATFS ptr).
+    for (int off = -16; off <= 14; off += 2) {
+        uint16_t a = sp + off;
+        Debug::log("NEO8v2:   [SP%+03d %04X] = %02X%02X", off, (unsigned)a,
+                   (unsigned)MemESP::readbyte(a + 1), (unsigned)MemESP::readbyte(a));
+    }
+    for (int off = 0; off < 16; off += 2) {
+        uint16_t a = iy + off;
+        Debug::log("NEO8v2:   [IY+%02d %04X] = %02X%02X", off, (unsigned)a,
+                   (unsigned)MemESP::readbyte(a + 1), (unsigned)MemESP::readbyte(a));
+    }
+}
+#endif
+
 void Debug::fault_log(const char* fmt, ...)
 {
     // Per-core static buffers: the fault stack may itself be the problem

@@ -73,6 +73,9 @@ int DivMMC::mmc_write_index = -1;
 int DivMMC::mmc_csd_index = -1;
 int DivMMC::mmc_cid_index = -1;
 int DivMMC::mmc_ocr_index = -1;
+bool DivMMC::mmc_wr25_active = false;
+int  DivMMC::mmc_wr25_idx = -1;
+bool DivMMC::mmc_wr25_r1 = false;
 
 uint32_t DivMMC::mmc_read_address = 0;
 uint32_t DivMMC::mmc_write_address = 0;
@@ -663,6 +666,9 @@ void DivMMC::mmc_cs(uint8_t value) {
     mmc_csd_index = -1;
     mmc_cid_index = -1;
     mmc_ocr_index = -1;
+    mmc_wr25_active = false;
+    mmc_wr25_idx = -1;
+    mmc_wr25_r1 = false;
 }
 
 // Port 0xEB read — SD protocol response
@@ -795,6 +801,15 @@ uint8_t DivMMC::mmc_read() {
             }
             return 0xFF;
 
+        case 0x59: // CMD25 WRITE_MULTIPLE_BLOCK — R1 once, then idle 0xFF
+                   // (blocks are flushed instantly, so no busy phase; the
+                   // driver's poll-until-0xFF loops pass straight through)
+            if (mmc_wr25_r1) {
+                mmc_wr25_r1 = false;
+                return 0;
+            }
+            return 0xFF;
+
         case 0x50: // CMD16 SET_BLOCKLEN — R1=00 (accepted)
             mmc_last_command = 0;
             return 0;
@@ -839,6 +854,46 @@ void DivMMC::mmc_write(uint8_t value) {
     if (!mmc_file_open[0] && !divsd_mode) return;
     if (!mmc_cs_active) return;
 
+    // CMD25 WRITE_MULTIPLE_BLOCK data phase — token-framed stream that must
+    // be consumed BEFORE command parsing (payload bytes in 0x40-0x7F would
+    // otherwise start a bogus command frame). Neo8Tracker's Z-SD save path
+    // writes modules this way: 0xFC + 512 bytes + 2 CRC per block, 0xFD stop.
+    if (mmc_wr25_active) {
+        if (mmc_wr25_idx < 0) {
+            if (value == 0xFC) {
+                mmc_wr25_idx = 0;                 // start-block token
+            } else if (value == 0xFD) {
+                mmc_wr25_active = false;          // stop-tran token
+                mmc_last_command = 0;
+            }
+            // 0xFF gap bytes ignored
+            return;
+        }
+        if (mmc_wr25_idx < 512) {
+            if (sdhc_mode) {
+                mmc_sector_buf[mmc_wr25_idx] = value;
+            } else {
+                writeByte(mmc_write_address + mmc_wr25_idx, value);
+            }
+            mmc_wr25_idx++;
+            return;
+        }
+        // 2 CRC bytes close the block; flush and advance to the next sector.
+        if (++mmc_wr25_idx >= 514) {
+            if (sdhc_mode) {
+                mmc_sector_buf_addr = mmc_write_address;
+                mmc_sector_dirty = false;
+                storeSector(mmc_write_address);
+                mmc_write_address += 1;           // sector-addressed
+            } else {
+                flushWriteBuffer();
+                mmc_write_address += 512;
+            }
+            mmc_wr25_idx = -1;                    // wait for next 0xFC/0xFD
+        }
+        return;
+    }
+
     if (mmc_index_command == 0) {
         // SD command frame: bits 7:6 must be 01b. Anything else is a fill /
         // wake-up byte (typically 0xFF) that the card silently discards.
@@ -846,6 +901,9 @@ void DivMMC::mmc_write(uint8_t value) {
         // Receive command byte
         mmc_last_command = value;
         mmc_index_command++;
+#if ZC_PORT_TRACE
+        Debug::log("ZC: CMD%u (%02X)", (unsigned)(value & 0x3F), (unsigned)value);
+#endif
         return;
     }
 
@@ -982,6 +1040,21 @@ void DivMMC::mmc_write(uint8_t value) {
             #undef WRITE_BLOCK_OFFSET
             break;
         }
+
+        case 0x59: // CMD25 WRITE_MULTIPLE_BLOCK — params, then token stream
+            mmc_params[mmc_index_command - 1] = value;
+            mmc_index_command++;
+            if (mmc_index_command == 6) {
+                mmc_index_command = 0;
+                mmc_write_address = ((uint32_t)mmc_params[0] << 24) |
+                                    ((uint32_t)mmc_params[1] << 16) |
+                                    ((uint32_t)mmc_params[2] << 8) |
+                                    mmc_params[3];
+                mmc_wr25_active = true;
+                mmc_wr25_idx = -1;
+                mmc_wr25_r1 = true;
+            }
+            break;
 
         case 0x77: // CMD55 APP_CMD (prefix for ACMD)
         case 0x69: // ACMD41 SD_SEND_OP_COND
@@ -1284,6 +1357,9 @@ void DivMMC::zc_write_config(uint8_t value) {
     // bit1=0 means card selected. bit0 is SD power and is ignored here.
     bool new_cs = (value & 0x02) == 0;
     if (new_cs != mmc_cs_active) {
+#if ZC_PORT_TRACE
+        Debug::log("ZC: cfg=%02X cs=%d", (unsigned)value, (int)new_cs);
+#endif
         mmc_cs(new_cs ? 0x00 : 0x01); // mmc_cs treats bit0==0 as active
     }
 }

@@ -451,6 +451,16 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
           (Config::Issue2)) { // Issue 2 behaviour only on Spectrum 48K
         if (port254 & 0x18)
           data |= 0x40;
+      } else if (Z80Ops::isPentagon) {
+        // Pentagon: the EAR input comes from the tape amplifier and idles
+        // HIGH with nothing connected — real hardware reads bit 6 = 1 (no
+        // port-254 feedback path on Pentagon). Software probes rely on it:
+        // Neo8Tracker's PentEvo/TS-Conf/Pent1024v2 memory driver detects a
+        // ZXEVO with `IN A,(#04BE); CP 255` — an idle-0 EAR made every even
+        // port read 0xBF and misdetected ZXEVO on P512/P1024. Tape pulses
+        // still toggle via the tapeEarBit XOR below (edge-based loaders are
+        // polarity-insensitive).
+        data |= 0x40;
       } else {
         if (port254 & 0x10)
           data |= 0x40;
@@ -1227,6 +1237,8 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     //            Z80::getRegPC(), data, !!(data & 0x01), !!(data & 0x02), !!(data & 0x04),
     //            !!(data & 0x10), !!(data & 0x20), !!(data & 0x80));
     portEFF7 = data;
+    // (page0ram/notMore128 from bits 2-3 are handled by the dedicated #EFF7
+    // paging handler further down — single owner, don't duplicate here.)
     // Pentagon 16col — keep existing bit 0 behaviour (legacy mode_16col_onoff)
     if (Config::mode16col_onoff) {
       bool want = (data & 0x01) != 0;
@@ -1885,17 +1897,20 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     }
     ioContentionLate(MemESP::ramContended[rambank]);
   }
-  // Pentagon #EFF7 (page0ram/notMore128). The loose Pentagon decode
-  // (address & 0x1008)==0 (= A12=0 & A3=0) COLLIDES with the Profi CP/M FDC
-  // command port #83: e.g. RDSEC 0x82/0x86 → OUT(0x83),A makes address 0x8283/
-  // 0x8683 (A12=0, low-byte bit3=0), which spuriously enters this handler and
-  // clobbers page0ram = bit3(opcode) → pages ROM into bank0 mid-RDSEC. The
-  // MBOOTHDD stack lives at 0x00D8 (page0), so the next CALL/RET reads its
-  // return address from ROM → wild jump (NOP-slide crash). Profi gets page0ram
-  // from DFFD bit4 (above) and does not use the Pentagon-1024 #EFF7 port, so
-  // require the real #EFF7 address for Profi to avoid the FDC-port collision.
-  bool eff7_decode = (Z80Ops::isProfi) ? ((address & 0xF008) == 0xE000)
-                                               : ((address & 0x1008) == 0);
+  // Pentagon #EFF7 (page0ram/notMore128). The old loose Pentagon decode
+  // (address & 0x1008)==0 (= A12=0 & A3=0) COLLIDES with low ports whose bit3
+  // is 0 — hw-hit twice:
+  //  - Profi CP/M FDC command port #83 (RDSEC 0x82/0x86 → OUT(0x83),A gives
+  //    address 0x8283/0x8683) — clobbered page0ram mid-RDSEC, MBOOTHDD stack
+  //    in page0 → wild jump (NOP-slide crash);
+  //  - Z-Controller SD ports #0057/#0077 (Neo8Tracker's FAT driver runs FROM
+  //    page0 RAM and streams sectors with OUT (C),A to BC=0x0057 — every data
+  //    byte's bit3 flapped page0ram under the executing code → crash into
+  //    screen memory).
+  // Real Pentagon-1024SL software addresses the port as a full 16-bit #EFF7
+  // (LD BC,#EFF7), so require the #EFF7 family on Pentagon too (same fix as
+  // Profi's: A15-A12=0xE, A3=0 — keeps mirror decodes like #EFF7/#EFFF-#xEF7).
+  bool eff7_decode = ((address & 0xF008) == 0xE000);
   if ((Z80Ops::isPentagon || Z80Ops::isProfi) && eff7_decode) { // EFF7
     // The #EFF7 page0-overlay / lock-disable (bits 2,3) is a Pentagon-1024SL (and
     // Profi) feature; a plain Pentagon 512/128 has no #EFF7 and must NOT respond to
@@ -1904,16 +1919,32 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     // before ever touching #7FFD bit5 (which would permanently lock a 512).
     if (!MemESP::pagingLock && (Z80Ops::is1024 || Z80Ops::isProfi)) {
       uint8_t prevPage0 = MemESP::page0ram;
+      uint8_t prevSRAM = MemESP::newSRAM;
       uint8_t prevNotMore = MemESP::notMore128;
       MemESP::notMore128 = bitRead(data, 2);
-      MemESP::page0ram = bitRead(data, 3);
-      if (MemESP::page0ram != prevPage0)
-        MemESP::recoverPage0();
+      if (Z80Ops::is1024) {
+        // Pentagon-1024SL v2.x: EFF7 D3 overlays the hidden CACHE page at
+        // 0x0000-0x3FFF — the SAME separate memory the #FB/#7B trap maps
+        // (Unreal's EFF7_ROCACHE), NOT RAM bank 0. Mapping ram[0] here
+        // aliased the overlay with 7FFD bank 0 at #C000 — an aliasing real
+        // hardware doesn't have. Neo8Tracker's FAT driver keeps its
+        // workspace in the overlay while the tracker uses bank 0 through
+        // #C000: with the false aliasing they silently corrupted each other
+        // (wild jumps / DI+HALT during mount; worked in UnrealSpeccy).
+        MemESP::newSRAM = bitRead(data, 3);
+        if (MemESP::newSRAM != prevSRAM)
+          MemESP::recoverPage0();
+      } else {
+        MemESP::page0ram = bitRead(data, 3);
+        if (MemESP::page0ram != prevPage0)
+          MemESP::recoverPage0();
+      }
       // Only flash the RAM paging LED on an actual paging change. #EFF7 is
       // shared with the CMOS-enable bit (D7): Gluk's RTC clock loop toggles D7
       // every update, which would otherwise blink the RAM LED with no real
       // paging activity.
-      if (MemESP::page0ram != prevPage0 || MemESP::notMore128 != prevNotMore)
+      if (MemESP::page0ram != prevPage0 || MemESP::newSRAM != prevSRAM ||
+          MemESP::notMore128 != prevNotMore)
         LED::touchW(LED::RAM);
     }
   }

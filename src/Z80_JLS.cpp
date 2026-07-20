@@ -1221,6 +1221,9 @@ IRAM_ATTR void Z80::execute() {
 
     // Ports::FDDStep();
 
+#if NEO8_TRAP
+    Debug::neo8TrapStep(REG_PC, REG_SP, REG_IX, REG_IY);
+#endif
     opCode = Z80Ops::fetchOpcode();
 
     regR++;
@@ -1261,7 +1264,9 @@ IRAM_ATTR void Z80::exec_nocheck() {
     while (CPU::tstates < CPU::stFrame) {
 
         if (nbp > 0 && Config::hasBreakPoint(REG_PC, Config::BP_PC)) return;
-
+#if NEO8_TRAP
+        Debug::neo8TrapStep(REG_PC, REG_SP, REG_IX, REG_IY);
+#endif
         uint8_t pg = REG_PCh >> 6;
         VIDEO::Draw_Opcode(MemESP::ramContended[pg]);
 #if !PICO_RP2040

@@ -96,6 +96,12 @@ private:
     static int mmc_cid_index;
     static int mmc_ocr_index;
 
+    // CMD25 WRITE_MULTIPLE_BLOCK stream (token-framed: 0xFC block, 0xFD stop).
+    // Used by Neo8Tracker's Z-SD save path; CMD24-only engines hang it.
+    static bool mmc_wr25_active;
+    static int  mmc_wr25_idx;     // -1 = waiting for token, 0..511 data, 512..513 CRC
+    static bool mmc_wr25_r1;      // R1 pending for the CMD25 response
+
     static uint32_t mmc_read_address;
     static uint32_t mmc_write_address;
 
