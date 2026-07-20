@@ -3131,6 +3131,12 @@ void ESPectrum::loop() {
             break;
           }
         }
+#if !PICO_RP2040
+        // Blanking just started (v_sync fires at scanout line v_active): apply
+        // any pending Profi DS80 palette refresh now, while the scanout DMA is
+        // off-screen — tear-free palette animation (see profiPaletteApplyPending).
+        VIDEO::profiPaletteApplyPending();
+#endif
       } else {
         if (idle > 0) {
 #if !PICO_RP2040
