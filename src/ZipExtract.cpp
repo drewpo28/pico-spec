@@ -232,18 +232,19 @@ string ZipExtract::extractByIndex(const string& zipPath, int fileIndex) {
     return "";
 }
 
-bool ZipExtract::extractFile(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize) {
+bool ZipExtract::extractFile(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize, const char* outPath) {
+    if (!outPath) outPath = TEMP_FILE;
     if (compression == 0)
         // Streaming-stored (csz=0 in local header): csz==usz for stored data.
-        return extractStored(zipFile, compressedSize ? compressedSize : uncompressedSize);
+        return extractStored(zipFile, compressedSize ? compressedSize : uncompressedSize, outPath);
     if (compression == 8)
-        return extractDeflate(zipFile, compressedSize);
+        return extractDeflate(zipFile, compressedSize, outPath);
     return false;
 }
 
-bool ZipExtract::extractStored(FIL* zipFile, uint32_t size) {
+bool ZipExtract::extractStored(FIL* zipFile, uint32_t size, const char* outPath) {
     FIL& outFile = s_outFile;
-    if (f_open(&outFile, TEMP_FILE, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
+    if (f_open(&outFile, outPath, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
         return false;
 
     uint8_t buf[ZIP_BUF_SIZE];
@@ -281,9 +282,9 @@ static void* zip_zalloc(void* /*opaque*/, size_t items, size_t size) {
 }
 static void zip_zfree(void* /*opaque*/, void* p) { Buffer::pfree(p); }
 
-bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize) {
+bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize, const char* outPath) {
     FIL& outFile = s_outFile;
-    if (f_open(&outFile, TEMP_FILE, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
+    if (f_open(&outFile, outPath, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
         return false;
 
     uint8_t s_inbuf[ZIP_BUF_SIZE];
@@ -524,6 +525,14 @@ int ZipExtract::extractAll(const string& zipPath, const string& destDir) {
     if (f_open(&zipFile, zipPath.c_str(), FA_READ) != FR_OK)
         return 0;
 
+    // Temp file on the DESTINATION volume: f_rename resolves the new name on the
+    // OLD name's volume (the "USB:" prefix of the new name is silently ignored),
+    // so extracting via SD /tmp and renaming to "USB:/..." landed the files in a
+    // same-named folder on the SD card instead of the stick.
+    char tmpPath[160];
+    snprintf(tmpPath, sizeof(tmpPath), "%s.zip_extract.tmp", destDir.c_str());
+    Debug::log("ZIP: extractAll %s -> %s", zipPath.c_str(), destDir.c_str());
+
     FSIZE_t zipSize = f_size(&zipFile);
     LocalFileHeader hdr;
     UINT br;
@@ -549,15 +558,18 @@ int ZipExtract::extractAll(const string& zipPath, const string& destDir) {
             // Build destination path: destDir + basename
             const char* base = getBaseName(s_zip_fnBuf);
 
-            // Extract to TEMP_FILE first, then rename to dest
-            // Use extractFile which writes to TEMP_FILE
-            bool ok = extractFile(&zipFile, hdr.compression, hdr.compressedSize, hdr.uncompressedSize);
+            // Extract to a temp on the destination volume, then rename in place
+            bool ok = extractFile(&zipFile, hdr.compression, hdr.compressedSize, hdr.uncompressedSize, tmpPath);
             if (ok) {
-                char destPath[128];
+                char destPath[160];
                 snprintf(destPath, sizeof(destPath), "%s%s", destDir.c_str(), base);
                 f_unlink(destPath); // remove if exists
-                f_rename(TEMP_FILE, destPath);
-                extracted++;
+                FRESULT rr = f_rename(tmpPath, destPath);
+                if (rr == FR_OK) extracted++;
+                else Debug::log("ZIP: rename %s -> %s failed (%d)", tmpPath, destPath, (int)rr);
+            } else {
+                Debug::log("ZIP: extract '%s' failed (comp=%u csz=%lu)",
+                           s_zip_fnBuf, hdr.compression, (unsigned long)hdr.compressedSize);
             }
             // Re-seek past data (extractFile consumed it, but be safe)
         }
@@ -570,7 +582,8 @@ int ZipExtract::extractAll(const string& zipPath, const string& destDir) {
     }
 
     f_close(&zipFile);
-    f_unlink(TEMP_FILE); // clean up temp
+    f_unlink(tmpPath); // clean up temp
+    Debug::log("ZIP: extractAll done, %d file(s)", extracted);
     return extracted;
 }
 

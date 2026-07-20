@@ -62,9 +62,12 @@ private:
     static const char* TEMP_FILE;
 
     static bool hasMatchingExtension(const string& filename, uint8_t fileType);
-    static bool extractFile(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize);
-    static bool extractStored(FIL* zipFile, uint32_t size);
-    static bool extractDeflate(FIL* zipFile, uint32_t compressedSize);
+    // outPath: where the file is written. Default TEMP_FILE (SD /tmp); extractAll
+    // passes a temp on the DESTINATION volume — f_rename ignores the volume prefix
+    // of the new name, so the temp must already live on the target volume.
+    static bool extractFile(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize, const char* outPath = nullptr);
+    static bool extractStored(FIL* zipFile, uint32_t size, const char* outPath);
+    static bool extractDeflate(FIL* zipFile, uint32_t compressedSize, const char* outPath);
 };
 #endif // PICO_RP2040
 
