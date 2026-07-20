@@ -3515,6 +3515,51 @@ IRAM_ATTR void VIDEO::EndFrame() {
 #endif
 }
 
+// Repaint one full frame from the frozen machine state. The scanline renderer
+// only paints as a side effect of Z80 execution advancing CPU::tstates, so a
+// paused machine never repaints — an OSD window closed while paused would stay
+// on screen until unpause. Walks the paper renderer and the border state
+// machine across a whole frame without executing a single instruction (same
+// video-only technique as CPU::FlushOnHalt / EndFrame's brdChange repaint).
+void VIDEO::RedrawPausedFrame() {
+
+    if (!vga.frameBuffer) return;
+
+    uint32_t saved_tstates = CPU::tstates;
+
+    // Arm the paper renderer at start-of-frame state (mirror of EndFrame's
+    // re-arm — while paused it may be left at Blank by a maxSpeed skip-frame).
+    linedraw_cnt = lin_end;
+    tstateDraw = tStatesScreen;
+    void (*blank)(unsigned int, bool);
+    if (snow_toggle) {
+        Draw = &MainScreen_Blank_Snow;
+        Draw_Opcode = &MainScreen_Blank_Snow_Opcode;
+        blank = &Blank_Snow;
+    } else {
+        Draw = &MainScreen_Blank;
+        Draw_Opcode = &MainScreen_Blank_Opcode;
+        blank = &Blank;
+    }
+
+    // Walk the whole paper area; the chain parks itself at Blank after lin_end2.
+    // Guard: ~1 line per call, so a frame is ~lines calls — cap well above that.
+    CPU::tstates = 0;
+    for (int guard = 2048; Draw != blank && guard; guard--)
+        Draw(tStatesPerLine, false);
+
+    // Full border repaint: with tstates at end-of-frame the border state machine
+    // walks Top→Middle→Bottom→Blank in one call, preserving the stats carve-outs.
+    CPU::tstates = CPU::statesInFrame;
+    lastBrdTstate = tStatesBorder;
+    DrawBorder = &TopBorder_Blank;
+    DrawBorder();
+
+    CPU::tstates = saved_tstates;
+    // Draw/DrawBorder are left "done" (Blank/Border_Blank); the per-frame
+    // EndFrame call in CPU::loop's paused branch re-arms them as usual.
+}
+
 //----------------------------------------------------------------------------------------------------------------
 // Border Drawing
 //----------------------------------------------------------------------------------------------------------------

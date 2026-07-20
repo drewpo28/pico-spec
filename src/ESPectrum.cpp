@@ -1556,6 +1556,13 @@ IRAM_ATTR void ESPectrum::processKeyboard() {
 #endif // DIRTY_LINES
           // Refresh border
           VIDEO::brdnextframe = true;
+          // While paused the renderer never repaints (CPU::loop bails straight
+          // to EndFrame), so whatever the OSD drew stays on screen forever.
+          // Repaint the frozen frame and put the PAUSE box back on top.
+          if (CPU::paused) {
+            VIDEO::RedrawPausedFrame();
+            OSD::osdCenteredMsg(OSD_PAUSE[Config::lang], LEVEL_INFO, 0);
+          }
           ESPectrum::ts_start += esp_timer_get_time() - osd_start;
           return;
         }

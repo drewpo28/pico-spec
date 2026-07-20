@@ -168,6 +168,9 @@ public:
 
   // Video draw functions
   static void EndFrame();
+  // Repaint a full frame from the frozen machine state (used while CPU::paused,
+  // where the renderer otherwise never runs — e.g. to erase a closed OSD menu).
+  static void RedrawPausedFrame();
   static void Blank(unsigned int statestoadd, bool contended);
   static void Blank_Opcode(bool contended);
   static void Blank_Snow(unsigned int statestoadd, bool contended);
