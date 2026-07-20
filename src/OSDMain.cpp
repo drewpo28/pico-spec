@@ -10317,6 +10317,17 @@ void OSD::HWInfo() {
             " Flash size     : %d MB\n"
             " Flash JEDEC ID : %02X-%02X-%02X-%02X\n",
             (int)(flash_size >> 20), rx[0], rx[1], rx[2], rx[3]);
+#if !PICO_RP2040
+        if (flash_qe) {
+            pos += snprintf(hwtext + pos, sizeof(hwtext) - pos,
+                " Flash QE bit   : %s\n", flash_qe_text());
+            if (flash_qe >= 4)
+                pos += snprintf(hwtext + pos, sizeof(hwtext) - pos,
+                    " Flash QE diag  : %02X %02X %02X %02X %02X %02X\n",
+                    flash_qe_diag[0], flash_qe_diag[1], flash_qe_diag[2],
+                    flash_qe_diag[3], flash_qe_diag[4], flash_qe_diag[5]);
+        }
+#endif
     }
 
 #ifndef MURM2
@@ -10435,6 +10446,17 @@ void OSD::ChipInfo() {
             " Flash size     : %d MB\n"
             " Flash JEDEC ID : %02X-%02X-%02X-%02X\n",
             (int)(flash_size >> 20), rx[0], rx[1], rx[2], rx[3]);
+#if !PICO_RP2040
+        if (flash_qe) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                " Flash QE bit   : %s\n", flash_qe_text());
+            if (flash_qe >= 4)
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    " Flash QE diag  : %02X %02X %02X %02X %02X %02X\n",
+                    flash_qe_diag[0], flash_qe_diag[1], flash_qe_diag[2],
+                    flash_qe_diag[3], flash_qe_diag[4], flash_qe_diag[5]);
+        }
+#endif
     }
 
 #ifndef MURM2

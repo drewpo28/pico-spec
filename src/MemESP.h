@@ -75,6 +75,9 @@ extern volatile uint32_t mem_acc_dirty_cnt, mem_acc_dirty_sum;
 uint32_t butter_psram_size();
 extern uint8_t rx[4];
 #if !PICO_RP2040
+extern uint8_t flash_qe;       // Puya QE-bit fix status (0=n/a; see flash_qe_text())
+extern uint8_t flash_qe_diag[6];
+const char* flash_qe_text();
 extern uint8_t* g_alfWindow;   // AlfCart's 16K SD-faulted window (nullptr = unmounted)
 #endif
 extern "C" uint32_t psram_size();   // SPI PSRAM size (0 on butter/QSPI boards)
