@@ -166,7 +166,11 @@ bool FileUtils::mkdirParents(const char* path) {
     if (len >= sizeof(buf)) return false;
     memcpy(buf, path, len);
     buf[len] = 0;
-    for (size_t i = 1; i < len; ++i) {
+    // Skip a volume prefix ("USB:/...") — f_mkdir("USB:") is an error, not FR_EXIST
+    size_t start = 1;
+    const char* colon = strchr(buf, ':');
+    if (colon) start = (size_t)(colon - buf) + 2;
+    for (size_t i = start; i < len; ++i) {
         if (buf[i] == '/') {
             buf[i] = 0;
             FRESULT r = f_mkdir(buf);

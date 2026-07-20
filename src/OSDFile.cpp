@@ -42,6 +42,7 @@ using namespace std;
 
 #include "OSDMain.h"
 #include "FileUtils.h"
+#include "UsbMsc.h"
 #include "AlfCart.h"
 #include "Config.h"
 #include "ESPectrum.h"
@@ -1666,14 +1667,34 @@ static int rfd_scroll(const string& title, sorted_files& idx,
     }
 }
 
-// Pick a destination folder on the SD card (for downloads). Navigates local
-// directories with the same bounded-RAM scroller. Returns the chosen absolute
-// path, or "" if cancelled.
-static string rfd_choose_folder(const string& start) {
+// Volume helpers for the local pickers. When both the SD card and a USB stick
+// are present the pickers can cross between them ("USB:/..." paths; unprefixed
+// = SD). In usbRoot mode the stick IS the only volume — no switching.
+static const char *MSG_RFD_TO_USB[2] = { "[USB Drive]", "[Unidad USB]" };
+static const char *MSG_RFD_TO_SD[2]  = { "[SD Card]",   "[Tarjeta SD]" };
+static bool rfd_on_usb(const string& p) { return p.compare(0, 4, "USB:") == 0; }
+static bool rfd_can_switch() { return UsbMsc::ready() && !FileUtils::usbRoot; }
+// One level up; stays at the volume root ("/" or "USB:/").
+static string rfd_parent(const string& cur) {
+    size_t s = cur.find_last_of('/');
+    if (rfd_on_usb(cur)) return (s == string::npos || s <= 4) ? "USB:/" : cur.substr(0, s);
+    return (s == 0 || s == string::npos) ? "/" : cur.substr(0, s);
+}
+// A remembered start dir can be stale (e.g. "USB:/..." with the stick gone).
+static string rfd_start_dir(const string& start) {
     string cur = start.empty() ? "/" : start;
+    DIR dp;
+    if (f_opendir(&dp, cur.c_str()) == FR_OK) f_closedir(&dp); else cur = "/";
+    return cur;
+}
+
+// Pick a destination folder on the SD card / USB stick (for downloads).
+// Navigates local directories with the same bounded-RAM scroller. Returns the
+// chosen absolute path, or "" if cancelled.
+static string rfd_choose_folder(const string& start) {
+    string cur = rfd_start_dir(start);
     sorted_files idx;
     idx.init("__sdfolder__");
-    const char* synth[2] = { Config::lang ? "[Elegir esta carpeta]" : "[Select this folder]", ".." };
     while (1) {
         idx.unlink();
         DIR dp; FILINFO fno;
@@ -1687,15 +1708,24 @@ static string rfd_choose_folder(const string& start) {
             f_closedir(&dp);
         }
         idx.sort();
-        int sel = rfd_scroll(cur, idx, synth, 2);
+        const char* synth[3] = { Config::lang ? "[Elegir esta carpeta]" : "[Select this folder]", "..", nullptr };
+        int ns = 2;
+        if (rfd_can_switch())
+            synth[ns++] = rfd_on_usb(cur) ? MSG_RFD_TO_SD[Config::lang] : MSG_RFD_TO_USB[Config::lang];
+        int sel = rfd_scroll(cur, idx, synth, ns);
         if (sel < 0)  { idx.unlink(); return ""; }   // cancel
         if (sel == 0) { idx.unlink(); return cur; }  // choose current
         if (sel == 1) {                              // parent
-            size_t s = cur.find_last_of('/');
-            cur = (s == 0 || s == string::npos) ? "/" : cur.substr(0, s);
+            string up = rfd_parent(cur);
+            if (up == cur && rfd_on_usb(cur) && rfd_can_switch()) up = "/"; // ".." at USB:/ → SD root
+            cur = up;
             continue;
         }
-        string rec = idx.get(sel - 2);
+        if (sel == 2 && ns == 3) {                   // volume switch
+            cur = rfd_on_usb(cur) ? "/" : "USB:/";
+            continue;
+        }
+        string rec = idx.get(sel - ns);
         string name = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER) ? rec.substr(1) : rec;
         if (cur.back() != '/') cur += '/';
         cur += name;
@@ -1706,10 +1736,9 @@ static string rfd_choose_folder(const string& start) {
 // filter, so the user can upload arbitrary files. Navigates dirs + files with
 // the bounded-RAM scroller. Returns the chosen absolute file path, or "".
 static string rfd_choose_file(const string& start) {
-    string cur = start.empty() ? "/" : start;
+    string cur = rfd_start_dir(start);
     sorted_files idx;
     idx.init("__sdfile__");
-    const char* synth[1] = { ".." };
     while (1) {
         idx.unlink();
         DIR dp; FILINFO fno;
@@ -1723,14 +1752,23 @@ static string rfd_choose_file(const string& start) {
             f_closedir(&dp);
         }
         idx.sort();
-        int sel = rfd_scroll(cur, idx, synth, 1);
+        const char* synth[2] = { "..", nullptr };
+        int ns = 1;
+        if (rfd_can_switch())
+            synth[ns++] = rfd_on_usb(cur) ? MSG_RFD_TO_SD[Config::lang] : MSG_RFD_TO_USB[Config::lang];
+        int sel = rfd_scroll(cur, idx, synth, ns);
         if (sel < 0)  { idx.unlink(); return ""; }   // cancel
         if (sel == 0) {                              // parent
-            size_t s = cur.find_last_of('/');
-            cur = (s == 0 || s == string::npos) ? "/" : cur.substr(0, s);
+            string up = rfd_parent(cur);
+            if (up == cur && rfd_on_usb(cur) && rfd_can_switch()) up = "/"; // ".." at USB:/ → SD root
+            cur = up;
             continue;
         }
-        string rec = idx.get(sel - 1);
+        if (sel == 1 && ns == 2) {                   // volume switch
+            cur = rfd_on_usb(cur) ? "/" : "USB:/";
+            continue;
+        }
+        string rec = idx.get(sel - ns);
         bool isDir = (!rec.empty() && (uint8_t)rec[0] == DIR_MARKER);
         string name = isDir ? rec.substr(1) : rec;
         if (cur.back() != '/') cur += '/';
@@ -1985,8 +2023,7 @@ void OSD::remoteFileDialog(RemoteFs* fs) {
             if (outKey == FDK_F7 && !ro) {                          // F7 → upload an SD file
                 string local = rfd_choose_file(Config::net_ul_dir);
                 if (!local.empty()) {
-                    size_t s = local.find_last_of('/');
-                    Config::net_ul_dir = (s == 0 || s == string::npos) ? "/" : local.substr(0, s);
+                    Config::net_ul_dir = rfd_parent(local);   // dirname, volume-aware
                     Config::saveWifiConfig();
                     string base = local.substr(local.find_last_of('/') + 1);
                     rfd_xfer_title = MSG_NET_UPLOADING[Config::lang];
