@@ -413,8 +413,21 @@ bool FileUtils::hasZIPextension(const string& filename)
 #endif
 
 void FileUtils::deleteFilesWithExtension(const char *folder_path, const char *extension) {
+#if PICO_RP2040
+    // RP2040: no USB-MSC pump under FatFs (the chain that overflowed) and BSS is
+    // the scarcer resource on ZERO — keep these on the stack as before.
     DIR dir;
     FILINFO entry;
+    char file_path[512];
+#else
+    // Static FatFs objects + path buffer: DIR + FILINFO(LFN) + 512 B path ≈ 0.8 KB
+    // is too fat for the deep call chains this runs in (Tape::LoadTape flashload /
+    // TZX cleanup, near the bottom of the 4 KB core0 stack — part of the usbRoot
+    // overflow of 2026-07-21). Core0-only, non-reentrant use.
+    static DIR dir;
+    static FILINFO entry;
+    static char file_path[512];
+#endif
     if (f_opendir(&dir, folder_path) != FR_OK) {
         // perror("Unable to open directory");
         return;
@@ -423,7 +436,6 @@ void FileUtils::deleteFilesWithExtension(const char *folder_path, const char *ex
     while (f_readdir(&dir, &entry) == FR_OK && entry.fname[0] != '\0') {
         if (strcmp(entry.fname, ".") != 0 && strcmp(entry.fname, "..") != 0) {
             if (strstr(entry.fname, extension) != NULL) {
-                char file_path[512];
                 snprintf(file_path, sizeof(file_path), "%s/%s", folder_path, entry.fname);
                 if (f_unlink(file_path) == 0) {
                     printf("Deleted file: %s\n", entry.fname);

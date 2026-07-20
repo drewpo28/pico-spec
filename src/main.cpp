@@ -817,6 +817,38 @@ Ps2Kbd_Mrmltr ps2kbd(
 );
 #endif
 
+// ── Uptime across soft reboots ───────────────────────────────────────────────
+// HWInfo's Uptime used raw time_us_64() (µs since the last chip reset), so an
+// F12 reboot / video-mode switch / crash watchdog restarted it from zero.
+// Accumulate the pre-reboot seconds in a watchdog scratch register instead:
+// scratch survives a watchdog reboot but is cleared by a power-on / RUN-pin
+// reset — exactly the boundary a "since power-on" uptime wants.
+// scratch[3] = 0x55 tag (top byte) | uptime seconds (24 bits ≈ 194 days).
+// scratch[2] is MIDI_REFLASH_SCRATCH (MidiSynth.cpp); 4..7 belong to the
+// SDK/bootrom watchdog_reboot vector.
+#define UPTIME_SCRATCH  3
+#define UPTIME_TAG      0x55000000u
+#define UPTIME_TAG_MASK 0xFF000000u
+static uint32_t s_uptime_offset_s = 0; // seconds accumulated before the last watchdog reboot
+
+extern "C" uint32_t uptime_seconds(void) {
+    return s_uptime_offset_s + (uint32_t)(time_us_64() / 1000000ULL);
+}
+
+// Called once at main() entry, before anything can arm the watchdog.
+static void uptime_init(void) {
+    uint32_t v = watchdog_hw->scratch[UPTIME_SCRATCH];
+    if (watchdog_caused_reboot() && (v & UPTIME_TAG_MASK) == UPTIME_TAG)
+        s_uptime_offset_s = v & ~UPTIME_TAG_MASK;
+    watchdog_hw->scratch[UPTIME_SCRATCH] = UPTIME_TAG | (s_uptime_offset_s & ~UPTIME_TAG_MASK);
+}
+
+// Refreshed from the 150 ms input tick below so even a crash-path watchdog
+// reboot (which never goes through esp_hard_reset) keeps the running total.
+static inline void uptime_refresh(void) {
+    watchdog_hw->scratch[UPTIME_SCRATCH] = UPTIME_TAG | (uptime_seconds() & ~UPTIME_TAG_MASK);
+}
+
 void repeat_me_for_input() {
     static uint32_t tickKbdRep1 = time_us_32();
     // 60 FPS loop
@@ -838,6 +870,7 @@ void repeat_me_for_input() {
         uint32_t tickKbdRep2 = time_us_32();
         if (tickKbdRep2 - tickKbdRep1 > 150000) { // repeat each 150 ms
             repeat_handler();
+            uptime_refresh();
             tickKbdRep1 = tickKbdRep2;
         }
 
@@ -1136,6 +1169,10 @@ extern "C" void sigbus_handler(uint32_t *frame) {
     // CFSR/BFAR only exist on Cortex-M3+ (not M0+)
     uint32_t cfsr = *(volatile uint32_t*)0xE000ED28u;
     uint32_t bfar = *(volatile uint32_t*)0xE000ED38u;
+    // PICO_USE_STACK_GUARDS: on an MSPLIM violation (UFSR.STKOF, CFSR bit 20)
+    // v8-M clamps SP to the limit and suppresses the frame push — so sp==bot,
+    // frame[] contents are garbage, and only the STKOF bit tells the story.
+    if (cfsr & (1u << 20)) ovf = 1;
     printf("SIGBUS[%d] core%u: PC=%08x LR=%08x SP=%08x CFSR=%08x BFAR=%08x stackOvf=%d (bot=%08x top=%08x)\n",
            count, (unsigned)core, (unsigned)pc, (unsigned)lr, (unsigned)sp, (unsigned)cfsr, (unsigned)bfar,
            ovf, (unsigned)bot, (unsigned)top);
@@ -1451,6 +1488,7 @@ volatile uint32_t g_tusb_assert_count = 0;
 extern "C" void picospec_tusb_assert_hook(void) { g_tusb_assert_count++; }
 
 int main() {
+    uptime_init();   // capture pre-reboot uptime from watchdog scratch (see uptime_seconds)
 #if defined(DBG_UART_ENABLED) && defined(PICO_DEFAULT_UART)
     // Early console at the boot clock: proves bootrom/crt0 completed and logs the
     // reset reason before any flash/clock/PSRAM bring-up (the pre-stdio window

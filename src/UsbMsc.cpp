@@ -25,13 +25,22 @@ static uint8_t          g_lun      = 0;
 static uint32_t         g_blkcnt   = 0;
 static uint32_t         g_blksz    = 0;
 
-// Heap-lazy FatFs volume object + DMA bounce buffer — allocated once when the
-// first stick ever mounts, so SRAM-tight boards (m1p2 Profi ~10 KB heap) pay
-// ~1.1 KB only if a stick is actually used. Never freed: umount/replug churn
-// must not fragment the heap.
+// Heap-lazy FatFs volume object + DMA bounce buffer + pump alt-stack —
+// allocated once when the first stick ever mounts, so SRAM-tight boards
+// (m1p2 Profi ~10 KB heap) pay ~5.3 KB only if a stick is actually used.
+// Never freed: umount/replug churn must not fragment the heap.
+//
+// pump_stack: tuh_task() runs on this stack, NOT the caller's (see mscService).
+// hw-traced 2026-07-21: in usbRoot mode every FatFs sector I/O anywhere in the
+// firmware nests the whole TinyUSB host machinery (ioWait → tuh_task → hcd ISR
+// processing → class callbacks, + Debug::log + alarm-IRQ frames — IRQs push on
+// MSP too) on top of the caller. Tape::LoadTape → FatFs → usb_disk_read blew
+// through the 4 KB core0 stack into SCRATCH_X and trashed core1's live stack.
+#define MSC_PUMP_STACK_SIZE 4096
 struct UsbFsMem {
     FATFS   fs;                                          // volume "USB:"
     uint8_t bounce[FF_MAX_SS] __attribute__((aligned(4)));
+    uint8_t pump_stack[MSC_PUMP_STACK_SIZE] __attribute__((aligned(8)));
 };
 static UsbFsMem* g_mem = nullptr;
 
@@ -42,10 +51,45 @@ static UsbFsMem* g_mem = nullptr;
 // a tuh callback — but keep the guard anyway so a future mistake degrades to
 // a timeout instead of a "Data Seq Error" panic.
 static volatile bool g_in_tuh = false;
+
+// Call fn(arg) with MSP switched to new_top and MSPLIM guarding new_bottom
+// (same pattern as net_call_on_stack in OSDMain.cpp, which is gated behind
+// ZIFI_NET_CLIENT — this file only builds on RP2350/Cortex-M33, so MSPLIM
+// always exists). SP is restored BEFORE MSPLIM so there is no window where
+// SP sits below the active limit.
+__attribute__((naked, noinline))
+static void mscCallOnStack(void* new_top, void (*fn)(void*), void* arg, void* new_bottom) {
+    __asm volatile(
+        "mrs  r12, msplim       \n" // r12 = old MSPLIM
+        "msr  msplim, r3        \n" // guard the alt stack (SP still above it)
+        "mov  r3, sp            \n" // r3 = old SP
+        "mov  sp, r0            \n" // SP = new_top
+        "push {r2, r3, r12, lr} \n" // 16 bytes → keeps 8-byte alignment
+        "mov  r0, r2            \n" // r0 = arg
+        "blx  r1                \n" // fn(arg)
+        "pop  {r2, r3, r12, lr} \n"
+        "mov  sp, r3            \n" // restore SP first...
+        "msr  msplim, r12       \n" // ...then the old limit
+        "bx   lr                \n"
+    );
+}
+
+static void tuhTaskTramp(void*) { tuh_task(); }
+
 static inline void mscService() {
     if (g_in_tuh) return;
     g_in_tuh = true;
-    tuh_task();
+    if (g_mem) {
+        // Deep-context pump (FatFs disk I/O can sit near the bottom of the
+        // 4 KB core0 stack): run tuh_task on the dedicated alt-stack so the
+        // host-stack depth never adds to the caller's. IRQs taken during the
+        // pump also push here (they use MSP) — 4 KB covers both.
+        void* top = (void*)(((uintptr_t)g_mem->pump_stack + MSC_PUMP_STACK_SIZE) & ~(uintptr_t)7);
+        mscCallOnStack(top, tuhTaskTramp, nullptr, g_mem->pump_stack);
+    } else {
+        // Pre-mount pumps (waitReady at boot) run from shallow contexts.
+        tuh_task();
+    }
     g_in_tuh = false;
 }
 

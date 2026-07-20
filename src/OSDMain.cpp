@@ -10279,9 +10279,13 @@ void OSD::showTextDialog(const char* title, const char* text, bool blocking, int
 // loop repaint just that one row between full redraws.
 static int s_hwinfo_uptime_line = -1;
 
+extern "C" uint32_t uptime_seconds(void); // main.cpp — survives F12/watchdog reboots
+
 static int formatUptimeLine(char* out, int outsz) {
-    // Hardware timer counts µs since power-on — no separate counter needed
-    uint32_t up_s = (uint32_t)(time_us_64() / 1000000ULL);
+    // Seconds since POWER-ON: the hardware timer resets on every watchdog
+    // reboot (F12 / video-mode switch), so main.cpp accumulates the running
+    // total across those in a watchdog scratch register.
+    uint32_t up_s = uptime_seconds();
     return snprintf(out, outsz, " Uptime         : %dd %02d:%02d:%02d",
         (int)(up_s / 86400), (int)(up_s / 3600 % 24),
         (int)(up_s / 60 % 60), (int)(up_s % 60));
