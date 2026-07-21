@@ -42,6 +42,11 @@ public:
 
     static void cleanup();
 
+    // Real extraction body — extractFile() runs it on a heap alt-stack (the
+    // caller chain is OSD-deep and the 4 KB core0 stack is not enough on top).
+    // Public only so the file-static alt-stack trampoline can call it.
+    static bool extractFileInner(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize, const char* outPath);
+
 private:
     // ZIP Local File Header (30 bytes fixed part)
     struct __attribute__((packed)) LocalFileHeader {

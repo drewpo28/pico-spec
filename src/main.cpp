@@ -15,6 +15,9 @@
 #include <hardware/clocks.h>
 #include <hardware/uart.h>
 #include <hardware/watchdog.h>    // watchdog_caused_reboot (boot breadcrumb)
+#if !PICO_RP2040
+#include <hardware/structs/powman.h>  // chip_reset reason decode (boot breadcrumb)
+#endif
 
 #include <hardware/pll.h>
 
@@ -1498,6 +1501,22 @@ int main() {
     uart_init(uart_default, 115200);
     gpio_set_function(PICO_DEFAULT_UART_TX_PIN, GPIO_FUNC_UART);
     Debug::log("main: entry, wd_reboot=%d", (int)watchdog_caused_reboot());
+#if !PICO_RP2040
+    // Decode WHY the chip reset (hw-traced 2026-07-21: "wd_reboot=0 mid-ZIP-extract"
+    // reboots were undiagnosable — POR/BOR here means the supply sagged, RUN means
+    // the reset button / debug probe, WDG means our own esp_hard_reset/crash path).
+    {
+        uint32_t cr = powman_hw->chip_reset;
+        Debug::log("main: chip_reset=%08X%s%s%s%s%s%s", (unsigned)cr,
+                   (cr & POWMAN_CHIP_RESET_HAD_POR_BITS)                  ? " POR"    : "",
+                   (cr & POWMAN_CHIP_RESET_HAD_BOR_BITS)                  ? " BOR"    : "",
+                   (cr & POWMAN_CHIP_RESET_HAD_RUN_LOW_BITS)              ? " RUN"    : "",
+                   (cr & (POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_SWCORE_BITS |
+                          POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_RSM_BITS)) ? " WDG"    : "",
+                   (cr & POWMAN_CHIP_RESET_HAD_GLITCH_DETECT_BITS)        ? " GLITCH" : "",
+                   (cr & POWMAN_CHIP_RESET_HAD_DP_RESET_REQ_BITS)         ? " DBG"    : "");
+    }
+#endif
     uart_tx_wait_blocking(uart_default);   // drain before the clock switch garbles it
 #endif
     flash_info();

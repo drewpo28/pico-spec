@@ -232,8 +232,70 @@ string ZipExtract::extractByIndex(const string& zipPath, int fileIndex) {
     return "";
 }
 
+// ── Alt-stack for the extraction body ────────────────────────────────────────
+// hw-traced 2026-07-21 (STKOF at MSPLIM, caught by PICO_USE_STACK_GUARDS):
+// extractFile runs at the bottom of an OSD-deep chain (file browser / archive
+// launch), and inflate + FatFs + Debug::log + 31.5 kHz HDMI-audio IRQ frames
+// (IRQs push on MSP) overflow the 4 KB core0 stack even with every big local
+// here already static. Run the body on a short-lived 8 KB heap stack instead.
+// Same MSP+MSPLIM switch pattern as mscCallOnStack (UsbMsc.cpp) /
+// net_call_on_stack (OSDMain.cpp); this file is RP2350-only (Cortex-M33).
+#define ZIP_DEEP_STACK_SIZE 8192
+
+extern "C" size_t getLargestAllocatable(void);  // OSDMain.cpp — malloc panics on OOM
+
+__attribute__((naked, noinline))
+static void zipCallOnStack(void* new_top, void (*fn)(void*), void* arg, void* new_bottom) {
+    __asm volatile(
+        "mrs  r12, msplim       \n" // r12 = old MSPLIM
+        "msr  msplim, r3        \n" // guard the alt stack (SP still above it)
+        "mov  r3, sp            \n" // r3 = old SP
+        "mov  sp, r0            \n" // SP = new_top
+        "push {r2, r3, r12, lr} \n" // 16 bytes → keeps 8-byte alignment
+        "mov  r0, r2            \n" // r0 = arg
+        "blx  r1                \n" // fn(arg)
+        "pop  {r2, r3, r12, lr} \n"
+        "mov  sp, r3            \n" // restore SP first...
+        "msr  msplim, r12       \n" // ...then the old limit
+        "bx   lr                \n"
+    );
+}
+
+struct ZipDeepArgs {
+    FIL*        zipFile;
+    uint16_t    compression;
+    uint32_t    compressedSize;
+    uint32_t    uncompressedSize;
+    const char* outPath;
+    bool        ret;
+};
+
+static void extractFileTramp(void* p) {
+    ZipDeepArgs* a = (ZipDeepArgs*)p;
+    a->ret = ZipExtract::extractFileInner(a->zipFile, a->compression,
+                                          a->compressedSize, a->uncompressedSize, a->outPath);
+}
+
 bool ZipExtract::extractFile(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize, const char* outPath) {
     if (!outPath) outPath = TEMP_FILE;
+    ZipDeepArgs a = { zipFile, compression, compressedSize, uncompressedSize, outPath, false };
+    uint8_t* stk = nullptr;
+    if (getLargestAllocatable() >= ZIP_DEEP_STACK_SIZE + 4096)
+        stk = (uint8_t*)malloc(ZIP_DEEP_STACK_SIZE);
+    if (stk) {
+        void* top = (void*)(((uintptr_t)stk + ZIP_DEEP_STACK_SIZE) & ~(uintptr_t)7);
+        zipCallOnStack(top, extractFileTramp, &a, stk);
+        free(stk);
+    } else {
+        // Heap too tight for the alt-stack — run in place (pre-guard behavior;
+        // the stack guard turns a repeat overflow into a clean fault, not
+        // cross-core corruption).
+        extractFileTramp(&a);
+    }
+    return a.ret;
+}
+
+bool ZipExtract::extractFileInner(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize, const char* outPath) {
     if (compression == 0)
         // Streaming-stored (csz=0 in local header): csz==usz for stored data.
         return extractStored(zipFile, compressedSize ? compressedSize : uncompressedSize, outPath);
