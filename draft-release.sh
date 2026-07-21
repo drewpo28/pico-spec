@@ -8,7 +8,9 @@
 #
 # With --prerelease the release is instead published immediately as a PUBLIC
 # pre-release (visible to users, marked "Pre-release", tag + source archives
-# created at once). An existing draft of the same version is promoted.
+# created at once). An existing draft of the same version is promoted; an
+# already-published pre-release is deleted and recreated (tag included) so
+# the tag, the source archives and the release date always match the build.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -153,22 +155,37 @@ fi
 # --- Create draft/pre-release, or update an existing editable one ---
 # Editable: a draft always; in --prerelease mode also a published pre-release.
 # A published FULL release is never touched — bump PORT_VERSION instead.
+EXISTS=false
+IS_DRAFT=""
 if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+    EXISTS=true
     IS_DRAFT=$(gh release view "$TAG" -R "$REPO" --json isDraft --template '{{.isDraft}}')
     IS_PRE=$(gh release view "$TAG" -R "$REPO" --json isPrerelease --template '{{.isPrerelease}}')
-    if [ "$IS_DRAFT" != "true" ]; then
-        if ! $PRERELEASE || [ "$IS_PRE" != "true" ]; then
-            echo "Error: release $TAG is already PUBLISHED — refusing to overwrite it."
-            echo "       Bump PORT_VERSION for a new release."
-            exit 1
-        fi
+fi
+
+if $EXISTS && [ "$IS_DRAFT" != "true" ]; then
+    if ! $PRERELEASE || [ "$IS_PRE" != "true" ]; then
+        echo "Error: release $TAG is already PUBLISHED — refusing to overwrite it."
+        echo "       Bump PORT_VERSION for a new release."
+        exit 1
     fi
-    echo "Release $TAG already exists — updating assets (--clobber)"
+    # A published pre-release has an immutable tag: updating assets in place
+    # would leave the tag / source archives / release date at the old commit.
+    # Recreate the whole release so everything matches this build.
+    echo "Pre-release $TAG is already published — recreating it at $TARGET_SHA"
+    echo "so the tag, source archives and release date match this build"
+    gh release delete "$TAG" -R "$REPO" --cleanup-tag -y
+    git tag -d "$TAG" >/dev/null 2>&1 || true
+    EXISTS=false
+fi
+
+if $EXISTS; then
+    echo "Draft $TAG already exists — updating assets (--clobber)"
     gh release upload "$TAG" -R "$REPO" --clobber "${FILES[@]}"
     if [ -n "$NOTES_FILE" ]; then
         gh release edit "$TAG" -R "$REPO" --notes-file "$NOTES_FILE"
     fi
-    if $PRERELEASE && [ "$IS_DRAFT" = "true" ]; then
+    if $PRERELEASE; then
         echo "Promoting draft $TAG to a public pre-release"
         gh release edit "$TAG" -R "$REPO" --target "$TARGET_SHA" --draft=false --prerelease
     fi
@@ -183,6 +200,11 @@ else
         --target "$TARGET_SHA" \
         "${NOTES_ARGS[@]}" \
         "${FILES[@]}"
+fi
+
+# Keep the local tag in sync with the (re)created remote tag
+if $PRERELEASE; then
+    git fetch origin --tags --force --quiet 2>/dev/null || true
 fi
 
 echo ""

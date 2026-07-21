@@ -22,8 +22,9 @@ Steps:
    - `release not found` → the script will create a fresh public pre-release;
    - existing with `draft=true` → the script updates its assets/notes and
      PROMOTES the draft to a public pre-release;
-   - existing with `draft=false prerelease=true` → the script updates the
-     published pre-release's assets/notes in place;
+   - existing with `draft=false prerelease=true` → the script DELETES and
+     RECREATES the pre-release (tag included) at HEAD, so the tag, the
+     "Source code" archives and the release date all match the new build;
    - existing with `draft=false prerelease=false` → STOP: this version is
      already published as a full release; the user must bump PORT_VERSION
      (or pass a new version argument) first.
