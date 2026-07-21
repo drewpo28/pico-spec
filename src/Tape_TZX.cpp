@@ -419,7 +419,7 @@ void Tape::TZX_Open(const string& name) {
 
     FileUtils::deleteFilesWithExtension("/tmp",".tmp");
 
-    string fname = FileUtils::TAP_Path + "/" + name;
+    string fname = FileUtils::TAP_Path + name;   // TAP_Path already ends in '/'
 
     if (f_open(&tape, fname.c_str(), FA_READ) != FR_OK) {
         OSD::osdCenteredMsg(OSD_TAPE_LOAD_ERR, LEVEL_ERROR);

@@ -99,7 +99,7 @@ void Tape::PZX_Open(const string& name) {
         tapeFileType = TAPE_FTYPE_EMPTY;
     }
 
-    string fname = FileUtils::TAP_Path + "/" + name;
+    string fname = FileUtils::TAP_Path + name;   // TAP_Path already ends in '/'
 
     if (f_open(&tape, fname.c_str(), FA_READ) != FR_OK) {
         OSD::osdCenteredMsg(OSD_TAPE_LOAD_ERR, LEVEL_ERROR);
