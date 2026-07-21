@@ -694,8 +694,10 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     // MC146818 RTC data read (#BFF7) — Pentagon/Profi "Mr Gluk" TimeKeeper.
     // Register index was latched via OUT (#DFF7). Port is RTC-specific on these
     // machines, so no extra gating needed.
-    if (Config::rtc_enabled && (Z80Ops::isPentagon || Z80Ops::isProfi) && address == 0xBFF7) {
-      uint8_t rv = RTC::readData();
+    if ((Z80Ops::isPentagon || Z80Ops::isProfi) && address == 0xBFF7) {
+      // RTC off → static response (see RTC::readDisabled) instead of leaving the
+      // port unclaimed; keeps the boot clock's UIP-wait from hanging.
+      uint8_t rv = Config::rtc_enabled ? RTC::readData() : RTC::readDisabled();
 #if RTC_PORT_TRACE
       // Rate cap: the ROMain status clock polls 6 regs per 50 Hz frame — an
       // uncapped log (~300 lines/s) exceeds the 115200 console and stalls
@@ -1347,12 +1349,14 @@ IRAM_ATTR uint8_t Ports::input(uint16_t address) {
     }
 #endif
 #if !PICO_RP2040 // RTC (and Profi itself) are RP2350-only
-    if (Config::rtc_enabled && Z80Ops::isProfi) {
+    if (Z80Ops::isProfi) {
       bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
       if ((cpm && rom14) || (dos && !rom14)) {
         uint8_t lo8 = address & 0xFF;
         if ((lo8 | 0x40) == 0xDF) {
-          uint8_t rv = RTC::readData();
+          // RTC off → static response (UIP-clear on status regs) so ROMain's
+          // boot MC146818 UIP-wait exits instead of spinning on 0xFF forever.
+          uint8_t rv = Config::rtc_enabled ? RTC::readData() : RTC::readDisabled();
 #if RTC_PORT_TRACE
           Debug::log("[RTC-DS IN] sel=%02X -> %02X pc=%04X", RTC::dbgSel(), rv, Z80::getRegPC());
 #endif
@@ -1693,7 +1697,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
   // MC146818 RTC (Pentagon/Profi "Mr Gluk" TimeKeeper):
   //   OUT (#DFF7), reg  → latch register index
   //   OUT (#BFF7), data → write selected register
-  if (Config::rtc_enabled && (Z80Ops::isPentagon || Z80Ops::isProfi)) {
+  if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
 #if RTC_PORT_TRACE
     if (a8 == 0xF7) {
       static uint32_t out_n = 0;
@@ -1702,8 +1706,11 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
                    address, data, Z80::getRegPC(), Ports::portEFF7, (unsigned)out_n);
     }
 #endif
+    // Register-select is latched even when the RTC is off, so a subsequent read
+    // returns the right static value (RTC::readDisabled). Data writes only take
+    // effect when enabled — disabled = "ports don't act" but still respond.
     if (address == 0xDFF7) { RTC::selectReg(data); return; }
-    if (address == 0xBFF7) { RTC::writeData(data); return; }
+    if (address == 0xBFF7) { if (Config::rtc_enabled) RTC::writeData(data); return; }
   }
   // Karabas-Pro's own native RTC ports (#FF/#BF AS, #DF/#9F DS) are handled
   // LATER in this function, after the Beta-128/FDC write switch — see the
@@ -2698,11 +2705,14 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
     }
 #endif
 #if !PICO_RP2040 // RTC (and Profi itself) are RP2350-only
-    if (Config::rtc_enabled && Z80Ops::isProfi) {
+    if (Z80Ops::isProfi) {
       bool cpm = (portDFFD & 0x20), rom14 = MemESP::romLatch, dos = ESPectrum::trdos;
       if ((cpm && rom14) || (dos && !rom14)) {
         uint8_t lo8 = address & 0xFF;
         if ((lo8 | 0x40) == 0xFF) { // #FF/#BF (AS)
+          // Latch the register index even when the RTC is off (the FDC already
+          // had its refusal in the switch above) so a following read returns the
+          // right static value; the data write below is what's gated on enabled.
           RTC::selectReg(data);
 #if RTC_PORT_TRACE
           Debug::log("[RTC-AS OUT] sel<-%02X pc=%04X", data, Z80::getRegPC());
@@ -2711,7 +2721,7 @@ IRAM_ATTR void Ports::output(uint16_t address, uint8_t data) {
           return;
         }
         if ((lo8 | 0x40) == 0xDF) { // #DF/#9F (DS)
-          RTC::writeData(data);
+          if (Config::rtc_enabled) RTC::writeData(data); // off = swallow (no clock/NVRAM)
 #if RTC_PORT_TRACE
           Debug::log("[RTC-DS OUT] sel=%02X <-%02X pc=%04X", RTC::dbgSel(), data, Z80::getRegPC());
 #endif

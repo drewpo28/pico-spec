@@ -104,6 +104,22 @@ void RTC::flushNVRAM() {
 // the seconds register).
 void RTC::selectReg(uint8_t reg) { sel = reg; }
 
+uint8_t RTC::readDisabled() {
+    // RTC turned off in Options → ports respond deterministically. Data/time/
+    // NVRAM float high (0xFF, so the Karabas ROMain corner clock just shows
+    // FF.FF.FF), but the STATUS registers must read NOT-busy: reg A UIP (bit7)
+    // and reg C IRQ flags CLEAR. ROMain's boot init runs the datasheet
+    // "IN reg A; wait while UIP=1" spin — with a constant 0xFF (UIP=1) it hangs
+    // forever (the exact "won't start with RTC off" boot hang; RTC on returns
+    // reg A = 0x20, UIP=0). Register index is still latched by selectReg() even
+    // while disabled, so this sees the right sel.
+    switch (sel) {
+        case 0x0A: return 0x00; // reg A: UIP=0, no update in progress
+        case 0x0C: return 0x00; // reg C: no pending interrupt flags
+        default:   return 0xFF; // seconds..year, control B/D, NVRAM
+    }
+}
+
 void RTC::writeData(uint8_t v) {
     if (sel <= 0x09) {
         // Time/alarm registers: accepted only inside the datasheet set-time

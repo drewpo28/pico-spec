@@ -23,6 +23,10 @@ public:
     static void    selectReg(uint8_t reg); // OUT (#DFF7)
     static void    writeData(uint8_t v);   // OUT (#BFF7)
     static uint8_t readData();             // IN  A,(#BFF7)
+    // RTC disabled in Options: the ports still answer with a static value so
+    // register-select writes never leak elsewhere and the Karabas ROMain boot
+    // clock's MC146818 "wait until UIP clears" loop can't spin forever on 0xFF.
+    static uint8_t readDisabled();
 
     // Set the base time from broken-down local time (e.g. parsed SNTP reply).
     static void    setDateTime(int year, int month, int day,
