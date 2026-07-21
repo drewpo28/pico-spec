@@ -175,7 +175,16 @@ project(${PROJECT_NAME} C CXX ASM)
 # video stack — manifesting as SIGBUS (MSTKERR) crashes (F1 file info, F9 create
 # TRD) and a garbled screen. Grow core0 to 4 KB (fills the otherwise-empty 4 KB
 # SCRATCH_Y exactly); pin core1 at 2 KB so SCRATCH_X is unchanged.
-add_compile_definitions(PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x800)
+#
+# PICO_USE_STACK_GUARDS: hw-traced 2026-07-21 — even 4 KB overflowed again in
+# usbRoot mode (Tape::LoadTape → FatFs → usb_disk_read → tuh_task pump), and the
+# silent descent into SCRATCH_X trashed core1's live IRQ frames: core1 SIGBUS
+# storms with garbage PC (values = core0 locals), then double-fault LOCKUP on
+# both cores. The guard (MSPLIM on RP2350, MPU canary on RP2040, both cores)
+# turns any future overflow into an immediate fault AT the boundary — the
+# overflowing core traps with stackOvf=1 instead of corrupting its neighbour.
+add_compile_definitions(PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x800
+                        PICO_USE_STACK_GUARDS=1)
 
 # ZiFi network client (FTP/SFTP/SSH) uses the SDK-vendored mbedTLS as a crypto
 # primitive library. Point the SDK's mbedTLS at our trimmed config via an
