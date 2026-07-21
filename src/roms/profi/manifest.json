@@ -19,6 +19,38 @@
       "len": 19,
       "runs": 1,
       "diff_bytes": 1
+    },
+    {
+      "name": "Profi bank1 (PQDOS)",
+      "sym": "gb_rom_profi_pq_bank1",
+      "overlay_sym": "gb_overlay_profi_bank1_pq",
+      "len": 5061,
+      "runs": 121,
+      "diff_bytes": 4323
+    },
+    {
+      "name": "Profi bank2 (PQDOS)",
+      "sym": "gb_rom_profi_pq_bank2",
+      "overlay_sym": "gb_overlay_profi_bank2_pq",
+      "len": 101,
+      "runs": 4,
+      "diff_bytes": 65
+    },
+    {
+      "name": "Profi bank3 (PQDOS)",
+      "sym": "gb_rom_profi_pq_bank3",
+      "overlay_sym": "gb_overlay_profi_bank3_pq",
+      "len": 2218,
+      "runs": 101,
+      "diff_bytes": 1600
+    },
+    {
+      "name": "Profi bank1 (ROMain)",
+      "sym": "gb_rom_profi_romain_bank1",
+      "overlay_sym": "gb_overlay_profi_bank1_romain",
+      "len": 1430,
+      "runs": 39,
+      "diff_bytes": 1184
     }
   ]
 }

@@ -22,6 +22,7 @@ FIL* IDE::file = nullptr;
 bool IDE::file_open[2] = { false, false };
 bool IDE::is_atapi[2]  = { false, false };
 bool IDE::sig_valid[2] = { false, false };
+bool IDE::profi_hidd_slot[2] = { false, false };
 
 uint32_t IDE::data_offset[2] = { 0, 0 };
 uint16_t IDE::cylinders[2] = { 0, 0 };
@@ -153,6 +154,7 @@ bool IDE::open_image(int slot, const char* path) {
     // Defaults: raw image — data at offset 0, geometry from size.
     data_offset[slot] = 0;
     is_atapi[slot] = false;
+    profi_hidd_slot[slot] = false;
     uint32_t total_lba = (uint32_t)(fsize / 512);
 
     // --- ATAPI CD-ROM (.iso) detection ---
@@ -234,28 +236,44 @@ bool IDE::open_image(int slot, const char* path) {
     }
 
     // --- Profi CP/M HDD (raw) detection ---
-    // The Profi HiDD partition header sits in sector 256 (after 256 reserved
-    // sectors); its signature is the byte-swapped string "ProfiHDD" = "rPfoHiDD"
-    // at byte offset 256*512 + 16 = 131088. Profi formats the disk with a fixed
-    // CHS geometry of H=16, S=16, and the SYS-ROM boot reads CHS cyl=1 (=lba 256
-    // with H*S=256) to fetch this header — so we MUST report H=16,S=16, otherwise
-    // the synthesized H=16,S=63 sends cyl=1 to lba 1008 and boot fails.
-    // Only honored under the PROFI scheme: under NEMO the same image is presented
-    // as a plain raw disk (H=16,S=63) so NEMO tools (Demeter, etc.) can partition
-    // it in their own format. Image interpretation follows the selected interface.
-    if (scheme == PROFI && fsize >= 131088 + 8) {
-        uint8_t psig[8];
-        f_lseek(&file[slot], 131088);
-        f_read(&file[slot], psig, 8, &br);
-        if (br == 8 && memcmp(psig, "rPfoHiDD", 8) == 0) {
-            heads[slot]   = 16;
-            sectors[slot] = 16;
-            uint32_t cyl = total_lba / (16u * 16u);
+    // The Profi HiDD partition header lives at cylinder 1 (after one cylinder of
+    // reserved sectors); its signature is the byte-swapped string "ProfiHDD" =
+    // "rPfoHiDD" at byte offset 16 of that sector, and the sector's first 3 words
+    // (big-endian, byte-swapped on the 16-bit Profi IDE bus) encode H,S,C.
+    // TWO layouts exist depending on who formatted the disk — same signature,
+    // different geometry, so cylinder 1 falls at a different LBA:
+    //   • original Profi SYS ROM (Dos5): H=16 S=16 → cyl 1 = LBA 256  (hdr@131088)
+    //   • Karabas ROMain (Doctor Max):   H=16 S=63 → cyl 1 = LBA 1008 (hdr@516112)
+    // The SYS-ROM/ROMain boot reads its cyl 1 to fetch this header — so we must
+    // report the MATCHING H/S, else cyl 1 maps to the wrong LBA and boot fails
+    // ("CP/M partition not found" / wrong-geometry truncation).  Read H/S from
+    // the header itself so both layouts (and any future S value) are exact.
+    // Only honored under the PROFI scheme: under NEMO the same image is a plain
+    // raw disk (H=16,S=63) so NEMO tools (Demeter, etc.) partition it themselves.
+    if (scheme == PROFI) {
+        // Try both known header LBAs; whichever carries the signature wins.
+        static const uint32_t hidd_lbas[2] = { 256, 1008 };
+        for (int k = 0; k < 2; k++) {
+            FSIZE_t hoff = (FSIZE_t)hidd_lbas[k] * 512;
+            if (fsize < hoff + 512) continue;
+            uint8_t hdr[24];
+            f_lseek(&file[slot], hoff);
+            f_read(&file[slot], hdr, sizeof(hdr), &br);
+            if (br < (UINT)sizeof(hdr) || memcmp(hdr + 16, "rPfoHiDD", 8) != 0) continue;
+            uint16_t h = ((uint16_t)hdr[0] << 8) | hdr[1];  // big-endian in header
+            uint16_t s = ((uint16_t)hdr[2] << 8) | hdr[3];
+            if (h < 1 || h > 255 || s < 1 || s > 255) {     // sane geometry only
+                h = 16; s = (hidd_lbas[k] == 256) ? 16 : 63;
+            }
+            heads[slot]   = h;
+            sectors[slot] = s;
+            uint32_t cyl = total_lba / ((uint32_t)h * s);
             cylinders[slot] = cyl ? (cyl > 65535 ? 65535 : cyl) : 1;
             data_offset[slot] = 0;
             memset(identity[slot], 0, 106);
-            Debug::log("IDE hd%d: Profi HiDD C=%u H=16 S=16 lba=%u",
-                       slot, cylinders[slot], total_lba);
+            profi_hidd_slot[slot] = true;
+            Debug::log("IDE hd%d: Profi HiDD (cyl1=LBA%u) C=%u H=%u S=%u lba=%u",
+                       slot, hidd_lbas[k], cylinders[slot], h, s, total_lba);
             return true;
         }
     }
@@ -296,16 +314,33 @@ void IDE::init() {
         if (file_open[d]) {
             uint16_t c = Config::ide_chs[d][0], h = Config::ide_chs[d][1], s = Config::ide_chs[d][2];
             if (c && h && s) {
-                cylinders[d] = c; heads[d] = h; sectors[d] = s;
-                Debug::log("IDE hd%d: geometry override C=%u H=%u S=%u", d, c, h, s);
+                if (profi_hidd_slot[d]) {
+                    // HiDD header found: its H/S are authoritative (that's what
+                    // the disk was formatted with — Dos5 16/16 or ROMain 16/63).
+                    // The Profi CHS editor stores {C,16,16} ("Profi: C only"), so
+                    // honor just the cylinder part; a stale 16/16 override saved
+                    // against a Dos5 image must not clobber a ROMain image's
+                    // geometry (was: 2 GB ROMain CF shown as 3884/16/16 = 485 MB).
+                    cylinders[d] = c;
+                    Debug::log("IDE hd%d: C override %u (H/S from HiDD header %u/%u)",
+                               d, c, heads[d], sectors[d]);
+                } else {
+                    cylinders[d] = c; heads[d] = h; sectors[d] = s;
+                    Debug::log("IDE hd%d: geometry override C=%u H=%u S=%u", d, c, h, s);
+                }
             }
-            // Profi CP/M: BIOS always uses H=16 S=16 for CHS addressing (standard
-            // Profi geometry). The first sector the BIOS reads is cylinder=1 which
-            // maps to LBA 256 (= 1*16*16). Any other S would give wrong LBA, causing
-            // "HDD Failure" before the ProfiHiDD header can be read and geometry synced.
-            // Force H=16 S=16 here; read_sector() will re-sync from the ProfiHiDD header
-            // at LBA 256 and update cylinders to match the actual image size.
-            if (scheme == PROFI) {
+            // Profi CP/M: the original Profi SYS ROM (Dos5) addresses the HDD in
+            // CHS mode with a fixed H=16 S=16 and reads cylinder 1 (= LBA 256) to
+            // find the HiDD header, so for an UNFORMATTED / unrecognised image we
+            // must present H=16 S=16 or that first CHS read lands on the wrong LBA
+            // and boot fails. But when open_image already matched a HiDD header
+            // (profi_hidd_slot) it set the EXACT geometry from that header — Dos5
+            // images give H=16 S=16, Karabas ROMain images give H=16 S=63 — and
+            // forcing S=16 there would corrupt the ROMain geometry (was showing
+            // 3884/16/16 = 485 MB for a 2 GB disk and breaking CP/M detection).
+            // ROMain also addresses purely by LBA, so it only needs the geometry
+            // reported correctly, not forced.
+            if (scheme == PROFI && !profi_hidd_slot[d]) {
                 heads[d] = 16; sectors[d] = 16;
                 if (c) cylinders[d] = c;  // keep user cylinder count if specified
                 Debug::log("IDE hd%d: Profi forced H=16 S=16 C=%u for CHS compat",

@@ -1746,6 +1746,60 @@ void OSD::bootTrdos() {
 }
 
 // OSD Main Loop
+void OSD::nmiAction() {
+#if !PICO_RP2040
+    if (DivMMC::enabled) {
+        // DivMMC NMI: automap at 0x0066 handled by preOpcFetch/postOpcFetch
+        Z80::triggerNMI();
+    } else
+#endif
+    if (Z80Ops::isByte) {
+        // ZX Byte: NMI menu with COBMECT mode toggle
+        menu_level = 0;
+        menu_curopt = 1;
+        menu_saverect = true;
+        string nmi_menu = MENU_NMI_TITLE[Config::lang];
+        nmi_menu += "NMI\n";
+        nmi_menu += MENU_BYTE_COBMECT_MODE[Config::lang];
+        uint8_t nmi_cols = 20;
+        uint16_t nmi_w = (nmi_cols * OSD_FONT_W) + 2;
+        uint16_t nmi_h = (rowCount(nmi_menu) * OSD_FONT_H) + 2;
+        uint8_t opt = simpleMenuRun(nmi_menu,
+            scrAlignCenterX(nmi_w), scrAlignCenterY(nmi_h),
+            rowCount(nmi_menu), nmi_cols);
+        if (opt == 1) {
+            Z80::triggerNMI();
+        } else if (opt == 2) {
+            Config::byte_cobmect_mode = !Config::byte_cobmect_mode;
+            Config::save();
+            // BYTE and BYTE-compat are both overlays over the Sinclair 48K base.
+            MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_48k,
+                Config::byte_cobmect_mode ? gb_overlay_48k_byte_sovmest : gb_overlay_48k_byte);
+            MemESP::recoverPage0();
+            osdCenteredMsg(Config::byte_cobmect_mode ? OSD_COBMECT_ON[Config::lang] : OSD_COBMECT_OFF[Config::lang], LEVEL_INFO, 500);
+        }
+    } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
+        menu_level = 0;
+        menu_curopt = 1;
+        menu_saverect = true;
+        string nmi_menu = MENU_NMI_TITLE[Config::lang];
+        nmi_menu += MENU_NMI_SEL[Config::lang];
+        uint8_t nmi_cols = 20;
+        uint16_t nmi_w = (nmi_cols * OSD_FONT_W) + 2;
+        uint16_t nmi_h = (rowCount(nmi_menu) * OSD_FONT_H) + 2;
+        uint8_t opt = simpleMenuRun(nmi_menu,
+            scrAlignCenterX(nmi_w), scrAlignCenterY(nmi_h),
+            rowCount(nmi_menu), nmi_cols);
+        if (opt == 1)
+            Z80::triggerNMI();
+        else if (opt == 2)
+            Z80::triggerNMIDOS();
+    } else {
+        Z80::triggerNMI();
+    }
+}
+
 void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 
     struct AYGuard {
@@ -1836,9 +1890,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
     }
 
 #if !PICO_RP2040
-    // Alt+` (grave/tilde) — toggle Profi extended keyboard mode (only in Profi arch)
-    if (Config::arch == "Profi" && ALT && !CTRL &&
-        (KeytoESP == fabgl::VK_GRAVEACCENT || KeytoESP == fabgl::VK_TILDE)) {
+    // Alt+` (grave/tilde) or plain PrtScr (the Karabas-Pro hardware combo) —
+    // toggle Profi extended keyboard mode (only in Profi arch)
+    if (Config::arch == "Profi" && !CTRL &&
+        ((ALT && (KeytoESP == fabgl::VK_GRAVEACCENT || KeytoESP == fabgl::VK_TILDE)) ||
+         (!ALT && KeytoESP == fabgl::VK_PRINTSCREEN))) {
         Config::profi_ext_keys = !Config::profi_ext_keys;
         Config::save();
         osdCenteredMsg(Config::profi_ext_keys ? " XT keyboard ON  " : " XT keyboard OFF ", LEVEL_INFO, 500);
@@ -1894,57 +1950,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             pokeDialog();
         } else
         if (hkIdx == Config::HK_NMI) { // NMI
-#if !PICO_RP2040
-            if (DivMMC::enabled) {
-                // DivMMC NMI: automap at 0x0066 handled by preOpcFetch/postOpcFetch
-                Z80::triggerNMI();
-            } else
-#endif
-            if (Z80Ops::isByte) {
-                // ZX Byte: NMI menu with COBMECT mode toggle
-                menu_level = 0;
-                menu_curopt = 1;
-                menu_saverect = true;
-                string nmi_menu = MENU_NMI_TITLE[Config::lang];
-                nmi_menu += "NMI\n";
-                nmi_menu += MENU_BYTE_COBMECT_MODE[Config::lang];
-                uint8_t nmi_cols = 20;
-                uint16_t nmi_w = (nmi_cols * OSD_FONT_W) + 2;
-                uint16_t nmi_h = (rowCount(nmi_menu) * OSD_FONT_H) + 2;
-                uint8_t opt = simpleMenuRun(nmi_menu,
-                    scrAlignCenterX(nmi_w), scrAlignCenterY(nmi_h),
-                    rowCount(nmi_menu), nmi_cols);
-                if (opt == 1) {
-                    Z80::triggerNMI();
-                } else if (opt == 2) {
-                    Config::byte_cobmect_mode = !Config::byte_cobmect_mode;
-                    Config::save();
-                    // BYTE and BYTE-compat are both overlays over the Sinclair 48K base.
-                    MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
-                    MemESP::registerOverlay(gb_rom_0_sinclair_48k,
-                        Config::byte_cobmect_mode ? gb_overlay_48k_byte_sovmest : gb_overlay_48k_byte);
-                    MemESP::recoverPage0();
-                    osdCenteredMsg(Config::byte_cobmect_mode ? OSD_COBMECT_ON[Config::lang] : OSD_COBMECT_OFF[Config::lang], LEVEL_INFO, 500);
-                }
-            } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
-                menu_level = 0;
-                menu_curopt = 1;
-                menu_saverect = true;
-                string nmi_menu = MENU_NMI_TITLE[Config::lang];
-                nmi_menu += MENU_NMI_SEL[Config::lang];
-                uint8_t nmi_cols = 20;
-                uint16_t nmi_w = (nmi_cols * OSD_FONT_W) + 2;
-                uint16_t nmi_h = (rowCount(nmi_menu) * OSD_FONT_H) + 2;
-                uint8_t opt = simpleMenuRun(nmi_menu,
-                    scrAlignCenterX(nmi_w), scrAlignCenterY(nmi_h),
-                    rowCount(nmi_menu), nmi_cols);
-                if (opt == 1)
-                    Z80::triggerNMI();
-                else if (opt == 2)
-                    Z80::triggerNMIDOS();
-            } else {
-                Z80::triggerNMI();
-            }
+            nmiAction();
         }
         else
         if (hkIdx == Config::HK_RESET_TO) { // Reset to...
@@ -5511,21 +5517,31 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 // Profi submenu: ROM selection + XT keyboard + OSD palette
                                 string profi_sub =
                                     string(Config::lang ? "Profi\n" : "Profi\n") +
-                                    "1024K\n" +
+                                    "1024K (Original)\n" +
+                                    "1024K (Karabas)\n" +
+                                    "1024K (Karabas+PQDOS)\n" +
+                                    "1024K (Karabas+FlashTool)\n" +
+                                    "1024K (Karabas+FDImage)\n" +
                                     string("XT keyboard [") +
                                     (Config::profi_ext_keys ? "ON" : "OFF") + "]\n" +
                                     string("OSD palette [") +
                                     (Config::profi_ds80_std_palette_osd ? "STD" : "DS80") + "]\n";
                                 uint8_t opt_p = menuRun(profi_sub);
-                                if (opt_p == 1) {
-                                    // ROM selected
+                                if (opt_p >= 1 && opt_p <= 5) {
+                                    // ROM selected — mirrors the real Karabas-Pro ROMSET
+                                    // slots: 1=stock "Original", 2="Karabas" (ROMain,
+                                    // ROMSET 0), 3=PQDOS BIOS (ROMSET 1), 4=Flash Tool
+                                    // (ROMSET 2), 5=FDImage (ROMSET 3)
+                                    static const char* profi_romsets[5] = {
+                                        "Profi", "ProfiKarabas", "ProfiPQ",
+                                        "ProfiKarabasFT", "ProfiKarabasFDI" };
                                     arch = "Profi";
-                                    romset = "Profi";
+                                    romset = profi_romsets[opt_p - 1];
                                     opt2 = 1; // signal machine switch
                                     menu_curopt = 1;
                                     menu_saverect = false;
                                     break;
-                                } else if (opt_p == 2) {
+                                } else if (opt_p == 6) {
                                     // XT keyboard toggle (Yes/No submenu) — level 3
                                     // Remind the user it can also be toggled live via the hotkey.
                                     osdCenteredMsg(Config::lang
@@ -5552,12 +5568,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             menu_curopt = opt3;
                                             menu_saverect = false;
                                         } else {
-                                            menu_curopt = 2;
+                                            menu_curopt = 6;
                                             menu_level = 2;
                                             break; // back to Profi submenu
                                         }
                                     }
-                                } else if (opt_p == 3) {
+                                } else if (opt_p == 7) {
                                     // OSD palette toggle (STD / DS80) submenu — level 3
                                     menu_level = 3;
                                     menu_curopt = 1;
@@ -5589,7 +5605,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             menu_curopt = opt3;
                                             menu_saverect = false;
                                         } else {
-                                            menu_curopt = 3;
+                                            menu_curopt = 7;
                                             menu_level = 2;
                                             break; // back to Profi submenu
                                         }
@@ -7608,8 +7624,26 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 auto descs = Config::lang ? hkDescES : hkDescEN;
                 const int maxCols = osdMaxCols();
                 const int descCol = 16;
+                // Profi/Karabas-Pro "Menu"-key (Win/GUI) combos — not configurable
+                // hotkeys (handled in ESPectrum::processKeyboard), so they're
+                // listed here as a static section when a Profi machine is active.
+                static const char* const profiKeys[] = {
+                    "Menu+F1-F4", "Menu+F5", "Menu+F7", "Menu+F11",
+                    "Menu+F12", "Menu+Tab", "Menu+J", "Menu+Esc",
+                };
+                static const char* const profiDescEN[] = {
+                    "ROMSET 0-3 select", "Turbo FDC", "AY stereo mode", "CPU speed",
+                    "NMI", "Swap drives A/B", "Joystick type", "Main menu",
+                };
+                static const char* const profiDescES[] = {
+                    "Sel. ROMSET 0-3", "Turbo FDC", "Estereo AY", "Velocidad CPU",
+                    "NMI", "Discos A/B", "Tipo joystick", "Menu principal",
+                };
+                const int profiN = (int)(sizeof(profiKeys) / sizeof(profiKeys[0]));
+                const bool showProfi = Z80Ops::isProfi;
+                // -3 = Profi section header, -(4+p) = Profi line p,
                 // -2 = PrtScr, -1 = ScrollLk, 0..HK_COUNT-1 = hotkey index
-                int8_t hkOrder[Config::HK_COUNT + 2];
+                int8_t hkOrder[Config::HK_COUNT + 2 + 16];
                 int nlines = 0;
                 for (int i = 0; i < Config::HK_COUNT; i++) {
                     if (Config::hotkeys[i].vk == (uint16_t)fabgl::VK_NONE) continue;
@@ -7617,12 +7651,29 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 }
                 hkOrder[nlines++] = -2; // PrtScr
                 hkOrder[nlines++] = -1; // ScrollLk
+                if (showProfi) {
+                    hkOrder[nlines++] = -3; // section header
+                    for (int p = 0; p < profiN; p++) hkOrder[nlines++] = (int8_t)(-(4 + p));
+                }
 
                 // Format one help line into buf (42 bytes max)
                 auto fmtLine = [&](int idx, char *buf) {
                     const char *key, *desc;
                     char keybuf[16];
-                    if (idx == -2) { key = "PrtScr"; desc = Config::lang ? "Captura BMP" : "BMP capture"; }
+                    if (idx == -3) { // Profi/Karabas section header (no key column)
+                        snprintf(buf, 42, " Karabas (Menu=Win):");
+                        int len = strlen(buf);
+                        if (len < maxCols) { memset(buf + len, ' ', maxCols - len); buf[maxCols] = 0; }
+                        else buf[maxCols] = 0;
+                        return;
+                    }
+                    if (idx <= -4) { int p = -4 - idx; key = profiKeys[p]; desc = Config::lang ? profiDescES[p] : profiDescEN[p]; }
+                    // On Profi plain PrtScr toggles the XT keyboard; BMP capture
+                    // moves to Alt+PrtScr (see ESPectrum::processKeyboard).
+                    else if (idx == -2) {
+                        if (showProfi) { key = "PrtScr"; desc = Config::lang ? "Teclado XT" : "XT keyboard"; }
+                        else { key = "PrtScr"; desc = Config::lang ? "Captura BMP" : "BMP capture"; }
+                    }
                     else if (idx == -1) { key = "ScrollLk"; desc = Config::lang ? "Cursor=Joy" : "Cursor=Joy"; }
                     else {
                         string b = hkBindingText(idx);
@@ -8884,6 +8935,11 @@ static void saveDumpToFile(uint16_t addr_from, uint16_t addr_to) {
 
     snprintf(line, sizeof(line), "TR-DOS: %s  TR-DOS BIOS: %d\n",
         ESPectrum::trdos ? "on" : "off", Config::trdosBios);
+    f_write(f, line, strlen(line), &bw);
+
+    snprintf(line, sizeof(line), "portDFFD: %02X  (CPM=%d ROM14=%d DS80=%d NOROM=%d)\n",
+        Ports::portDFFD, (Ports::portDFFD & 0x20) != 0, MemESP::romLatch,
+        (Ports::portDFFD & 0x80) != 0, (Ports::portDFFD & 0x10) != 0);
     f_write(f, line, strlen(line), &bw);
 
     // Registers

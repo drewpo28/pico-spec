@@ -253,6 +253,11 @@ public:
   static void profiPaletteReset();
   // Update palette[index] from a Profi RRRGGGBB color byte; sets dirty flag.
   static void profiPaletteWrite(uint8_t index, uint8_t profi_color);
+  // Apply a pending live-palette refresh to the scanout driver. Call ONLY while
+  // the display is in vertical blanking (right after the v_sync wait): the
+  // conv_color rewrite races active scanout otherwise — visible as a stable
+  // palette tear line during guest palette animation (Karabas-Pro tests).
+  static void profiPaletteApplyPending();
 #endif
 
   static bool isProfiDS80();

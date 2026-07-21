@@ -661,6 +661,11 @@ IRAM_ATTR void Z80Ops::addressOnBus(uint16_t address, int32_t wstates) {
 
 /* Callback to know when the INT signal is active */
 IRAM_ATTR bool Z80Ops::isActiveINT(void) {
+    // Karabas serial-mouse hardware INT (RST20H): level-asserted while an RX
+    // byte waits with INT_EN set in CP/M mode. Sampled only in the checked
+    // execute() loops (like the frame INT), so worst-case latency is one
+    // exec_nocheck stretch — fine for a level line the device keeps high.
+    if (Ports::serialMouseIntAsserted()) return true;
     // Adding latetiming shifts the check 1T later for Late mode.
     // At end of frame (tstates=statesInFrame-1), tmp wraps to 0, firing
     // the Late INT via straddle — this is the correct hardware behaviour.

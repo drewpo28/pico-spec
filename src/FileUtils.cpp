@@ -88,7 +88,7 @@ DISK_FTYPE FileUtils::fileTypes[7] = {
     {".tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.zip,.ZIP",2,2,0,""},
     {".trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.td0,.TD0,.mbd,.MBD,.pro,.PRO,.zip,.ZIP",2,2,0,""},
     {".rom,.ROM,.bin,.BIN,.zip,.ZIP",2,2,0,""},
-    {".mmc,.MMC,.hdf,.HDF,.hdd,.HDD,.vhd,.VHD,.iso,.ISO,.zip,.ZIP",2,2,0,""},
+    {".mmc,.MMC,.hdf,.HDF,.hdd,.HDD,.vhd,.VHD,.img,.IMG,.iso,.ISO,.zip,.ZIP",2,2,0,""},
     {".sna,.SNA,.z80,.Z80,.p,.P,.tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.td0,.TD0,.mbd,.MBD,.pro,.PRO,.mmc,.MMC,.hdf,.HDF,.rom,.ROM,.bin,.BIN,.dls,.DLS,.zip,.ZIP",2,2,0,""},
     {".dls,.DLS",2,2,0,""}   // DISK_DLSFILE (GM.DLS soundbank conversion)
 #endif

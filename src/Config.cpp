@@ -342,14 +342,57 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
     } else if (arch == "Profi") {
         if (newRomSet=="") romSet = "Profi"; else romSet = newRomSet;
         if (newRomSet=="") romSetProfi = "Profi"; else romSetProfi = newRomSet;
-        // bank0 (service) + bank1 (Profi TR-DOS) stay raw; bank2/bank3 are overlays
-        // over the Sinclair 128K halves (rom[0]/rom[1]). See RomOverlay.h.
-        MemESP::rom[0].assign_rom(gb_rom_profi_bank0);
-        MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
-        MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
-        MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2);
-        MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
-        MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_profi_bank3);
+        // Five romsets mirroring the real Karabas-Pro ROMSET slots. Every branch
+        // sets the overlay for EVERY base it assigns — including nullptr for
+        // "no overlay" — because registerOverlay() state persists per-base
+        // across romset switches (switching PQDOS→Original used to leave the
+        // PQ bank1 overlay live on the stock bank1).
+        if (romSetProfi == "ProfiPQ") {
+            // ROMSET 1: PQDOS BIOS 0.41h1 (bank0 raw, ~94% different from stock);
+            // bank1/2/3 overlay over the same bases as stock (tools/rom_pack.py).
+            MemESP::rom[0].assign_rom(gb_rom_profi_pq_bank0);
+            MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
+            MemESP::registerOverlay(gb_rom_profi_bank1, gb_overlay_profi_bank1_pq);
+            MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2_pq);
+            MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_profi_bank3_pq);
+        } else if (romSetProfi == "ProfiKarabas") {
+            // ROMSET 0 (ROMain_ramdisk_A.rom, byte-faithful): ROMain bank0
+            // (graphical boot menu) + bank1 with the ROMain ramdisk-TR-DOS
+            // overlay; the image's bank2 == stock Profi bank2, bank3 == plain
+            // Sinclair 128K second half (no overlay).
+            MemESP::rom[0].assign_rom(gb_rom_profi_bank0_karabas);
+            MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
+            MemESP::registerOverlay(gb_rom_profi_bank1, gb_overlay_profi_bank1_romain);
+            MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2);
+            MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, nullptr);
+        } else if (romSetProfi == "ProfiKarabasFT") {
+            // ROMSET 2: Flash Tool v2.7 by Doctor Max. bank1 is empty (0xFF) in
+            // the real image; bank0/2/3 are unique raw dumps (profi_banks_dmax.c).
+            MemESP::rom[0].assign_rom(gb_rom_profi_bank0_flashtool);
+            MemESP::rom[1].assign_rom(gb_rom_profi_bank_ff);
+            MemESP::rom[2].assign_rom(gb_rom_profi_bank2_flashtool);
+            MemESP::rom[3].assign_rom(gb_rom_profi_bank3_flashtool);
+        } else if (romSetProfi == "ProfiKarabasFDI") {
+            // ROMSET 3: FDImage v0.87 by Doctor Max. Same layout as Flash Tool.
+            MemESP::rom[0].assign_rom(gb_rom_profi_bank0_fdimage);
+            MemESP::rom[1].assign_rom(gb_rom_profi_bank_ff);
+            MemESP::rom[2].assign_rom(gb_rom_profi_bank2_fdimage);
+            MemESP::rom[3].assign_rom(gb_rom_profi_bank3_fdimage);
+        } else {
+            // "Original": bank0 (service) + bank1 (Profi TR-DOS) raw; bank2/bank3
+            // overlay the Sinclair 128K halves (rom[0]/rom[1]). See RomOverlay.h.
+            MemESP::rom[0].assign_rom(gb_rom_profi_bank0);
+            MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
+            MemESP::registerOverlay(gb_rom_profi_bank1, nullptr);
+            MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2);
+            MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_profi_bank3);
+        }
 #endif
     } else { // Pentagon by default
         if (newRomSet=="") romSet = "128Kp"; else romSet = newRomSet;

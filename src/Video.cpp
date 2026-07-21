@@ -41,6 +41,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "FileUtils.h"
 #include "VidPrecalc.h"
 #include "CPU.h"
+#include "ESPectrum.h"
 #include "MemESP.h"
 #include "Config.h"
 #include "OSDMain.h"
@@ -339,6 +340,16 @@ void VIDEO::clearDS80Padding() {
 void VIDEO::profiPaletteReset() {
     for (int i = 0; i < 16; i++) profi_palette_live[i] = profi_default_palette16[i];
     profi_palette_dirty = true; // refresh on next EndFrame if DS80 active
+}
+
+void VIDEO::profiPaletteApplyPending() {
+#if !PICO_RP2040
+    if (profi_palette_dirty && profi_ds80_active
+        && !profi_ds80_activate_pending && !profi_ds80_deactivate_pending) {
+        profi_ds80_driver_set(true, profi_palette_live, &profi_pair_lookup[0][0]);
+        profi_palette_dirty = false;
+    }
+#endif
 }
 
 void VIDEO::profiPaletteWrite(uint8_t index, uint8_t profi_color) {
@@ -3233,15 +3244,18 @@ IRAM_ATTR void VIDEO::EndFrame() {
         }
     }
 
-    // Profi palette refresh — immediately after mode-switch handling, while
-    // still guaranteed to be in blanking window (ESPectrum_vsync fires at v_active).
-    {
-        if (profi_palette_dirty && profi_ds80_active
-            && !profi_ds80_activate_pending && !profi_ds80_deactivate_pending) {
-            profi_ds80_driver_set(true, profi_palette_live, &profi_pair_lookup[0][0]);
-            profi_palette_dirty = false;
-        }
-    }
+    // Profi palette refresh. EndFrame is NOT in the display blanking window:
+    // ESPectrum_vsync (fired at scanout line v_active) only STARTS the frame's
+    // emulation, and EndFrame runs when the Z80 frame finishes — typically
+    // mid-scanout of the next refresh. Rewriting conv_color here while the DMA
+    // is on-screen splits the picture into old/new palette halves (stable tear
+    // line during guest palette fades — Karabas-Pro palette test). With v-sync
+    // pacing ON the refresh is applied by ESPectrum::loop right after the
+    // v_sync wait (true blanking start) via profiPaletteApplyPending(); apply
+    // here only when that hook won't run (v-sync pacing off, or maxSpeed which
+    // skips the wait) — unsynced anyway, a tear is unavoidable then.
+    if (!Config::v_sync_enabled || ESPectrum::maxSpeed)
+        profiPaletteApplyPending();
 
     // DS80 top/bottom border bands (720×576) are rendered per-T-state by the
     // border state machine (TopBorder/BottomBorder with DS80 geometry) — no

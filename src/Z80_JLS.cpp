@@ -985,11 +985,28 @@ IRAM_ATTR void Z80::check_trdos() {
                 // program legitimately running code at 0x3Dxx (Kings Valley CP/M
                 // keeps a routine + stack there) must NOT trigger the automap —
                 // it used to swap page0 for TR-DOS ROM mid-game and crash it.
+                // Karabas UNLOCK_128 (#008B bit7): the FPGA trap fires on
+                // "rom14=1 OR unlock_128" — with the bit set, TR-DOS is also
+                // enterable from the 128K ROM (our bank 2, rom14=0).
                 if ((Z80Ops::is48 && MemESP::romInUse == 0) ||
                     (Config::arch == "Profi" && MemESP::romInUse == 3 && !MemESP::newSRAM && !MemESP::page0ram) ||
+                    (Config::arch == "Profi" && MemESP::romInUse == 2 && (Ports::port008B & 0x80) && !MemESP::newSRAM && !MemESP::page0ram) ||
                     (!Z80Ops::is48 && Config::arch != "Profi" && MemESP::romInUse == 1 && !MemESP::newSRAM)) {
                     // Profi uses its own TR-DOS in ROM bank 1; others use the external TR-DOS ROM (bank 4)
                     uint8_t dosBank = (Config::arch == "Profi") ? 1 : 4;
+#if !PICO_RP2040 && FDD_PORT_TRACE
+                    // trdos-transition trace (PQDOS RST8 chain: FE00 stub →
+                    // CALL 3D38 automap → bank1 → JP 5C92 exit — chasing where
+                    // the BIOS-path boot diverges, 2026-07-09).
+                    if (Z80Ops::isProfi) {
+                        static int dosMapCnt = 0;
+                        if (dosMapCnt < 120)
+                            Debug::log("[DOS MAP] pc=%04X romU %d->%d p0ram=%u rom14=%u #%d",
+                                       REG_PC, (int)MemESP::romInUse, dosBank,
+                                       (unsigned)MemESP::page0ram, (unsigned)MemESP::romLatch,
+                                       ++dosMapCnt);
+                    }
+#endif
                     MemESP::romInUse = dosBank;
                     MemESP::ramCurrent[0] = MemESP::rom[dosBank].direct();
                     ESPectrum::trdos = true;
@@ -1005,9 +1022,24 @@ IRAM_ATTR void Z80::check_trdos() {
             // SYS ROM (bank0) SYSEN clears when execution reaches RAM — selects 128K/SOS ROM.
             bool doExit = REG_PCh >= 0x40;
             if (Config::arch == "Profi" && MemESP::romInUse != 1 && MemESP::romInUse != 0) doExit = false;
+            // Karabas ONROM (#008B bit6): the FPGA's forced-DOS level outranks
+            // the PC>=0x4000 exit — hold trdos until the guest clears the bit.
+            if (Config::arch == "Profi" && (Ports::port008B & 0x40)) doExit = false;
 
             if (doExit) {
 
+#if !PICO_RP2040 && FDD_PORT_TRACE
+                // See matching [DOS MAP] trace above.
+                if (Z80Ops::isProfi) {
+                    static int dosExitCnt = 0;
+                    if (dosExitCnt < 120)
+                        Debug::log("[DOS EXIT] pc=%04X romU %d->%d p0ram=%u rom14=%u #%d",
+                                   REG_PC, (int)MemESP::romInUse,
+                                   (int)(MemESP::romLatch ? 3 : 2),
+                                   (unsigned)MemESP::page0ram, (unsigned)MemESP::romLatch,
+                                   ++dosExitCnt);
+                }
+#endif
                 if (Z80Ops::is48)
                     MemESP::romInUse = 0;
                 else if (Config::arch == "Profi")
@@ -1086,13 +1118,18 @@ void Z80::interrupt(void) {
     push(REG_PC); // el push añadirá 6 t-estados (+contended si toca)
     if (modeINT == IntMode::IM2) {
 
-        REG_PC = Z80Ops::peek16((regI << 8) | 0xff); // +6 t-estados
+        // INT-ack bus byte: the Karabas serial-mouse hw_int drives 0xE7
+        // (RST20H) while its request is asserted; the ULA default is 0xFF.
+        uint8_t busByte = Ports::serialMouseIntAsserted() ? 0xE7 : 0xFF;
+        REG_PC = Z80Ops::peek16((regI << 8) | busByte); // +6 t-estados
 
         check_trdos();
         // check_trdos_unpage();
 
     } else {
-        REG_PC = 0x0038;
+        // IM0 executes the bus byte: RST20H → 0x0020 for the serial mouse.
+        REG_PC = (modeINT == IntMode::IM0 && Ports::serialMouseIntAsserted())
+                     ? 0x0020 : 0x0038;
     }
     REG_WZ = REG_PC;
 
