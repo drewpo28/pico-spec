@@ -7624,8 +7624,26 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 auto descs = Config::lang ? hkDescES : hkDescEN;
                 const int maxCols = osdMaxCols();
                 const int descCol = 16;
+                // Profi/Karabas-Pro "Menu"-key (Win/GUI) combos — not configurable
+                // hotkeys (handled in ESPectrum::processKeyboard), so they're
+                // listed here as a static section when a Profi machine is active.
+                static const char* const profiKeys[] = {
+                    "Menu+F1-F4", "Menu+F5", "Menu+F7", "Menu+F11",
+                    "Menu+F12", "Menu+Tab", "Menu+J", "Menu+Esc",
+                };
+                static const char* const profiDescEN[] = {
+                    "ROMSET 0-3 select", "Turbo FDC", "AY stereo mode", "CPU speed",
+                    "NMI", "Swap drives A/B", "Joystick type", "Main menu",
+                };
+                static const char* const profiDescES[] = {
+                    "Sel. ROMSET 0-3", "Turbo FDC", "Estereo AY", "Velocidad CPU",
+                    "NMI", "Discos A/B", "Tipo joystick", "Menu principal",
+                };
+                const int profiN = (int)(sizeof(profiKeys) / sizeof(profiKeys[0]));
+                const bool showProfi = Z80Ops::isProfi;
+                // -3 = Profi section header, -(4+p) = Profi line p,
                 // -2 = PrtScr, -1 = ScrollLk, 0..HK_COUNT-1 = hotkey index
-                int8_t hkOrder[Config::HK_COUNT + 2];
+                int8_t hkOrder[Config::HK_COUNT + 2 + 16];
                 int nlines = 0;
                 for (int i = 0; i < Config::HK_COUNT; i++) {
                     if (Config::hotkeys[i].vk == (uint16_t)fabgl::VK_NONE) continue;
@@ -7633,12 +7651,29 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 }
                 hkOrder[nlines++] = -2; // PrtScr
                 hkOrder[nlines++] = -1; // ScrollLk
+                if (showProfi) {
+                    hkOrder[nlines++] = -3; // section header
+                    for (int p = 0; p < profiN; p++) hkOrder[nlines++] = (int8_t)(-(4 + p));
+                }
 
                 // Format one help line into buf (42 bytes max)
                 auto fmtLine = [&](int idx, char *buf) {
                     const char *key, *desc;
                     char keybuf[16];
-                    if (idx == -2) { key = "PrtScr"; desc = Config::lang ? "Captura BMP" : "BMP capture"; }
+                    if (idx == -3) { // Profi/Karabas section header (no key column)
+                        snprintf(buf, 42, " Karabas (Menu=Win):");
+                        int len = strlen(buf);
+                        if (len < maxCols) { memset(buf + len, ' ', maxCols - len); buf[maxCols] = 0; }
+                        else buf[maxCols] = 0;
+                        return;
+                    }
+                    if (idx <= -4) { int p = -4 - idx; key = profiKeys[p]; desc = Config::lang ? profiDescES[p] : profiDescEN[p]; }
+                    // On Profi plain PrtScr toggles the XT keyboard; BMP capture
+                    // moves to Alt+PrtScr (see ESPectrum::processKeyboard).
+                    else if (idx == -2) {
+                        if (showProfi) { key = "PrtScr"; desc = Config::lang ? "Teclado XT" : "XT keyboard"; }
+                        else { key = "PrtScr"; desc = Config::lang ? "Captura BMP" : "BMP capture"; }
+                    }
                     else if (idx == -1) { key = "ScrollLk"; desc = Config::lang ? "Cursor=Joy" : "Cursor=Joy"; }
                     else {
                         string b = hkBindingText(idx);
