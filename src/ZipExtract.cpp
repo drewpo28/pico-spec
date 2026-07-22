@@ -244,19 +244,32 @@ string ZipExtract::extractByIndex(const string& zipPath, int fileIndex) {
 
 extern "C" size_t getLargestAllocatable(void);  // OSDMain.cpp — malloc panics on OOM
 
+// MSPLIM must be OFF (0) whenever SP crosses between stacks: the caller may
+// itself be on a heap alt-stack BELOW this one (archive download → extract runs
+// on net_call_on_stack's stack), and raising MSPLIM above a live SP means any
+// IRQ in that window pushes its frame below the limit → STKOF hard fault
+// (hw-traced 2026-07-22: SIGBUS with SP==MSPLIM==alt-stack bottom, PC inside
+// this function). IRQs during the limit-off windows are fine — SP always
+// points into a valid stack there.
 __attribute__((naked, noinline))
 static void zipCallOnStack(void* new_top, void (*fn)(void*), void* arg, void* new_bottom) {
     __asm volatile(
         "mrs  r12, msplim       \n" // r12 = old MSPLIM
-        "msr  msplim, r3        \n" // guard the alt stack (SP still above it)
-        "mov  r3, sp            \n" // r3 = old SP
+        "push {r4}              \n" // scratch reg (old stack; SP ≥ old MSPLIM here)
+        "movs r4, #0            \n"
+        "msr  msplim, r4        \n" // limit off while SP crosses stacks
+        "mov  r4, sp            \n" // r4 = old SP
         "mov  sp, r0            \n" // SP = new_top
-        "push {r2, r3, r12, lr} \n" // 16 bytes → keeps 8-byte alignment
+        "msr  msplim, r3        \n" // SP is on the alt stack now — arm its guard
+        "push {r2, r4, r12, lr} \n" // 16 bytes → keeps 8-byte alignment
         "mov  r0, r2            \n" // r0 = arg
         "blx  r1                \n" // fn(arg)
-        "pop  {r2, r3, r12, lr} \n"
-        "mov  sp, r3            \n" // restore SP first...
-        "msr  msplim, r12       \n" // ...then the old limit
+        "pop  {r2, r4, r12, lr} \n"
+        "movs r1, #0            \n"
+        "msr  msplim, r1        \n" // limit off for the return crossing
+        "mov  sp, r4            \n" // restore old SP
+        "msr  msplim, r12       \n" // restore old limit (≤ old SP by construction)
+        "pop  {r4}              \n"
         "bx   lr                \n"
     );
 }
