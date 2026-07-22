@@ -5804,6 +5804,19 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 // NOTE: GM.DLS MIDI is NOT auto-disabled on Profi entry anymore.
                                 // On tight butter-less boards the featureBudgetGate popup offers
                                 // MIDI as a manual free candidate instead (user decides).
+                                // Karabas-Pro romsets (everything but the stock "Profi"
+                                // Original) boot from SD through the real board's
+                                // Z-Controller (ROMain "Loading boot from SD" = FATALL
+                                // via ZC) — auto-enable it on entry so SD boot works
+                                // out of the box. esxDOS/MB-02+ are already forced off
+                                // above; skipped silently if the budget gate declines.
+                                if (arch == "Profi" && romset != "Profi" &&
+                                    !Config::zcontroller && FileUtils::fsMount &&
+                                    OSD::featureBudgetGate(Subsystems::FEAT_ZCONTROLLER)) {
+                                    Config::zcontroller = true;
+                                    DivMMC::zc_init();
+                                    OSD::osdCenteredMsg("Z-Controller enabled", LEVEL_INFO, 1500);
+                                }
 #endif
                                 Config::save();
 #if !PICO_RP2040
