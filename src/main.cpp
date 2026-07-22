@@ -1514,7 +1514,7 @@ int main() {
                    (cr & POWMAN_CHIP_RESET_HAD_BOR_BITS)                  ? " BOR"    : "",
                    (cr & POWMAN_CHIP_RESET_HAD_RUN_LOW_BITS)              ? " RUN"    : "",
                    (cr & (POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_SWCORE_BITS |
-                          POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_RSM_BITS)) ? " WDG"    : "",
+                          POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_PSM_BITS)) ? " WDG"    : "",
                    (cr & POWMAN_CHIP_RESET_HAD_GLITCH_DETECT_BITS)        ? " GLITCH" : "",
                    (cr & POWMAN_CHIP_RESET_HAD_DP_RESET_REQ_BITS)         ? " DBG"    : "");
     }
