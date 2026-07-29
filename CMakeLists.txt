@@ -26,7 +26,7 @@ option(PICO_PC "RP2040-PICO-PC" OFF)
 option(PICO_DV "RP2350-PICO-DV" OFF)
 option(ZERO "RP2040-PiZero" OFF)
 option(ZERO2 "RP2350-PiZero" OFF)
-option(ZIFI_NET_CLIENT "Enable FTP/SFTP/SSH client over ZiFi (RP2350 only, uses mbedTLS)" ON)
+option(ZIFI_NET_CLIENT "Enable FTP/SFTP/SSH client over ZiFi (RP2350 only, uses mbedTLS)" OFF)
 
 # Per-subsystem port-access tracing toggles (debugging). OFF by default — when
 # ON, gated `#if XXX_TRACE` Debug::log() calls in the sources become active.
