@@ -581,7 +581,12 @@ void ESPectrum::bootKeyboard() {
 extern int ram_pages, butter_pages, psram_pages, swap_pages;
 
 static void assign_ram(int i) {
-  static size_t butter_remains = butter_psram_size();
+  // Not the raw chip size: Buffer::pageBudget* holds back what GS, DivMMC and the
+  // Buffer arena need above the pages. Without that a large Murmuzavr page count ate
+  // the whole chip and everything that belongs in PSRAM landed on the heap instead
+  // (see the note in Buffer.h). Pages past the budget go to SD swap.
+  static size_t butter_remains = Buffer::pageBudgetButter();
+  static size_t spi_budget     = Buffer::pageBudgetSpi();
   static size_t butter_idx = 0;
   // Profi DS80 hires color attr pages (56/58) + CP/M's hot working page (61):
   // on SPI-PSRAM boards the Profi BIOS selects bankLatch=56..63 (portDFFD[2:0]=7)
@@ -660,7 +665,7 @@ static void assign_ram(int i) {
           (uint8_t *)PSRAM_DATA + (butter_idx++) * MEM_PG_SZ, i, false);
       butter_remains -= MEM_PG_SZ;
       ++butter_pages;
-    } else if (psram_size() >= (MEM_PG_SZ * (i + 1))) {
+    } else if (spi_budget >= ((size_t)MEM_PG_SZ * (i + 1))) {
       MemESP::ram[i].assign_vram(i, mem_type_t::PSRAM_SPI);
       ++psram_pages;
     } else {
@@ -756,6 +761,25 @@ void ESPectrum::setup() {
           Config::romSet = Config::romSetPent;
       }
     }
+  }
+
+  // The live page count is derived from the persisted pick HERE and nowhere else: the arch
+  // for this boot is final and nothing has sized a page strip yet. Murmuzavr extended RAM
+  // is Pentagon hardware, and it is expensive — 2048 pages cost ~32 KB of SRAM bookkeeping
+  // (descriptors + ram[]) plus their share of the PSRAM page budget. The #AFF7 plane latch
+  // itself is not arch-gated (Ports.cpp), so without this clamp a "Profi + Murmuzavr
+  // 32 MB" config OOM-panicked in setup(): Profi spends another ~80 KB of its own (incl.
+  // the 16 KB DS80 colour SRAM), so the WD1793 track buffer no longer fit — with no way to
+  // reach the menu and undo it. Config::mem_pg_cnt keeps the pick, so coming back to a
+  // Pentagon does not need it re-entered.
+  MEM_PG_CNT = Config::mem_pg_cnt;
+  if (MEM_PG_CNT > 64 && !(Config::arch == "Pentagon" || Config::arch == "P512" ||
+                           Config::arch == "P1024")) {
+    Debug::log("setup: Murmuzavr %u pages dropped — %s is not Pentagon",
+               (unsigned)MEM_PG_CNT, Config::arch.c_str());
+    Debug::log2SD("setup: MEM_PG_CNT %u -> 64 (arch=%s, Murmuzavr is Pentagon-only)",
+                  (unsigned)MEM_PG_CNT, Config::arch.c_str());
+    MEM_PG_CNT = 64;
   }
 
   //=======================================================================================

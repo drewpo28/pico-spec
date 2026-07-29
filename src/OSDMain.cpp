@@ -401,6 +401,17 @@ bool OSD::featureBudgetGate(int featureId) {
 
     if (r == BUDGET_ALLOW) return true;
 
+    // Enough total SRAM, just not in one block: nothing to give up, only a reboot to
+    // take (setup() allocates from an unfragmented heap). Persist the enable and go —
+    // declining leaves the feature off, exactly like Esc out of the free-list.
+    if (r == BUDGET_NEEDS_REBOOT) {
+        const string dlg = (string)featureName(f) + ": " + OSD_DLG_APPLYREBOOT[Config::lang];
+        if (OSD::msgDialog("", dlg.c_str()) != DLG_YES) return false;
+        featureSetEnabled(f, true);
+        Config::save();
+        esp_hard_reset();   // never returns
+    }
+
     if (r == BUDGET_DENY || nCand == 0) {
         osdCenteredMsg((string)featureName(f) + ":\n" + MSG_BUDGET_DENY[Config::lang],
                        LEVEL_WARN, 4000);
@@ -653,15 +664,23 @@ void net_call_on_stack(void* new_top, void (*fn)(void*), void* arg) {
 // boards palloc routes the TLS set to XIP PSRAM instead, so no lease is needed.
 struct NetArenaLease {
     bool held = false;
+    bool released = false;
     NetArenaLease() {
         void* base; size_t size;
         if (VIDEO::gigascreenLendRegion(base, size)) {
             if (Buffer::lendArena(base, size)) held = true;
             else VIDEO::gigascreenReclaimRegion();   // lend rejected → undo the detach
+        } else {
+            // Nothing lendable can still mean there IS a prev-FB — just a chunked one,
+            // which is not one region. Then it is released outright for the session
+            // (VIDEO::gigascreenReleaseForNet) so the heap, not the arena, gets those
+            // ~38 KB. No-op in every other case.
+            released = VIDEO::gigascreenReleaseForNet();
         }
     }
     ~NetArenaLease() {
         if (held) { Buffer::reclaimArena(); VIDEO::gigascreenReclaimRegion(); }
+        if (released) VIDEO::gigascreenRestoreAfterNet();
     }
 };
 
@@ -944,10 +963,15 @@ static bool f5Locations() {
 // Readers are gated by `li < ftpd_log_count`, and ftpd_log_count only advances
 // after a successful alloc here, so they never touch a null buffer.
 static char (*ftpd_log)[FTPD_LOG_COLS] = nullptr;
+extern "C" size_t getLargestAllocatable(void);   // defined at the bottom of this file
 static int  ftpd_log_count = 0;  // total lines pushed (monotonic)
 static bool ftpd_log_dirty = true;
 static void ftpdLogLine(const char* s) {
     if (!ftpd_log) {
+        // Gate, don't null-check: pico_malloc wraps calloc too and PANICs on OOM
+        // instead of returning NULL, so "drop the line rather than crash" only
+        // works if we never make an ask that can fail (see Buffer::palloc).
+        if (getLargestAllocatable() < FTPD_LOG_LINES * FTPD_LOG_COLS + 8192) return;
         ftpd_log = (char(*)[FTPD_LOG_COLS])calloc(FTPD_LOG_LINES, FTPD_LOG_COLS);
         if (!ftpd_log) return;   // OOM — drop the line rather than crash
     }
@@ -4027,9 +4051,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #ifdef USE_GS
                     // GS works on butter XIP (fast) or, as a fallback, on plain SPI PSRAM
                     // (slow path, ~30× slower — best-effort, may glitch on MOD playback).
-                    // For SPI fallback, need room for MemESP swap pool + 2 MB GS RAM.
-                    bool gs_avail = (butter_psram_size() > 0)
-                                    || (psram_size() >= (size_t)MEM_PG_CNT * MEM_PG_SZ + (2u << 20));
+                    // Buffer owns the test: the SPI fallback needs GS's region + the
+                    // minimum arena + a usable swap pool, and a large Murmuzavr page
+                    // count must NOT count against it (those pages yield to GS via
+                    // Buffer::pageBudgetSpi) — measuring MEM_PG_CNT * MEM_PG_SZ against
+                    // the chip hid the whole GS row at 8 MB+ of extended RAM.
+                    bool gs_avail = Buffer::gsPsramAvailable();
                     if (gs_avail) {
                         // Insert GS before "Audio Driver" (second-to-last item, before Volume Boost)
                         size_t last_nl = audio_menu.rfind('\n', audio_menu.size() - 2);
@@ -5427,12 +5454,27 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                             }
                         } else if (ext_ram && arch_num == 7) { // Murmuzavr
+                            // Murmuzavr extends Pentagon paging (#AFF7 planes over #7FFD),
+                            // and ESPectrum::setup drops the count at boot on anything else
+                            // — say so here instead of letting the pick vanish silently.
+                            if (!(Config::arch == "Pentagon" || Config::arch == "P512" ||
+                                  Config::arch == "P1024")) {
+                                osdCenteredMsg(Config::lang
+                                    ? " Murmuzavr: solo Pentagon 128/512/1024 "
+                                    : " Murmuzavr needs Pentagon 128/512/1024 ", LEVEL_WARN, 3000);
+                                menu_curopt = 7;
+                                menu_level = 2;
+                                break;
+                            }
                             menu_level = 2;
                             menu_curopt = 1;
                             menu_saverect = true;
                             while (1) {
                                 string opt_menu = (FileUtils::fsMount ? MENU_MURMUZAVR : MENU_MURMUZAVR_NONE)[Config::lang];
-                                uint32_t new_opt = MEM_PG_CNT, prev_opt = MEM_PG_CNT;
+                                // The PICK, not the live count: a machine that boots
+                                // clamped (Profi, see ESPectrum::setup) would otherwise
+                                // show "None" and re-select the same size forever.
+                                uint32_t new_opt = Config::mem_pg_cnt, prev_opt = Config::mem_pg_cnt;
                                 if (!FileUtils::fsMount) {
                                     opt_menu.replace(opt_menu.find("[N",0),2,"[*");
 #if PICO_RP2350
@@ -5491,6 +5533,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     else if (opt2 == 5) new_opt = 2048;
                                     if (prev_opt != new_opt) {
                                         if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
+                                            // The pick is what gets persisted; the live
+                                            // count is re-derived from it in setup()
+                                            // after the reboot below.
+                                            Config::mem_pg_cnt = (uint16_t)new_opt;
                                             MEM_PG_CNT = new_opt;
                                             Config::save();
                                             OSD::esp_hard_reset();

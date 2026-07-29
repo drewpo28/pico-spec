@@ -151,10 +151,33 @@ void td0LoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side);
 #define MALLOC_CAP_8BIT 0
 #endif
 
+// Index of the track's sector whose ID field matches the header the FDC is
+// currently positioned behind, or -1. Used to attribute a write to the right
+// sector (physical-damage emulation); mirrors the lookup in WriteEnd.
+// FDI (and with it the damage map) is RP2350-only — the struct fields do not
+// exist on RP2040, so the whole damage path is compiled out there.
+#if !PICO_RP2040
+IRAM_ATTR static int fdiSectorFromHeader(rvmWD1793 *wd) {
+  for (int n = 0; n < wd->fdiSectorCount && n < 32; n++) {
+    uint32_t idPos = wd->fdiSectorIdPos[n];
+    if (idPos + 5 < (uint32_t)wd->diskTrackLen &&
+        wd->diskTrackBuf[idPos + 1] == wd->header[1] &&
+        wd->diskTrackBuf[idPos + 2] == wd->header[2] &&
+        wd->diskTrackBuf[idPos + 3] == wd->header[3] &&
+        wd->diskTrackBuf[idPos + 4] == wd->header[4])
+      return n;
+  }
+  return -1;
+}
+#endif
+
 IRAM_ATTR static void _end(rvmWD1793 *wd) {
   wd->status &= ~kRVMWD177XStatusBusy;
   wd->state = kRVMWD177XNone;
   wd->stepState = kRVMWD177XStepIdle;
+#if !PICO_RP2040
+  wd->fdiWrGuard = -1;   // damage guard is per Write Sector command
+#endif
   wd->control &= ~(kRVMWD177XWriting|kRVMWD177XDRQ);
   wd->retry = 15;
   wd->control |= kRVMWD177XINTRQ; //TODO: ADD A INTERRUPT HANDLER
@@ -709,6 +732,22 @@ IRAM_ATTR void _do(rvmWD1793 *wd) {
       wd->control|=kRVMWD177XWriting;
       wd->a=(wd->command & 0x1)?0xf8:0xfb;
       // wd->crc=crc(wd->crc,wd->a);
+
+      // Arm the damage guard for this data field. The sector is identified by the
+      // ID field we are positioned behind, not by whatever find_marker matched
+      // last, so a healthy sector can never inherit a neighbour's damage. The
+      // count includes the data mark about to be laid down (guard = offset + 1),
+      // so offset 0 leaves the whole field untouched while the mark is refreshed.
+#if !PICO_RP2040
+      wd->fdiWrGuard = -1;
+      wd->fdiWrCount = 0;
+      if (wd->disk[wd->diskS] && wd->disk[wd->diskS]->IsFDIFile && wd->fdiOrigBadMask) {
+        int n = fdiSectorFromHeader(wd);
+        if (n >= 0 && (wd->fdiOrigBadMask & (1u << n)) &&
+            wd->fdiDmgOffSec[n] != FDI_DMG_UNKNOWN)
+          wd->fdiWrGuard = (int)wd->fdiDmgOffSec[n] + 1;
+      }
+#endif
       return;
     }
 
@@ -776,7 +815,12 @@ case kRVMWD177XWriteData: {
                   wd->diskTrackBuf[idPos + 3] == wd->header[3] &&
                   wd->diskTrackBuf[idPos + 4] == wd->header[4])
               {
-                  wd->fdiSectorFlags[n] &= ~1;
+                  // Physical damage never heals: the sector keeps its bad-CRC
+                  // flag, and the CRC stored in the MFM buffer stays inverted
+                  // (same convention fdiLoadTrack uses) so every later read of
+                  // the freshly written prefix still reports a CRC error.
+                  bool damaged = (wd->fdiOrigBadMask & (1u << n)) != 0;
+                  if (!damaged) wd->fdiSectorFlags[n] &= ~1;
                   int bufLen = wd->diskTrackLen;
                   for (int i = idPos + 7; i < (int)idPos + 87 && i < bufLen; i++) {
                       if (wd->diskTrackBuf[i] == 0xFB || wd->diskTrackBuf[i] == 0xF8) {
@@ -788,6 +832,7 @@ case kRVMWD177XWriteData: {
                               uint16_t crc = 0xFFFF;
                               for (int j = crcStart; j < crcPos; j++)
                                   crc = vgCrc(crc, wd->diskTrackBuf[j]);
+                              if (damaged) crc ^= 0xFFFF;
                               wd->diskTrackBuf[crcPos] = (uint8_t)(crc >> 8);
                               wd->diskTrackBuf[crcPos + 1] = (uint8_t)(crc & 0xFF);
                           }
@@ -1473,6 +1518,12 @@ IRAM_ATTR void rvmWD1793Write(rvmWD1793 *wd,uint8_t a,uint8_t value) {
           wd->stepState = kRVMWD177XStepIdle;
           wd->control &= ~(kRVMWD177XWriting|kRVMWD177XDRQ);
           wd->retry = 15;
+#if !PICO_RP2040
+          // This abort is inlined instead of going through _end(), so disarm the
+          // FDI damage guard here too — an aborted Write Sector must not leave it
+          // armed for the next command on the same disk.
+          wd->fdiWrGuard = -1;
+#endif
 
         } else {
 
@@ -1803,6 +1854,8 @@ IRAM_ATTR uint8_t rvmWD1793Read(rvmWD1793 *wd,uint8_t a) {
 
 static void fdiFlushTrack(rvmWD1793 *wd);
 static void mbdFlushTrack(rvmWD1793 *wd);
+static uint16_t fdiDamageOffset(rvmwdDisk *disk, uint32_t cyl, uint8_t side, uint8_t secR);
+static void fdiScanDamage(rvmwdDisk *disk, uint8_t *const *data, const uint16_t *len);
 
 // Fast mode (sectdatapos fast addressing) is only valid for standard-format
 // disks (SCL/TRD). Raw-format images (UDI/FDI/MBD/TD0/PRO) need real MFM
@@ -1878,6 +1931,9 @@ void rvmWD1793Reset(rvmWD1793 *wd) {
   wd->fdiTstates = 0;
   wd->fdiSectorCount = 0;
   wd->fdiDataCrcError = false;
+  wd->fdiOrigBadMask = 0;
+  wd->fdiWrGuard = -1;
+  wd->fdiWrCount = 0;
   wd->trackLoadPending = 0;
 #endif
 }
@@ -2130,14 +2186,77 @@ bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string
         int totalTracks = cyls * sides;
         if (totalTracks > 168) totalTracks = 168;
 
+        // Walk the track headers through a sliding window over the scratch
+        // buffer (one SD read per ~8 KB of headers instead of one per track),
+        // recording each header's file position and, on the way, every sector
+        // whose data CRC is flagged bad — those were unreadable on the source
+        // disk and need a damage offset (see fdiScanDamage).
+        rvmwdDisk *fd = wd->disk[UnitNum];
+        uint32_t dmgFilePos[FDI_DMG_MAX];
+        uint16_t dmgLen[FDI_DMG_MAX];
+        uint32_t dmgStaged = 0;                 // bytes of sector data to stage
+        const UINT winMax = sizeof(g_rawTrkDataBuf);
+        const uint32_t trkHdrMax = 7 + 32 * 7;  // largest possible track block
+        // The window must hold a whole track block, or a track's later sector
+        // descriptors would fall outside it and be skipped.
+        static_assert(sizeof(g_rawTrkDataBuf) >= 7 + 32 * 7, "scratch too small for a track block");
+        uint32_t winPos = trkHdrPos;
+        UINT winLen = 0;
+
         for (int i = 0; i < totalTracks; i++) {
-            wd->disk[UnitNum]->fdiTrackHdrOffsets[i] = trkHdrPos;
-            uint8_t trkHdr[7];
-            f_lseek(wd->disk[UnitNum]->Diskfile, trkHdrPos);
-            f_read(wd->disk[UnitNum]->Diskfile, trkHdr, 7, &br);
-            uint8_t sectorCount = trkHdr[6];
+            fd->fdiTrackHdrOffsets[i] = trkHdrPos;
+            if (trkHdrPos < winPos || trkHdrPos + trkHdrMax > winPos + winLen) {
+                winPos = trkHdrPos;
+                f_lseek(fd->Diskfile, winPos);
+                if (f_read(fd->Diskfile, g_rawTrkDataBuf, winMax, &br) != FR_OK || !br)
+                    break;                      // truncated image — stop scanning
+                winLen = br;
+            }
+            uint32_t inWin = trkHdrPos - winPos;
+            if (inWin + 7 > winLen) break;
+            const uint8_t *th = g_rawTrkDataBuf + inWin;
+            uint32_t trkDataOff = th[0] | (th[1] << 8) | (th[2] << 16) | ((uint32_t)th[3] << 24);
+            uint8_t sectorCount = th[6];
+            for (uint8_t s = 0; s < sectorCount && s < 32; s++) {
+                if (inWin + 7 + (uint32_t)(s + 1) * 7 > winLen) break;
+                const uint8_t *sh = th + 7 + s * 7;
+                uint8_t secR = sh[2], secN = sh[3], flags = sh[4];
+                if (flags & 0x40) continue;                    // no data area
+                if (flags & (1 << (secN & 3))) continue;        // data CRC was good
+                uint16_t slen = (uint16_t)(128 << (secN & 3));
+                if (fd->fdiDmgCount >= FDI_DMG_MAX || dmgStaged + slen > winMax) {
+                    Debug::log("FDI: more damaged sectors than the damage map holds "
+                               "— writes to the rest are refused");
+                    s = 32;                                    // stop collecting
+                    break;
+                }
+                uint8_t k = fd->fdiDmgCount++;
+                fd->fdiDmgCyl[k]  = (uint8_t)(i / sides);
+                fd->fdiDmgSide[k] = (uint8_t)(i % sides);
+                fd->fdiDmgR[k]    = secR;
+                fd->fdiDmgOff[k]  = 0;
+                dmgFilePos[k] = fd->fdiDataOffset + trkDataOff + (sh[5] | (sh[6] << 8));
+                dmgLen[k]     = slen;
+                dmgStaged    += slen;
+            }
             trkHdrPos += 7 + sectorCount * 7;
         }
+
+        // Stage the damaged sectors' data in the same scratch buffer (the header
+        // walk is done with it) and recover each one's damage offset.
+        if (fd->fdiDmgCount) {
+            uint8_t *dmgData[FDI_DMG_MAX];
+            uint32_t at = 0;
+            for (uint8_t k = 0; k < fd->fdiDmgCount; k++) {
+                dmgData[k] = g_rawTrkDataBuf + at;
+                f_lseek(fd->Diskfile, dmgFilePos[k]);
+                if (f_read(fd->Diskfile, dmgData[k], dmgLen[k], &br) != FR_OK || br < dmgLen[k])
+                    dmgLen[k] = (uint16_t)br;   // short read: judge what we got
+                at += dmgLen[k];
+            }
+            fdiScanDamage(fd, dmgData, dmgLen);
+        }
+        invalidateSclCacheForScratch();  // scratch shares SRAM with the SCL track-0 cache
 
         wd->disk[UnitNum]->t0s1_info = 0;
         wd->disk[UnitNum]->cursectbufpos = 0xff;
@@ -2612,6 +2731,116 @@ static uint16_t vgCrc(uint16_t crc, uint8_t byte) {
     return crc;
 }
 
+// --- FDI physical damage (copy protection) -----------------------------------
+//
+// An FDI sector flagged with a bad data CRC was unreadable on the source disk:
+// the data field is valid up to the damaged spot and garbage from there to its
+// end (which is why the CRC fails). Copy protections exploit exactly that —
+// they write a pattern over the sector, read it back and expect the first
+// mismatch at the damaged offset, because a real scratch keeps its old content
+// no matter what the drive writes.
+//
+// The FDI format has nowhere to record that offset, so it is recovered from the
+// image itself at insert time — see fdiScanDamage below.
+
+// --- Recovering the damage offsets from the image ----------------------------
+//
+// A disk protected this way stores the same data stream redundantly across
+// several damaged sectors at different rotational offsets — precisely so its
+// loader can rebuild the stream from the parts that still read. That redundancy
+// is also what lets us find each sector's damage without any outside reference:
+// align a damaged sector against every other copy and see where it stops
+// agreeing. An overlapping copy can start disagreeing no later than this
+// sector's own damage (it may disagree earlier, at its own), so the largest
+// agreement found across all overlaps is the estimate.
+//
+// Verified against br2b.fdi (Black Raven disk 2) with the true offsets measured
+// by diffing the cracked RAVEN2.FDI rip: 4 of 6 sectors exact, the other two 4
+// and 2 bytes early — far inside the ±20 bytes that protection tolerates.
+#define DMG_ANCHOR      16   // bytes that must match before an alignment is trusted
+#define DMG_STEP         8   // anchor stride within the damaged sector
+#define DMG_MIN_TAIL     8   // bytes of disagreement needed to call it a boundary
+#define DMG_MIN_VARIETY  4   // distinct bytes an anchor needs (filler matches anywhere)
+
+static bool dmgVaried(const uint8_t *w, int n) {
+    int distinct = 0;
+    for (int i = 0; i < n; i++) {
+        bool seen = false;
+        for (int j = 0; j < i; j++) if (w[j] == w[i]) { seen = true; break; }
+        if (!seen && ++distinct >= DMG_MIN_VARIETY) return true;
+    }
+    return false;
+}
+
+static int dmgFind(const uint8_t *hay, int hlen, const uint8_t *needle, int nlen) {
+    for (int i = 0; i + nlen <= hlen; i++)
+        if (!memcmp(hay + i, needle, nlen)) return i;
+    return -1;
+}
+
+// First index where a stops agreeing with b at this alignment, or 0 when the
+// overlap gives no evidence of a boundary.
+static int dmgAgreement(const uint8_t *a, int alen, const uint8_t *b, int blen,
+                        int shift, int start) {
+    int limit = alen;
+    if (blen - shift < limit) limit = blen - shift;
+    if (start < -shift) start = -shift;
+    int i = start;
+    while (i < limit && a[i] == b[i + shift]) i++;
+    if (i >= limit || limit - i < DMG_MIN_TAIL) return 0;
+    return i;
+}
+
+static uint16_t dmgOffsetFor(int s, uint8_t *const *data, const uint16_t *len, int count) {
+    const uint8_t *d = data[s];
+    int dlen = len[s], best = 0;
+    for (int o = 0; o < count; o++) {
+        if (o == s) continue;
+        const uint8_t *e = data[o];
+        int elen = len[o];
+        // Copies of the very same window need no anchor search, which also
+        // covers sectors whose readable part is featureless filler.
+        int cand = dmgAgreement(d, dlen, e, elen, 0, 0);
+        if (cand > best) best = cand;
+        for (int a = 0; a + DMG_ANCHOR < dlen; a += DMG_STEP) {
+            if (!dmgVaried(d + a, DMG_ANCHOR)) continue;
+            int pos = dmgFind(e, elen, d + a, DMG_ANCHOR);
+            if (pos < 0) continue;
+            cand = dmgAgreement(d, dlen, e, elen, pos - a, a + DMG_ANCHOR);
+            if (cand > best) best = cand;
+        }
+    }
+    return (uint16_t)best;
+}
+
+// Fill in fdiDmgOff[] for the damaged sectors collected at insert. Their data is
+// staged in g_rawTrkDataBuf (the caller has already read it there and passed the
+// per-sector pointers), so this costs no SD I/O and no extra RAM.
+static void fdiScanDamage(rvmwdDisk *disk, uint8_t *const *data, const uint16_t *len) {
+    for (uint8_t i = 0; i < disk->fdiDmgCount; i++) {
+        uint16_t off = dmgOffsetFor(i, data, len, disk->fdiDmgCount);
+        disk->fdiDmgOff[i] = off ? off : FDI_DMG_UNKNOWN;
+        if (off)
+            Debug::log("FDI: cyl %u side %u sector %u damaged from byte %u of %u",
+                       (unsigned)disk->fdiDmgCyl[i], (unsigned)disk->fdiDmgSide[i],
+                       (unsigned)disk->fdiDmgR[i], (unsigned)off, (unsigned)len[i]);
+        else
+            Debug::log("FDI: cyl %u side %u sector %u has a bad data CRC, damage not "
+                       "located (no redundant copy) — it keeps the CRC error",
+                       (unsigned)disk->fdiDmgCyl[i], (unsigned)disk->fdiDmgSide[i],
+                       (unsigned)disk->fdiDmgR[i]);
+    }
+}
+
+// Damage offset for one sector, or FDI_DMG_UNKNOWN when the scan could not
+// locate it (the sector is damaged, but nothing says where).
+static uint16_t fdiDamageOffset(rvmwdDisk *disk, uint32_t cyl, uint8_t side, uint8_t secR) {
+    for (uint8_t i = 0; i < disk->fdiDmgCount; i++)
+        if (disk->fdiDmgCyl[i] == cyl && disk->fdiDmgSide[i] == side && disk->fdiDmgR[i] == secR)
+            return disk->fdiDmgOff[i];
+    return FDI_DMG_UNKNOWN;
+}
+
 // Flush modified FDI track buffer back to FDI file.
 // Parses MFM buffer to find sector data and writes it back at original FDI file offsets.
 static void fdiFlushTrack(rvmWD1793 *wd) {
@@ -2663,6 +2892,19 @@ static void fdiFlushTrack(rvmWD1793 *wd) {
         }
         if (dataPos < 0 || dataPos + slen > bufLen) continue;
 
+        // Sector with a located scratch: leave the image alone. Its buffer copy
+        // now mixes the guest's freshly written prefix with the original
+        // unreadable tail, and writing that back would destroy the disk's
+        // protection for good. The write therefore lives only as long as the
+        // track stays in the buffer, which is all a protection needs (it writes
+        // and reads back on the spot); the untouched file restores the sector on
+        // the next track load. A damaged sector whose scratch was never located
+        // took the write in full, so it is coherent and does get persisted — its
+        // bad-CRC flag stays set either way, since nothing ever clears bit 0 of
+        // fdiSectorFlags for it.
+        if (sec < 32 && (wd->fdiOrigBadMask & (1u << sec)) &&
+            wd->fdiDmgOffSec[sec] != FDI_DMG_UNKNOWN) continue;
+
         // Write sector data back to FDI file
         uint32_t filePos = disk->fdiDataOffset + trkDataOffset + secDataOff;
         UINT bw;
@@ -2699,6 +2941,8 @@ void fdiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
         wd->diskTrackLen = 0;
         return;
     }
+
+    wd->fdiOrigBadMask = 0;   // rebuilt below from this track's sector flags
 
     // Read FDI track header (4 bytes data offset + 2 reserved + 1 sector count)
     uint8_t trkHdr[7];
@@ -2807,8 +3051,15 @@ void fdiLoadTrack(rvmWD1793 *wd, uint32_t cyl, uint8_t side) {
         // Address mark
         if (sec < 32) {
             wd->fdiSectorIdPos[sec] = pos; // record position of 0xFE
-            wd->fdiSectorFlags[sec] = (!(flags & (1 << (secN & 3))) ? 1 : 0)
-                                    | ((flags & 0x40) ? 2 : 0);
+            bool badCrc = !(flags & (1 << (secN & 3)));
+            bool noData = (flags & 0x40) != 0;
+            wd->fdiSectorFlags[sec] = (badCrc ? 1 : 0) | (noData ? 2 : 0);
+            // Remember which sectors were damaged on the source disk, and where
+            // each one's unreadable region starts, so writes can't repair them.
+            if (badCrc && !noData) {
+                wd->fdiOrigBadMask |= (1u << sec);
+                wd->fdiDmgOffSec[sec] = fdiDamageOffset(disk, cyl, side, secR);
+            }
         }
         if (pos < imageSize) buf[pos++] = 0xFE;
         // ID field: C H R N
@@ -3365,6 +3616,11 @@ static void wdRunTrackLoader(rvmWD1793 *wd, uint8_t cyl, uint8_t side) {
                (unsigned)wd->diskS, wd->diskLoadedCyl, wd->diskLoadedSide,
                (unsigned)wd->state, (unsigned)wd->stepState);
 #endif
+    if (!disk->IsFDIFile) {
+        // Only FDI carries a physical-damage map; don't let a previous FDI
+        // track's mask leak into another format's sector flags.
+        wd->fdiOrigBadMask = 0;
+    }
     if (disk->IsUDIFile)      udiLoadTrack(wd, cyl, side);
     else if (disk->IsTD0File) td0LoadTrack(wd, cyl, side);
     else if (disk->IsFDIFile) fdiLoadTrack(wd, cyl, side);
@@ -3667,9 +3923,21 @@ IRAM_ATTR uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control) {
       disk->indx++;
 
       if(control & kRVMwdDiskControlWrite) {
-        if (disk->indx < wd->diskTrackLen)
-          wd->diskTrackBuf[disk->indx] = control & 0xff;
-        wd->diskDirty = true;
+        // Physically damaged sector (copy protection): the surface takes fresh
+        // flux only up to the damaged spot. From there to the end of the data
+        // field — CRC bytes included — it keeps whatever the source disk held,
+        // so a write/read-back probe sees its pattern diverge exactly at the
+        // damage. See fdiScanDamage / the guard armed in WriteDataFlag.
+        bool damaged = false;
+        if (wd->fdiWrGuard >= 0) {
+          damaged = (wd->fdiWrCount >= (uint32_t)wd->fdiWrGuard);
+          wd->fdiWrCount++;
+        }
+        if (!damaged) {
+          if (disk->indx < wd->diskTrackLen)
+            wd->diskTrackBuf[disk->indx] = control & 0xff;
+          wd->diskDirty = true;
+        }
         return 0;
       }
 

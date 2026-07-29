@@ -97,6 +97,13 @@ static uint8_t dataLenForStatus(uint8_t status) {
     }
 }
 
+// GM System On (F0 7E 7F 09 01 F7): players send it to return the synth to the
+// GM power-on state (bend range ±2, controllers, programs, sustain). The engine
+// itself never sees SysEx, so it is recognized here in the byte parser; every
+// other SysEx is still dropped. gm_match counts pattern bytes matched so far.
+static const uint8_t GM_ON[6] = {0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7};
+static uint8_t gm_match = 0;
+
 static inline const uint8_t* bankFlashPtr()   { return (const uint8_t*)__gm_bank_start; }
 static inline size_t         bankRegionSize() { return (size_t)(__gm_bank_end - __gm_bank_start); }
 
@@ -334,13 +341,19 @@ void MidiSynth::feedByte(uint8_t b) {
         if (b >= 0xF8) return;       // realtime — ignore
         if (b >= 0xF0) {             // SysEx / system common — reset parser
             midi_status = midi_data_pos = midi_expected = 0;
+            if (b == 0xF7 && gm_match == 5) reset();  // GM System On completed
+            gm_match = (b == 0xF0);  // F0 starts a fresh match, anything else aborts
             return;
         }
+        gm_match = 0;                // a channel status aborts any open SysEx
         midi_status   = b;
         midi_data_pos = 0;
         midi_expected = dataLenForStatus(b);
     } else {                         // data byte
-        if (midi_expected == 0) return;
+        if (midi_expected == 0) {    // inside a SysEx (or stray): match GM On, drop the rest
+            gm_match = (gm_match && gm_match < 5 && b == GM_ON[gm_match]) ? gm_match + 1 : 0;
+            return;
+        }
         midi_data[midi_data_pos++] = b;
         if (midi_data_pos >= midi_expected) {
             processMessage(midi_status, midi_data[0],

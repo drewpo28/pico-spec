@@ -1332,6 +1332,24 @@ static size_t sharedFB_prev_size = 0;     // actual byte capacity of sharedFB_pr
 // to the heap when no butter PSRAM is present. NEED_POINTER keeps it addressable
 // for the per-pixel blend hot path (SPI PSRAM/SD-swap are never selected).
 static Buffer sharedFB_prevBuf;
+// Chunked fallback for the prev-FB. It is only ever addressed row by row, through
+// vga.prevFrameBuffer[] — so it does not have to be one block, and cutting it into
+// whole-row pieces makes a mid-session Gigascreen enable work on a fragmented heap
+// (hw, PICO_DV without PSRAM: 66 KB free but the largest hole 36.5 KB vs a 37.7 KB
+// prev-FB — previously only a reboot could place it, because setup() allocates before
+// anything else fragments the heap). The single block is still tried first, so butter
+// boards keep the XIP placement and nothing below changes for them.
+// The three things that DO require one region opt out explicitly: the XIP scanline
+// window (butter-only, guarded in pwRefreshGate), whole-region cache maintenance
+// (only reachable with that window on) and gigascreenLendRegion (declines).
+#define PREV_CHUNKS_MIN 4
+#define PREV_CHUNKS_MAX 8
+// Never ask for the heap's very last block: Buffer's last-resort malloc PANICS on
+// failure (pico_malloc), so every chunk is pre-checked with this much to spare.
+#define PREV_CHUNK_SLACK 1024
+static Buffer sharedFB_prevChunk[PREV_CHUNKS_MAX];
+static int    sharedFB_prev_nchunks = 0;      // 0 = single block in sharedFB_prevBuf
+static int    sharedFB_prev_chunk_rows = 0;   // rows per chunk (last one may hold fewer)
 static void **sharedFB_arr1 = nullptr;    // pointer array for frameBuffer (FB_MAX_LINES slots)
 static void **sharedFB_arr2 = nullptr;    // pointer array for prevFrameBuffer
 
@@ -1371,30 +1389,108 @@ static bool ensureMainFB(int lines, int stride) {
     return true;
 }
 
+extern "C" size_t getLargestAllocatable(void);  // OSDMain.cpp — malloc panics on OOM
+extern size_t getFreeHeap(void);                // ESPectrum.cpp (also declared below)
+
+// Row `row` of the prev-FB, whichever way it is backed. The ONLY way the render
+// path reaches prev-FB rows is the pointer array these fill, so chunking is
+// invisible above this line.
+static inline uint8_t* prevRowPtr(int row, int prev_stride) {
+    if (!sharedFB_prev_nchunks) return sharedFB_prev + (size_t)row * prev_stride;
+    const int c = row / sharedFB_prev_chunk_rows;
+    return (uint8_t*)sharedFB_prevChunk[c].data()
+         + (size_t)(row - c * sharedFB_prev_chunk_rows) * prev_stride;
+}
+
+static void prevFBFree() {
+    sharedFB_prevBuf.free();
+    for (int c = 0; c < sharedFB_prev_nchunks; c++) sharedFB_prevChunk[c].free();
+    sharedFB_prev_nchunks = 0;
+    sharedFB_prev_chunk_rows = 0;
+    sharedFB_prev = nullptr;
+    sharedFB_prev_size = 0;
+}
+
+// Rows per chunk / largest single allocation at the finest split we will attempt.
+static inline int prevChunkRows(int lines, int n) { return (lines + n - 1) / n; }
+size_t VIDEO::gigascreenPrevFBBlockBytes() {
+    if (!sharedFB_lines) return gigascreenPrevFBBytes();
+    return (size_t)prevChunkRows(sharedFB_lines, PREV_CHUNKS_MAX) * (sharedFB_stride / 2);
+}
+
+// Split the prev-FB across n..PREV_CHUNKS_MAX blocks of whole rows, fewest first.
+static bool prevFBAllocChunked(int lines, int prev_stride, size_t want) {
+    // Butter PSRAM absorbs the prev-FB (Buffer routes PREFER_PSRAM there first), so
+    // the heap pre-checks below must not speak for it — see ensurePrevFB.
+    const bool heap_backed = (butter_psram_size() == 0);
+    for (int n = PREV_CHUNKS_MIN; n <= PREV_CHUNKS_MAX; n *= 2) {
+        const int rows = prevChunkRows(lines, n);
+        int got = 0;
+        bool ok = true;
+        for (int c = 0; c < n; c++) {
+            const int r0 = c * rows;
+            if (r0 >= lines) break;                      // fewer chunks than n suffice
+            const int rc = (r0 + rows <= lines) ? rows : (lines - r0);
+            const size_t bytes = (size_t)rc * prev_stride;
+            if ((heap_backed && getLargestAllocatable() < bytes + PREV_CHUNK_SLACK) ||
+                !sharedFB_prevChunk[c].alloc(bytes, Buffer::NEED_POINTER | Buffer::PREFER_PSRAM)) {
+                ok = false;
+                break;
+            }
+            memset(sharedFB_prevChunk[c].data(), 0, bytes);
+            got = c + 1;
+        }
+        if (ok) {
+            sharedFB_prev_nchunks    = got;
+            sharedFB_prev_chunk_rows = rows;
+            sharedFB_prev            = sharedFB_prevChunk[0].data();  // also the "exists" marker
+            sharedFB_prev_size       = want;
+            Debug::log("VIDEO: prevFB %uKB in %d chunks x %d rows on %s (fragmented heap)",
+                       (unsigned)(want >> 10), got, rows, sharedFB_prevChunk[0].tierName());
+            return true;
+        }
+        for (int c = 0; c < got; c++) sharedFB_prevChunk[c].free();
+        sharedFB_prev_nchunks = 0;
+    }
+    return false;
+}
+
 static bool ensurePrevFB(int lines, int stride) {
     if (Config::arch == "Profi") return true; // Gigascreen not available for Profi
+    const int prev_stride = stride / 2;
     size_t want = fbPrevBytes(lines, stride);
     if (sharedFB_prev && sharedFB_prev_size == want) return true;
     if (sharedFB_prev) {
         pwShutdown();  // stop window DMA / drop cached state before freeing
-        sharedFB_prevBuf.free(); sharedFB_prev = nullptr; sharedFB_prev_size = 0;
+        prevFBFree();
     }
     // Memory policy lives in Subsystem: can this prevFB be allocated without starving
     // the heap on a butter-less board? (Butter-PSRAM boards always pass — it goes to
-    // XIP.) Decline → GsSubsys::apply() cleanly disables Gigascreen for the session.
-    if (!Subsystems::gigascreenPrevFBAffordable(want)) return false;
+    // XIP.) The block requirement is per-allocation, so it is asked about the chunk
+    // size, not the total. Decline → GsSubsys::apply() cleanly disables Gigascreen.
+    const size_t block_need = (size_t)prevChunkRows(lines, PREV_CHUNKS_MAX) * prev_stride;
+    if (!Subsystems::gigascreenPrevFBAffordable(want, block_need)) return false;
     // Butter PSRAM first (frees SRAM), heap fallback. NEED_POINTER keeps it
     // addressable for the per-pixel blend; SPI PSRAM / SD-swap are never picked.
-    if (!sharedFB_prevBuf.alloc(want, Buffer::NEED_POINTER | Buffer::PREFER_PSRAM)) {
-        Debug::log("VIDEO: prevFB alloc failed (want=%u) — Gigascreen off this session", (unsigned)want);
-        return false;
+    // One block is preferred (butter/XIP placement, lendable, DMA window eligible);
+    // whole-row chunks only when the heap has no hole that big.
+    // The heap pre-check guards the heap fallback only: on a butter board the buffer
+    // lands in XIP PSRAM at no heap cost (which is also why gigascreenPrevFBAffordable
+    // short-circuits there), and letting a fragmented heap push it to chunks would
+    // needlessly forfeit the XIP scanline window (pwRefreshGate declines chunks).
+    if ((butter_psram_size() != 0 || getLargestAllocatable() >= want + PREV_CHUNK_SLACK) &&
+        sharedFB_prevBuf.alloc(want, Buffer::NEED_POINTER | Buffer::PREFER_PSRAM)) {
+        uint8_t *p = sharedFB_prevBuf.data();
+        memset(p, 0, want);
+        sharedFB_prev = p;
+        sharedFB_prev_size = want;
+        Debug::log("VIDEO: prevFB %uKB on %s", (unsigned)(want >> 10), sharedFB_prevBuf.tierName());
+        return true;
     }
-    uint8_t *p = sharedFB_prevBuf.data();
-    memset(p, 0, want);
-    sharedFB_prev = p;
-    sharedFB_prev_size = want;
-    Debug::log("VIDEO: prevFB %uKB on %s", (unsigned)(want >> 10), sharedFB_prevBuf.tierName());
-    return true;
+    sharedFB_prevBuf.free();
+    if (prevFBAllocChunked(lines, prev_stride, want)) return true;
+    Debug::log("VIDEO: prevFB alloc failed (want=%u) — Gigascreen off this session", (unsigned)want);
+    return false;
 }
 
 static void setupSharedFBPointers(Graphics<unsigned char> &vga, int lines, int stride) {
@@ -1407,7 +1503,7 @@ static void setupSharedFBPointers(Graphics<unsigned char> &vga, int lines, int s
     if (sharedFB_prev && sharedFB_arr2) {
         int prev_stride = stride / 2; // 4-bit packed
         for (int i = 0; i < lines; i++) {
-            sharedFB_arr2[i] = sharedFB_prev + i * prev_stride;
+            sharedFB_arr2[i] = prevRowPtr(i, prev_stride);
         }
         vga.prevFrameBuffer = (unsigned char **)sharedFB_arr2;
     } else {
@@ -1576,6 +1672,7 @@ static void pwRefreshGate() {
     const int W = sharedFB_stride / 2;
     bool want = sharedFB_prev != nullptr
         && !pw_failed
+        && !sharedFB_prev_nchunks          // chunked: not one region, no row arithmetic
         && ((uintptr_t)sharedFB_prev & 3) == 0
         && pwPrevInButter()
         && !ds80_border_geom
@@ -1696,7 +1793,7 @@ bool GsSubsys::apply() {
         if (!sharedFB_arr2) {
             sharedFB_arr2 = (void**)malloc(FB_MAX_LINES * sizeof(void*));
             if (!sharedFB_arr2) {
-                sharedFB_prevBuf.free(); sharedFB_prev = nullptr; sharedFB_prev_size = 0;
+                prevFBFree();
                 wanted = false;
                 Config::gigascreen_enabled = false;
                 VIDEO::gigascreen_enabled = false;
@@ -1706,7 +1803,7 @@ bool GsSubsys::apply() {
         // Re-derive prev pointer array from the current resolution.
         int prev_stride = sharedFB_stride / 2;
         for (int i = 0; i < sharedFB_lines; i++) {
-            sharedFB_arr2[i] = sharedFB_prev + i * prev_stride;
+            sharedFB_arr2[i] = prevRowPtr(i, prev_stride);
         }
         VIDEO::vga.prevFrameBuffer = (unsigned char**)sharedFB_arr2;
         enabled = true;
@@ -1718,8 +1815,7 @@ bool GsSubsys::apply() {
         enabled = false;
         pwShutdown();  // wait out window DMA before the backing store goes away
         free(sharedFB_arr2);  sharedFB_arr2  = nullptr;
-        sharedFB_prevBuf.free();  sharedFB_prev  = nullptr;
-        sharedFB_prev_size = 0;
+        prevFBFree();
     }
     return true;
 }
@@ -1737,6 +1833,9 @@ bool VIDEO::gigascreenLendRegion(void*& base, size_t& size) {
     // TLS working set instead. On butter boards palloc already routes it to XIP.
     if (s_prev_lent) return false;
     if (!Config::gigascreen_enabled || !sharedFB_prev || sharedFB_prev_size == 0) return false;
+    // Chunked prev-FB is not one region — the borrower gets base+size, so decline
+    // rather than hand out a span that ends inside somebody else's allocation.
+    if (sharedFB_prev_nchunks) return false;
     if (butter_psram_size() != 0) return false;
     base = sharedFB_prev;
     size = sharedFB_prev_size;
@@ -1752,6 +1851,56 @@ void VIDEO::gigascreenReclaimRegion() {
     // then re-attach the prev pointer array.
     if (sharedFB_prev && sharedFB_prev_size) memset(sharedFB_prev, 0, sharedFB_prev_size);
     if (sharedFB_arr2) VIDEO::vga.prevFrameBuffer = (unsigned char**)sharedFB_arr2;
+}
+
+// ── Chunked prev-FB: hand the whole buffer back for a network session ─────────
+// A chunked prev-FB is not one region, so gigascreenLendRegion declines it — and
+// with a small GIGASCREEN_PREVFB_HEADROOM that would leave a TLS session (16 KB
+// input buffer + 4 KB output + alt stack) with only the bare headroom, which is the
+// OOM the lease exists to prevent. So give the buffer up entirely instead: the
+// emulator is paused, nothing reads prev-FB, the heap gets all ~38 KB back, and the
+// chunks are normally consecutive so freeing them coalesces into large runs.
+// Rebuilt on restore; if the heap has fragmented past hope by then, Gigascreen goes
+// quiet until a reboot rather than taking the config down with it.
+static bool s_prev_released_for_net = false;
+
+bool VIDEO::gigascreenReleaseForNet() {
+    if (s_prev_released_for_net || s_prev_lent) return false;
+    if (!Config::gigascreen_enabled || !sharedFB_prev) return false;
+    if (!sharedFB_prev_nchunks) return false;    // single block: lending is cheaper
+    if (butter_psram_size() != 0) return false;  // lives in XIP, the heap doesn't care
+    GsSubsys::request(false);
+    GsSubsys::apply();                           // detaches, frees the chunks + arr2
+    // Renderers do guard on prevFrameBuffer, but RedrawPausedFrame() runs while the
+    // OSD is up — don't leave the live flag claiming Gigascreen with no buffer.
+    VIDEO::gigascreen_enabled = false;           // restore puts it back from _onoff
+    VIDEO::gigascreen_auto_countdown = 0;
+    s_prev_released_for_net = true;
+    Debug::log("VIDEO: prevFB (chunked) released for network session, freeHeap=%u",
+               (unsigned)getFreeHeap());
+    return true;
+}
+
+void VIDEO::gigascreenRestoreAfterNet() {
+    if (!s_prev_released_for_net) return;
+    s_prev_released_for_net = false;
+    // apply()'s own OOM path clears Config::gigascreen_enabled; the user's choice is
+    // not ours to drop over a transient heap state, so put it back and let the live
+    // flags carry the "off for now" state (every reader pairs them with a
+    // prevFrameBuffer null check).
+    const bool cfg_on = Config::gigascreen_enabled;
+    GsSubsys::request(true);
+    if (!GsSubsys::apply() || !VIDEO::vga.prevFrameBuffer) {
+        Config::gigascreen_enabled = cfg_on;
+        VIDEO::gigascreen_enabled  = false;
+        VIDEO::gigascreen_auto_countdown = 0;
+        Debug::log("VIDEO: prevFB not recoverable after network session (freeHeap=%u)"
+                   " — Gigascreen off until reboot", (unsigned)getFreeHeap());
+        return;
+    }
+    VIDEO::InitPrevBuffer();                     // reseed from the live frame
+    VIDEO::gigascreen_enabled = (Config::gigascreen_onoff == 1);  // On=live, Auto=armed
+    VIDEO::gigascreen_auto_countdown = 0;
 }
 
 size_t VIDEO::gigascreenPrevFBBytes() {
@@ -1912,7 +2061,12 @@ void VIDEO::changeMode() {
         // Non-shared fallback (RP2040 always; RP2350 only if shared alloc failed).
         // prevFrameBuffer is RP2350-only (Gigascreen) — guard the cleanup.
 #if !PICO_RP2040
-        if (vga.prevFrameBuffer) {
+        // freeFrameBuffer frees fb[0] as "the one data block", which is only true for
+        // an allocateFrameBuffer() array — the shared array's row 0 belongs to
+        // sharedFB_prevBuf/prevChunk[0] and is owned by GsSubsys. Reaching here with
+        // it installed would be a double free (this branch means the shared scheme was
+        // never used, so it cannot happen; the check keeps it that way).
+        if (vga.prevFrameBuffer && (void**)vga.prevFrameBuffer != sharedFB_arr2) {
             auto oldPrev = vga.prevFrameBuffer;
             vga.prevFrameBuffer = nullptr;
             freeFrameBuffer((void**)oldPrev);

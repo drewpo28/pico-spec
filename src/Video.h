@@ -51,9 +51,15 @@ visit https://zxespectrum.speccy.org/contacto
 // running system keeps working room. Shared by VIDEO::ensurePrevFB (the live
 // allocation guard) and the SRAM budget gate (Subsystems::featureMargin for
 // FEAT_GIGASCREEN) — they MUST use the same value, or the gate says ALLOW while
-// ensurePrevFB silently declines (Gigascreen stays off, no popup). Empirically
-// the system runs fine down to ~20 KB free, so 24 KB leaves a small buffer.
-static constexpr size_t GIGASCREEN_PREVFB_HEADROOM = 24 * 1024;
+// ensurePrevFB silently declines (Gigascreen stays off, no popup).
+// History: 24 KB originally, over an empirical "runs fine down to ~20 KB" floor.
+// Lowered to 16 KB deliberately, to let Gigascreen coexist with the small audio
+// features on a butter-less board (37.7 KB prev-FB out of ~66 KB of heap leaves no
+// room for both otherwise). This is BELOW that measured floor: it is the emulator
+// itself that keeps running, but what spends this headroom are the file dialogs,
+// the browser index, ZIP extraction and network sessions — those are what to
+// re-test after touching this number, not gameplay.
+static constexpr size_t GIGASCREEN_PREVFB_HEADROOM = 16 * 1024;
 #endif
 
 #define TSTATES_PER_LINE 224
@@ -199,9 +205,23 @@ public:
   static bool gigascreenLendRegion(void*& base, size_t& size);
   static void gigascreenReclaimRegion();
 
+  // Same purpose, for a prev-FB that got split into whole-row chunks: it is not one
+  // region, so it cannot be lent — give it up entirely for the session instead and
+  // rebuild it afterwards. Returns true when something was released (then the caller
+  // MUST pair it with gigascreenRestoreAfterNet). No-op for a single-block prev-FB,
+  // which takes the cheaper lending path above.
+  static bool gigascreenReleaseForNet();
+  static void gigascreenRestoreAfterNet();
+
   // Byte size the Gigascreen prev-FB needs in the *current* video mode (4-bit
   // packed). Used by the SRAM budget manager to cost the Gigascreen feature.
   static size_t gigascreenPrevFBBytes();
+
+  // Largest SINGLE allocation the prev-FB needs. Smaller than gigascreenPrevFBBytes()
+  // because the buffer is only ever addressed row by row (vga.prevFrameBuffer[]) and
+  // falls back to whole-row chunks when the heap has no block big enough. This — not
+  // the total — is what the budget gate must compare against the largest free block.
+  static size_t gigascreenPrevFBBlockBytes();
 #endif
 
   static void Border_Blank();

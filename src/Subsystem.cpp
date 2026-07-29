@@ -498,7 +498,10 @@ size_t featureCost(FeatureId f) {
         case FEAT_SAA:           return 2 * 1024;    // SAASound object (~1.5K: state + 2x640B buffers)
         case FEAT_COVOX:         return 2 * 1024;    // 2x640B stereo sample buffer (~1.25K)
 #ifdef VGA_HDMI
-        case FEAT_HDMI_AUDIO:    return 9 * 1024;    // packet queue + sample rings (~8.5K; blobs shared w/ HDMI video)
+        // 128x36 B packet queue + 2x512x2 B sample rings = 6656 B (blobs shared with
+        // HDMI video). Rings were 1024 deep until the ~0.5 KB Gigascreen shortfall
+        // sent us looking — see the HDMI_AUDIO_RING_SIZE note in drivers/hdmi/hdmi.c.
+        case FEAT_HDMI_AUDIO:    return 7 * 1024;
 #endif
         case FEAT_ULAPLUS:       return 0;           // AluBytes table lives in flash; only ~68B static state
         case FEAT_TIMEX:         return 0;           // ~3B static state, no heap
@@ -683,7 +686,8 @@ static size_t featureMargin(FeatureId f) {
     return SRAM_MARGIN;
 }
 
-bool gigascreenPrevFBAffordable(size_t want) {
+bool gigascreenPrevFBAffordable(size_t want, size_t block_need) {
+    if (!block_need || block_need > want) block_need = want;
     // Butter PSRAM present → prev-FB lands in XIP (Buffer NEED_POINTER|PREFER_PSRAM),
     // never touches the heap, so it always fits. Mirrors featureCost()'s butter==free
     // assumption.
@@ -696,10 +700,10 @@ bool gigascreenPrevFBAffordable(size_t want) {
     //    miss it → false decline).
     //  • total free must still leave GIGASCREEN_PREVFB_HEADROOM after the block — that
     //    headroom need not be contiguous, so it's a getFreeHeap() check, not a block one.
-    if (getLargestAllocatable() < want || getFreeHeap() < want + GIGASCREEN_PREVFB_HEADROOM) {
-        Debug::log("Subsys: Gigascreen prevFB declined (largest=%u free=%u want=%u+head=%u)",
+    if (getLargestAllocatable() < block_need || getFreeHeap() < want + GIGASCREEN_PREVFB_HEADROOM) {
+        Debug::log("Subsys: Gigascreen prevFB declined (largest=%u free=%u want=%u block=%u+head=%u)",
                    (unsigned)getLargestAllocatable(), (unsigned)getFreeHeap(),
-                   (unsigned)want, (unsigned)GIGASCREEN_PREVFB_HEADROOM);
+                   (unsigned)want, (unsigned)block_need, (unsigned)GIGASCREEN_PREVFB_HEADROOM);
         return false;
     }
     return true;
@@ -754,7 +758,13 @@ BudgetResult budgetCheck(FeatureId enabling, FeatureId* candidates, int* nCand, 
     // single allocation is therefore one 16 KB page, not 64 KB. Using the full cost as
     // the block proxy falsely DENIES on a fragmented-but-roomy heap (e.g. m1p2: 76 KB
     // free total, largest block < 64 KB → phantom deficit). Total-free still gates it.
-    const size_t blockNeed = (enabling == FEAT_PROFI) ? (size_t)MEM_PG_SZ : cost;
+    // Gigascreen's prev-FB is addressed row by row and falls back to whole-row chunks
+    // when no single hole fits (VIDEO::ensurePrevFB), so its block requirement is one
+    // chunk — using the full cost here demanded a 37.7 KB hole and sent a perfectly
+    // affordable mid-session enable down the reboot path (hw, PICO_DV without PSRAM).
+    const size_t blockNeed = (enabling == FEAT_PROFI)      ? (size_t)MEM_PG_SZ
+                           : (enabling == FEAT_GIGASCREEN) ? VIDEO::gigascreenPrevFBBlockBytes()
+                                                           : cost;
     const size_t blockDef = (blockFree < blockNeed)     ? (blockNeed - blockFree)     : 0;
     const size_t totalDef = (totalFree < cost + margin) ? (cost + margin - totalFree) : 0;
     *deficit = blockDef > totalDef ? blockDef : totalDef;
@@ -762,6 +772,14 @@ BudgetResult budgetCheck(FeatureId enabling, FeatureId* candidates, int* nCand, 
                featureName(enabling), (unsigned)blockFree, (unsigned)totalFree,
                (unsigned)cost, (unsigned)margin, (unsigned)*deficit);
     if (*deficit == 0) return BUDGET_ALLOW;
+
+    // Total free is sufficient and only contiguity is missing — the heap is merely
+    // fragmented (hw: Gigascreen on a butter-less DV, 66 KB free, largest block
+    // 36.5 KB vs a 37.7 KB prev-FB). Turning other features off is the wrong remedy:
+    // it would free memory that is not the problem, and the *same* reboot it needs
+    // already fixes it, because setup() rebuilds every feature from Config on a
+    // fresh heap (VIDEO::Init allocates the prev-FB before anything fragments it).
+    if (totalDef == 0) return BUDGET_NEEDS_REBOOT;
 
     // Build the list of features the user could turn off to make room.
     size_t maxFree = 0;

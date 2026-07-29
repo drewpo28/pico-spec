@@ -43,11 +43,40 @@ static void civil_from_days(int32_t z, int& y, unsigned& m, unsigned& d) {
 }
 
 static inline uint8_t to_bcd(int v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
+static inline int     from_bcd(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
+
+// ─── reg B data format (DM bit2: BCD/binary, bit1: 24h/12h) ───────────────────
+// Every clock field crosses the port in the format reg B advertises. Handing back
+// BCD while the guest has DM=1 is exactly how a correct wall clock renders as
+// nonsense: day 29 (BCD 0x29) read as binary prints 41, year 26 (0x26) prints 38.
+uint8_t RTC::encField(int v) { return regBcd() ? to_bcd(v) : (uint8_t)v; }
+int     RTC::decField(uint8_t v) { return regBcd() ? from_bcd(v) : (int)v; }
+
+// 12-hour mode: 1..12 with bit7 = PM (midnight and noon are both 12).
+uint8_t RTC::encHour(int h24) {
+    if (reg24h()) return encField(h24);
+    bool pm = h24 >= 12;
+    int h12 = h24 % 12; if (!h12) h12 = 12;
+    return (uint8_t)(encField(h12) | (pm ? 0x80 : 0x00));
+}
+const char* RTC::formatStr() {
+    return regBcd() ? (reg24h() ? "BCD/24h" : "BCD/12h")
+                    : (reg24h() ? "bin/24h" : "bin/12h");
+}
+
+int RTC::decHour(uint8_t v) {
+    if (reg24h()) return decField(v);
+    bool pm = v & 0x80;
+    int h = decField(v & 0x7F) % 12;   // 12 → 0, so 12 AM = 0h
+    return pm ? h + 12 : h;
+}
 
 // ─── lifecycle ────────────────────────────────────────────────────────────────
 void RTC::init() {
     for (unsigned i = 0; i < sizeof(regs); i++) regs[i] = 0;
-    // Reg B: bit1 = 24-hour, DM (bit2) = 0 → BCD (what Mr Gluk expects)
+    // Reg B power-on default: bit1 = 24-hour, DM (bit2) = 0 → BCD. The guest may
+    // change either bit; loadNVRAM() restores whatever it last set, and the read
+    // path follows reg B rather than assuming this default.
     regs[0x0B] = 0x02;
     // Reg D: bit7 VRT = 1 (battery/RAM valid) so the service doesn't flag a dead clock
     regs[0x0D] = 0x80;
@@ -132,14 +161,23 @@ void RTC::writeData(uint8_t v) {
     if (sel == 0x0B) {
         uint8_t prev = regs[0x0B];
         if (prev != v) { regs[0x0B] = v; nv_dirty = true; }
+#if RTC_PORT_TRACE
+        // The format bits decide how every clock read is encoded, and they are
+        // battery-backed (cmos.nvr) — call the change out by name instead of
+        // leaving it to be spotted as one `sel=0B` line among hundreds.
+        if ((prev ^ v) & 0x06)
+            Debug::log("[RTC MOD] reg B %02X -> %02X : %s, %s",
+                       prev, v, (v & 0x04) ? "binary" : "BCD",
+                       (v & 0x02) ? "24h" : "12h");
+#endif
         if (v & 0x80) {
             // SET raised: snapshot the current time into the shadow buffer so
             // read-modify-write clock setters start from the live values.
             int yy, mo, dd, hh, mi, ss;
             if (now(yy, mo, dd, hh, mi, ss)) {
-                regs[0x00] = to_bcd(ss); regs[0x02] = to_bcd(mi);
-                regs[0x04] = to_bcd(hh); regs[0x07] = to_bcd(dd);
-                regs[0x08] = to_bcd(mo); regs[0x09] = to_bcd(yy % 100);
+                regs[0x00] = encField(ss); regs[0x02] = encField(mi);
+                regs[0x04] = encHour(hh);  regs[0x07] = encField(dd);
+                regs[0x08] = encField(mo); regs[0x09] = encField(yy % 100);
             }
         } else if (prev & 0x80) {
             commitTimeRegs(); // SET 1→0: apply the buffered time
@@ -153,14 +191,11 @@ void RTC::writeData(uint8_t v) {
 }
 
 // Apply the shadow time registers written under SET as the new wall clock.
-// Honors reg B DM (bit2): 0 = BCD (the mode we advertise), 1 = binary.
+// Reads them back in whatever format reg B advertises (DM bit2 BCD/binary,
+// bit1 24h/12h) — the same conversions the read path uses.
 void RTC::commitTimeRegs() {
-    bool bcd = !(regs[0x0B] & 0x04);
-    auto dec = [bcd](uint8_t v) -> int {
-        return bcd ? ((v >> 4) * 10 + (v & 0x0F)) : v;
-    };
-    int ss = dec(regs[0x00]), mi = dec(regs[0x02]), hh = dec(regs[0x04]);
-    int dd = dec(regs[0x07]), mo = dec(regs[0x08]), yy = dec(regs[0x09]);
+    int ss = decField(regs[0x00]), mi = decField(regs[0x02]), hh = decHour(regs[0x04]);
+    int dd = decField(regs[0x07]), mo = decField(regs[0x08]), yy = decField(regs[0x09]);
     // Sanity-check before committing — a garbage write must not wreck a good
     // (possibly SNTP-synced) clock.
     if (ss > 59 || mi > 59 || hh > 23 || dd < 1 || dd > 31 || mo < 1 || mo > 12 || yy > 99)
@@ -189,13 +224,13 @@ uint8_t RTC::readData() {
         // 1970-01-01 (Thursday=4), so offset by +3 (not +4, which gives Sun=1).
         unsigned dow = (unsigned)(((days % 7) + 3) % 7) + 1; // 1=Mon..7=Sun
         switch (sel) {
-            case 0x00: return to_bcd(ss);
-            case 0x02: return to_bcd(mm);
-            case 0x04: return to_bcd(hh);
-            case 0x06: return (uint8_t)dow;
-            case 0x07: return to_bcd((int)dd);
-            case 0x08: return to_bcd((int)mo);
-            case 0x09: return to_bcd(y % 100);
+            case 0x00: return encField(ss);
+            case 0x02: return encField(mm);
+            case 0x04: return encHour(hh);
+            case 0x06: return (uint8_t)dow;  // 1..7 — identical in BCD and binary
+            case 0x07: return encField((int)dd);
+            case 0x08: return encField((int)mo);
+            case 0x09: return encField(y % 100);
             default:   return regs[sel]; // alarm regs 0x01/0x03/0x05 (stored)
         }
     }

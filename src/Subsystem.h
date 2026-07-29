@@ -45,10 +45,15 @@ namespace Subsystems {
     const char* featureName(FeatureId f);     // localised, for the popup
     void        featureSetEnabled(FeatureId f, bool on);  // writes Config only (caller reboots)
 
-    enum BudgetResult { BUDGET_ALLOW, BUDGET_DENY, BUDGET_NEEDS_FREE };
+    enum BudgetResult { BUDGET_ALLOW, BUDGET_DENY, BUDGET_NEEDS_FREE, BUDGET_NEEDS_REBOOT };
     // Decide whether `enabling` fits. On BUDGET_NEEDS_FREE, fills candidates[] (enabled
     // features that can be turned off, excl. ones `enabling` already auto-disables) and
     // *deficit (bytes still needed). candidates[] must hold FEAT_COUNT entries.
+    // BUDGET_NEEDS_REBOOT means there IS enough total free SRAM but not in one block:
+    // nothing has to be given up, the feature just cannot be built mid-session. Every
+    // feature is (re)created from Config during setup(), before the heap fragments —
+    // Gigascreen's prev-FB explicitly so (VIDEO::Init) — so persisting the enable and
+    // rebooting is the whole fix. Callers: save + reboot, don't offer a free-list.
     BudgetResult budgetCheck(FeatureId enabling, FeatureId* candidates, int* nCand, size_t* deficit);
 
     // Can the Gigascreen prev-FB (`want` bytes) be allocated without starving the
@@ -56,7 +61,9 @@ namespace Subsystems {
     // butter-less boards must fit it in the largest block AND keep
     // GIGASCREEN_PREVFB_HEADROOM of total free heap. Called by VIDEO::ensurePrevFB
     // before the Buffer alloc so the memory policy stays here, not in Video.
-    bool gigascreenPrevFBAffordable(size_t want);
+    // The block requirement is `block_need`, the prev-FB's chunk size (0 = the whole
+    // thing must fit one block).
+    bool gigascreenPrevFBAffordable(size_t want, size_t block_need = 0);
 #endif
 }
 

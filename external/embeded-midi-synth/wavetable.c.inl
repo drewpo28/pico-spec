@@ -559,10 +559,19 @@ static void wt_note_on(uint8_t channel, uint8_t note, uint8_t velocity) {
     v->key_group = rg->key_group;
     v->age = g_next_age++;
 
+    // The bank is user-converted data validated only by magic/version, so the
+    // loop fields cannot be trusted: loop_length == 0 would spin the render's
+    // wrap-around loop forever (audio path hang), and a loop reaching past
+    // frame_count reads beyond the wave — past the malloc'd copy on the RAM
+    // cache path. Such regions play as one-shot instead. (Subtraction form so
+    // start+length cannot overflow uint32.)
+    uint8_t looped = (rg->flags & GM_RGN_LOOPED) != 0 && rg->loop_length > 0 &&
+                     rg->loop_length <= w->frame_count &&
+                     rg->loop_start <= w->frame_count - rg->loop_length;
     v->wave_index = rg->wave_index;
-    v->pcm = wt_wave_base(v, w, (rg->flags & GM_RGN_LOOPED) != 0);
+    v->pcm = wt_wave_base(v, w, looped);
     v->frame_count = w->frame_count;
-    if (rg->flags & GM_RGN_LOOPED) {  // honor DLS loop (EG1 decay governs ring time)
+    if (looped) {                     // honor DLS loop (EG1 decay governs ring time)
         v->looped = 1;
         v->loop_start = rg->loop_start;
         v->loop_end = rg->loop_start + rg->loop_length;
@@ -665,6 +674,13 @@ static void WT_RAMFUNC(parse_midi)(const midi_command_t *m) {
                 case 0x0b: ch->expression = m->velocity & 0x7f; wt_channel_reamp(channel); break;
                 case 0x65: ch->rpn_msb = m->velocity & 0x7f; break; // RPN MSB
                 case 0x64: ch->rpn_lsb = m->velocity & 0x7f; break; // RPN LSB
+                case 0x63:            // NRPN MSB / LSB: NRPNs themselves are not
+                case 0x62:            // implemented, but selecting one must deselect
+                                      // the RPN — or the NRPN's data entry (GS/XG
+                                      // files send bursts of them) lands in whatever
+                                      // RPN was last selected, typically bend range.
+                    ch->rpn_msb = 127; ch->rpn_lsb = 127;
+                    break;
                 case 0x06: // data entry MSB -> whole semitones of bend range
                     if (wt_rpn_is_bend_range(ch)) {
                         ch->bend_range_cents = (m->velocity & 0x7f) * 100 + (ch->bend_range_cents % 100);
@@ -712,11 +728,20 @@ static void WT_RAMFUNC(parse_midi)(const midi_command_t *m) {
                     }
                     break;
                 case 0x79:
-                    ch->volume = 100; ch->expression = 127; ch->pan = 64;
-                    ch->bank_msb = 0; ch->bank_lsb = 0; ch->pitch_bend = 8192; ch->sustain = 0;
+                    // Reset All Controllers, per RP-015: expression, modulation,
+                    // pitch-bend VALUE, sustain and the RPN selection. Volume,
+                    // pan, bank select and the bend RANGE explicitly persist —
+                    // files send CC121 mid-song expecting their mix to survive;
+                    // full cleanup between songs is GM System On's job.
+                    ch->expression = 127;
                     ch->modulation = 0;
+                    ch->pitch_bend = 8192;
+                    ch->sustain = 0;
+                    for (uint32_t mm = g_active_mask; mm; mm &= mm - 1) {
+                        wt_voice_t *v = &g_voices[wt_ctz32(mm)];
+                        if (v->channel == channel && v->sustained) wt_release_voice(v);
+                    }
                     ch->rpn_msb = 127; ch->rpn_lsb = 127;
-                    ch->bend_range_cents = WT_PITCH_BEND_RANGE_SEMITONES * 100;
                     wt_channel_reamp(channel);
                     wt_channel_repitch(channel);
                     break;

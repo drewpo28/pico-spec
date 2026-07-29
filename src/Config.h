@@ -112,6 +112,14 @@ public:
     static uint8_t  vreq_voltage;  // vreg_voltage_t enum value, default VREG_VOLTAGE_1_60
 #endif
     static bool     Issue2;
+    // Murmuzavr extended page count as CHOSEN/PERSISTED (64..2048; 64 = mode off). The
+    // live count the emulator runs on is the global MEM_PG_CNT, read once from this in
+    // ESPectrum::setup() — and deliberately NOT kept in step afterwards: MemESP indexes
+    // ROM as ram[MEM_PG_CNT + romLatch], so bumping the live count while a machine runs
+    // sends every ROM read past the end of the page strip. save() serialises THIS field,
+    // never the live one; that is what makes the pick survive the Pentagon-only clamp
+    // (a save made while running Profi would otherwise persist the clamped 64).
+    static uint16_t mem_pg_cnt;
     static bool     rtc_enabled;  // Pentagon/Profi Mr Gluk MC146818 RTC + CMOS NVRAM (RP2350)
     static bool     flashload;
     static bool     tape_player;
