@@ -46,7 +46,7 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - Selectable color palettes: Pulsar (default), Alone, Grayscale, Mars, Ocean (Unreal Speccy compatible format).
 - Custom palettes support: load user-defined palettes from `/palette.nvs` file on SD card (up to 11 custom palettes, 3x3 RGB color transform matrix).
 - Ula+ support (https://sinclair.wiki.zxnet.co.uk/wiki/ULAplus).
-- Murmuzavr (up to 32 MB) support.
+- Murmuzavr extended RAM (up to 32 MB) on Pentagon 128K/512K/1024K — the selected size is remembered when you switch to another machine and back.
 - Z80 DMA / zxnDMA emulation: Port #0B (MB02+) and Port #6B (DATA-GEAR) modes (RP2350 only).
 - Contended memory and contended I/O emulation.
 - AY-3-8912 / TurboSound emulation.
@@ -61,6 +61,7 @@ Best performance for case Pimoroni "Pico Plus 2" is used.
 - Two real joysticks support (Up to 8 button joysticks).
 - USB HID gamepad support: XInput (Xbox 360/One), DualShock 4 (PS4), DualSense (PS5), generic HID gamepads with auto-detected report descriptors and analog trigger support.
 - Emulation of Betadisk interface with four drives and TRD, SCL, UDI, FDI (read and write) and TD0 (Teledisk, read-only) support. Fast and realtime modes. Per-drive Write Protect, inline drive status in the Drives menu, F5 slot-picker popup (F2 toggle WP, F8 eject) when mounting from the file browser.
+- FDI copy protection: sectors that were physically damaged on the original floppy stay damaged — a write lands only up to the damaged spot and the CRC error never heals, so protections that write a pattern and look for where it breaks (Чёрный Ворон / Black Raven) load. The damage position is derived from the image itself, no extra files needed (RP2350 only).
 - TR-DOS auto-boot: optionally inject a boot loader into TRD/SCL images that lack one, so downloaded disks auto-start (Storage → Betadisk → Auto-boot) (RP2350 only).
 - IDE/HDD emulation: NEMO and Profi schemes, HDF / raw .hdd / Fixed VHD images, create-empty-image helper, mounted from the Storage → IDE/HDD menu (RP2350 only).
 - MB-02+ disk interface emulation: WD2797 FDC, Z80-DMA, 512KB SRAM paging, BS-DOS 308, MBD disk images, 4 drives, NMI menu (RP2350 only).
@@ -176,6 +177,8 @@ Four modes are available:
   - **Music Box** — Triangle wave with fast decay and low sustain — delicate and percussive.
   - **Synth** — All saw wave with medium low-pass filter.
 - **GM.DLS Wavetable** — A fixed-point General MIDI **wavetable** synthesizer that plays a real GM sound bank, for far more realistic instruments than the procedural Software synth. No external hardware. You supply the bank (`gm_bank.bin`): pack it once on a PC, copy it to the SD card, and select this mode — the device installs the bank into a dedicated flash partition on the next boot (one-time write, ~20–30 s, LED blinks). The bank then persists across reboots and firmware updates.
+
+Both built-in synths (**Software** and **GM.DLS Wavetable**) honour the GM System On SysEx and Reset All Controllers, so a player that moves between songs starts each one from the General MIDI power-on state instead of inheriting the previous tune's pitch bend, sustain or controller settings.
 
 ### GM.DLS instrument bank
 

@@ -512,6 +512,90 @@ static string wifiAskPassword(const string& ssid) {
     return pass;
 }
 
+// ── Shared on-screen line log (WiFi connect window + FTP server terminal) ────
+// Scrolling line ring: fixed char[][] (no heap churn), holding the most recent
+// lines; every renderer shows the tail (auto-scroll). Deliberately OUTSIDE
+// #if ZIFI_NET_CLIENT — the Network menu's WiFi scan/connect flow logs the live
+// ESP-01 exchange through it in builds without the FTP/SFTP/SSH client too.
+#define FTPD_LOG_LINES 40
+#define FTPD_LOG_COLS  72
+// Lazy-heaped (2880 B) — costs 0 SRAM until the FTP server / WiFi-connect window
+// actually logs a line, so it never starves the razor-thin Profi heap at
+// VIDEO::Init (Profi forces ~80 KB of SRAM pages before the framebuffer alloc).
+// Readers are gated by `li < ftpd_log_count`, and ftpd_log_count only advances
+// after a successful alloc here, so they never touch a null buffer.
+static char (*ftpd_log)[FTPD_LOG_COLS] = nullptr;
+extern "C" size_t getLargestAllocatable(void);   // defined at the bottom of this file
+static int  ftpd_log_count = 0;  // total lines pushed (monotonic)
+static bool ftpd_log_dirty = true;
+static void ftpdLogLine(const char* s) {
+    if (!ftpd_log) {
+        // Gate, don't null-check: pico_malloc wraps calloc too and PANICs on OOM
+        // instead of returning NULL, so "drop the line rather than crash" only
+        // works if we never make an ask that can fail (see Buffer::palloc).
+        if (getLargestAllocatable() < FTPD_LOG_LINES * FTPD_LOG_COLS + 8192) return;
+        ftpd_log = (char(*)[FTPD_LOG_COLS])calloc(FTPD_LOG_LINES, FTPD_LOG_COLS);
+        if (!ftpd_log) return;   // OOM — drop the line rather than crash
+    }
+    int slot = ftpd_log_count % FTPD_LOG_LINES;
+    strncpy(ftpd_log[slot], s ? s : "", FTPD_LOG_COLS - 1);
+    ftpd_log[slot][FTPD_LOG_COLS - 1] = '\0';
+    ftpd_log_count++;
+    ftpd_log_dirty = true;
+}
+
+// ── Live ESP-01 AT-log window (shown during a blocking WiFi connect) ──────────
+// ZiFiAT::log_cb → wifiLogLine appends each tx/rx line to the shared ftpd_log ring
+// and redraws the tail immediately, so the ESP-01 exchange scrolls live while
+// connect() blocks. Reuses ftpd_log[] (a generic line ring) — the WiFi connect
+// window and the FTP server are never up at the same time.
+static string s_wifilog_sub;
+static void wifiLogDraw() {
+    OSD::drawOSD(true);
+    int visCols = OSD::osdMaxCols(); if (visCols > 40) visCols = 40;
+    int visRows = OSD::osdMaxRows() - 4;
+    char row[42];
+    OSD::osdAt(1, 0);                                   // subtitle: "Connecting <ssid>"
+    VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(1, 0));
+    snprintf(row, sizeof(row), " %s", s_wifilog_sub.c_str());
+    int hl = strlen(row); while (hl < visCols) row[hl++] = ' '; row[visCols] = '\0';
+    VIDEO::vga.print(row);
+    OSD::osdAt(2, 0);                                   // separator
+    VIDEO::vga.setTextColor(zxColor(5, 0), zxColor(1, 0));
+    memset(row, '-', visCols); row[0] = ' '; row[visCols] = '\0';
+    VIDEO::vga.print(row);
+    int first = ftpd_log_count > visRows ? ftpd_log_count - visRows : 0; // tail
+    VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
+    for (int r = 0; r < visRows; r++) {
+        OSD::osdAt(3 + r, 0);
+        int li = first + r;
+        if (li < ftpd_log_count) {
+            const char* s = ftpd_log[li % FTPD_LOG_LINES];
+            int len = strlen(s); if (len > visCols) len = visCols;
+            memcpy(row, s, len); memset(row + len, ' ', visCols - len);
+        } else memset(row, ' ', visCols);
+        row[visCols] = '\0';
+        VIDEO::vga.print(row);
+    }
+}
+static void wifiLogLine(const char* s) { ftpdLogLine(s); wifiLogDraw(); }
+// Append a final line (e.g. an error) and hold the window open until the user
+// presses a key — so a failure stays readable instead of auto-closing.
+static void wifiLogHold(const char* msg) {
+    if (msg && msg[0]) ftpdLogLine(msg);
+    ftpdLogLine(Config::lang ? " -- pulsa una tecla --" : " -- press a key --");
+    wifiLogDraw();
+    auto* kb = ESPectrum::PS2Controller.keyboard();
+    while (kb->virtualKeyAvailable()) { fabgl::VirtualKeyItem k; kb->getNextVirtualKey(&k); } // drain
+    for (;;) {
+        if (kb->virtualKeyAvailable()) {
+            fabgl::VirtualKeyItem k;
+            if (kb->getNextVirtualKey(&k) && k.down) break;
+        }
+        sleep_ms(5);
+    }
+}
+
 #if ZIFI_NET_CLIENT
 // ─── Network file-transfer client (FTP / SFTP) ──────────────────────────────
 // A centred single-line text-entry dialog (host / user / port). Returns the
@@ -953,87 +1037,6 @@ static bool f5Locations() {
 }
 
 // ── FTP server: share the SD card to the LAN ─────────────────────────────────
-// Scrolling log ring for the on-screen terminal. Fixed char[][] (no heap churn),
-// holding the most recent lines; the renderer always shows the tail (auto-scroll).
-#define FTPD_LOG_LINES 40
-#define FTPD_LOG_COLS  72
-// Lazy-heaped (2880 B) — costs 0 SRAM until the FTP server / WiFi-connect window
-// actually logs a line, so it never starves the razor-thin Profi heap at
-// VIDEO::Init (Profi forces ~80 KB of SRAM pages before the framebuffer alloc).
-// Readers are gated by `li < ftpd_log_count`, and ftpd_log_count only advances
-// after a successful alloc here, so they never touch a null buffer.
-static char (*ftpd_log)[FTPD_LOG_COLS] = nullptr;
-extern "C" size_t getLargestAllocatable(void);   // defined at the bottom of this file
-static int  ftpd_log_count = 0;  // total lines pushed (monotonic)
-static bool ftpd_log_dirty = true;
-static void ftpdLogLine(const char* s) {
-    if (!ftpd_log) {
-        // Gate, don't null-check: pico_malloc wraps calloc too and PANICs on OOM
-        // instead of returning NULL, so "drop the line rather than crash" only
-        // works if we never make an ask that can fail (see Buffer::palloc).
-        if (getLargestAllocatable() < FTPD_LOG_LINES * FTPD_LOG_COLS + 8192) return;
-        ftpd_log = (char(*)[FTPD_LOG_COLS])calloc(FTPD_LOG_LINES, FTPD_LOG_COLS);
-        if (!ftpd_log) return;   // OOM — drop the line rather than crash
-    }
-    int slot = ftpd_log_count % FTPD_LOG_LINES;
-    strncpy(ftpd_log[slot], s ? s : "", FTPD_LOG_COLS - 1);
-    ftpd_log[slot][FTPD_LOG_COLS - 1] = '\0';
-    ftpd_log_count++;
-    ftpd_log_dirty = true;
-}
-
-// ── Live ESP-01 AT-log window (shown during a blocking WiFi connect) ──────────
-// ZiFiAT::log_cb → wifiLogLine appends each tx/rx line to the shared ftpd_log ring
-// and redraws the tail immediately, so the ESP-01 exchange scrolls live while
-// connect() blocks. Reuses ftpd_log[] (a generic line ring) — the WiFi connect
-// window and the FTP server are never up at the same time.
-static string s_wifilog_sub;
-static void wifiLogDraw() {
-    OSD::drawOSD(true);
-    int visCols = OSD::osdMaxCols(); if (visCols > 40) visCols = 40;
-    int visRows = OSD::osdMaxRows() - 4;
-    char row[42];
-    OSD::osdAt(1, 0);                                   // subtitle: "Connecting <ssid>"
-    VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(1, 0));
-    snprintf(row, sizeof(row), " %s", s_wifilog_sub.c_str());
-    int hl = strlen(row); while (hl < visCols) row[hl++] = ' '; row[visCols] = '\0';
-    VIDEO::vga.print(row);
-    OSD::osdAt(2, 0);                                   // separator
-    VIDEO::vga.setTextColor(zxColor(5, 0), zxColor(1, 0));
-    memset(row, '-', visCols); row[0] = ' '; row[visCols] = '\0';
-    VIDEO::vga.print(row);
-    int first = ftpd_log_count > visRows ? ftpd_log_count - visRows : 0; // tail
-    VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
-    for (int r = 0; r < visRows; r++) {
-        OSD::osdAt(3 + r, 0);
-        int li = first + r;
-        if (li < ftpd_log_count) {
-            const char* s = ftpd_log[li % FTPD_LOG_LINES];
-            int len = strlen(s); if (len > visCols) len = visCols;
-            memcpy(row, s, len); memset(row + len, ' ', visCols - len);
-        } else memset(row, ' ', visCols);
-        row[visCols] = '\0';
-        VIDEO::vga.print(row);
-    }
-}
-static void wifiLogLine(const char* s) { ftpdLogLine(s); wifiLogDraw(); }
-// Append a final line (e.g. an error) and hold the window open until the user
-// presses a key — so a failure stays readable instead of auto-closing.
-static void wifiLogHold(const char* msg) {
-    if (msg && msg[0]) ftpdLogLine(msg);
-    ftpdLogLine(Config::lang ? " -- pulsa una tecla --" : " -- press a key --");
-    wifiLogDraw();
-    auto* kb = ESPectrum::PS2Controller.keyboard();
-    while (kb->virtualKeyAvailable()) { fabgl::VirtualKeyItem k; kb->getNextVirtualKey(&k); } // drain
-    for (;;) {
-        if (kb->virtualKeyAvailable()) {
-            fabgl::VirtualKeyItem k;
-            if (kb->getNextVirtualKey(&k) && k.down) break;
-        }
-        sleep_ms(5);
-    }
-}
-
 struct FtpdCtx { const char* ip; };
 
 // Run the server session (details panel + live log terminal) in a blocking loop
@@ -5836,7 +5839,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 if (Config::arch == "Profi" && Config::zifi_enabled) {
                                     Config::zifi_enabled = 0;
                                     ZiFi::enabled = 0;
-                                    if (!ZiFiAT::connected) { ZiFiSock::end(); ZiFi::deinit(); }
+                                    if (!ZiFiAT::connected) {
+#if ZIFI_NET_CLIENT
+                                        ZiFiSock::end();
+#endif
+                                        ZiFi::deinit();
+                                    }
                                     OSD::osdCenteredMsg("ZiFi NIC disabled", LEVEL_WARN, 1500);
                                 }
                                 // Switching into Profi: turn DivMMC off and free its
