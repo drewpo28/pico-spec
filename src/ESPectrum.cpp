@@ -96,6 +96,7 @@ extern "C" volatile bool profi_ds80_active;
 // specification ("C") is not permitted at block scope. ALL platforms — the
 // factory-reset probe uses it on RP2040 (MURM/ZERO) KBDUSB builds too.
 extern "C" bool usb_keyboard_mounted(void);
+extern "C" size_t getLargestAllocatable(void);  // defined in OSDMain.cpp
 #endif
 
 //=======================================================================================
@@ -270,6 +271,11 @@ int32_t ESPectrum::mouseX = 0;
 int32_t ESPectrum::mouseY = 0;
 bool ESPectrum::mouseButtonL = 0;
 bool ESPectrum::mouseButtonR = 0;
+bool ESPectrum::mouseButtonM = 0;
+uint8_t ESPectrum::mouseWheel = 0;
+bool ESPectrum::mouseSeen = false;
+int32_t ESPectrum::mouseDX = 0;
+int32_t ESPectrum::mouseDY = 0;
 
 bool ESPectrum::maxSpeed = false;
 
@@ -575,7 +581,12 @@ void ESPectrum::bootKeyboard() {
 extern int ram_pages, butter_pages, psram_pages, swap_pages;
 
 static void assign_ram(int i) {
-  static size_t butter_remains = butter_psram_size();
+  // Not the raw chip size: Buffer::pageBudget* holds back what GS, DivMMC and the
+  // Buffer arena need above the pages. Without that a large Murmuzavr page count ate
+  // the whole chip and everything that belongs in PSRAM landed on the heap instead
+  // (see the note in Buffer.h). Pages past the budget go to SD swap.
+  static size_t butter_remains = Buffer::pageBudgetButter();
+  static size_t spi_budget     = Buffer::pageBudgetSpi();
   static size_t butter_idx = 0;
   // Profi DS80 hires color attr pages (56/58) + CP/M's hot working page (61):
   // on SPI-PSRAM boards the Profi BIOS selects bankLatch=56..63 (portDFFD[2:0]=7)
@@ -654,7 +665,7 @@ static void assign_ram(int i) {
           (uint8_t *)PSRAM_DATA + (butter_idx++) * MEM_PG_SZ, i, false);
       butter_remains -= MEM_PG_SZ;
       ++butter_pages;
-    } else if (psram_size() >= (MEM_PG_SZ * (i + 1))) {
+    } else if (spi_budget >= ((size_t)MEM_PG_SZ * (i + 1))) {
       MemESP::ram[i].assign_vram(i, mem_type_t::PSRAM_SPI);
       ++psram_pages;
     } else {
@@ -676,6 +687,7 @@ void ESPectrum::setup() {
   mem_desc_t::reset();
   Ports::portAFF7 = 0;
   Ports::portDFFD = 0;
+  Ports::serialMouseReset();
   //=======================================================================================
   // LOAD CONFIG
   //=======================================================================================
@@ -737,6 +749,11 @@ void ESPectrum::setup() {
           Config::romSet = Config::pref_romSetP1M;
         else
           Config::romSet = Config::romSetP1M;
+      } else if (Config::arch == "Profi") {
+        if (Config::pref_romSetProfi != "Last")
+          Config::romSet = Config::pref_romSetProfi;
+        else
+          Config::romSet = Config::romSetProfi;
       } else {
         if (Config::pref_romSetPent != "Last")
           Config::romSet = Config::pref_romSetPent;
@@ -744,6 +761,25 @@ void ESPectrum::setup() {
           Config::romSet = Config::romSetPent;
       }
     }
+  }
+
+  // The live page count is derived from the persisted pick HERE and nowhere else: the arch
+  // for this boot is final and nothing has sized a page strip yet. Murmuzavr extended RAM
+  // is Pentagon hardware, and it is expensive — 2048 pages cost ~32 KB of SRAM bookkeeping
+  // (descriptors + ram[]) plus their share of the PSRAM page budget. The #AFF7 plane latch
+  // itself is not arch-gated (Ports.cpp), so without this clamp a "Profi + Murmuzavr
+  // 32 MB" config OOM-panicked in setup(): Profi spends another ~80 KB of its own (incl.
+  // the 16 KB DS80 colour SRAM), so the WD1793 track buffer no longer fit — with no way to
+  // reach the menu and undo it. Config::mem_pg_cnt keeps the pick, so coming back to a
+  // Pentagon does not need it re-entered.
+  MEM_PG_CNT = Config::mem_pg_cnt;
+  if (MEM_PG_CNT > 64 && !(Config::arch == "Pentagon" || Config::arch == "P512" ||
+                           Config::arch == "P1024")) {
+    Debug::log("setup: Murmuzavr %u pages dropped — %s is not Pentagon",
+               (unsigned)MEM_PG_CNT, Config::arch.c_str());
+    Debug::log2SD("setup: MEM_PG_CNT %u -> 64 (arch=%s, Murmuzavr is Pentagon-only)",
+                  (unsigned)MEM_PG_CNT, Config::arch.c_str());
+    MEM_PG_CNT = 64;
   }
 
   //=======================================================================================
@@ -1280,10 +1316,22 @@ void ESPectrum::reset(uint8_t romInUse) {
   }
 #endif
   Ports::portDFFD = 0;
+  Ports::serialMouseReset();
   // Profi SYSEN: boot into SYS ROM (bank0) with trdos=true to protect page0
   ESPectrum::trdos = (Config::arch == "Profi" && romInUse == 0);
 
   Debug::log("[reset] arch=%s romInUse=%d trdos=%d", Config::arch.c_str(), romInUse, (int)ESPectrum::trdos);
+#if !PICO_RP2040 && FDD_PORT_TRACE
+  // g_fdcCmdCount gates the [WR→DIR]/[WR→RSTVEC]/[WR→CBIOS] write-count caps
+  // in MemESP.h (only trace once real disk activity starts, skipping the
+  // SYS-ROM self-test's memtest/buffer-clear noise). It's a plain static, so
+  // without this it carries over across a soft reset within the same power
+  // session — on a SECOND boot attempt it's already >0 from the FIRST one,
+  // so the gate does nothing and the caps burn on self-test again. Reset it
+  // here so every [RESET] gets a fresh budget for its own disk activity.
+  extern uint32_t g_fdcCmdCount;
+  g_fdcCmdCount = 0;
+#endif
   // Memory
   MemESP::page0ram = 0;
   MemESP::romInUse = romInUse;
@@ -1472,8 +1520,16 @@ IRAM_ATTR bool ESPectrum::readKbd(fabgl::VirtualKeyItem *Nextkey) {
     if (Nextkey->vk ==
         fabgl::VK_PRINTSCREEN) { // Capture framebuffer to BMP file in SD Card
                                  // (thx @dcrespo3d!)
-      CaptureToBmp();
-      r = false;
+      // On Profi plain PrtScr is the Karabas-Pro XT-keyboard toggle (handled
+      // in do_OSD) — there the BMP capture moves to Alt+PrtScr; other archs
+      // keep the plain-PrtScr capture.
+      bool xtToggle = Z80Ops::isProfi &&
+                      !PS2Controller.keyboard()->isVKDown(fabgl::VK_LALT) &&
+                      !PS2Controller.keyboard()->isVKDown(fabgl::VK_RALT);
+      if (!xtToggle) {
+        CaptureToBmp();
+        r = false;
+      }
     } else if (Nextkey->vk ==
                fabgl::VK_SCROLLLOCK) { // Change CursorAsJoy setting
       Config::CursorAsJoy = !Config::CursorAsJoy;
@@ -1490,6 +1546,64 @@ fabgl::VirtualKey ESPectrum::VK_ESPECTRUM_FIRE1 = fabgl::VK_NONE;
 fabgl::VirtualKey ESPectrum::VK_ESPECTRUM_FIRE2 = fabgl::VK_NONE;
 fabgl::VirtualKey ESPectrum::VK_ESPECTRUM_TAB = fabgl::VK_TAB;
 fabgl::VirtualKey ESPectrum::VK_ESPECTRUM_GRAVEACCENT = fabgl::VK_GRAVEACCENT;
+
+#if !PICO_RP2040
+// Map a fabgl VirtualKey to a PQ-DOS serial-keyboard scancode. Table verified
+// against the 0.41h1 BIOS translate routine (ROM 0x2363: `LD HL,0x2429` —
+// 0x2429 holds 'B'): base layout is "BHY65TGVNJU74RFCMKI83EDX?LO92WSZ <cr>P01QA?./"
+// — scan 0='B', 1='H', 2='Y'… The Ctrl layer at ROM 0x2401 confirms the base:
+// index 0 = 0x02 (Ctrl+B/STX), 1 = 0x08 (Ctrl+H/BS), 2 = 0x19 (Ctrl+Y). The
+// same "BH"-prefixed table exists in every build (h1/h2 bank0+bank3, the old
+// profi64k.rom, and QDOS.SYS on pqdos1.fdi) — an earlier extraction matched
+// the table from its 'Y' byte, which shifted every code by -2 and left B/H
+// "missing". Slots 0x18/0x27 are genuinely NUL. Returns 0xFF for unmapped.
+// PQDOS reads keys ONLY via ports #F3/#D3 (Ports::pushKey), never the #FE matrix.
+static uint8_t pqdosScancode(fabgl::VirtualKey vk) {
+  switch (vk) {
+    case fabgl::VK_A: case fabgl::VK_a: return 0x26;
+    case fabgl::VK_B: case fabgl::VK_b: return 0x00;
+    case fabgl::VK_C: case fabgl::VK_c: return 0x0F;
+    case fabgl::VK_D: case fabgl::VK_d: return 0x16;
+    case fabgl::VK_E: case fabgl::VK_e: return 0x15;
+    case fabgl::VK_F: case fabgl::VK_f: return 0x0E;
+    case fabgl::VK_G: case fabgl::VK_g: return 0x06;
+    case fabgl::VK_H: case fabgl::VK_h: return 0x01;
+    case fabgl::VK_I: case fabgl::VK_i: return 0x12;
+    case fabgl::VK_J: case fabgl::VK_j: return 0x09;
+    case fabgl::VK_K: case fabgl::VK_k: return 0x11;
+    case fabgl::VK_L: case fabgl::VK_l: return 0x19;
+    case fabgl::VK_M: case fabgl::VK_m: return 0x10;
+    case fabgl::VK_N: case fabgl::VK_n: return 0x08;
+    case fabgl::VK_O: case fabgl::VK_o: return 0x1A;
+    case fabgl::VK_P: case fabgl::VK_p: return 0x22;
+    case fabgl::VK_Q: case fabgl::VK_q: return 0x25;
+    case fabgl::VK_R: case fabgl::VK_r: return 0x0D;
+    case fabgl::VK_S: case fabgl::VK_s: return 0x1E;
+    case fabgl::VK_T: case fabgl::VK_t: return 0x05;
+    case fabgl::VK_U: case fabgl::VK_u: return 0x0A;
+    case fabgl::VK_V: case fabgl::VK_v: return 0x07;
+    case fabgl::VK_W: case fabgl::VK_w: return 0x1D;
+    case fabgl::VK_X: case fabgl::VK_x: return 0x17;
+    case fabgl::VK_Y: case fabgl::VK_y: return 0x02;
+    case fabgl::VK_Z: case fabgl::VK_z: return 0x1F;
+    case fabgl::VK_0: case fabgl::VK_KP_0: return 0x23;
+    case fabgl::VK_1: case fabgl::VK_KP_1: return 0x24;
+    case fabgl::VK_2: case fabgl::VK_KP_2: return 0x1C;
+    case fabgl::VK_3: case fabgl::VK_KP_3: return 0x14;
+    case fabgl::VK_4: case fabgl::VK_KP_4: return 0x0C;
+    case fabgl::VK_5: case fabgl::VK_KP_5: return 0x04;
+    case fabgl::VK_6: case fabgl::VK_KP_6: return 0x03;
+    case fabgl::VK_7: case fabgl::VK_KP_7: return 0x0B;
+    case fabgl::VK_8: case fabgl::VK_KP_8: return 0x13;
+    case fabgl::VK_9: case fabgl::VK_KP_9: return 0x1B;
+    case fabgl::VK_SPACE: return 0x20;
+    case fabgl::VK_RETURN: case fabgl::VK_KP_ENTER: return 0x21;
+    case fabgl::VK_PERIOD: return 0x28;
+    case fabgl::VK_SLASH: return 0x29;
+    default: return 0xFF;
+  }
+}
+#endif
 
 IRAM_ATTR void ESPectrum::processKeyboard() {
   static uint8_t PS2cols[8] = {0xbf, 0xbf, 0xbf, 0xbf, 0xbf, 0xbf, 0xbf, 0xbf};
@@ -1516,6 +1630,134 @@ IRAM_ATTR void ESPectrum::processKeyboard() {
     if (r) {
       KeytoESP = NextKey.vk;
       Kdown = NextKey.down;
+#if !PICO_RP2040
+      // PQ-DOS serial keyboard: feed key-downs to the #F3/#D3 queue (Profi only).
+      // Harmless on non-PQDOS software — those ports are ignored unless polled.
+#if FDD_PORT_TRACE
+      if (Kdown)
+        Debug::log("[PQKBD KEYDN] vk=%d profi=%d sc=%02X", (int)KeytoESP,
+                   (int)Z80Ops::isProfi, (int)pqdosScancode(KeytoESP));
+#endif
+      if (Kdown && Z80Ops::isProfi) {
+        uint8_t sc = pqdosScancode(KeytoESP);
+        if (sc != 0xFF) Ports::pushKey(sc);
+      }
+      // Real Karabas-Pro "Menu"-key ROMSET hotkeys: Menu(Win/GUI)+F1..F4 pick
+      // ROMSET 0..3 (ROMain / PQDOS / Flash Tool / FDImage) and reset into its
+      // bank0 — mirrors the hardware combos from the Karabas-Pro manual.
+      // Active only while a Karabas* romset is already selected ("1024K
+      // (Original)" is not part of the real Karabas flash, so plain GUI+F1
+      // there still means nothing / OSD keeps its normal F-key behavior).
+      if (Kdown && Z80Ops::isProfi &&
+          KeytoESP >= fabgl::VK_F1 && KeytoESP <= fabgl::VK_F4 &&
+          (Kbd->isVKDown(fabgl::VK_LGUI) || Kbd->isVKDown(fabgl::VK_RGUI))) {
+        static const char* karabasRomsets[4] = {
+            "ProfiKarabas", "ProfiPQ", "ProfiKarabasFT", "ProfiKarabasFDI" };
+        bool inKarabas = false;
+        for (int i = 0; i < 4; i++)
+          if (Config::romSet == karabasRomsets[i]) { inKarabas = true; break; }
+        if (inKarabas) {
+          const char* target = karabasRomsets[KeytoESP - fabgl::VK_F1];
+          if (Config::romSet != target) {
+            Config::romSet = target;
+            if (Config::pref_romSetProfi == "Last") Config::romSetProfi = target;
+            Config::save();
+            Config::requestMachine("Profi", target);
+          }
+          ESPectrum::reset(); // hardware combo resets into the ROMSET's bank0
+          return;
+        }
+      }
+#endif
+      // The rest of the Karabas-Pro "Menu"-key combos from the user manual.
+      // Unlike Menu+F1..F4 they map onto machine-independent emulator settings,
+      // so they work on any arch. osdCenteredMsg blocks for the toast duration —
+      // compensate ts_start like the do_OSD dispatch below does.
+      if (Kdown && (Kbd->isVKDown(fabgl::VK_LGUI) || Kbd->isVKDown(fabgl::VK_RGUI))) {
+        auto menuToast = [](const char *msg) {
+          int64_t t = esp_timer_get_time();
+          OSD::osdCenteredMsg(msg, LEVEL_INFO, 500);
+          ESPectrum::ts_start += esp_timer_get_time() - t;
+        };
+        if (KeytoESP == fabgl::VK_F5) { // TurboFDC = our TR-DOS fast mode
+          Config::trdosFastMode = !Config::trdosFastMode;
+          rvmWD1793UpdateFastmode(&ESPectrum::fdd);
+          Config::save();
+          menuToast(Config::trdosFastMode ? " Turbo FDC: On  " : " Turbo FDC: Off " );
+          return;
+        }
+        if (KeytoESP == fabgl::VK_F7) { // SSG stereo mode
+          static const char* const ayModes[3] =
+              { " AY stereo: ABC  ", " AY stereo: ACB  ", " AY stereo: Mono " };
+          Config::ayConfig = (Config::ayConfig + 1) % 3;
+          Config::save();
+          menuToast(ayModes[Config::ayConfig]);
+          return;
+        }
+        if (KeytoESP == fabgl::VK_F8 ||   // AY/YM chip select
+            KeytoESP == fabgl::VK_F9 ||   // VGA/TV scan mode
+            KeytoESP == fabgl::VK_F10) {  // 50/60 Hz scan rate
+          menuToast(" Not supported ");
+          return;
+        }
+        if (KeytoESP == fabgl::VK_F11) { // Turbo 3.5/7/14 MHz — 3-state cycle
+          // (the configurable Turbo hotkey also offers 28 MHz as a 4th state)
+          static const char* const mhz[3] =
+              { " CPU: 3.5 MHz " , " CPU: 7 MHz   ", " CPU: 14 MHz  " };
+          ESPectrum::multiplicator = (ESPectrum::multiplicator + 1) % 3;
+          CPU::updateStatesInFrame();
+          menuToast(mhz[ESPectrum::multiplicator]);
+          return;
+        }
+        if (KeytoESP == fabgl::VK_F12) { // NMI — route through do_OSD with the
+          // combo bound to the NMI hotkey, so its DS80/AY guards apply and
+          // Pentagon/Profi get the visible NMI/NMI+DOS chooser (a bare
+          // triggerNMI is invisible there: the ROM's 0x66 just RETNs).
+          const Config::HotkeyBinding &hk = Config::hotkeys[Config::HK_NMI];
+          if (hk.vk != (uint16_t)fabgl::VK_NONE) {
+            int64_t osd_start = esp_timer_get_time();
+            OSD::do_OSD((fabgl::VirtualKey)hk.vk, hk.alt, hk.ctrl);
+            Kbd->emptyVirtualKeyQueue();
+            VIDEO::brdnextframe = true;
+            ESPectrum::ts_start += esp_timer_get_time() - osd_start;
+          } else
+            Z80::triggerNMI();
+          return;
+        }
+        if (KeytoESP == fabgl::VK_TAB) { // swap drive letters A<->B
+          rvmWD1793SwapDrives(&ESPectrum::fdd, 0, 1);
+          bool wp = Config::driveWP[0];
+          Config::driveWP[0] = Config::driveWP[1];
+          Config::driveWP[1] = wp;
+          Config::save(); // persists the per-unit filenames + WP flags
+          menuToast(" Drives A <-> B ");
+          return;
+        }
+        if (KeytoESP == fabgl::VK_j || KeytoESP == fabgl::VK_J) { // joystick type
+          static const char* const joyNames[5] =
+              { " Joy: Cursor     ", " Joy: Kempston   ", " Joy: Sinclair 1 ",
+                " Joy: Sinclair 2 ", " Joy: Fuller     " };
+          Config::joystick = (Config::joystick + 1) % 5; // Custom stays OSD-only
+          // NOT setJoyMap() — it wipes joydef and pops a "load default map?"
+          // dialog; the pad-button mapping is orthogonal to the port type and
+          // stays editable in the OSD joystick menu.
+          Config::save();
+          menuToast(joyNames[Config::joystick]);
+          return;
+        }
+        if (KeytoESP == fabgl::VK_ESCAPE) { // open the OSD main menu
+          int64_t osd_start = esp_timer_get_time();
+          OSD::do_OSD(fabgl::VK_F1, false, false);
+          Kbd->emptyVirtualKeyQueue();
+#ifdef DIRTY_LINES
+          for (int i = 0; i < SPEC_H; i++)
+            VIDEO::dirty_lines[i] |= 0x01;
+#endif // DIRTY_LINES
+          VIDEO::brdnextframe = true;
+          ESPectrum::ts_start += esp_timer_get_time() - osd_start;
+          return;
+        }
+      }
       if ((Kdown) &&
           ((KeytoESP >= fabgl::VK_F1 && KeytoESP <= fabgl::VK_F12) ||
             KeytoESP == fabgl::VK_PAUSE || KeytoESP == fabgl::VK_PRINTSCREEN ||
@@ -1556,6 +1798,13 @@ IRAM_ATTR void ESPectrum::processKeyboard() {
 #endif // DIRTY_LINES
           // Refresh border
           VIDEO::brdnextframe = true;
+          // While paused the renderer never repaints (CPU::loop bails straight
+          // to EndFrame), so whatever the OSD drew stays on screen forever.
+          // Repaint the frozen frame and put the PAUSE box back on top.
+          if (CPU::paused) {
+            VIDEO::RedrawPausedFrame();
+            OSD::osdCenteredMsg(OSD_PAUSE[Config::lang], LEVEL_INFO, 0);
+          }
           ESPectrum::ts_start += esp_timer_get_time() - osd_start;
           return;
         }
@@ -2378,6 +2627,7 @@ void ESPectrum::loop() {
 
     if (ZiFi::enabled) ZiFi::tick();
     RTC::flushNVRAM(); // persist CMOS NVRAM to SD when dirty (debounced)
+    Ports::serialMouseTick(); // arm the COM-mouse RST20H when movement queued
 
     // Auto-sync the RTC over SNTP at startup when both ZiFi and RTC are on and a
     // WiFi network is configured. Runs entirely in the background (non-blocking
@@ -2390,16 +2640,24 @@ void ESPectrum::loop() {
     // pull WiFi up as a side effect via `ZiFi::enabled && rtc_enabled`, which is
     // exactly the leak that made FTP/SSH work only with the NIC on). The background
     // state machine also runs SNTP, harmless when RTC is off.
-    if (!Config::wifi_ssid.empty() && Config::arch != "Profi" && Config::wifi_enabled) {
+    if (!Config::wifi_ssid.empty() && Config::wifi_enabled) {
         if (!rtc_autosync_begun) {
             uint32_t now = to_ms_since_boot(get_absolute_time());
             if (rtc_autosync_at == 0) rtc_autosync_at = now + 4000;
             else if (now >= rtc_autosync_at) {
                 rtc_autosync_begun = true;
-                ZiFiAT::autoSyncBegin(Config::wifi_ssid, Config::wifi_pass, Config::wifi_tz);
+                // Profi heap guard (decided once, replaces the old blanket
+                // `arch != "Profi"` exclusion that left the ROMain/PQDOS clock
+                // permanently at 00.00.00): autoSyncBegin brings the ESP link up
+                // (ZiFi::init allocs the 8 KB RX ring + TX FIFO on the heap) —
+                // fine on butter-PSRAM Profi (~68 KB free with CDC up), but the
+                // SPI-PSRAM m1p2 Profi runs with ~10 KB free and OOMs (see
+                // profi_zifi_oom_fix). Skip only when the headroom isn't there.
+                if (Config::arch != "Profi" || getLargestAllocatable() >= 16384)
+                    ZiFiAT::autoSyncBegin(Config::wifi_ssid, Config::wifi_pass, Config::wifi_tz);
             }
         } else {
-            ZiFiAT::autoSyncPoll();
+            ZiFiAT::autoSyncPoll(); // no-op unless autoSyncBegin actually ran
         }
     }
 #endif
@@ -2823,6 +3081,35 @@ void ESPectrum::loop() {
         frame_cnt = 0; neg_cnt = 0; w_idle = INT32_MAX; w_pmax = 0;
       }
     }
+#if FDD_PORT_TRACE
+    // [FDC IDLE]: one-shot marker for "disk loading stopped here" — fires the
+    // first time 3 consecutive 60-frame windows (~3-4s) pass with no new WD1793
+    // command after having seen at least one, so a boot-load hang shows exactly
+    // which track/sector/side/PC the last accepted command was, instead of
+    // requiring a manual scan of every [FDC CMD]/[FDC RD-END] line by hand.
+    // Re-arms if disk activity resumes and later stops again.
+    if (Z80Ops::isProfi) {
+      extern uint32_t g_fdcCmdCount;
+      extern uint16_t g_fdcLastTrk, g_fdcLastPc;
+      extern uint8_t  g_fdcLastSec, g_fdcLastSide, g_fdcLastCmd;
+      static uint32_t p_fdcCmdCount = 0;
+      static uint32_t idleWindows = 0;
+      static bool reported = false;
+      if (g_fdcCmdCount != p_fdcCmdCount) {
+        p_fdcCmdCount = g_fdcCmdCount;
+        idleWindows = 0;
+        reported = false;
+      } else if (g_fdcCmdCount > 0 && !reported) {
+        if (++idleWindows >= 3) {
+          reported = true;
+          Debug::log("[FDC IDLE] no new WD1793 command for ~%u frames (total cmds=%u); "
+                     "last: cmd=%02X trk=%d sec=%d side=%d pc=%04X",
+                     idleWindows * 60, g_fdcCmdCount, g_fdcLastCmd, g_fdcLastTrk,
+                     g_fdcLastSec, g_fdcLastSide, g_fdcLastPc);
+        }
+      }
+    }
+#endif
     // Deferred WD1793 SD I/O (track loads, PRO flush/f_sync) runs inside this
     // frame's idle window, so disk operations stop eating frame time (negative
     // IDL on Profi CP/M disk ops).  g_wdDeferLoads is refreshed EVERY frame,
@@ -2868,6 +3155,12 @@ void ESPectrum::loop() {
             break;
           }
         }
+#if !PICO_RP2040
+        // Blanking just started (v_sync fires at scanout line v_active): apply
+        // any pending Profi DS80 palette refresh now, while the scanout DMA is
+        // off-screen — tear-free palette animation (see profiPaletteApplyPending).
+        VIDEO::profiPaletteApplyPending();
+#endif
       } else {
         if (idle > 0) {
 #if !PICO_RP2040

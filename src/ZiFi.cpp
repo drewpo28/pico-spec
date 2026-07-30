@@ -843,7 +843,9 @@ void __not_in_flash("zifi") ZiFi::uart16550Write(uint8_t reg_hi, uint8_t data) {
             // the guest's OUT path; the per-frame tick() owns RX spilling.
             if (!fifo_full(zifi_out_head, zifi_out_tail))
                 zifi_out_buf[zifi_out_head++] = data;
-            while (!fifo_empty(zifi_out_head, zifi_out_tail) && uart_is_writable(g_uart)) {
+            // g_uart guard: on the CDC transport g_uart is null (the ring drains
+            // via cdcPump()/tick()) and uart_is_writable(nullptr) reads ROM.
+            while (g_uart && !fifo_empty(zifi_out_head, zifi_out_tail) && uart_is_writable(g_uart)) {
                 uart_get_hw(g_uart)->dr = zifi_out_buf[zifi_out_tail++];
                 tx_bytes++;
             }
@@ -858,6 +860,51 @@ void __not_in_flash("zifi") ZiFi::uart16550Write(uint8_t reg_hi, uint8_t data) {
         case 7: u16550_scr = data; return; // SCR
         default: return;                 // LSR/MSR read-only
     }
+}
+
+// ─── ZX UNO register window (#FC3B / #FD3B) ───────────────────────────────────
+// Karabas-Pro exposes its on-board ESP8266 through the ZX UNO register file:
+// OUT (#FC3B) latches an internal register index, #FD3B reads/writes that
+// register. Only the UART registers are implemented (as on the real board):
+//   #C6 — UART data: read = received byte (accumulator), write = transmit
+//   #C7 — UART status: bit0 RX_RECV (byte waiting), bit1 TX_BUSY
+//   #C8/#C9 — UART2, only present on EP4CE10 boards → absent here (0xFF)
+// Data bridges to the same ESP FIFOs as the ZIFI-API and 16550 windows, so
+// Karabas network software drives our ESP-01 / CDC link unchanged.
+uint8_t ZiFi::uno_addr    = 0;
+uint8_t ZiFi::uno_last_rx = 0;
+
+uint8_t __not_in_flash("zifi") ZiFi::unoUartRead(bool dataPort) {
+    if (!dataPort) return uno_addr;             // #FC3B reads the latch back
+    cdcPump();   // load-bearing — see the comment in ZiFi::read
+    switch (uno_addr) {
+        case 0xC6: { // UART data — accumulator holds the byte until the next RX
+            int b = rxPop();
+            if (b >= 0) uno_last_rx = (uint8_t)b;
+            return uno_last_rx;
+        }
+        case 0xC7: { // UART status
+            uint8_t st = rxAvailable() ? 0x01 : 0x00;
+            if (fifo_full(zifi_out_head, zifi_out_tail)) st |= 0x02; // TX_BUSY
+            return st;
+        }
+        default: return 0xFF; // UART2 / unimplemented registers
+    }
+}
+
+void __not_in_flash("zifi") ZiFi::unoUartWrite(bool dataPort, uint8_t data) {
+    if (!dataPort) { uno_addr = data; return; } // #FC3B: latch register index
+    if (uno_addr != 0xC6) return;               // only the UART data reg is writable
+    // Same TX path as the 16550 THR: queue, then drain opportunistically while
+    // the GPIO UART has room (on the CDC transport g_uart is null and the ring
+    // drains via cdcPump()/tick() instead).
+    if (!fifo_full(zifi_out_head, zifi_out_tail))
+        zifi_out_buf[zifi_out_head++] = data;
+    while (g_uart && !fifo_empty(zifi_out_head, zifi_out_tail) && uart_is_writable(g_uart)) {
+        uart_get_hw(g_uart)->dr = zifi_out_buf[zifi_out_tail++];
+        tx_bytes++;
+    }
+    LED::touchW(LED::NET); // TX activity → up arrow (red)
 }
 
 // ─── USB-CDC transport (CH340/CP210x/FTDI dongle) ─────────────────────────────

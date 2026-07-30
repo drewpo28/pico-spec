@@ -55,6 +55,7 @@ SECTIONS
         *(SORT(.fini_array.*))
         *(.fini_array)
         PROVIDE_HIDDEN (__fini_array_end = .);
+        PROVIDE(__dso_handle = 0);
 
         *(.eh_frame*)
         . = ALIGN(4);

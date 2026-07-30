@@ -232,18 +232,94 @@ string ZipExtract::extractByIndex(const string& zipPath, int fileIndex) {
     return "";
 }
 
-bool ZipExtract::extractFile(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize) {
+// ── Alt-stack for the extraction body ────────────────────────────────────────
+// hw-traced 2026-07-21 (STKOF at MSPLIM, caught by PICO_USE_STACK_GUARDS):
+// extractFile runs at the bottom of an OSD-deep chain (file browser / archive
+// launch), and inflate + FatFs + Debug::log + 31.5 kHz HDMI-audio IRQ frames
+// (IRQs push on MSP) overflow the 4 KB core0 stack even with every big local
+// here already static. Run the body on a short-lived 8 KB heap stack instead.
+// Same MSP+MSPLIM switch pattern as mscCallOnStack (UsbMsc.cpp) /
+// net_call_on_stack (OSDMain.cpp); this file is RP2350-only (Cortex-M33).
+#define ZIP_DEEP_STACK_SIZE 8192
+
+extern "C" size_t getLargestAllocatable(void);  // OSDMain.cpp — malloc panics on OOM
+
+// MSPLIM must be OFF (0) whenever SP crosses between stacks: the caller may
+// itself be on a heap alt-stack BELOW this one (archive download → extract runs
+// on net_call_on_stack's stack), and raising MSPLIM above a live SP means any
+// IRQ in that window pushes its frame below the limit → STKOF hard fault
+// (hw-traced 2026-07-22: SIGBUS with SP==MSPLIM==alt-stack bottom, PC inside
+// this function). IRQs during the limit-off windows are fine — SP always
+// points into a valid stack there.
+__attribute__((naked, noinline))
+static void zipCallOnStack(void* new_top, void (*fn)(void*), void* arg, void* new_bottom) {
+    __asm volatile(
+        "mrs  r12, msplim       \n" // r12 = old MSPLIM
+        "push {r4}              \n" // scratch reg (old stack; SP ≥ old MSPLIM here)
+        "movs r4, #0            \n"
+        "msr  msplim, r4        \n" // limit off while SP crosses stacks
+        "mov  r4, sp            \n" // r4 = old SP
+        "mov  sp, r0            \n" // SP = new_top
+        "msr  msplim, r3        \n" // SP is on the alt stack now — arm its guard
+        "push {r2, r4, r12, lr} \n" // 16 bytes → keeps 8-byte alignment
+        "mov  r0, r2            \n" // r0 = arg
+        "blx  r1                \n" // fn(arg)
+        "pop  {r2, r4, r12, lr} \n"
+        "movs r1, #0            \n"
+        "msr  msplim, r1        \n" // limit off for the return crossing
+        "mov  sp, r4            \n" // restore old SP
+        "msr  msplim, r12       \n" // restore old limit (≤ old SP by construction)
+        "pop  {r4}              \n"
+        "bx   lr                \n"
+    );
+}
+
+struct ZipDeepArgs {
+    FIL*        zipFile;
+    uint16_t    compression;
+    uint32_t    compressedSize;
+    uint32_t    uncompressedSize;
+    const char* outPath;
+    bool        ret;
+};
+
+static void extractFileTramp(void* p) {
+    ZipDeepArgs* a = (ZipDeepArgs*)p;
+    a->ret = ZipExtract::extractFileInner(a->zipFile, a->compression,
+                                          a->compressedSize, a->uncompressedSize, a->outPath);
+}
+
+bool ZipExtract::extractFile(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize, const char* outPath) {
+    if (!outPath) outPath = TEMP_FILE;
+    ZipDeepArgs a = { zipFile, compression, compressedSize, uncompressedSize, outPath, false };
+    uint8_t* stk = nullptr;
+    if (getLargestAllocatable() >= ZIP_DEEP_STACK_SIZE + 4096)
+        stk = (uint8_t*)malloc(ZIP_DEEP_STACK_SIZE);
+    if (stk) {
+        void* top = (void*)(((uintptr_t)stk + ZIP_DEEP_STACK_SIZE) & ~(uintptr_t)7);
+        zipCallOnStack(top, extractFileTramp, &a, stk);
+        free(stk);
+    } else {
+        // Heap too tight for the alt-stack — run in place (pre-guard behavior;
+        // the stack guard turns a repeat overflow into a clean fault, not
+        // cross-core corruption).
+        extractFileTramp(&a);
+    }
+    return a.ret;
+}
+
+bool ZipExtract::extractFileInner(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize, const char* outPath) {
     if (compression == 0)
         // Streaming-stored (csz=0 in local header): csz==usz for stored data.
-        return extractStored(zipFile, compressedSize ? compressedSize : uncompressedSize);
+        return extractStored(zipFile, compressedSize ? compressedSize : uncompressedSize, outPath);
     if (compression == 8)
-        return extractDeflate(zipFile, compressedSize);
+        return extractDeflate(zipFile, compressedSize, outPath);
     return false;
 }
 
-bool ZipExtract::extractStored(FIL* zipFile, uint32_t size) {
+bool ZipExtract::extractStored(FIL* zipFile, uint32_t size, const char* outPath) {
     FIL& outFile = s_outFile;
-    if (f_open(&outFile, TEMP_FILE, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
+    if (f_open(&outFile, outPath, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
         return false;
 
     uint8_t buf[ZIP_BUF_SIZE];
@@ -281,9 +357,9 @@ static void* zip_zalloc(void* /*opaque*/, size_t items, size_t size) {
 }
 static void zip_zfree(void* /*opaque*/, void* p) { Buffer::pfree(p); }
 
-bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize) {
+bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize, const char* outPath) {
     FIL& outFile = s_outFile;
-    if (f_open(&outFile, TEMP_FILE, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
+    if (f_open(&outFile, outPath, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
         return false;
 
     uint8_t s_inbuf[ZIP_BUF_SIZE];
@@ -524,6 +600,14 @@ int ZipExtract::extractAll(const string& zipPath, const string& destDir) {
     if (f_open(&zipFile, zipPath.c_str(), FA_READ) != FR_OK)
         return 0;
 
+    // Temp file on the DESTINATION volume: f_rename resolves the new name on the
+    // OLD name's volume (the "USB:" prefix of the new name is silently ignored),
+    // so extracting via SD /tmp and renaming to "USB:/..." landed the files in a
+    // same-named folder on the SD card instead of the stick.
+    char tmpPath[160];
+    snprintf(tmpPath, sizeof(tmpPath), "%s.zip_extract.tmp", destDir.c_str());
+    Debug::log("ZIP: extractAll %s -> %s", zipPath.c_str(), destDir.c_str());
+
     FSIZE_t zipSize = f_size(&zipFile);
     LocalFileHeader hdr;
     UINT br;
@@ -549,15 +633,18 @@ int ZipExtract::extractAll(const string& zipPath, const string& destDir) {
             // Build destination path: destDir + basename
             const char* base = getBaseName(s_zip_fnBuf);
 
-            // Extract to TEMP_FILE first, then rename to dest
-            // Use extractFile which writes to TEMP_FILE
-            bool ok = extractFile(&zipFile, hdr.compression, hdr.compressedSize, hdr.uncompressedSize);
+            // Extract to a temp on the destination volume, then rename in place
+            bool ok = extractFile(&zipFile, hdr.compression, hdr.compressedSize, hdr.uncompressedSize, tmpPath);
             if (ok) {
-                char destPath[128];
+                char destPath[160];
                 snprintf(destPath, sizeof(destPath), "%s%s", destDir.c_str(), base);
                 f_unlink(destPath); // remove if exists
-                f_rename(TEMP_FILE, destPath);
-                extracted++;
+                FRESULT rr = f_rename(tmpPath, destPath);
+                if (rr == FR_OK) extracted++;
+                else Debug::log("ZIP: rename %s -> %s failed (%d)", tmpPath, destPath, (int)rr);
+            } else {
+                Debug::log("ZIP: extract '%s' failed (comp=%u csz=%lu)",
+                           s_zip_fnBuf, hdr.compression, (unsigned long)hdr.compressedSize);
             }
             // Re-seek past data (extractFile consumed it, but be safe)
         }
@@ -570,7 +657,8 @@ int ZipExtract::extractAll(const string& zipPath, const string& destDir) {
     }
 
     f_close(&zipFile);
-    f_unlink(TEMP_FILE); // clean up temp
+    f_unlink(tmpPath); // clean up temp
+    Debug::log("ZIP: extractAll done, %d file(s)", extracted);
     return extracted;
 }
 

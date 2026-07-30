@@ -15,12 +15,18 @@
 #include <hardware/clocks.h>
 #include <hardware/uart.h>
 #include <hardware/watchdog.h>    // watchdog_caused_reboot (boot breadcrumb)
+#if !PICO_RP2040
+#include <hardware/structs/powman.h>  // chip_reset reason decode (boot breadcrumb)
+#endif
 
 #include <hardware/pll.h>
 
 #ifdef PICO_RP2350
 #include <hardware/regs/qmi.h>
 #include <hardware/structs/qmi.h>
+#include <pico/bootrom.h>              // rom_func_lookup_inline (flash QE fix window)
+#include <hardware/regs/pads_qspi.h>   // SD2/SD3 pull-ups (flash QE fix window)
+#include <hardware/structs/pads_qspi.h>
 #endif
 
 #include "ESPectrum.h"
@@ -124,7 +130,7 @@ extern "C" bool handleScancode(const uint32_t ps2scancode) {
         bool pressed = cd < 0x80;
         cd &= 0x7F;
         switch (cd) {
-            case 0x5B: kbdPushData(fabgl::VirtualKey::VK_LCTRL, pressed); return true; /// L WIN
+            case 0x5B: kbdPushData(fabgl::VirtualKey::VK_LGUI, pressed); return true; /// L WIN = Karabas "Menu"
             case 0x1D: {
                 if (Config::CursorAsJoy) joyPushData(fabgl::VirtualKey::VK_DPAD_ALTFIRE, pressed);
                 kbdPushData(fabgl::VirtualKey::VK_RCTRL, pressed);
@@ -136,7 +142,7 @@ extern "C" bool handleScancode(const uint32_t ps2scancode) {
                 kbdPushData(fabgl::VirtualKey::VK_RCTRL, pressed);
                 return true;
             }
-            case 0x5D: kbdPushData(fabgl::VirtualKey::VK_F1, pressed); return true; /// MENU
+            case 0x5D: kbdPushData(fabgl::VirtualKey::VK_LGUI, pressed); return true; /// MENU = Karabas "Menu"
             case 0x37: kbdPushData(fabgl::VirtualKey::VK_PRINTSCREEN, pressed); return true;
             case 0x46: kbdPushData(fabgl::VirtualKey::VK_BREAK, pressed); return true;
             case 0x52: kbdPushData(fabgl::VirtualKey::VK_INSERT, pressed); return true;
@@ -758,8 +764,10 @@ static mod2key_t mod2key[] = {
     { KEYBOARD_MODIFIER_RIGHTCTRL,  fabgl::VirtualKey::VK_RCTRL},
     { KEYBOARD_MODIFIER_RIGHTSHIFT, fabgl::VirtualKey::VK_RSHIFT},
     { KEYBOARD_MODIFIER_LEFTSHIFT,  fabgl::VirtualKey::VK_LSHIFT},
-    { KEYBOARD_MODIFIER_RIGHTGUI,   fabgl::VirtualKey::VK_F2},
-    { KEYBOARD_MODIFIER_LEFTGUI,    fabgl::VirtualKey::VK_F1},
+    // GUI/Win = the Karabas-Pro "Menu" key (ROMSET hotkeys Menu+F1..F4, see
+    // ESPectrum::processKeyboard). Used to be bound to VK_F1/VK_F2 (OSD menu).
+    { KEYBOARD_MODIFIER_RIGHTGUI,   fabgl::VirtualKey::VK_RGUI},
+    { KEYBOARD_MODIFIER_LEFTGUI,    fabgl::VirtualKey::VK_LGUI},
 };
 
 void __not_in_flash_func(process_kbd_report)(
@@ -814,6 +822,38 @@ Ps2Kbd_Mrmltr ps2kbd(
 );
 #endif
 
+// ── Uptime across soft reboots ───────────────────────────────────────────────
+// HWInfo's Uptime used raw time_us_64() (µs since the last chip reset), so an
+// F12 reboot / video-mode switch / crash watchdog restarted it from zero.
+// Accumulate the pre-reboot seconds in a watchdog scratch register instead:
+// scratch survives a watchdog reboot but is cleared by a power-on / RUN-pin
+// reset — exactly the boundary a "since power-on" uptime wants.
+// scratch[3] = 0x55 tag (top byte) | uptime seconds (24 bits ≈ 194 days).
+// scratch[2] is MIDI_REFLASH_SCRATCH (MidiSynth.cpp); 4..7 belong to the
+// SDK/bootrom watchdog_reboot vector.
+#define UPTIME_SCRATCH  3
+#define UPTIME_TAG      0x55000000u
+#define UPTIME_TAG_MASK 0xFF000000u
+static uint32_t s_uptime_offset_s = 0; // seconds accumulated before the last watchdog reboot
+
+extern "C" uint32_t uptime_seconds(void) {
+    return s_uptime_offset_s + (uint32_t)(time_us_64() / 1000000ULL);
+}
+
+// Called once at main() entry, before anything can arm the watchdog.
+static void uptime_init(void) {
+    uint32_t v = watchdog_hw->scratch[UPTIME_SCRATCH];
+    if (watchdog_caused_reboot() && (v & UPTIME_TAG_MASK) == UPTIME_TAG)
+        s_uptime_offset_s = v & ~UPTIME_TAG_MASK;
+    watchdog_hw->scratch[UPTIME_SCRATCH] = UPTIME_TAG | (s_uptime_offset_s & ~UPTIME_TAG_MASK);
+}
+
+// Refreshed from the 150 ms input tick below so even a crash-path watchdog
+// reboot (which never goes through esp_hard_reset) keeps the running total.
+static inline void uptime_refresh(void) {
+    watchdog_hw->scratch[UPTIME_SCRATCH] = UPTIME_TAG | (uptime_seconds() & ~UPTIME_TAG_MASK);
+}
+
 void repeat_me_for_input() {
     static uint32_t tickKbdRep1 = time_us_32();
     // 60 FPS loop
@@ -835,6 +875,7 @@ void repeat_me_for_input() {
         uint32_t tickKbdRep2 = time_us_32();
         if (tickKbdRep2 - tickKbdRep1 > 150000) { // repeat each 150 ms
             repeat_handler();
+            uptime_refresh();
             tickKbdRep1 = tickKbdRep2;
         }
 
@@ -1133,6 +1174,10 @@ extern "C" void sigbus_handler(uint32_t *frame) {
     // CFSR/BFAR only exist on Cortex-M3+ (not M0+)
     uint32_t cfsr = *(volatile uint32_t*)0xE000ED28u;
     uint32_t bfar = *(volatile uint32_t*)0xE000ED38u;
+    // PICO_USE_STACK_GUARDS: on an MSPLIM violation (UFSR.STKOF, CFSR bit 20)
+    // v8-M clamps SP to the limit and suppresses the frame push — so sp==bot,
+    // frame[] contents are garbage, and only the STKOF bit tells the story.
+    if (cfsr & (1u << 20)) ovf = 1;
     printf("SIGBUS[%d] core%u: PC=%08x LR=%08x SP=%08x CFSR=%08x BFAR=%08x stackOvf=%d (bot=%08x top=%08x)\n",
            count, (unsigned)core, (unsigned)pc, (unsigned)lr, (unsigned)sp, (unsigned)cfsr, (unsigned)bfar,
            ovf, (unsigned)bot, (unsigned)top);
@@ -1199,6 +1244,175 @@ static void __not_in_flash_func(flash_info)() {
         flash_do_cmd(tx, rx, 4);
     }
 }
+
+#if !PICO_RP2040
+// Flash QE bit fix for Puya flash on RP2350 boards (see fhoedemakers/flash_config).
+// Puya ships with SR2.QE=0 and its 01h command writes SR1 only, so boot2's
+// Winbond-style 2-byte 01h status write silently fails — quad XIP keeps sampling
+// WP#/HOLD# and locks up under overclock. Must run BEFORE flash_timings()/
+// set_sys_clock — the overclock is what triggers the lockup.
+//
+// The whole command sequence runs inside ONE exit-XIP window. Per the PY25Q128HA
+// datasheet, Volatile SR Write Enable (50h) must be IMMEDIATELY followed by the
+// Write Status Register command — no other flash commands in between. Chaining
+// flash_do_cmd() calls violates that: each call's epilogue re-runs boot2, which
+// itself talks to the flash (SR2 check + its own Winbond-style SR write attempt),
+// clearing the volatile-WE latch — hw-confirmed as "FIX FAILED" on ZERO2.
+// Preferred path is the volatile SR2 write (instant, zero wear, re-applied each
+// boot); if the chip ignores it, fall back to a one-time NON-volatile write
+// (06h + 31h + WIP poll — the fhoedemakers-proven sequence).
+// 0=n/a (not Puya)  1=already set  2=volatile  3=non-volatile 31h
+// 4=FAILED  5=non-volatile 01h 2-byte  6=raw-window self-test failed
+uint8_t flash_qe = 0;
+
+const char* flash_qe_text() {
+    switch (flash_qe) {
+        case 1: return "set";
+        case 2: return "set (volatile)";
+        case 3: return "set (non-volatile)";
+        case 5: return "set (01h fallback)";
+        case 6: return "WINDOW FAULT";
+        default: return "FIX FAILED";
+    }
+}
+
+// One CS-framed command inside an open exit-XIP window (mirror of the QMI half
+// of the SDK's flash_do_cmd). Caller guarantees: XIP exited, IRQs off, and no
+// flash-resident code touched until the window is closed.
+// NOTE: all three must be __no_inline_not_in_flash_func, NOT __not_in_flash_func:
+// the latter permits inlining, and MinSizeRel inlined the whole window body into
+// flash-resident main() — executing from (dead) XIP inside the window, hardfault
+// at the first XIP-cache miss (hw-traced on ZERO2 with the debug probe).
+static void __no_inline_not_in_flash_func(qe_cmd_raw)(const uint8_t *tx, uint8_t *rxb, size_t n) {
+    hw_set_bits(&qmi_hw->direct_csr, QMI_DIRECT_CSR_ASSERT_CS0N_BITS);   // CS low
+    hw_set_bits(&qmi_hw->direct_csr, QMI_DIRECT_CSR_EN_BITS);
+    size_t txr = n, rxr = n;
+    while (txr || rxr) {
+        uint32_t flags = qmi_hw->direct_csr;
+        if (txr && !(flags & QMI_DIRECT_CSR_TXFULL_BITS)) {
+            qmi_hw->direct_tx = *tx++;
+            --txr;
+        }
+        if (rxr && !(flags & QMI_DIRECT_CSR_RXEMPTY_BITS)) {
+            uint8_t b = (uint8_t)qmi_hw->direct_rx;
+            if (rxb) *rxb++ = b;
+            --rxr;
+        }
+    }
+    hw_clear_bits(&qmi_hw->direct_csr, QMI_DIRECT_CSR_EN_BITS);
+    hw_clear_bits(&qmi_hw->direct_csr, QMI_DIRECT_CSR_ASSERT_CS0N_BITS); // CS high
+}
+
+static uint8_t __no_inline_not_in_flash_func(qe_read_reg)(uint8_t cmd) {
+    uint8_t tx[2] = { cmd, 0 }, rxb[2];
+    qe_cmd_raw(tx, rxb, 2);
+    return rxb[1];
+}
+
+// Diagnostics captured inside the window, logged afterwards:
+// [0]=in-window JEDEC MF (self-test vs rx[1]) [1]=SR1 [2]=SR2 initial
+// [3]=SR2 after volatile try [4]=SR1 after 06h (WEL check) [5]=SR2 final
+uint8_t flash_qe_diag[6];
+
+static void __no_inline_not_in_flash_func(flash_qe_fix)() {
+    if (rx[1] != 0x85)                       // Puya only; Winbond is factory-set,
+        return;                              // other vendors have different SR layouts
+    // boot2 copy to re-enter fast XIP afterwards (on RP2350 crt0 parks boot2 in BOOTRAM)
+    static uint32_t boot2_copy[64];
+    const volatile uint32_t *b2 = (const volatile uint32_t *)BOOTRAM_BASE;
+    for (int i = 0; i < 64; ++i)
+        boot2_copy[i] = b2[i];
+    __compiler_memory_barrier();
+
+    rom_connect_internal_flash_fn connect_flash =
+        (rom_connect_internal_flash_fn)rom_func_lookup_inline(ROM_FUNC_CONNECT_INTERNAL_FLASH);
+    rom_flash_exit_xip_fn exit_xip =
+        (rom_flash_exit_xip_fn)rom_func_lookup_inline(ROM_FUNC_FLASH_EXIT_XIP);
+    rom_flash_flush_cache_fn flush_cache =
+        (rom_flash_flush_cache_fn)rom_func_lookup_inline(ROM_FUNC_FLASH_FLUSH_CACHE);
+
+    // ROM's exit_xip resets the QMI CS1 window to the clean 03h config — save and
+    // restore it like the SDK does (harmless this early: psram_init runs later,
+    // but keeps this function safe to call at any point).
+    uint32_t m1_timing = qmi_hw->m[1].timing;
+    uint32_t m1_rcmd   = qmi_hw->m[1].rcmd;
+    uint32_t m1_rfmt   = qmi_hw->m[1].rfmt;
+    uint32_t pads_save[count_of(pads_qspi_hw->io)];
+    for (size_t i = 0; i < count_of(pads_qspi_hw->io); ++i)
+        pads_save[i] = pads_qspi_hw->io[i];
+
+    const uint32_t ints = save_and_disable_interrupts();
+    connect_flash();
+    exit_xip();
+    // Pull SD2 (WP#) and SD3 (HOLD#) high during the window: with QE=0 the chip
+    // interprets them as control pins, and in serial direct mode the QMI leaves
+    // them undriven. A floating/low WP# + SRP0 hardware-protects the status
+    // registers — every SR write is then silently ignored (pads are io[3]/io[4]:
+    // SCLK, SD0, SD1, SD2, SD3, SS).
+    hw_write_masked(&pads_qspi_hw->io[3], PADS_QSPI_GPIO_QSPI_SD2_PUE_BITS,
+                    PADS_QSPI_GPIO_QSPI_SD2_PUE_BITS | PADS_QSPI_GPIO_QSPI_SD2_PDE_BITS);
+    hw_write_masked(&pads_qspi_hw->io[4], PADS_QSPI_GPIO_QSPI_SD3_PUE_BITS,
+                    PADS_QSPI_GPIO_QSPI_SD3_PUE_BITS | PADS_QSPI_GPIO_QSPI_SD3_PDE_BITS);
+    // ---- window open: only qe_* helpers below (all RAM-resident) ----
+    // Self-test: re-read JEDEC ID through our raw path; must match flash_info()'s.
+    uint8_t jtx[4] = { 0x9f, 0, 0, 0 }, jrx[4];
+    qe_cmd_raw(jtx, jrx, 4);
+    flash_qe_diag[0] = jrx[1];
+    flash_qe_diag[1] = qe_read_reg(0x05);
+    uint8_t sr2 = qe_read_reg(0x35);
+    flash_qe_diag[2] = sr2;
+    if (jrx[1] != rx[1] || jrx[2] != rx[2] || jrx[3] != rx[3]) {
+        flash_qe = 6;                                     // raw window broken — don't write anything
+    } else if (sr2 & 0x02) {
+        flash_qe = 1;                                     // QE already set
+    } else {
+        uint8_t wr31[2] = { 0x31, (uint8_t)(sr2 | 0x02) };
+        const uint8_t c50 = 0x50, c06 = 0x06;
+        qe_cmd_raw(&c50, NULL, 1);                        // Volatile SR Write Enable
+        qe_cmd_raw(wr31, NULL, 2);                        // Write SR2 (volatile copy)
+        for (volatile int i = 0; i < 2000; ++i);          // settle (volatile write is ~instant)
+        flash_qe_diag[3] = qe_read_reg(0x35);
+        if (flash_qe_diag[3] & 0x02) {
+            flash_qe = 2;
+        } else {
+            // Volatile write ignored — one-time non-volatile write instead.
+            qe_cmd_raw(&c06, NULL, 1);                    // Write Enable (WEL)
+            flash_qe_diag[4] = qe_read_reg(0x05);
+            if (flash_qe_diag[4] & 0x02) {                // WEL latched?
+                qe_cmd_raw(wr31, NULL, 2);
+                for (int i = 0; i < 20000; ++i)           // WIP poll, tW max ~12 ms
+                    if (!(qe_read_reg(0x05) & 0x01))
+                        break;
+                flash_qe = (qe_read_reg(0x35) & 0x02) ? 3 : 4;
+                if (flash_qe == 4) {
+                    // Last resort: Winbond-style 2-byte 01h write (SR1+SR2) —
+                    // some Puya parts route SR2 only through this form.
+                    uint8_t wr01[3] = { 0x01, qe_read_reg(0x05), (uint8_t)(sr2 | 0x02) };
+                    wr01[1] &= (uint8_t)~0x03;            // don't write back WIP/WEL
+                    qe_cmd_raw(&c06, NULL, 1);
+                    qe_cmd_raw(wr01, NULL, 3);
+                    for (int i = 0; i < 20000; ++i)
+                        if (!(qe_read_reg(0x05) & 0x01))
+                            break;
+                    flash_qe = (qe_read_reg(0x35) & 0x02) ? 5 : 4;
+                }
+            } else {
+                flash_qe = 4;
+            }
+        }
+    }
+    flash_qe_diag[5] = qe_read_reg(0x35);
+    // ---- close window: flush cache, re-enter fast XIP via boot2 ----
+    flush_cache();
+    ((void (*)(void))((intptr_t)boot2_copy + 1))();
+    qmi_hw->m[1].timing = m1_timing;
+    qmi_hw->m[1].rcmd   = m1_rcmd;
+    qmi_hw->m[1].rfmt   = m1_rfmt;
+    for (size_t i = 0; i < count_of(pads_qspi_hw->io); ++i)
+        pads_qspi_hw->io[i] = pads_save[i];
+    restore_interrupts(ints);
+}
+#endif
 
 // Try to switch sys clock with PLL lock timeout.
 // Returns true if PLL locked and clock switched; false if PLL did not lock
@@ -1279,6 +1493,7 @@ volatile uint32_t g_tusb_assert_count = 0;
 extern "C" void picospec_tusb_assert_hook(void) { g_tusb_assert_count++; }
 
 int main() {
+    uptime_init();   // capture pre-reboot uptime from watchdog scratch (see uptime_seconds)
 #if defined(DBG_UART_ENABLED) && defined(PICO_DEFAULT_UART)
     // Early console at the boot clock: proves bootrom/crt0 completed and logs the
     // reset reason before any flash/clock/PSRAM bring-up (the pre-stdio window
@@ -1288,9 +1503,32 @@ int main() {
     uart_init(uart_default, 115200);
     gpio_set_function(PICO_DEFAULT_UART_TX_PIN, GPIO_FUNC_UART);
     Debug::log("main: entry, wd_reboot=%d", (int)watchdog_caused_reboot());
+#if !PICO_RP2040
+    // Decode WHY the chip reset (hw-traced 2026-07-21: "wd_reboot=0 mid-ZIP-extract"
+    // reboots were undiagnosable — POR/BOR here means the supply sagged, RUN means
+    // the reset button / debug probe, WDG means our own esp_hard_reset/crash path).
+    {
+        uint32_t cr = powman_hw->chip_reset;
+        Debug::log("main: chip_reset=%08X%s%s%s%s%s%s", (unsigned)cr,
+                   (cr & POWMAN_CHIP_RESET_HAD_POR_BITS)                  ? " POR"    : "",
+                   (cr & POWMAN_CHIP_RESET_HAD_BOR_BITS)                  ? " BOR"    : "",
+                   (cr & POWMAN_CHIP_RESET_HAD_RUN_LOW_BITS)              ? " RUN"    : "",
+                   (cr & (POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_SWCORE_BITS |
+                          POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_PSM_BITS)) ? " WDG"    : "",
+                   (cr & POWMAN_CHIP_RESET_HAD_GLITCH_DETECT_BITS)        ? " GLITCH" : "",
+                   (cr & POWMAN_CHIP_RESET_HAD_DP_RESET_REQ_BITS)         ? " DBG"    : "");
+    }
+#endif
     uart_tx_wait_blocking(uart_default);   // drain before the clock switch garbles it
 #endif
     flash_info();
+#if !PICO_RP2040
+    flash_qe_fix();
+    if (flash_qe)
+        Debug::log("main: flash QE (Puya) %s | jed=%02X sr1=%02X sr2=%02X vol=%02X wel=%02X fin=%02X",
+                   flash_qe_text(), flash_qe_diag[0], flash_qe_diag[1], flash_qe_diag[2],
+                   flash_qe_diag[3], flash_qe_diag[4], flash_qe_diag[5]);
+#endif
 #ifdef PICO_RP2040
     vreg_set_voltage(VREG_VOLTAGE_MAX); // 1.30V — max for RP2040
     sleep_ms(10);

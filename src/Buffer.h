@@ -63,6 +63,26 @@ public:
     // empty and everything falls back to heap.
     static void initPools();
 
+    // ── How much PSRAM the ZX RAM pages may claim ─────────────────────────────
+    // MemESP fills butter (or SPI) PSRAM with ZX pages bottom-up and used to take
+    // whatever it could reach. With MEM_PG_CNT at its ceiling — 2048 pages, i.e.
+    // Machine > Murmuzavr > 32 MB — that is 32 MB of demand against an 8 MB chip, so
+    // the pages swallowed the whole chip: initPools() carved a 0 KB arena, GS::init
+    // declined its sample RAM ("not enough butter PSRAM"), and every buffer that
+    // belongs in PSRAM (Gigascreen prevFB, GS work RAM/rings, zip inflate, net rings)
+    // fell back to the heap — which then OOM-panicked in setup(). These cap what
+    // MemESP may take so the reservations above it always survive; the pages that no
+    // longer fit go to SD swap, which is where pages past the chip already went.
+    static size_t pageBudgetButter();    // butter PSRAM bytes offered to ZX pages
+    static size_t pageBudgetSpi();       // SPI PSRAM bytes offered to ZX pages
+    // Top of the SPI region ZX pages can occupy: the budget, capped by what
+    // MEM_PG_CNT can address. Anything that must sit clear of the swap pool (GS's SPI
+    // sample RAM, the SPI arena) reserves above this.
+    static size_t spiPageExtent();
+    // True when GS's sample RAM can be reserved at all: butter PSRAM always has room,
+    // an SPI-only board must hold GS + the minimum arena + a usable swap pool.
+    static bool   gsPsramAvailable();
+
     // Register the flash partition that backs TIER_FLASH (e.g. the GM.DLS bank
     // region). `xipBase` is the partition's XIP address (>= XIP_BASE), `size` its
     // length. Call once at boot, before any ALLOW_FLASH allocation. Idempotent.

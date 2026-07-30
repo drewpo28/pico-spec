@@ -56,6 +56,7 @@ uint16_t Config::max_tft_freq = 126;
 uint8_t  Config::vreq_voltage = VREG_VOLTAGE_1_60;
 #endif
 bool     Config::Issue2 = true;
+uint16_t Config::mem_pg_cnt = 64;      // Murmuzavr off; the live count is MEM_PG_CNT
 bool     Config::rtc_enabled = false;
 bool     Config::flashload = true;
 bool     Config::tape_player = false; // Tape player mode
@@ -342,14 +343,57 @@ void Config::requestMachine(const string& newArch, const string& newRomSet)
     } else if (arch == "Profi") {
         if (newRomSet=="") romSet = "Profi"; else romSet = newRomSet;
         if (newRomSet=="") romSetProfi = "Profi"; else romSetProfi = newRomSet;
-        // bank0 (service) + bank1 (Profi TR-DOS) stay raw; bank2/bank3 are overlays
-        // over the Sinclair 128K halves (rom[0]/rom[1]). See RomOverlay.h.
-        MemESP::rom[0].assign_rom(gb_rom_profi_bank0);
-        MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
-        MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
-        MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2);
-        MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
-        MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_profi_bank3);
+        // Five romsets mirroring the real Karabas-Pro ROMSET slots. Every branch
+        // sets the overlay for EVERY base it assigns — including nullptr for
+        // "no overlay" — because registerOverlay() state persists per-base
+        // across romset switches (switching PQDOS→Original used to leave the
+        // PQ bank1 overlay live on the stock bank1).
+        if (romSetProfi == "ProfiPQ") {
+            // ROMSET 1: PQDOS BIOS 0.41h1 (bank0 raw, ~94% different from stock);
+            // bank1/2/3 overlay over the same bases as stock (tools/rom_pack.py).
+            MemESP::rom[0].assign_rom(gb_rom_profi_pq_bank0);
+            MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
+            MemESP::registerOverlay(gb_rom_profi_bank1, gb_overlay_profi_bank1_pq);
+            MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2_pq);
+            MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_profi_bank3_pq);
+        } else if (romSetProfi == "ProfiKarabas") {
+            // ROMSET 0 (ROMain_ramdisk_A.rom, byte-faithful): ROMain bank0
+            // (graphical boot menu) + bank1 with the ROMain ramdisk-TR-DOS
+            // overlay; the image's bank2 == stock Profi bank2, bank3 == plain
+            // Sinclair 128K second half (no overlay).
+            MemESP::rom[0].assign_rom(gb_rom_profi_bank0_karabas);
+            MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
+            MemESP::registerOverlay(gb_rom_profi_bank1, gb_overlay_profi_bank1_romain);
+            MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2);
+            MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, nullptr);
+        } else if (romSetProfi == "ProfiKarabasFT") {
+            // ROMSET 2: Flash Tool v2.7 by Doctor Max. bank1 is empty (0xFF) in
+            // the real image; bank0/2/3 are unique raw dumps (profi_banks_dmax.c).
+            MemESP::rom[0].assign_rom(gb_rom_profi_bank0_flashtool);
+            MemESP::rom[1].assign_rom(gb_rom_profi_bank_ff);
+            MemESP::rom[2].assign_rom(gb_rom_profi_bank2_flashtool);
+            MemESP::rom[3].assign_rom(gb_rom_profi_bank3_flashtool);
+        } else if (romSetProfi == "ProfiKarabasFDI") {
+            // ROMSET 3: FDImage v0.87 by Doctor Max. Same layout as Flash Tool.
+            MemESP::rom[0].assign_rom(gb_rom_profi_bank0_fdimage);
+            MemESP::rom[1].assign_rom(gb_rom_profi_bank_ff);
+            MemESP::rom[2].assign_rom(gb_rom_profi_bank2_fdimage);
+            MemESP::rom[3].assign_rom(gb_rom_profi_bank3_fdimage);
+        } else {
+            // "Original": bank0 (service) + bank1 (Profi TR-DOS) raw; bank2/bank3
+            // overlay the Sinclair 128K halves (rom[0]/rom[1]). See RomOverlay.h.
+            MemESP::rom[0].assign_rom(gb_rom_profi_bank0);
+            MemESP::rom[1].assign_rom(gb_rom_profi_bank1);
+            MemESP::registerOverlay(gb_rom_profi_bank1, nullptr);
+            MemESP::rom[2].assign_rom(gb_rom_0_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_128k, gb_overlay_profi_bank2);
+            MemESP::rom[3].assign_rom(gb_rom_1_sinclair_128k);
+            MemESP::registerOverlay(gb_rom_1_sinclair_128k, gb_overlay_profi_bank3);
+        }
 #endif
     } else { // Pentagon by default
         if (newRomSet=="") romSet = "128Kp"; else romSet = newRomSet;
@@ -1005,13 +1049,17 @@ void Config::load() {
             hotkeys[i].alt  = (mod >> 1) & 1;
             hotkeys[i].ctrl = (mod     ) & 1;
         }
-        int mem_pg_cnt = 0;
-        nvs_get_i("MEM_PG_CNT", mem_pg_cnt, sts);
-        if (mem_pg_cnt < 8 || mem_pg_cnt > 2048) MEM_PG_CNT = 64;
+        // Murmuzavr page count. Lands in Config::mem_pg_cnt (the persisted pick); the
+        // live MEM_PG_CNT is derived from it once in ESPectrum::setup(), which also
+        // applies the Pentagon-only clamp.
+        int pg = 0;
+        nvs_get_i("MEM_PG_CNT", pg, sts);
+        if (pg < 8 || pg > 2048) pg = 64;
         #if PICO_RP2040
-        else if (mem_pg_cnt > 512) MEM_PG_CNT = 512;
+        else if (pg > 512) pg = 512;
         #endif
-        else MEM_PG_CNT = mem_pg_cnt;
+        mem_pg_cnt = (uint16_t)pg;
+        MEM_PG_CNT = mem_pg_cnt;
     }
     loaded = true;
 #if !PICO_RP2040
@@ -1075,10 +1123,20 @@ void Config::save(const char* path) {
     if (FileUtils::fsMount) {
         if (!toDefault && !loaded) {
             // Config was never loaded from file — refuse to overwrite
-            // existing storage.nvs with defaults
+            // existing storage.nvs with defaults. The guard is for a file we
+            // could not READ (SD hiccup at boot); a file THIS session created
+            // is ours, which is why the successful write below sets `loaded`.
+            // Without that, only the first save of a session landed: a boot
+            // with no storage.nvs yet (new firmware version = new config dir)
+            // left loaded=false, the first save created the file, and every
+            // later save in the same session was blocked by it — a menu commit
+            // persisted its own field but MachineSwitch's save (which carries
+            // arch/romSet, and runs second) was refused, so the machine
+            // reverted on the next boot.
             FILINFO fi;
             if (f_stat(STORAGE_NVS, &fi) == FR_OK) {
-                Debug::log("Config::save BLOCKED — not loaded, file exists (%u bytes)", fi.fsize);
+                Debug::log("Config::save BLOCKED — not loaded, file exists (%lu bytes)",
+                           (unsigned long)fi.fsize);
                 return;
             }
         }
@@ -1322,7 +1380,8 @@ void Config::save(const char* path) {
         uint8_t mod = (hotkeys[i].alt ? 2 : 0) | (hotkeys[i].ctrl ? 1 : 0);
         nvs_set_u8(buf, key, mod);
     }
-    nvs_set_i(buf,"MEM_PG_CNT", MEM_PG_CNT);
+    // The PICK, not the live count — see Config::mem_pg_cnt in Config.h.
+    nvs_set_i(buf,"MEM_PG_CNT", mem_pg_cnt);
 
     if (handle) {
         // f_sync flushes FAT before close so we don't commit the
@@ -1344,6 +1403,10 @@ void Config::save(const char* path) {
                 // File is authoritative — drop any stale RAM copy
                 nvs_ram_buf.clear();
                 nvs_ram_buf.shrink_to_fit();
+                // storage.nvs now holds exactly this state, so a later save in
+                // the same session is no longer "defaults over an unread file"
+                // and must not be blocked by the guard above.
+                loaded = true;
             }
         } else {
             // Write failed — remove incomplete temp, keep original intact

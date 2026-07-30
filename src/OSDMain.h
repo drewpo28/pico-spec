@@ -90,6 +90,10 @@ public:
     static void clearStats();
     static void drawVolumeBox();
     static void do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL);
+    // NMI action shared by the configurable NMI hotkey and Karabas Menu+F12:
+    // DivMMC → plain NMI; ZX Byte / Pentagon / Profi → chooser menu (NMI vs
+    // NMI+DOS etc.); otherwise plain NMI.
+    static void nmiAction();
     static void HWInfo();
     static void ChipInfo();
     static void BoardInfo();

@@ -14,6 +14,10 @@ extern "C" {
 }
 extern int butter_pages;
 
+// Raw-passthrough target: physical SD (pdrv 0) normally, the USB stick
+// (pdrv 1) when it took over as the root volume (no SD card at boot).
+static BYTE raw_pdrv() { return FileUtils::usbRoot ? 1 : 0; }
+
 // Static member definitions
 bool DivMMC::enabled = false;
 bool DivMMC::automap = false;
@@ -223,19 +227,24 @@ void DivMMC::init() {
     }
 
     if (divsd_mode && enabled) {
-        // DivSD: raw SD access — SDHC mode (sector-addressed)
+        // DivSD: raw card access — SDHC mode (sector-addressed)
         sdhc_mode = true;
-        DWORD sector_count = 0;
-        disk_ioctl(0, GET_SECTOR_COUNT, &sector_count);
+        // usbRoot: the stick may not have enumerated yet at boot time
+        if (FileUtils::usbRoot) FileUtils::waitVolumeReady("USB:/");
+        // LBA_t: with FF_LBA64 the USB ioctl writes 8 bytes — a DWORD here
+        // would get its neighbour on the stack clobbered
+        LBA_t sector_count = 0;
+        disk_ioctl(raw_pdrv(), GET_SECTOR_COUNT, &sector_count);
         mmc_file_size[0] = (uint32_t)((uint64_t)sector_count * 512 > 0xFFFFFFFF ? 0xFFFFFFFF : sector_count * 512);
-        buildCSD_real(sector_count);
+        buildCSD_real((uint32_t)sector_count);
         // SDHC OCR: power_up done (bit31) + CCS=1 (bit30) + voltage
         mmc_ocr[0] = 0xC0;  // bits 31:24 — power_up=1, CCS=1
         mmc_ocr[1] = 0xFF;  // bits 23:16 — all voltages
         mmc_ocr[2] = 0x80;  // bits 15:8
         mmc_ocr[3] = 0x00;  // bits 7:0
         mmc_ocr[4] = 0x00;
-        Debug::log("%s: raw SD, %lu sectors, SDHC mode", mode_name, (unsigned long)sector_count);
+        Debug::log("%s: raw %s, %lu sectors, SDHC mode", mode_name,
+                   FileUtils::usbRoot ? "USB" : "SD", (unsigned long)sector_count);
         Debug::log("CSD: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
             mmc_csd[0], mmc_csd[1], mmc_csd[2], mmc_csd[3], mmc_csd[4],
             mmc_csd[5], mmc_csd[6], mmc_csd[7], mmc_csd[8], mmc_csd[9], mmc_csd[10]);
@@ -618,7 +627,15 @@ void DivMMC::flushWriteBuffer() {
 // synthesize one and shift the .mmc data by +1 sector.
 void DivMMC::loadSector(uint32_t sector) {
     if (divsd_mode) {
-        disk_read(0, mmc_sector_buf, sector, 1);
+        DRESULT r = disk_read(raw_pdrv(), mmc_sector_buf, sector, 1);
+        // Bring-up trace: the first reads (+ early errors) show whether the
+        // guest talks to the card at all and whether transfers succeed
+        static uint8_t rd_trace = 0;
+        if (rd_trace < 12 || (r != RES_OK && rd_trace < 24)) {
+            rd_trace++;
+            Debug::log("ZC/DivSD rd sec=%lu res=%d", (unsigned long)sector, (int)r);
+        }
+        if (r != RES_OK) memset(mmc_sector_buf, 0xFF, 512);
         return;
     }
     if (!mmc_file_open[0]) {
@@ -635,7 +652,12 @@ void DivMMC::loadSector(uint32_t sector) {
 
 void DivMMC::storeSector(uint32_t sector) {
     if (divsd_mode) {
-        disk_write(0, mmc_sector_buf, sector, 1);
+        DRESULT r = disk_write(raw_pdrv(), mmc_sector_buf, sector, 1);
+        static uint8_t wr_trace = 0;
+        if (wr_trace < 8 || (r != RES_OK && wr_trace < 16)) {
+            wr_trace++;
+            Debug::log("ZC/DivSD wr sec=%lu res=%d", (unsigned long)sector, (int)r);
+        }
         return;
     }
     if (!mmc_file_open[0]) return;
@@ -1238,13 +1260,17 @@ void DivMMC::ide_write(uint8_t reg, uint8_t value) {
 
 void DivMMC::zc_init() {
     if (zc_enabled) return;
-    // Real SD card in SDHC sector-addressed mode.
+    // Real card (SD, or USB stick in usbRoot mode) in SDHC sector-addressed mode.
     divsd_mode = true;
     sdhc_mode = true;
-    DWORD sector_count = 0;
-    disk_ioctl(0, GET_SECTOR_COUNT, &sector_count);
+    // usbRoot: the stick may not have enumerated yet at boot time
+    if (FileUtils::usbRoot) FileUtils::waitVolumeReady("USB:/");
+    // LBA_t: with FF_LBA64 the USB ioctl writes 8 bytes — a DWORD here
+    // would get its neighbour on the stack clobbered
+    LBA_t sector_count = 0;
+    disk_ioctl(raw_pdrv(), GET_SECTOR_COUNT, &sector_count);
     mmc_file_size[0] = (uint32_t)((uint64_t)sector_count * 512 > 0xFFFFFFFF ? 0xFFFFFFFF : sector_count * 512);
-    buildCSD_real(sector_count);
+    buildCSD_real((uint32_t)sector_count);
     mmc_ocr[0] = 0xC0;
     mmc_ocr[1] = 0xFF;
     mmc_ocr[2] = 0x80;
@@ -1265,7 +1291,8 @@ void DivMMC::zc_init() {
     mmc_sector_dirty = false;
     zc_config = 0;
     zc_enabled = true;
-    Debug::log("Z-Controller: raw SD, %lu sectors, SDHC mode", (unsigned long)sector_count);
+    Debug::log("Z-Controller: raw %s, %lu sectors, SDHC mode",
+               FileUtils::usbRoot ? "USB" : "SD", (unsigned long)sector_count);
 }
 
 void DivMMC::zc_shutdown() {

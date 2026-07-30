@@ -75,6 +75,9 @@ extern volatile uint32_t mem_acc_dirty_cnt, mem_acc_dirty_sum;
 uint32_t butter_psram_size();
 extern uint8_t rx[4];
 #if !PICO_RP2040
+extern uint8_t flash_qe;       // Puya QE-bit fix status (0=n/a; see flash_qe_text())
+extern uint8_t flash_qe_diag[6];
+const char* flash_qe_text();
 extern uint8_t* g_alfWindow;   // AlfCart's 16K SD-faulted window (nullptr = unmounted)
 #endif
 extern "C" uint32_t psram_size();   // SPI PSRAM size (0 on butter/QSPI boards)
@@ -150,22 +153,42 @@ public:
     // have been re-synced to a colder page since the request was queued).
     inline bool acc_hot() { return _int->acc_hits >= 128; }
 private:
+    // ONE PER ZX RAM PAGE, and MEM_PG_CNT goes up to 2048 (Machine > Murmuzavr >
+    // 32 MB) — so 2050 of these exist and every byte of the struct is SRAM the rest
+    // of the firmware cannot have.  Hence:
+    //  - `vram_off` is NOT stored: the backing offset is always page * MEM_PG_SZ, so
+    //    only the page index is kept (uint16 covers the 2048-page ceiling that
+    //    Config::load clamps to, plus the two hidden ROM pages),
+    //  - the layout is ordered so the whole thing is 12 bytes with no padding,
+    //  - allocation goes through the pooled operator new below.
+    // At 2050 pages that is 24 KB instead of 49 KB; the old 20-byte struct in a
+    // 24-byte malloc chunk left too little heap for VIDEO::Init + the WD1793 track
+    // buffer and Murmuzavr 32 MB panicked with "Out of memory" during setup().
+    // `dirty` keeps its own addressable byte — bank_dirty[] holds a bool* to it and
+    // writebyte() stores through that on every RAM write.
     struct mem_desc_int_t {
         uint8_t* p;
-        uint32_t vram_off;
-        mem_type_t mem_type;
-        bool is_rom;
-        bool pinned;  // if true, _sync skips this entry (never evicted while pinned)
-        bool dirty;   // frame modified since last load/write-back; clean victims
-                      // are evicted WITHOUT the 16KB write-back (see _sync)
+        uint16_t page_idx; // backing-store page number; offset = page_idx * MEM_PG_SZ
         uint16_t acc_hits; // accessor-mode accesses, CUMULATIVE across bank visits
                       // (reset only when the page is loaded into the pool) — a
                       // page trampolined often-but-lightly still accumulates to
                       // the promotion threshold instead of staying per-byte forever
+        uint8_t mem_type; // a mem_type_t, stored narrow (compares/assigns unchanged)
+        bool is_rom;
+        bool pinned;  // if true, _sync skips this entry (never evicted while pinned)
+        bool dirty;   // frame modified since last load/write-back; clean victims
+                      // are evicted WITHOUT the 16KB write-back (see _sync)
 #if MEM_ACCESS_TRACE
         uint32_t acc; // Z80 accesses (fetch/read/write) since last load — see [ACC] log
 #endif
-        mem_desc_int_t() : p(0), vram_off(0), mem_type(POINTER), is_rom(false), pinned(false), dirty(true), acc_hits(0) {}
+        mem_desc_int_t() : p(0), page_idx(0), acc_hits(0), mem_type(POINTER),
+                           is_rom(false), pinned(false), dirty(true) {}
+        inline uint32_t vram_off() const { return (uint32_t)page_idx * MEM_PG_SZ; }
+        // Bump-allocated from pooled blocks (MemESP.cpp): descriptors are created
+        // once at setup() and never destroyed, so 2050 individual malloc chunks only
+        // pay a 4-byte header each and fragment the free list for nothing.
+        static void* operator new(size_t sz);
+        static void  operator delete(void*, size_t) {}
     };
     mem_desc_int_t* _int;
     uint8_t* to_vram(void);
@@ -179,7 +202,7 @@ public:
     mem_desc_t(const mem_desc_t& s) : _int( s._int ) {}
     mem_desc_t(uint8_t* p, uint32_t page) : _int( new mem_desc_int_t() ) {
         this->_int->p = p;
-        this->_int->vram_off = page * MEM_PG_SZ;
+        this->_int->page_idx = (uint16_t)page;
     }
     void operator=(const mem_desc_t& s) {
         _int = s._int;
@@ -194,8 +217,8 @@ public:
     // Nop when already POINTER (page already in SRAM).  Called at DS80 activate
     // to ensure the color-attr page is in SRAM for fast direct rendering.
     inline void preload() { if (_int->mem_type != POINTER) _sync(255); }
-    inline mem_type_t memType(void) { return _int->mem_type; }
-    inline uint32_t   spiBase(void) { return _int->vram_off; }
+    inline mem_type_t memType(void) { return (mem_type_t)_int->mem_type; }
+    inline uint32_t   spiBase(void) { return _int->vram_off(); }
     // Load into an SRAM pool frame (evicting a victim if needed) and plug the
     // slot bookkeeping.  Use when the caller NEEDS a real pointer (MB-02 page
     // memset/getPage, accessor promotion); CPU bank-switch sites use sync().
@@ -220,8 +243,8 @@ public:
     // (per-byte SD access would be catastrophically slow).
     inline uint8_t* sync(uint8_t bank) {
         if (bank < 4 && _int->mem_type != POINTER &&
-            (psram_size() >= _int->vram_off + MEM_PG_SZ ||
-             vram_butter(_int->vram_off))) {
+            (psram_size() >= _int->vram_off() + MEM_PG_SZ ||
+             vram_butter(_int->vram_off()))) {
             acc_bank[bank] = *this;
             plugged_in[bank] = 0;
             bank_dirty[bank] = &dirty_sink;   // accessor writes go straight to backing
@@ -245,7 +268,7 @@ public:
      // virtual RAM - PSRAM or swap
     inline void assign_vram(uint32_t page, mem_type_t mem_type) {
         this->_int->p = 0;
-        this->_int->vram_off = page * MEM_PG_SZ;
+        this->_int->page_idx = (uint16_t)page;
         this->_int->mem_type = mem_type;
     }
     static inline uint8_t* revoke_1_ram_page() {
@@ -261,7 +284,7 @@ public:
     }
     inline void assign_ram(uint8_t* p, uint32_t page, bool locked) {
         this->_int->p = p;
-        this->_int->vram_off = page * MEM_PG_SZ;
+        this->_int->page_idx = (uint16_t)page;
         this->_int->mem_type = POINTER;
         if (!locked) {
             pages.push_back(*this);
@@ -278,7 +301,7 @@ public:
     inline bool* dirty_ptr() { return &_int->dirty; }
     inline void assign_rom(const uint8_t* p) { // TODO: prev?
         this->_int->p = (uint8_t*)p;
-        this->_int->vram_off = 0;
+        this->_int->page_idx = 0;
         this->_int->mem_type = POINTER;
         this->_int->is_rom = true;
     }

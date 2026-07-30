@@ -141,6 +141,15 @@ const uint8_t System34_track[] = {
     SECTORHEADER_PRE, 0x10, SECTORHEADER_POST, SECTORDATA_PRE, SECTORDATA, SECTORDATA_POST,
     TRACK_POST};
 
+// Max entries in an FDI damage map (one per physically damaged sector).
+#define FDI_DMG_MAX 12
+// Damage offset for a sector known to be damaged but whose damaged point the
+// scan could not locate (a lone bad sector has no redundant copy to compare to).
+// Such a sector still takes writes — refusing them would only lose data, and no
+// protection can be satisfied without the real offset — but it never heals: the
+// data CRC stays bad, exactly as on the source disk.
+#define FDI_DMG_UNKNOWN 0xFFFF
+
 typedef struct
 {
     uint16_t tracks;
@@ -165,6 +174,16 @@ typedef struct
     bool IsFDIFile;
     uint32_t fdiTrackHdrOffsets[168]; // file offsets for each track header
     uint32_t fdiDataOffset;           // file offset of data block
+    // Physical-damage map for copy-protected images, built at insert by
+    // fdiScanDamage. A sector whose data CRC is flagged bad in the image was
+    // unreadable on the source disk; the damage starts partway into the data
+    // field and runs to its end. FDI cannot express that position, so it is
+    // recovered from the image's own redundant copies of the damaged sectors.
+    uint8_t  fdiDmgCount;
+    uint8_t  fdiDmgCyl[FDI_DMG_MAX];
+    uint8_t  fdiDmgSide[FDI_DMG_MAX];
+    uint8_t  fdiDmgR[FDI_DMG_MAX];
+    uint16_t fdiDmgOff[FDI_DMG_MAX];
     bool IsMBDFile;
     uint8_t mbdSectorsPerTrack;       // sectors per track (typically 11)
     uint16_t mbdSectorSize;           // bytes per sector (typically 1024)
@@ -372,6 +391,18 @@ typedef struct
     uint32_t fdiTstates;           // intra-command byte offset (for find_marker progression)
     bool     fdiDataCrcError;      // matched sector has CRC error
 
+    // --- Physical damage emulation (copy protection) -----------------------
+    // A sector flagged with a bad data CRC in the image was unreadable on the
+    // source disk. Real damage does not heal: a Write Sector lays down fresh
+    // flux only up to the damaged spot, the rest of the data field keeps its
+    // original content, and the CRC stays bad. Protections measure exactly that
+    // — they write a pattern, read it back and expect the first mismatch at the
+    // damaged offset.
+    uint32_t fdiOrigBadMask;       // bit per sector: data CRC was bad in the image
+    uint16_t fdiDmgOffSec[32];     // per-sector damage offset within the data field
+    int      fdiWrGuard;           // bytes this Write Sector may still lay down (-1 = unguarded)
+    uint32_t fdiWrCount;           // bytes written since the data mark
+
     // Deferred track load (idle-window SD I/O — see wdIdleIO in wd1793.cpp).
     // While pending, the MFM buffer still holds the PREVIOUS track: disk
     // rotation and the whole per-step state machine are frozen (the guest just
@@ -415,6 +446,9 @@ void rvmWD1793FreeTrackBuf(rvmWD1793 *wd);
 bool rvmWD1793InsertDisk(rvmWD1793 *wd, unsigned char UnitNum, const std::string& Filename);
 uint8_t rvmwdDiskStep(rvmWD1793 *wd, uint32_t control);
 void wdDiskEject(rvmWD1793 *wd, unsigned char UnitNum);
+// Swap the disks of two drive units (Karabas-Pro Menu+Tab); flushes/remaps the
+// unit-keyed track cache and deferred-sync markers, then updates fastmode.
+void rvmWD1793SwapDrives(rvmWD1793 *wd, uint8_t a, uint8_t b);
 void SCLtoTRD(rvmwdDisk *d, unsigned char *track0);
 bool rvmWD1793CreateEmptyTRD(const char *path);
 #if !PICO_RP2040

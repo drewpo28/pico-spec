@@ -401,6 +401,17 @@ bool OSD::featureBudgetGate(int featureId) {
 
     if (r == BUDGET_ALLOW) return true;
 
+    // Enough total SRAM, just not in one block: nothing to give up, only a reboot to
+    // take (setup() allocates from an unfragmented heap). Persist the enable and go —
+    // declining leaves the feature off, exactly like Esc out of the free-list.
+    if (r == BUDGET_NEEDS_REBOOT) {
+        const string dlg = (string)featureName(f) + ": " + OSD_DLG_APPLYREBOOT[Config::lang];
+        if (OSD::msgDialog("", dlg.c_str()) != DLG_YES) return false;
+        featureSetEnabled(f, true);
+        Config::save();
+        esp_hard_reset();   // never returns
+    }
+
     if (r == BUDGET_DENY || nCand == 0) {
         osdCenteredMsg((string)featureName(f) + ":\n" + MSG_BUDGET_DENY[Config::lang],
                        LEVEL_WARN, 4000);
@@ -499,6 +510,90 @@ static string wifiAskPassword(const string& ssid) {
     string pass = OSD::inlineTextEdit(x + OSD_FONT_W * (label + 1), y + 1 + OSD_FONT_H + 1, field, "", true);
     VIDEO::SaveRect.restore_last();
     return pass;
+}
+
+// ── Shared on-screen line log (WiFi connect window + FTP server terminal) ────
+// Scrolling line ring: fixed char[][] (no heap churn), holding the most recent
+// lines; every renderer shows the tail (auto-scroll). Deliberately OUTSIDE
+// #if ZIFI_NET_CLIENT — the Network menu's WiFi scan/connect flow logs the live
+// ESP-01 exchange through it in builds without the FTP/SFTP/SSH client too.
+#define FTPD_LOG_LINES 40
+#define FTPD_LOG_COLS  72
+// Lazy-heaped (2880 B) — costs 0 SRAM until the FTP server / WiFi-connect window
+// actually logs a line, so it never starves the razor-thin Profi heap at
+// VIDEO::Init (Profi forces ~80 KB of SRAM pages before the framebuffer alloc).
+// Readers are gated by `li < ftpd_log_count`, and ftpd_log_count only advances
+// after a successful alloc here, so they never touch a null buffer.
+static char (*ftpd_log)[FTPD_LOG_COLS] = nullptr;
+extern "C" size_t getLargestAllocatable(void);   // defined at the bottom of this file
+static int  ftpd_log_count = 0;  // total lines pushed (monotonic)
+static bool ftpd_log_dirty = true;
+static void ftpdLogLine(const char* s) {
+    if (!ftpd_log) {
+        // Gate, don't null-check: pico_malloc wraps calloc too and PANICs on OOM
+        // instead of returning NULL, so "drop the line rather than crash" only
+        // works if we never make an ask that can fail (see Buffer::palloc).
+        if (getLargestAllocatable() < FTPD_LOG_LINES * FTPD_LOG_COLS + 8192) return;
+        ftpd_log = (char(*)[FTPD_LOG_COLS])calloc(FTPD_LOG_LINES, FTPD_LOG_COLS);
+        if (!ftpd_log) return;   // OOM — drop the line rather than crash
+    }
+    int slot = ftpd_log_count % FTPD_LOG_LINES;
+    strncpy(ftpd_log[slot], s ? s : "", FTPD_LOG_COLS - 1);
+    ftpd_log[slot][FTPD_LOG_COLS - 1] = '\0';
+    ftpd_log_count++;
+    ftpd_log_dirty = true;
+}
+
+// ── Live ESP-01 AT-log window (shown during a blocking WiFi connect) ──────────
+// ZiFiAT::log_cb → wifiLogLine appends each tx/rx line to the shared ftpd_log ring
+// and redraws the tail immediately, so the ESP-01 exchange scrolls live while
+// connect() blocks. Reuses ftpd_log[] (a generic line ring) — the WiFi connect
+// window and the FTP server are never up at the same time.
+static string s_wifilog_sub;
+static void wifiLogDraw() {
+    OSD::drawOSD(true);
+    int visCols = OSD::osdMaxCols(); if (visCols > 40) visCols = 40;
+    int visRows = OSD::osdMaxRows() - 4;
+    char row[42];
+    OSD::osdAt(1, 0);                                   // subtitle: "Connecting <ssid>"
+    VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(1, 0));
+    snprintf(row, sizeof(row), " %s", s_wifilog_sub.c_str());
+    int hl = strlen(row); while (hl < visCols) row[hl++] = ' '; row[visCols] = '\0';
+    VIDEO::vga.print(row);
+    OSD::osdAt(2, 0);                                   // separator
+    VIDEO::vga.setTextColor(zxColor(5, 0), zxColor(1, 0));
+    memset(row, '-', visCols); row[0] = ' '; row[visCols] = '\0';
+    VIDEO::vga.print(row);
+    int first = ftpd_log_count > visRows ? ftpd_log_count - visRows : 0; // tail
+    VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
+    for (int r = 0; r < visRows; r++) {
+        OSD::osdAt(3 + r, 0);
+        int li = first + r;
+        if (li < ftpd_log_count) {
+            const char* s = ftpd_log[li % FTPD_LOG_LINES];
+            int len = strlen(s); if (len > visCols) len = visCols;
+            memcpy(row, s, len); memset(row + len, ' ', visCols - len);
+        } else memset(row, ' ', visCols);
+        row[visCols] = '\0';
+        VIDEO::vga.print(row);
+    }
+}
+static void wifiLogLine(const char* s) { ftpdLogLine(s); wifiLogDraw(); }
+// Append a final line (e.g. an error) and hold the window open until the user
+// presses a key — so a failure stays readable instead of auto-closing.
+static void wifiLogHold(const char* msg) {
+    if (msg && msg[0]) ftpdLogLine(msg);
+    ftpdLogLine(Config::lang ? " -- pulsa una tecla --" : " -- press a key --");
+    wifiLogDraw();
+    auto* kb = ESPectrum::PS2Controller.keyboard();
+    while (kb->virtualKeyAvailable()) { fabgl::VirtualKeyItem k; kb->getNextVirtualKey(&k); } // drain
+    for (;;) {
+        if (kb->virtualKeyAvailable()) {
+            fabgl::VirtualKeyItem k;
+            if (kb->getNextVirtualKey(&k) && k.down) break;
+        }
+        sleep_ms(5);
+    }
 }
 
 #if ZIFI_NET_CLIENT
@@ -653,15 +748,23 @@ void net_call_on_stack(void* new_top, void (*fn)(void*), void* arg) {
 // boards palloc routes the TLS set to XIP PSRAM instead, so no lease is needed.
 struct NetArenaLease {
     bool held = false;
+    bool released = false;
     NetArenaLease() {
         void* base; size_t size;
         if (VIDEO::gigascreenLendRegion(base, size)) {
             if (Buffer::lendArena(base, size)) held = true;
             else VIDEO::gigascreenReclaimRegion();   // lend rejected → undo the detach
+        } else {
+            // Nothing lendable can still mean there IS a prev-FB — just a chunked one,
+            // which is not one region. Then it is released outright for the session
+            // (VIDEO::gigascreenReleaseForNet) so the heap, not the arena, gets those
+            // ~38 KB. No-op in every other case.
+            released = VIDEO::gigascreenReleaseForNet();
         }
     }
     ~NetArenaLease() {
         if (held) { Buffer::reclaimArena(); VIDEO::gigascreenReclaimRegion(); }
+        if (released) VIDEO::gigascreenRestoreAfterNet();
     }
 };
 
@@ -934,82 +1037,6 @@ static bool f5Locations() {
 }
 
 // ── FTP server: share the SD card to the LAN ─────────────────────────────────
-// Scrolling log ring for the on-screen terminal. Fixed char[][] (no heap churn),
-// holding the most recent lines; the renderer always shows the tail (auto-scroll).
-#define FTPD_LOG_LINES 40
-#define FTPD_LOG_COLS  72
-// Lazy-heaped (2880 B) — costs 0 SRAM until the FTP server / WiFi-connect window
-// actually logs a line, so it never starves the razor-thin Profi heap at
-// VIDEO::Init (Profi forces ~80 KB of SRAM pages before the framebuffer alloc).
-// Readers are gated by `li < ftpd_log_count`, and ftpd_log_count only advances
-// after a successful alloc here, so they never touch a null buffer.
-static char (*ftpd_log)[FTPD_LOG_COLS] = nullptr;
-static int  ftpd_log_count = 0;  // total lines pushed (monotonic)
-static bool ftpd_log_dirty = true;
-static void ftpdLogLine(const char* s) {
-    if (!ftpd_log) {
-        ftpd_log = (char(*)[FTPD_LOG_COLS])calloc(FTPD_LOG_LINES, FTPD_LOG_COLS);
-        if (!ftpd_log) return;   // OOM — drop the line rather than crash
-    }
-    int slot = ftpd_log_count % FTPD_LOG_LINES;
-    strncpy(ftpd_log[slot], s ? s : "", FTPD_LOG_COLS - 1);
-    ftpd_log[slot][FTPD_LOG_COLS - 1] = '\0';
-    ftpd_log_count++;
-    ftpd_log_dirty = true;
-}
-
-// ── Live ESP-01 AT-log window (shown during a blocking WiFi connect) ──────────
-// ZiFiAT::log_cb → wifiLogLine appends each tx/rx line to the shared ftpd_log ring
-// and redraws the tail immediately, so the ESP-01 exchange scrolls live while
-// connect() blocks. Reuses ftpd_log[] (a generic line ring) — the WiFi connect
-// window and the FTP server are never up at the same time.
-static string s_wifilog_sub;
-static void wifiLogDraw() {
-    OSD::drawOSD(true);
-    int visCols = OSD::osdMaxCols(); if (visCols > 40) visCols = 40;
-    int visRows = OSD::osdMaxRows() - 4;
-    char row[42];
-    OSD::osdAt(1, 0);                                   // subtitle: "Connecting <ssid>"
-    VIDEO::vga.setTextColor(zxColor(7, 1), zxColor(1, 0));
-    snprintf(row, sizeof(row), " %s", s_wifilog_sub.c_str());
-    int hl = strlen(row); while (hl < visCols) row[hl++] = ' '; row[visCols] = '\0';
-    VIDEO::vga.print(row);
-    OSD::osdAt(2, 0);                                   // separator
-    VIDEO::vga.setTextColor(zxColor(5, 0), zxColor(1, 0));
-    memset(row, '-', visCols); row[0] = ' '; row[visCols] = '\0';
-    VIDEO::vga.print(row);
-    int first = ftpd_log_count > visRows ? ftpd_log_count - visRows : 0; // tail
-    VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
-    for (int r = 0; r < visRows; r++) {
-        OSD::osdAt(3 + r, 0);
-        int li = first + r;
-        if (li < ftpd_log_count) {
-            const char* s = ftpd_log[li % FTPD_LOG_LINES];
-            int len = strlen(s); if (len > visCols) len = visCols;
-            memcpy(row, s, len); memset(row + len, ' ', visCols - len);
-        } else memset(row, ' ', visCols);
-        row[visCols] = '\0';
-        VIDEO::vga.print(row);
-    }
-}
-static void wifiLogLine(const char* s) { ftpdLogLine(s); wifiLogDraw(); }
-// Append a final line (e.g. an error) and hold the window open until the user
-// presses a key — so a failure stays readable instead of auto-closing.
-static void wifiLogHold(const char* msg) {
-    if (msg && msg[0]) ftpdLogLine(msg);
-    ftpdLogLine(Config::lang ? " -- pulsa una tecla --" : " -- press a key --");
-    wifiLogDraw();
-    auto* kb = ESPectrum::PS2Controller.keyboard();
-    while (kb->virtualKeyAvailable()) { fabgl::VirtualKeyItem k; kb->getNextVirtualKey(&k); } // drain
-    for (;;) {
-        if (kb->virtualKeyAvailable()) {
-            fabgl::VirtualKeyItem k;
-            if (kb->getNextVirtualKey(&k) && k.down) break;
-        }
-        sleep_ms(5);
-    }
-}
-
 struct FtpdCtx { const char* ip; };
 
 // Run the server session (details panel + live log terminal) in a blocking loop
@@ -1746,6 +1773,60 @@ void OSD::bootTrdos() {
 }
 
 // OSD Main Loop
+void OSD::nmiAction() {
+#if !PICO_RP2040
+    if (DivMMC::enabled) {
+        // DivMMC NMI: automap at 0x0066 handled by preOpcFetch/postOpcFetch
+        Z80::triggerNMI();
+    } else
+#endif
+    if (Z80Ops::isByte) {
+        // ZX Byte: NMI menu with COBMECT mode toggle
+        menu_level = 0;
+        menu_curopt = 1;
+        menu_saverect = true;
+        string nmi_menu = MENU_NMI_TITLE[Config::lang];
+        nmi_menu += "NMI\n";
+        nmi_menu += MENU_BYTE_COBMECT_MODE[Config::lang];
+        uint8_t nmi_cols = 20;
+        uint16_t nmi_w = (nmi_cols * OSD_FONT_W) + 2;
+        uint16_t nmi_h = (rowCount(nmi_menu) * OSD_FONT_H) + 2;
+        uint8_t opt = simpleMenuRun(nmi_menu,
+            scrAlignCenterX(nmi_w), scrAlignCenterY(nmi_h),
+            rowCount(nmi_menu), nmi_cols);
+        if (opt == 1) {
+            Z80::triggerNMI();
+        } else if (opt == 2) {
+            Config::byte_cobmect_mode = !Config::byte_cobmect_mode;
+            Config::save();
+            // BYTE and BYTE-compat are both overlays over the Sinclair 48K base.
+            MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
+            MemESP::registerOverlay(gb_rom_0_sinclair_48k,
+                Config::byte_cobmect_mode ? gb_overlay_48k_byte_sovmest : gb_overlay_48k_byte);
+            MemESP::recoverPage0();
+            osdCenteredMsg(Config::byte_cobmect_mode ? OSD_COBMECT_ON[Config::lang] : OSD_COBMECT_OFF[Config::lang], LEVEL_INFO, 500);
+        }
+    } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
+        menu_level = 0;
+        menu_curopt = 1;
+        menu_saverect = true;
+        string nmi_menu = MENU_NMI_TITLE[Config::lang];
+        nmi_menu += MENU_NMI_SEL[Config::lang];
+        uint8_t nmi_cols = 20;
+        uint16_t nmi_w = (nmi_cols * OSD_FONT_W) + 2;
+        uint16_t nmi_h = (rowCount(nmi_menu) * OSD_FONT_H) + 2;
+        uint8_t opt = simpleMenuRun(nmi_menu,
+            scrAlignCenterX(nmi_w), scrAlignCenterY(nmi_h),
+            rowCount(nmi_menu), nmi_cols);
+        if (opt == 1)
+            Z80::triggerNMI();
+        else if (opt == 2)
+            Z80::triggerNMIDOS();
+    } else {
+        Z80::triggerNMI();
+    }
+}
+
 void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 
     struct AYGuard {
@@ -1836,9 +1917,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
     }
 
 #if !PICO_RP2040
-    // Alt+` (grave/tilde) — toggle Profi extended keyboard mode (only in Profi arch)
-    if (Config::arch == "Profi" && ALT && !CTRL &&
-        (KeytoESP == fabgl::VK_GRAVEACCENT || KeytoESP == fabgl::VK_TILDE)) {
+    // Alt+` (grave/tilde) or plain PrtScr (the Karabas-Pro hardware combo) —
+    // toggle Profi extended keyboard mode (only in Profi arch)
+    if (Config::arch == "Profi" && !CTRL &&
+        ((ALT && (KeytoESP == fabgl::VK_GRAVEACCENT || KeytoESP == fabgl::VK_TILDE)) ||
+         (!ALT && KeytoESP == fabgl::VK_PRINTSCREEN))) {
         Config::profi_ext_keys = !Config::profi_ext_keys;
         Config::save();
         osdCenteredMsg(Config::profi_ext_keys ? " XT keyboard ON  " : " XT keyboard OFF ", LEVEL_INFO, 500);
@@ -1894,57 +1977,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
             pokeDialog();
         } else
         if (hkIdx == Config::HK_NMI) { // NMI
-#if !PICO_RP2040
-            if (DivMMC::enabled) {
-                // DivMMC NMI: automap at 0x0066 handled by preOpcFetch/postOpcFetch
-                Z80::triggerNMI();
-            } else
-#endif
-            if (Z80Ops::isByte) {
-                // ZX Byte: NMI menu with COBMECT mode toggle
-                menu_level = 0;
-                menu_curopt = 1;
-                menu_saverect = true;
-                string nmi_menu = MENU_NMI_TITLE[Config::lang];
-                nmi_menu += "NMI\n";
-                nmi_menu += MENU_BYTE_COBMECT_MODE[Config::lang];
-                uint8_t nmi_cols = 20;
-                uint16_t nmi_w = (nmi_cols * OSD_FONT_W) + 2;
-                uint16_t nmi_h = (rowCount(nmi_menu) * OSD_FONT_H) + 2;
-                uint8_t opt = simpleMenuRun(nmi_menu,
-                    scrAlignCenterX(nmi_w), scrAlignCenterY(nmi_h),
-                    rowCount(nmi_menu), nmi_cols);
-                if (opt == 1) {
-                    Z80::triggerNMI();
-                } else if (opt == 2) {
-                    Config::byte_cobmect_mode = !Config::byte_cobmect_mode;
-                    Config::save();
-                    // BYTE and BYTE-compat are both overlays over the Sinclair 48K base.
-                    MemESP::rom[0].assign_rom(gb_rom_0_sinclair_48k);
-                    MemESP::registerOverlay(gb_rom_0_sinclair_48k,
-                        Config::byte_cobmect_mode ? gb_overlay_48k_byte_sovmest : gb_overlay_48k_byte);
-                    MemESP::recoverPage0();
-                    osdCenteredMsg(Config::byte_cobmect_mode ? OSD_COBMECT_ON[Config::lang] : OSD_COBMECT_OFF[Config::lang], LEVEL_INFO, 500);
-                }
-            } else if ((Z80Ops::isPentagon || Z80Ops::isProfi)) {
-                menu_level = 0;
-                menu_curopt = 1;
-                menu_saverect = true;
-                string nmi_menu = MENU_NMI_TITLE[Config::lang];
-                nmi_menu += MENU_NMI_SEL[Config::lang];
-                uint8_t nmi_cols = 20;
-                uint16_t nmi_w = (nmi_cols * OSD_FONT_W) + 2;
-                uint16_t nmi_h = (rowCount(nmi_menu) * OSD_FONT_H) + 2;
-                uint8_t opt = simpleMenuRun(nmi_menu,
-                    scrAlignCenterX(nmi_w), scrAlignCenterY(nmi_h),
-                    rowCount(nmi_menu), nmi_cols);
-                if (opt == 1)
-                    Z80::triggerNMI();
-                else if (opt == 2)
-                    Z80::triggerNMIDOS();
-            } else {
-                Z80::triggerNMI();
-            }
+            nmiAction();
         }
         else
         if (hkIdx == Config::HK_RESET_TO) { // Reset to...
@@ -4021,9 +4054,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 #ifdef USE_GS
                     // GS works on butter XIP (fast) or, as a fallback, on plain SPI PSRAM
                     // (slow path, ~30× slower — best-effort, may glitch on MOD playback).
-                    // For SPI fallback, need room for MemESP swap pool + 2 MB GS RAM.
-                    bool gs_avail = (butter_psram_size() > 0)
-                                    || (psram_size() >= (size_t)MEM_PG_CNT * MEM_PG_SZ + (2u << 20));
+                    // Buffer owns the test: the SPI fallback needs GS's region + the
+                    // minimum arena + a usable swap pool, and a large Murmuzavr page
+                    // count must NOT count against it (those pages yield to GS via
+                    // Buffer::pageBudgetSpi) — measuring MEM_PG_CNT * MEM_PG_SZ against
+                    // the chip hid the whole GS row at 8 MB+ of extended RAM.
+                    bool gs_avail = Buffer::gsPsramAvailable();
                     if (gs_avail) {
                         // Insert GS before "Audio Driver" (second-to-last item, before Volume Boost)
                         size_t last_nl = audio_menu.rfind('\n', audio_menu.size() - 2);
@@ -5421,12 +5457,27 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 }
                             }
                         } else if (ext_ram && arch_num == 7) { // Murmuzavr
+                            // Murmuzavr extends Pentagon paging (#AFF7 planes over #7FFD),
+                            // and ESPectrum::setup drops the count at boot on anything else
+                            // — say so here instead of letting the pick vanish silently.
+                            if (!(Config::arch == "Pentagon" || Config::arch == "P512" ||
+                                  Config::arch == "P1024")) {
+                                osdCenteredMsg(Config::lang
+                                    ? " Murmuzavr: solo Pentagon 128/512/1024 "
+                                    : " Murmuzavr needs Pentagon 128/512/1024 ", LEVEL_WARN, 3000);
+                                menu_curopt = 7;
+                                menu_level = 2;
+                                break;
+                            }
                             menu_level = 2;
                             menu_curopt = 1;
                             menu_saverect = true;
                             while (1) {
                                 string opt_menu = (FileUtils::fsMount ? MENU_MURMUZAVR : MENU_MURMUZAVR_NONE)[Config::lang];
-                                uint32_t new_opt = MEM_PG_CNT, prev_opt = MEM_PG_CNT;
+                                // The PICK, not the live count: a machine that boots
+                                // clamped (Profi, see ESPectrum::setup) would otherwise
+                                // show "None" and re-select the same size forever.
+                                uint32_t new_opt = Config::mem_pg_cnt, prev_opt = Config::mem_pg_cnt;
                                 if (!FileUtils::fsMount) {
                                     opt_menu.replace(opt_menu.find("[N",0),2,"[*");
 #if PICO_RP2350
@@ -5485,6 +5536,10 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                     else if (opt2 == 5) new_opt = 2048;
                                     if (prev_opt != new_opt) {
                                         if (confirmReboot(OSD_DLG_APPLYREBOOT)) {
+                                            // The pick is what gets persisted; the live
+                                            // count is re-derived from it in setup()
+                                            // after the reboot below.
+                                            Config::mem_pg_cnt = (uint16_t)new_opt;
                                             MEM_PG_CNT = new_opt;
                                             Config::save();
                                             OSD::esp_hard_reset();
@@ -5511,21 +5566,31 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 // Profi submenu: ROM selection + XT keyboard + OSD palette
                                 string profi_sub =
                                     string(Config::lang ? "Profi\n" : "Profi\n") +
-                                    "1024K\n" +
+                                    "1024K (Original)\n" +
+                                    "1024K (Karabas)\n" +
+                                    "1024K (Karabas+PQDOS)\n" +
+                                    "1024K (Karabas+FlashTool)\n" +
+                                    "1024K (Karabas+FDImage)\n" +
                                     string("XT keyboard [") +
                                     (Config::profi_ext_keys ? "ON" : "OFF") + "]\n" +
                                     string("OSD palette [") +
                                     (Config::profi_ds80_std_palette_osd ? "STD" : "DS80") + "]\n";
                                 uint8_t opt_p = menuRun(profi_sub);
-                                if (opt_p == 1) {
-                                    // ROM selected
+                                if (opt_p >= 1 && opt_p <= 5) {
+                                    // ROM selected — mirrors the real Karabas-Pro ROMSET
+                                    // slots: 1=stock "Original", 2="Karabas" (ROMain,
+                                    // ROMSET 0), 3=PQDOS BIOS (ROMSET 1), 4=Flash Tool
+                                    // (ROMSET 2), 5=FDImage (ROMSET 3)
+                                    static const char* profi_romsets[5] = {
+                                        "Profi", "ProfiKarabas", "ProfiPQ",
+                                        "ProfiKarabasFT", "ProfiKarabasFDI" };
                                     arch = "Profi";
-                                    romset = "Profi";
+                                    romset = profi_romsets[opt_p - 1];
                                     opt2 = 1; // signal machine switch
                                     menu_curopt = 1;
                                     menu_saverect = false;
                                     break;
-                                } else if (opt_p == 2) {
+                                } else if (opt_p == 6) {
                                     // XT keyboard toggle (Yes/No submenu) — level 3
                                     // Remind the user it can also be toggled live via the hotkey.
                                     osdCenteredMsg(Config::lang
@@ -5552,12 +5617,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             menu_curopt = opt3;
                                             menu_saverect = false;
                                         } else {
-                                            menu_curopt = 2;
+                                            menu_curopt = 6;
                                             menu_level = 2;
                                             break; // back to Profi submenu
                                         }
                                     }
-                                } else if (opt_p == 3) {
+                                } else if (opt_p == 7) {
                                     // OSD palette toggle (STD / DS80) submenu — level 3
                                     menu_level = 3;
                                     menu_curopt = 1;
@@ -5589,7 +5654,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             menu_curopt = opt3;
                                             menu_saverect = false;
                                         } else {
-                                            menu_curopt = 3;
+                                            menu_curopt = 7;
                                             menu_level = 2;
                                             break; // back to Profi submenu
                                         }
@@ -5774,7 +5839,12 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 if (Config::arch == "Profi" && Config::zifi_enabled) {
                                     Config::zifi_enabled = 0;
                                     ZiFi::enabled = 0;
-                                    if (!ZiFiAT::connected) { ZiFiSock::end(); ZiFi::deinit(); }
+                                    if (!ZiFiAT::connected) {
+#if ZIFI_NET_CLIENT
+                                        ZiFiSock::end();
+#endif
+                                        ZiFi::deinit();
+                                    }
                                     OSD::osdCenteredMsg("ZiFi NIC disabled", LEVEL_WARN, 1500);
                                 }
                                 // Switching into Profi: turn DivMMC off and free its
@@ -5788,6 +5858,19 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                 // NOTE: GM.DLS MIDI is NOT auto-disabled on Profi entry anymore.
                                 // On tight butter-less boards the featureBudgetGate popup offers
                                 // MIDI as a manual free candidate instead (user decides).
+                                // Karabas-Pro romsets (everything but the stock "Profi"
+                                // Original) boot from SD through the real board's
+                                // Z-Controller (ROMain "Loading boot from SD" = FATALL
+                                // via ZC) — auto-enable it on entry so SD boot works
+                                // out of the box. esxDOS/MB-02+ are already forced off
+                                // above; skipped silently if the budget gate declines.
+                                if (arch == "Profi" && romset != "Profi" &&
+                                    !Config::zcontroller && FileUtils::fsMount &&
+                                    OSD::featureBudgetGate(Subsystems::FEAT_ZCONTROLLER)) {
+                                    Config::zcontroller = true;
+                                    DivMMC::zc_init();
+                                    OSD::osdCenteredMsg("Z-Controller enabled", LEVEL_INFO, 1500);
+                                }
 #endif
                                 Config::save();
 #if !PICO_RP2040
@@ -7608,8 +7691,26 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 auto descs = Config::lang ? hkDescES : hkDescEN;
                 const int maxCols = osdMaxCols();
                 const int descCol = 16;
+                // Profi/Karabas-Pro "Menu"-key (Win/GUI) combos — not configurable
+                // hotkeys (handled in ESPectrum::processKeyboard), so they're
+                // listed here as a static section when a Profi machine is active.
+                static const char* const profiKeys[] = {
+                    "Menu+F1-F4", "Menu+F5", "Menu+F7", "Menu+F11",
+                    "Menu+F12", "Menu+Tab", "Menu+J", "Menu+Esc",
+                };
+                static const char* const profiDescEN[] = {
+                    "ROMSET 0-3 select", "Turbo FDC", "AY stereo mode", "CPU speed",
+                    "NMI", "Swap drives A/B", "Joystick type", "Main menu",
+                };
+                static const char* const profiDescES[] = {
+                    "Sel. ROMSET 0-3", "Turbo FDC", "Estereo AY", "Velocidad CPU",
+                    "NMI", "Discos A/B", "Tipo joystick", "Menu principal",
+                };
+                const int profiN = (int)(sizeof(profiKeys) / sizeof(profiKeys[0]));
+                const bool showProfi = Z80Ops::isProfi;
+                // -3 = Profi section header, -(4+p) = Profi line p,
                 // -2 = PrtScr, -1 = ScrollLk, 0..HK_COUNT-1 = hotkey index
-                int8_t hkOrder[Config::HK_COUNT + 2];
+                int8_t hkOrder[Config::HK_COUNT + 2 + 16];
                 int nlines = 0;
                 for (int i = 0; i < Config::HK_COUNT; i++) {
                     if (Config::hotkeys[i].vk == (uint16_t)fabgl::VK_NONE) continue;
@@ -7617,12 +7718,29 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 }
                 hkOrder[nlines++] = -2; // PrtScr
                 hkOrder[nlines++] = -1; // ScrollLk
+                if (showProfi) {
+                    hkOrder[nlines++] = -3; // section header
+                    for (int p = 0; p < profiN; p++) hkOrder[nlines++] = (int8_t)(-(4 + p));
+                }
 
                 // Format one help line into buf (42 bytes max)
                 auto fmtLine = [&](int idx, char *buf) {
                     const char *key, *desc;
                     char keybuf[16];
-                    if (idx == -2) { key = "PrtScr"; desc = Config::lang ? "Captura BMP" : "BMP capture"; }
+                    if (idx == -3) { // Profi/Karabas section header (no key column)
+                        snprintf(buf, 42, " Karabas (Menu=Win):");
+                        int len = strlen(buf);
+                        if (len < maxCols) { memset(buf + len, ' ', maxCols - len); buf[maxCols] = 0; }
+                        else buf[maxCols] = 0;
+                        return;
+                    }
+                    if (idx <= -4) { int p = -4 - idx; key = profiKeys[p]; desc = Config::lang ? profiDescES[p] : profiDescEN[p]; }
+                    // On Profi plain PrtScr toggles the XT keyboard; BMP capture
+                    // moves to Alt+PrtScr (see ESPectrum::processKeyboard).
+                    else if (idx == -2) {
+                        if (showProfi) { key = "PrtScr"; desc = Config::lang ? "Teclado XT" : "XT keyboard"; }
+                        else { key = "PrtScr"; desc = Config::lang ? "Captura BMP" : "BMP capture"; }
+                    }
                     else if (idx == -1) { key = "ScrollLk"; desc = Config::lang ? "Cursor=Joy" : "Cursor=Joy"; }
                     else {
                         string b = hkBindingText(idx);
@@ -8884,6 +9002,11 @@ static void saveDumpToFile(uint16_t addr_from, uint16_t addr_to) {
 
     snprintf(line, sizeof(line), "TR-DOS: %s  TR-DOS BIOS: %d\n",
         ESPectrum::trdos ? "on" : "off", Config::trdosBios);
+    f_write(f, line, strlen(line), &bw);
+
+    snprintf(line, sizeof(line), "portDFFD: %02X  (CPM=%d ROM14=%d DS80=%d NOROM=%d)\n",
+        Ports::portDFFD, (Ports::portDFFD & 0x20) != 0, MemESP::romLatch,
+        (Ports::portDFFD & 0x80) != 0, (Ports::portDFFD & 0x10) != 0);
     f_write(f, line, strlen(line), &bw);
 
     // Registers
@@ -10275,7 +10398,23 @@ void OSD::showTextDialog(const char* title, const char* text, bool blocking, int
     if (blocking) VIDEO::SaveRect.restore_last();
 }
 
-void OSD::HWInfo() {
+// 0-based line index of the Uptime row in the info text — lets HWInfo's live
+// loop repaint just that one row between full redraws.
+static int s_hwinfo_uptime_line = -1;
+
+extern "C" uint32_t uptime_seconds(void); // main.cpp — survives F12/watchdog reboots
+
+static int formatUptimeLine(char* out, int outsz) {
+    // Seconds since POWER-ON: the hardware timer resets on every watchdog
+    // reboot (F12 / video-mode switch), so main.cpp accumulates the running
+    // total across those in a watchdog scratch register.
+    uint32_t up_s = uptime_seconds();
+    return snprintf(out, outsz, " Uptime         : %dd %02d:%02d:%02d",
+        (int)(up_s / 86400), (int)(up_s / 3600 % 24),
+        (int)(up_s / 60 % 60), (int)(up_s % 60));
+}
+
+static void buildHWInfoText() {
     char (&hwtext)[OSD_INFO_BUF_SZ] = osd_info_buf;
     int pos = 0;
 
@@ -10317,14 +10456,28 @@ void OSD::HWInfo() {
             " Flash size     : %d MB\n"
             " Flash JEDEC ID : %02X-%02X-%02X-%02X\n",
             (int)(flash_size >> 20), rx[0], rx[1], rx[2], rx[3]);
+#if !PICO_RP2040
+        if (flash_qe) {
+            pos += snprintf(hwtext + pos, sizeof(hwtext) - pos,
+                " Flash QE bit   : %s\n", flash_qe_text());
+            if (flash_qe >= 4)
+                pos += snprintf(hwtext + pos, sizeof(hwtext) - pos,
+                    " Flash QE diag  : %02X %02X %02X %02X %02X %02X\n",
+                    flash_qe_diag[0], flash_qe_diag[1], flash_qe_diag[2],
+                    flash_qe_diag[3], flash_qe_diag[4], flash_qe_diag[5]);
+        }
+#endif
     }
 
 #ifndef MURM2
     {
         uint32_t psram32 = psram_size();
         if (psram32) {
-            uint8_t rx8[8];
-            psram_id(rx8);
+            // ID is immutable — read once, not on every 1 Hz refresh (SPI
+            // transaction under PSRAM_SPINLOCK, GS may be running on core1)
+            static uint8_t rx8[8];
+            static bool rx8_valid = false;
+            if (!rx8_valid) { psram_id(rx8); rx8_valid = true; }
             pos += snprintf(hwtext + pos, sizeof(hwtext) - pos,
                 " PSRAM size     : %d MB\n"
                 " PSRAM MF ID/KGD: %02X/%02X\n"
@@ -10380,6 +10533,14 @@ void OSD::HWInfo() {
     }
 #endif
 
+    {
+        int ln = 0;
+        for (int i = 0; i < pos; i++) if (hwtext[i] == '\n') ln++;
+        s_hwinfo_uptime_line = ln;
+        pos += formatUptimeLine(hwtext + pos, sizeof(hwtext) - pos);
+        if (pos < (int)sizeof(hwtext) - 1) { hwtext[pos++] = '\n'; hwtext[pos] = '\0'; }
+    }
+
     pos += snprintf(hwtext + pos, sizeof(hwtext) - pos,
         "\n"
         " Built at %s %s\n"
@@ -10388,7 +10549,71 @@ void OSD::HWInfo() {
         " %s\n",
         __DATE__, __TIME__, PICO_GIT_BRANCH, PICO_GIT_COMMIT, PICO_BUILD_NAME);
 
-    showTextDialog("Hardware info", hwtext);
+}
+
+void OSD::HWInfo() {
+    // Live variant (same pattern as HIDDevices): rebuild text at 1 Hz so
+    // Uptime and Free RAM tick while the dialog is open.
+    unsigned short sx = scrAlignCenterX(OSD_W);
+    unsigned short sy = scrAlignCenterY(OSD_H);
+    VIDEO::SaveRect.save(sx, sy, OSD_W, OSD_H);
+
+    fabgl::VirtualKeyItem Nextkey;
+    uint32_t last_draw = 0;
+    int scroll = 0;
+
+    bool down = false;
+    bool full = true; // full redraw (initial + after scroll keys), else Uptime row only
+    while (true) {
+        // Non-blocking key check
+        if (ESPectrum::PS2Controller.keyboard()->virtualKeyAvailable()) {
+            ESPectrum::PS2Controller.keyboard()->getNextVirtualKey(&Nextkey);
+            if (down && !Nextkey.down && (is_enter(Nextkey.vk) || is_back(Nextkey.vk))) {
+                click();
+                break;
+            }
+            if (Nextkey.down) {
+                down = (is_enter(Nextkey.vk) || is_back(Nextkey.vk));
+                if (Nextkey.vk == fabgl::VK_UP || Nextkey.vk == fabgl::VK_DOWN || Nextkey.vk == fabgl::VK_PAGEUP || Nextkey.vk == fabgl::VK_PAGEDOWN) {
+                    // Re-inject for showTextDialog's own scroll handling
+                    ESPectrum::PS2Controller.keyboard()->injectVirtualKey(Nextkey.vk, true);
+                }
+                last_draw = 0; // force redraw
+                full = true;
+            }
+        }
+
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if (now - last_draw < 1000) {
+            sleep_ms(5);
+            continue;
+        }
+        last_draw = now;
+
+        if (full) {
+            buildHWInfoText();
+            showTextDialog("Hardware info", osd_info_buf, false, &scroll);
+            full = false;
+        } else if (s_hwinfo_uptime_line >= 0) {
+            // Repaint only the Uptime row in place — no full-dialog redraw
+            int r = s_hwinfo_uptime_line - scroll;
+            const int visRows = osdMaxRows() - 4;
+            if (r >= 0 && r < visRows) {
+                const int visCols = osdMaxCols();
+                char row[42];
+                int len = formatUptimeLine(row, sizeof(row));
+                int w = visCols - 1; // keep last column intact (scrollbar lives there)
+                if (len > w) len = w;
+                memset(row + len, ' ', w - len);
+                row[w] = '\0';
+                osdAt(3 + r, 0);
+                VIDEO::vga.setTextColor(zxColor(7, 0), zxColor(1, 0));
+                VIDEO::vga.print(row);
+            }
+        }
+    }
+
+    VIDEO::SaveRect.restore_last();
 }
 
 void OSD::ChipInfo() {
@@ -10435,6 +10660,17 @@ void OSD::ChipInfo() {
             " Flash size     : %d MB\n"
             " Flash JEDEC ID : %02X-%02X-%02X-%02X\n",
             (int)(flash_size >> 20), rx[0], rx[1], rx[2], rx[3]);
+#if !PICO_RP2040
+        if (flash_qe) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                " Flash QE bit   : %s\n", flash_qe_text());
+            if (flash_qe >= 4)
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    " Flash QE diag  : %02X %02X %02X %02X %02X %02X\n",
+                    flash_qe_diag[0], flash_qe_diag[1], flash_qe_diag[2],
+                    flash_qe_diag[3], flash_qe_diag[4], flash_qe_diag[5]);
+        }
+#endif
     }
 
 #ifndef MURM2

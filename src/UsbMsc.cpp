@@ -25,13 +25,22 @@ static uint8_t          g_lun      = 0;
 static uint32_t         g_blkcnt   = 0;
 static uint32_t         g_blksz    = 0;
 
-// Heap-lazy FatFs volume object + DMA bounce buffer — allocated once when the
-// first stick ever mounts, so SRAM-tight boards (m1p2 Profi ~10 KB heap) pay
-// ~1.1 KB only if a stick is actually used. Never freed: umount/replug churn
-// must not fragment the heap.
+// Heap-lazy FatFs volume object + DMA bounce buffer + pump alt-stack —
+// allocated once when the first stick ever mounts, so SRAM-tight boards
+// (m1p2 Profi ~10 KB heap) pay ~5.3 KB only if a stick is actually used.
+// Never freed: umount/replug churn must not fragment the heap.
+//
+// pump_stack: tuh_task() runs on this stack, NOT the caller's (see mscService).
+// hw-traced 2026-07-21: in usbRoot mode every FatFs sector I/O anywhere in the
+// firmware nests the whole TinyUSB host machinery (ioWait → tuh_task → hcd ISR
+// processing → class callbacks, + Debug::log + alarm-IRQ frames — IRQs push on
+// MSP too) on top of the caller. Tape::LoadTape → FatFs → usb_disk_read blew
+// through the 4 KB core0 stack into SCRATCH_X and trashed core1's live stack.
+#define MSC_PUMP_STACK_SIZE 4096
 struct UsbFsMem {
     FATFS   fs;                                          // volume "USB:"
     uint8_t bounce[FF_MAX_SS] __attribute__((aligned(4)));
+    uint8_t pump_stack[MSC_PUMP_STACK_SIZE] __attribute__((aligned(8)));
 };
 static UsbFsMem* g_mem = nullptr;
 
@@ -42,10 +51,53 @@ static UsbFsMem* g_mem = nullptr;
 // a tuh callback — but keep the guard anyway so a future mistake degrades to
 // a timeout instead of a "Data Seq Error" panic.
 static volatile bool g_in_tuh = false;
+
+// Call fn(arg) with MSP switched to new_top and MSPLIM guarding new_bottom
+// (this file only builds on RP2350/Cortex-M33, so MSPLIM always exists).
+// MSPLIM must be OFF (0) whenever SP crosses between stacks: the caller may be
+// on another heap alt-stack BELOW this one (e.g. USB write during a ZIP
+// extract on zipCallOnStack's stack), and raising MSPLIM above a live SP means
+// any IRQ in that window pushes its frame below the limit → STKOF hard fault
+// (hw-traced 2026-07-22 in the identical zipCallOnStack; keep both in sync).
+__attribute__((naked, noinline))
+static void mscCallOnStack(void* new_top, void (*fn)(void*), void* arg, void* new_bottom) {
+    __asm volatile(
+        "mrs  r12, msplim       \n" // r12 = old MSPLIM
+        "push {r4}              \n" // scratch reg (old stack; SP ≥ old MSPLIM here)
+        "movs r4, #0            \n"
+        "msr  msplim, r4        \n" // limit off while SP crosses stacks
+        "mov  r4, sp            \n" // r4 = old SP
+        "mov  sp, r0            \n" // SP = new_top
+        "msr  msplim, r3        \n" // SP is on the alt stack now — arm its guard
+        "push {r2, r4, r12, lr} \n" // 16 bytes → keeps 8-byte alignment
+        "mov  r0, r2            \n" // r0 = arg
+        "blx  r1                \n" // fn(arg)
+        "pop  {r2, r4, r12, lr} \n"
+        "movs r1, #0            \n"
+        "msr  msplim, r1        \n" // limit off for the return crossing
+        "mov  sp, r4            \n" // restore old SP
+        "msr  msplim, r12       \n" // restore old limit (≤ old SP by construction)
+        "pop  {r4}              \n"
+        "bx   lr                \n"
+    );
+}
+
+static void tuhTaskTramp(void*) { tuh_task(); }
+
 static inline void mscService() {
     if (g_in_tuh) return;
     g_in_tuh = true;
-    tuh_task();
+    if (g_mem) {
+        // Deep-context pump (FatFs disk I/O can sit near the bottom of the
+        // 4 KB core0 stack): run tuh_task on the dedicated alt-stack so the
+        // host-stack depth never adds to the caller's. IRQs taken during the
+        // pump also push here (they use MSP) — 4 KB covers both.
+        void* top = (void*)(((uintptr_t)g_mem->pump_stack + MSC_PUMP_STACK_SIZE) & ~(uintptr_t)7);
+        mscCallOnStack(top, tuhTaskTramp, nullptr, g_mem->pump_stack);
+    } else {
+        // Pre-mount pumps (waitReady at boot) run from shallow contexts.
+        tuh_task();
+    }
     g_in_tuh = false;
 }
 

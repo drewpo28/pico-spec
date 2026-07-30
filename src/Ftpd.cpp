@@ -23,6 +23,12 @@
 // a time. Buffers with overlapping lifetimes get distinct members; leaf formatters
 // share. g_b is non-null for the whole begin()..stop() window (every deref happens
 // via poll(), which only runs between them).
+// pico_malloc PANICs on OOM instead of returning NULL (see Buffer.cpp), so every
+// heap ask here is gated on getLargestAllocatable() + this margin — never on the
+// allocation's own null result, which can't happen.
+extern "C" size_t getLargestAllocatable(void);   // OSDMain.cpp
+static const size_t FTPD_HEAP_MARGIN = 16 * 1024; // left free for the OSD/FatFS chain
+
 struct FtpdBuf {
     uint8_t  xfer[2048];   // RETR/STOR/LIST data transfer + recv (was g_buf)
     char     reply[320];   // reply() control-line formatter
@@ -238,8 +244,15 @@ static void doStor(const char* arg, bool append) {
     // mid-file FAT updates (f_expand is no help here: STOR doesn't know the size
     // up front). Heap-transient like g_b; on a tight heap fall back to direct
     // 2 KB writes from xfer.
+    // The gate is what makes that fallback reachable: pico_malloc PANICs on OOM
+    // ("*** PANIC *** Out of memory") instead of returning NULL, so std::nothrow
+    // alone never yields a null wrBuf — it took the whole firmware down mid-STOR
+    // (hw 2026-07-28: 16 KB ask with ~42 KB fragmented heap, two FDIs mounted).
+    // Same pattern as Buffer::palloc / mem_bounce_acquire.
     static const size_t WR_CHUNK_SZ = 16 * 1024;
-    std::unique_ptr<uint8_t[]> wrBuf(new (std::nothrow) uint8_t[WR_CHUNK_SZ]);
+    std::unique_ptr<uint8_t[]> wrBuf;
+    if (getLargestAllocatable() >= WR_CHUNK_SZ + FTPD_HEAP_MARGIN)
+        wrBuf.reset(new (std::nothrow) uint8_t[WR_CHUNK_SZ]);
     size_t wrFill = 0;
 
     bool ok = true;
@@ -460,7 +473,13 @@ static void handle(char* line) {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 bool Ftpd::begin(uint16_t port, LogCb log) {
-    if (!g_b) g_b = (FtpdBuf*)malloc(sizeof(FtpdBuf));  // ~4 KB, freed in stop()
+    // ~4 KB, freed in stop(). Gated, not null-checked: malloc panics rather than
+    // returning NULL, so an ungated ask would kill the firmware instead of
+    // surfacing "FTP server start failed" (the caller's OOM path).
+    if (!g_b) {
+        if (getLargestAllocatable() < sizeof(FtpdBuf) + FTPD_HEAP_MARGIN) return false;
+        g_b = (FtpdBuf*)malloc(sizeof(FtpdBuf));
+    }
     if (!g_b) return false;                              // OOM
     g_log = log;
     g_ctrl = -1;

@@ -332,11 +332,12 @@ On RP2350, UART TX available via two funcsel:
 3. **PICO_DV NESPAD vs Display** — NES_CLK=8, NES_LAT=9 inside display range (6-13). USE_NESPAD correctly not set
 4. **MURM2/MURM MIDI_TX=LOAD_WAV_PIO=22** — mutually exclusive features on same pin. Handled in code (warning in messages.h)
 
-## ZiFi NIC — two host interfaces (both bridge to one ESP UART)
+## ZiFi NIC — three host interfaces (all bridge to one ESP UART)
 
-Port low byte `0xEF`; high address byte = register. Gated by `Config::zifi_enabled`.
+Gated by `Config::zifi_enabled`. First two: port low byte `0xEF`, high address byte = register.
 - **ZIFI-API FIFO** (`#00EF`..`#C7EF`): hi ≤ 0xC7. `ZiFi::read/write`. DR data + ZIFR/ZOFR/IMR/CR. High-level FIFO interface.
 - **16550 UART window** (`#F8EF`..`#FFEF`): hi ≥ 0xF8. `ZiFi::uart16550Read/Write`. reg = hi&7: 0=RBR/THR(or DLL if DLAB), 1=IER/DLM, 2=IIR/FCR, 3=LCR, 4=MCR, 5=LSR, 6=MSR, 7=SCR. THR/RBR bridge to the SAME `zifi_in_buf`/`zifi_out_buf` as the API. LSR=`0x60 | (rx?1:0)`; baud fixed 115200 8N1 (divisor latches stored, ignored).
+- **ZX UNO window** (`#FC3B` addr latch / `#FD3B` data; full 16-bit decode, bit8 = data port): `ZiFi::unoUartRead/Write`. Karabas-Pro's native ESP8266 bridge (dev manual "Порты ZX UNO"). Internal regs: `#C6` UART data (read = accumulator `uno_last_rx`), `#C7` status (bit0 RX_RECV, bit1 TX_BUSY = out-FIFO full); `#C8/#C9` (UART2) absent → 0xFF. Same FIFOs as the `#xxEF` windows; machine-independent (not Profi-gated). NOT hw-confirmed yet.
 - Most real ZiFi software (e.g. `debug/NET/MRF.TRD` terminal, drivers ZW-64/ZW-64-SC/GZ-80) uses the **16550 window**, not the API. Verified by disasm: `LD B,#Fx; LD C,#EF; OUT (C),A` + `IN A,(#FDEF)` LSR poll. App sends its own AT commands over the bridge.
 - Wired in `Ports::input`/`Ports::output` after the API check.
 
@@ -546,16 +547,104 @@ over the ESP-01 and save to SD, with minimal SRAM. RP2350-only, behind
   - `OUT (#DFF7), reg` — latch register index (confirmed via `OUT (C),H` at Gluk ROM 0x11BA)
   - `OUT (#BFF7), data` / `IN A,(#BFF7)` — data register (runtime-unpacked, not in static ROM)
   - Wired in `Ports::input`/`Ports::output`; responds on `isPentagon||isProfi` (NOT gated on EFF7 bit7 CMOS, for robustness — those ports are RTC-specific on these machines)
-- Reg B=0x02 (24h, BCD — what Gluk expects); Reg D bit7 VRT=1 (battery valid); Reg A UIP=0 always. Clock regs 0x00-0x09 computed live from `base_secs + elapsed_ms` (no per-register tick); guest writes to time regs ignored.
+- Reg B=0x02 (24h, BCD — what Gluk expects); Reg D bit7 VRT=1 (battery valid). Clock regs 0x00-0x09 computed live from `base_secs + elapsed_ms` (no per-register tick). Reg A synthesizes a UIP pulse (last ~2 ms of each second); reg C synthesizes UF once per second + PF @~1 kHz with read-clear semantics (no RTC IRQ line on Karabas — software must poll these). Guest can SET the clock via the datasheet protocol only: reg B SET=1 (snapshots live time into the 0x00-0x09 shadow buffer, reads return it) → write time regs → SET=0 commits via `commitTimeRegs()` (BCD/binary per DM bit, range-checked). Blind writes without SET stay ignored (protects SNTP time from ROM auto-init).
 - Time source: SNTP via ZiFi ESP — `ZiFiAT::syncTime(tz, out)` sends `AT+CIPSNTPCFG=1,tz,"pool.ntp.org"` then polls `AT+CIPSNTPTIME?` (parses `+CIPSNTPTIME:Www Mmm dd hh:mm:ss yyyy`, accepts year≥2020).
 - Trigger: **manual** — Network menu → "Sync time (SNTP)". Timezone via Network → "Time zone" (UTC−12..+14 list → `Config::wifi_tz`, saved to wifi.cfg key `tz`).
 - **Network menu** (RP2350, built dynamically): row 1 = `WiFi On <ssid> <ip>` / `WiFi Off` (live status, padded to fixed 32 width so geometry stays stable) then `Sync time (SNTP)` / `Time zone >` / `ZiFi NIC >`. Selecting the **WiFi** row is the all-in-one action — connected: SSID+IP + disconnect (msgDialog); not connected: `AT+CWLAP` scan → pick SSID (dynamic menuRun list) → password (`wifiAskPassword` box over `OSD::inlineTextEdit`) → connect → saves SSID/pass to wifi.cfg. Status is cached (`getStatus` is blocking) and refreshed on menu entry + after connect/disconnect/NIC-toggle. Connect/Disconnect/Reload items removed.
 - **wifi.cfg** lives in `CONFIG_DIR` (`/.config/pico-spec/wifi.cfg`); legacy `/wifi.cfg` still read as fallback. `Config::saveWifiConfig()` writes ssid/pass/tz/autoconnect; `ZiFiAT::scan()` parses `+CWLAP`.
-- **Auto-sync on boot**: when `ZiFi::enabled && Config::rtc_enabled && wifi_ssid` set, `ESPectrum::loop` kicks off `ZiFiAT::autoSyncBegin()` ~4 s in, then `autoSyncPoll()` each tick. Non-blocking background state machine (CWMODE→CWJAP→CIPSNTPCFG→poll CIPSNTPTIME?, ~15 retries) — **no OSD, never freezes** audio/video; writes straight into RTC, silent on failure. Manual menu sync still uses the blocking `syncTime()`.
+- **Auto-sync on boot**: when `Config::wifi_enabled && wifi_ssid` set, `ESPectrum::loop` kicks off `ZiFiAT::autoSyncBegin()` ~4 s in, then `autoSyncPoll()` each tick. Non-blocking background state machine (CWMODE→CWJAP→CIPSNTPCFG→poll CIPSNTPTIME?, ~15 retries) — **no OSD, never freezes** audio/video; writes straight into RTC, silent on failure. Manual menu sync still uses the blocking `syncTime()`. On **Profi** gated by a once-only heap check (`getLargestAllocatable() >= 16K` at the 4 s mark) instead of the old blanket `arch != "Profi"` exclusion — that exclusion left the ROMain/PQDOS clock permanently at 00.00.00 (butter-PSRAM Profi has the headroom; tight m1p2 Profi still skips, preserving the OOM fix).
 - **"NO CMOS" fix (hw-confirmed)**: Gluk treats CMOS valid only when NVRAM **reg 0x11 == 0xAA** (unpacked-RAM check at 0x6049 `CP 0xAA / JR NZ`); reg 0x12 == 0x47 (`'G'`) gates loading the 27-byte config (regs 0x13–0x2D → RAM 0x63A1). No checksum. Gluk's auto-path writes a bogus 0x55 and never self-validates (real signature written only on menu-save). `RTC::init()` seeds `regs[0x11] = 0xAA` after `loadNVRAM()` so the clock works out of the box; Gluk then reads time regs 0x00–0x09.
-- NVRAM (0x0E–0x3F + reg B) persisted to `CONFIG_DIR/cmos.nvr` (battery emulation): `loadNVRAM()` at init, dirty-flushed from main loop via `RTC::flushNVRAM()`.
+- NVRAM (0x0E–0xFF + reg B; full 8-bit index — Karabas exposes 240 DS1307 cells, no `&0x3F` mask or high cells would alias onto the time regs) persisted to `CONFIG_DIR/cmos.nvr` (256 bytes; old 64-byte files still load): `loadNVRAM()` at init, dirty-flushed from main loop via `RTC::flushNVRAM()`.
 - `RTC_PORT_TRACE` CMake option (default OFF) logs every `..F7` IN/OUT for debugging.
-- **Toggle**: Options → Other → "RTC + NVRAM" (Yes/No → `Config::rtc_enabled`, default **off** — `Config::rtc_enabled = false`, NVS-persisted). RP2350-only: the menu row is appended at runtime under `#if !PICO_RP2040`; when off, the `#DFF7`/`#BFF7` port handlers are bypassed (Gluk shows "NO CMOS").
+- **Toggle**: Options → Other → "RTC + NVRAM" (Yes/No → `Config::rtc_enabled`, default **off** — `Config::rtc_enabled = false`, NVS-persisted). RP2350-only: the menu row is appended at runtime under `#if !PICO_RP2040`; when off, the RTC ports still RESPOND STATICALLY (not bypassed): reads float 0xFF (Gluk shows "NO CMOS"; Karabas clock shows FF), but status regs A/C read UIP/flags clear so the Karabas ROMain boot's MC146818 "wait until UIP clears" loop can't hang (was the "ROMain won't start with RTC off" bug); register-select is still latched, data writes swallowed (`RTC::readDisabled()`, four handlers in Ports.cpp).
+
+## FDI copy protection — physical damage emulation (`src/wd1793.cpp`)
+
+Ported from pico-speccy (hw-confirmed there 2026-07-28). RP2350-only — the whole
+damage path is compiled out on RP2040 with the rest of FDI support.
+
+An FDI sector flagged with a **bad data CRC** was unreadable on the source
+floppy: its data field is valid up to the damaged spot and garbage from there to
+the end. Protections (Чёрный Ворон / Black Raven disk 2 = `br2b.fdi`) write a
+pattern over such a sector, read it back and expect the **first mismatch at the
+damage offset** (Black Raven: ±10 in 2-byte compare units = ±20 bytes).
+
+- **Damage never heals.** WriteEnd keeps the bad-CRC flag and re-inverts the
+  stored MFM CRC for sectors in `wd->fdiOrigBadMask` (set per track in
+  `fdiLoadTrack`). Before this, a write "repaired" the sector — the protection
+  saw a healthy disk and looped forever.
+- **The damaged region refuses writes.** `fdiWrGuard`/`fdiWrCount` (armed in
+  `kRVMWD177XWriteDataFlag`, cleared in `_end`) make the buffer store in
+  `rvmwdDiskStep`'s FDI branch drop every byte from the damage offset on, CRC
+  bytes included. Guard = `offset + 1` because the count includes the data mark,
+  so data byte `offset` is the first one suppressed. The sector is identified by
+  its ID field (`fdiSectorFromHeader`), never by the last find_marker hit, so a
+  healthy sector can't inherit a neighbour's damage. Non-FDI images never arm the
+  guard (`fdiWrGuard` stays -1), so TRD/SCL/UDI/TD0/MBD writes are untouched.
+- **The image is never written back** for damaged sectors (`fdiFlushTrack`
+  skips them) — flushing the mixed prefix+tail would destroy the protection
+  permanently, and the pristine file is what restores the sector on reload. The
+  write therefore lives only while the track is buffered, which is all a
+  protection needs (write + read-back happen without an intervening seek).
+- **Damage offsets are recovered from the image itself** at insert
+  (`fdiScanDamage`, **no metadata file of any kind**). These disks store one stream
+  redundantly across several damaged sectors at different rotational offsets — so
+  their loader can rebuild it from the parts that still read — and that
+  redundancy locates the damage: align a damaged sector against every other copy
+  (shift 0 plus anchor-matched alignments, `DMG_*` tunables) and take the largest
+  agreement, since an overlap can start disagreeing no later than this sector's
+  own damage. Cost is well under a millisecond, once per insert.
+- The insert-time track-header walk slides an 8 KB window over `g_rawTrkDataBuf`
+  (**2 SD reads instead of 166** for an 83-cyl image) and collects the bad-CRC
+  sectors on the way; their data is then staged in the same buffer for the scan.
+  The window must hold one track block (`static_assert`).
+- **Damage located → the scratch is emulated** (write prefix only, nothing
+  persisted to the image). **Not located** (`FDI_DMG_UNKNOWN`, e.g. a lone bad
+  sector with no redundant copy) **→ the sector still takes writes in full and
+  they are persisted**, it just never heals. Refusing those writes would only lose
+  data: without the real offset no protection can be satisfied anyway (Black
+  Raven rejects a mismatch below index 12).
+- `tools/fdi_damage.py image.fdi [--ref crack.fdi]` is the host-side twin of the
+  scan — it needs no input from the firmware and feeds it nothing. Run it to
+  validate the derivation on a new protected image: `--ref` diffs against a
+  crack/rip for the exact offsets and reports the worst deviation. Only damaged
+  sectors are compared, since a healthy sector could supply an alignment the
+  firmware never sees.
+- Ground truth, `br2b.fdi` derived vs `RAVEN2.FDI` (the cracked rip), all side 1,
+  512-byte sectors — reproduced locally 2026-07-30 with `tools/fdi_damage.py --ref`:
+  cyl1 R145 397/397, cyl1 R147 413/413, cyl2 R145 352/**356**, cyl2 R147 326/326,
+  cyl3 R145 378/378, cyl3 R147 378/**380** — worst deviation 4 bytes, inside the
+  game's ±20. The firmware runs the same derivation on the image alone.
+- Black Raven's checker (readable in the *cracked* `RAVEN1.FDI` at load address
+  0xE000, protection routine ~0xE0CB): picks a protected sector from a table,
+  writes a pattern, reads it back to 0xA000, compares every 2nd byte, then
+  `CP 0xFA` / `CP 0x0C` / `SUB C; ADD A,0x0A; CP 0x16` — i.e. the mismatch index
+  must be 12..249 and within ±10 of the table value. The crack NOP'd those three
+  branches.
+
+## Murmuzavr extended RAM — page budget and the persisted pick
+
+- `MEM_PG_CNT` (64..2048) is the LIVE page count; `Config::mem_pg_cnt` is the
+  PERSISTED pick. `Config::save()` serialises the pick only — MemESP indexes ROM as
+  `ram[MEM_PG_CNT + romLatch]`, so the live count must not move while a machine
+  runs, and a save made on a machine that boots clamped must not overwrite the pick.
+- `ESPectrum::setup()` derives the live count from the pick exactly once and clamps
+  it to 64 on anything but Pentagon 128/512/1024 (Murmuzavr is a Pentagon
+  extension). Profi + 32 MB used to OOM-panic in setup() with no way back to the
+  menu. The Machine → Murmuzavr submenu refuses non-Pentagon machines up front.
+- `Buffer::pageBudgetButter/pageBudgetSpi` cap what ZX pages may take from PSRAM:
+  chip minus a 512 KB Buffer arena, minus GS sample RAM (when GS lands on that
+  chip) and minus the DivMMC banks. Pages past the budget go to SD swap. Without it
+  a 2048-page pick swallowed the whole chip, `initPools()` carved a 0 KB arena and
+  everything that belongs in PSRAM (Gigascreen prevFB, GS work RAM/rings, zip
+  inflate, net rings) fell back to the heap and OOM-panicked. `spiPageExtent()` is
+  the SPI top for the pages; GS::init reserves above it.
+- The page descriptor (`mem_desc_int_t`) is 12 bytes with `page_idx` instead of a
+  stored `vram_off` (offset = `page_idx * MEM_PG_SZ`) and comes from a pooled
+  bump allocator — 24 KB instead of 49 KB at 2050 pages. The `static_assert` on the
+  size is deliberate; 4 bytes added there is 8 KB of SRAM. Block size is what the
+  current `MEM_PG_CNT` needs, capped at 4 KB (a flat 4 KB block was a net heap LOSS
+  at the default 64 pages).
 
 ## Tools
 

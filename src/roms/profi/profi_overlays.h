@@ -3,4 +3,8 @@
 extern "C" {
 extern const unsigned char gb_overlay_profi_bank2[];
 extern const unsigned char gb_overlay_profi_bank3[];
+extern const unsigned char gb_overlay_profi_bank1_pq[];
+extern const unsigned char gb_overlay_profi_bank2_pq[];
+extern const unsigned char gb_overlay_profi_bank3_pq[];
+extern const unsigned char gb_overlay_profi_bank1_romain[];
 }

@@ -44,6 +44,15 @@ public:
     static uint8_t uart16550Read(uint8_t reg_hi);
     static void    uart16550Write(uint8_t reg_hi, uint8_t data);
 
+    // ZX UNO register-file window (#FC3B address / #FD3B data) — Karabas-Pro's
+    // host interface to its on-board ESP8266 (dev manual "Порты ZX UNO"). Only
+    // the UART registers exist: #C6 data, #C7 status (bit0 RX_RECV, bit1
+    // TX_BUSY); #C8/#C9 (UART2 on EP4CE10 boards) read as absent. Bridges to
+    // the same ESP FIFOs as the ZIFI-API and 16550 windows. dataPort selects
+    // #FD3B (true) vs #FC3B (false).
+    static uint8_t unoUartRead(bool dataPort);
+    static void    unoUartWrite(bool dataPort, uint8_t data);
+
     // Drive the SD-backed RX spill from a blocking recv loop (e.g. ZiFiSock during
     // a TLS catalog transfer) when the per-frame tick() can't run. Public wrapper.
     static void     rxSpill();
@@ -127,6 +136,11 @@ private:
     static volatile uint32_t rx_bytes;    // total bytes received from ESP
     static volatile uint32_t rx_dropped;  // bytes lost to RX-FIFO overflow
     static volatile uint32_t tx_bytes;    // total bytes sent to ESP
+
+    // ZX UNO window state: latched internal-register index (#FC3B) and the
+    // data-register "accumulator" (holds the last byte popped from RX).
+    static uint8_t uno_addr;
+    static uint8_t uno_last_rx;
 
     // 16550 register state (#F8EF..#FFEF window). Baud is fixed by the physical
     // ESP UART (115200 8N1), so the divisor latches are stored but ignored.

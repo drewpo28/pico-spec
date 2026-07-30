@@ -787,8 +787,10 @@ bool GS::init(uint32_t ram_size_bytes) {
             Debug::log("GS::init: no PSRAM (butter or SPI)");
             return false;
         }
-        // Make sure MemESP swap pool fits below GS RAM (worst case = MEM_PG_CNT pages).
-        size_t memesp_max = (size_t)MEM_PG_CNT * MEM_PG_SZ;
+        // Make sure the MemESP swap pool fits below GS RAM. Its top is the page
+        // budget, not MEM_PG_CNT: a Murmuzavr page count larger than the chip is
+        // capped by Buffer::pageBudgetSpi(), which already holds this region back.
+        size_t memesp_max = Buffer::spiPageExtent();
         if ((size_t)spi < memesp_max + ram_size_bytes) {
             Debug::log("GS::init: SPI PSRAM too small (%u, need %u + %u memesp)",
                        (unsigned)spi, (unsigned)ram_size_bytes, (unsigned)memesp_max);

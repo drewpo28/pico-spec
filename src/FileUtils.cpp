@@ -88,7 +88,7 @@ DISK_FTYPE FileUtils::fileTypes[7] = {
     {".tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.zip,.ZIP",2,2,0,""},
     {".trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.td0,.TD0,.mbd,.MBD,.pro,.PRO,.zip,.ZIP",2,2,0,""},
     {".rom,.ROM,.bin,.BIN,.zip,.ZIP",2,2,0,""},
-    {".mmc,.MMC,.hdf,.HDF,.hdd,.HDD,.vhd,.VHD,.iso,.ISO,.zip,.ZIP",2,2,0,""},
+    {".mmc,.MMC,.hdf,.HDF,.hdd,.HDD,.vhd,.VHD,.img,.IMG,.iso,.ISO,.zip,.ZIP",2,2,0,""},
     {".sna,.SNA,.z80,.Z80,.p,.P,.tap,.TAP,.tzx,.TZX,.pzx,.PZX,.wav,.WAV,.mp3,.MP3,.trd,.TRD,.scl,.SCL,.udi,.UDI,.fdi,.FDI,.td0,.TD0,.mbd,.MBD,.pro,.PRO,.mmc,.MMC,.hdf,.HDF,.rom,.ROM,.bin,.BIN,.dls,.DLS,.zip,.ZIP",2,2,0,""},
     {".dls,.DLS",2,2,0,""}   // DISK_DLSFILE (GM.DLS soundbank conversion)
 #endif
@@ -166,7 +166,11 @@ bool FileUtils::mkdirParents(const char* path) {
     if (len >= sizeof(buf)) return false;
     memcpy(buf, path, len);
     buf[len] = 0;
-    for (size_t i = 1; i < len; ++i) {
+    // Skip a volume prefix ("USB:/...") — f_mkdir("USB:") is an error, not FR_EXIST
+    size_t start = 1;
+    const char* colon = strchr(buf, ':');
+    if (colon) start = (size_t)(colon - buf) + 2;
+    for (size_t i = start; i < len; ++i) {
         if (buf[i] == '/') {
             buf[i] = 0;
             FRESULT r = f_mkdir(buf);
@@ -409,8 +413,21 @@ bool FileUtils::hasZIPextension(const string& filename)
 #endif
 
 void FileUtils::deleteFilesWithExtension(const char *folder_path, const char *extension) {
+#if PICO_RP2040
+    // RP2040: no USB-MSC pump under FatFs (the chain that overflowed) and BSS is
+    // the scarcer resource on ZERO — keep these on the stack as before.
     DIR dir;
     FILINFO entry;
+    char file_path[512];
+#else
+    // Static FatFs objects + path buffer: DIR + FILINFO(LFN) + 512 B path ≈ 0.8 KB
+    // is too fat for the deep call chains this runs in (Tape::LoadTape flashload /
+    // TZX cleanup, near the bottom of the 4 KB core0 stack — part of the usbRoot
+    // overflow of 2026-07-21). Core0-only, non-reentrant use.
+    static DIR dir;
+    static FILINFO entry;
+    static char file_path[512];
+#endif
     if (f_opendir(&dir, folder_path) != FR_OK) {
         // perror("Unable to open directory");
         return;
@@ -419,7 +436,6 @@ void FileUtils::deleteFilesWithExtension(const char *folder_path, const char *ex
     while (f_readdir(&dir, &entry) == FR_OK && entry.fname[0] != '\0') {
         if (strcmp(entry.fname, ".") != 0 && strcmp(entry.fname, "..") != 0) {
             if (strstr(entry.fname, extension) != NULL) {
-                char file_path[512];
                 snprintf(file_path, sizeof(file_path), "%s/%s", folder_path, entry.fname);
                 if (f_unlink(file_path) == 0) {
                     printf("Deleted file: %s\n", entry.fname);

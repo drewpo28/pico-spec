@@ -130,7 +130,16 @@ static inline uint32_t hdmi_scanline_gray(void) {
 // are rewritten between the two plays, so every transmitted line carries a
 // unique packet (no duplicated audio samples).
 // ============================================================
-#define HDMI_AUDIO_RING_SIZE 1024
+// Ring depth: this is NOT the stall cushion (that is the packet queue below,
+// drained by the core1 ISR). Producer and consumer of THIS ring are both the
+// core0 pcm tick — hdmi_audio_write_sample() upsamples into it and encodes
+// packets out of it in the same call — and that same function hard-caps the
+// backlog at 256 samples ("if (avail > 256) drop"). So occupancy is ~2 samples
+// in steady state and 256 in the worst case it allows; 512 keeps 2x headroom
+// over that cap. Was 1024 (4x the reachable depth): the 2 KB it gave back is
+// what lets Gigascreen + HDMI audio coexist on a butter-less board (the SRAM
+// budget gate missed it by ~0.5 KB). Must stay a power of two (RING_MASK).
+#define HDMI_AUDIO_RING_SIZE 512
 #define HDMI_AUDIO_RING_MASK (HDMI_AUDIO_RING_SIZE - 1)
 // Heap-allocated together with aq_blob (~8.6 KB total) by hdmi_audio_init();
 // freed by hdmi_audio_deinit() via the HdmiAudio subsystem so the SRAM is
