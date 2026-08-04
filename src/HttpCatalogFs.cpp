@@ -48,17 +48,30 @@ static std::string baseUrl() {
     return b;
 }
 
+// FNV-1a 32 — shared by the .tsv cache names below and the slug hash suffix.
+static uint32_t catvHash(const std::string& s) {
+    uint32_t h = 2166136261u; for (unsigned char c : s) { h ^= c; h *= 16777619u; } return h;
+}
+
 // Mirror of gen_static.py slug(): "" → "_root", '/' → '~', keep [A-Za-z0-9._-],
-// everything else → '_'. Must stay byte-identical to the exporter.
+// everything else → '_'; if anything was replaced (other than '/'), append
+// "-<fnv1a32 of the full path, 8 hex>" so lossy names (Cyrillic, parens) can't
+// collide. Must stay byte-identical to the exporter.
 static std::string slugPath(const std::string& path) {
     if (path.empty()) return "_root";
     std::string out;
-    out.reserve(path.size());
+    out.reserve(path.size() + 9);
+    bool lossy = false;
     for (unsigned char c : path) {
         if (c == '/') out += '~';
         else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
                  (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') out += (char)c;
-        else out += '_';
+        else { out += '_'; lossy = true; }
+    }
+    if (lossy) {
+        char h[12];
+        snprintf(h, sizeof(h), "-%08lx", (unsigned long)catvHash(path));
+        out += h;
     }
     return out;
 }
@@ -252,9 +265,6 @@ static void list_line(const char* line, void* arg) {
 }
 
 // ── Local .tsv cache (so get()/downloadBasename don't re-fetch over HTTPS) ──────
-static uint32_t catvHash(const std::string& s) {
-    uint32_t h = 2166136261u; for (unsigned char c : s) { h ^= c; h *= 16777619u; } return h;
-}
 std::string HttpCatalogFs::tsvCachePath() const {
     char b[40]; snprintf(b, sizeof(b), "/tmp/.catv_%08lx.tsv", (unsigned long)catvHash(site + "|" + cur_path));
     return std::string(b);
