@@ -376,6 +376,55 @@ static uint tmds_encoder(const uint8_t d8) {
 // Set to 0 to A/B against the old pairing.
 #define HDMI_TMDS_BALANCED_PAIR 1
 
+// Balance alone does not make every byte value equally kind to the receiver.
+// Two more properties of a pixel pair decide how much low-frequency energy and
+// how little clock information it carries:
+//   swing   peak |running disparity| inside the 20 bits — the baseline wander
+//           the sink's DC restore has to follow
+//   run     longest stretch of identical bits (the pair repeats across a run
+//           of same-colored pixels, so the wrap counts) — how long the CDR
+//           coasts without an edge
+// Over the 256 values these range from (2,4) to (9,9), and the worst two are
+// exactly 0x00 and 0xFF — black and full brightness, i.e. most of a ZX screen.
+// Both are also the only values with a single balanced pair, so the pair
+// search cannot improve them.
+//
+// SNAP: nudge each channel value by at most ±2 to the neighbour with the
+// lowest (swing, run). Mean swing over the range drops 4.12 -> 2.84, worst
+// 9 -> 7, at a level shift of ≤0.8% — invisible.
+// LEVEL_CLAMP: additionally keep values inside [LO..HI], which is what pulls
+// 0x00 (swing 8, run 9) and 0xFF (swing 9, run 9) down to (3,5) — with SNAP
+// that takes the whole range to mean swing 2.69, worst 5. Costs ~3% of black
+// level and ~3.5% of white.
+// hw (m1p1 + Samsung S27AG300N, 2026-08-05): SNAP+CLAMP is the combination
+// that made the link clean across resets, so both are on by default; the
+// lifted black is the price of a stable picture on a marginal receiver. Build
+// with -DHDMI_TMDS_LEVEL_CLAMP=0 to get true black back on a link that does
+// not need it. Turning either off never breaks the stream — the pairs stay
+// balanced, only the pattern quality degrades.
+// Both act on the TMDS words only — palette[] and the VGA LUT keep the exact
+// color, so VGA output and the OSD's own color logic are unaffected.
+#ifndef HDMI_TMDS_LEVEL_SNAP
+#define HDMI_TMDS_LEVEL_SNAP 1
+#endif
+#ifndef HDMI_TMDS_LEVEL_CLAMP
+#define HDMI_TMDS_LEVEL_CLAMP 1
+#endif
+#define HDMI_TMDS_LEVEL_LO 0x08
+#define HDMI_TMDS_LEVEL_HI 0xF6
+
+// Drive the TMDS clock pair softly: 8 mA + slow slew, against 12 mA + fast
+// slew on the data pairs. The clock is the board's strongest aggressor and it
+// runs right next to a data pair (on m1p1 the blue pair, GPIO 8/9, sits beside
+// the clock pair on 6/7 — which is why blue is the channel that breaks up
+// there), while the receiver has clock margin to spare on a short cable.
+// hw (m1p1 + Samsung S27AG300N, 2026-08-05): picked as the best variant over
+// several resets after an A/B against the 12 mA/fast default, so it is the
+// default now. Set to 0 if a board ever needs the harder clock edge.
+#ifndef HDMI_SOFT_CLK
+#define HDMI_SOFT_CLK 1
+#endif
+
 #if HDMI_TMDS_BALANCED_PAIR
 // 9-bit transition-minimised word: bits 0-7 = q_m, bit 8 = 1 when XOR was used
 static uint16_t tmds_qm(const uint8_t d8) {
@@ -405,31 +454,100 @@ static inline int tmds_ones(const uint16_t c) {
     return n;
 }
 
-// Characters for the two halves of a doubled pixel of value v, one-counts
-// summing to 10 (zero disparity). The first character always carries v exactly;
-// the second may carry v-1 or v+1 when v alone cannot balance.
-static void tmds_balanced_pair(const uint8_t v, uint16_t *first, uint16_t *second) {
+// Peak |running disparity| inside a pair, starting from balance (see SNAP).
+static int tmds_pair_swing(const uint16_t a, const uint16_t b) {
+    int rd = 0, peak = 0;
+    for (int k = 0; k < 20; k++) {
+        const uint16_t c = (k < 10) ? a : b;
+        rd += ((c >> (k % 10)) & 1) ? 1 : -1;
+        const int m = (rd < 0) ? -rd : rd;
+        if (m > peak) peak = m;
+    }
+    return peak;
+}
+
+// Longest run of identical bits, counted over two periods because the pair
+// repeats across a run of same-colored pixels (the wrap can be the worst spot).
+static int tmds_pair_run(const uint16_t a, const uint16_t b) {
+    int best = 0, run = 0, prev = -1;
+    for (int k = 0; k < 40; k++) {
+        const int i = k % 20;
+        const uint16_t c = (i < 10) ? a : b;
+        const int bit = (c >> (i % 10)) & 1;
+        run = (bit == prev) ? run + 1 : 1;
+        prev = bit;
+        if (run > best) best = run;
+    }
+    return (best > 20) ? 20 : best;
+}
+
+// Best balanced pair for value v: one-counts summing to 10 (zero disparity per
+// pixel), ranked by swing then run. The first character always carries v
+// exactly; the second may carry v±1 when v alone cannot balance (verified over
+// all 256 values that ±1 always suffices, and one LSB on every other pixel of
+// a doubled pair is invisible).
+static void tmds_best_pair(const uint8_t v, uint16_t *first, uint16_t *second,
+                           int *out_swing, int *out_run) {
     const uint16_t qv = tmds_qm(v);
     uint8_t cand[3];
     int nc = 0;
     cand[nc++] = v;                       // exact pair when it happens to balance
     if (v > 0) cand[nc++] = (uint8_t)(v - 1);
     if (v < 255) cand[nc++] = (uint8_t)(v + 1);
+    int best_sw = 99, best_rn = 99;
+    uint16_t best_a = tmds_rep(qv, 0), best_b = tmds_rep(qv, 1);  // safety default
     for (int c = 0; c < nc; c++) {
         const uint16_t qw = tmds_qm(cand[c]);
         for (int i = 0; i < 2; i++) {
             const uint16_t a = tmds_rep(qv, i);
             for (int j = 0; j < 2; j++) {
                 const uint16_t b = tmds_rep(qw, j);
-                if (tmds_ones(a) + tmds_ones(b) == 10) {
-                    *first = a; *second = b;
-                    return;
+                if (tmds_ones(a) + tmds_ones(b) != 10) continue;
+                const int sw = tmds_pair_swing(a, b);
+                const int rn = tmds_pair_run(a, b);
+                if (sw < best_sw || (sw == best_sw && rn < best_rn)) {
+                    best_sw = sw; best_rn = rn; best_a = a; best_b = b;
                 }
             }
         }
     }
-    // Unreachable for 8-bit values (checked exhaustively) — keep it safe anyway
-    *first = tmds_rep(qv, 0); *second = tmds_rep(qv, 1);
+    *first = best_a; *second = best_b;
+    if (out_swing) *out_swing = best_sw;
+    if (out_run) *out_run = best_rn;
+}
+
+// Level fed to the encoder for a channel value: snapped (and optionally
+// clamped) to the friendliest nearby level — see the SNAP/LEVEL_CLAMP comment.
+static uint8_t tmds_level(const uint8_t v) {
+#if HDMI_TMDS_LEVEL_CLAMP
+    int lo = HDMI_TMDS_LEVEL_LO, hi = HDMI_TMDS_LEVEL_HI;
+#else
+    int lo = 0, hi = 255;
+#endif
+    int base = (v < lo) ? lo : ((v > hi) ? hi : v);
+#if HDMI_TMDS_LEVEL_SNAP
+    int from = base - 2, to = base + 2;
+    if (from < lo) from = lo;
+    if (to > hi) to = hi;
+    int best_w = base, best_sw = 99, best_rn = 99;
+    for (int w = from; w <= to; w++) {
+        uint16_t a, b;
+        int sw, rn;
+        tmds_best_pair((uint8_t)w, &a, &b, &sw, &rn);
+        const int dist = (w > base) ? (w - base) : (base - w);
+        const int best_dist = (best_w > base) ? (best_w - base) : (base - best_w);
+        if (sw < best_sw || (sw == best_sw && rn < best_rn)
+            || (sw == best_sw && rn == best_rn && dist < best_dist)) {
+            best_sw = sw; best_rn = rn; best_w = w;
+        }
+    }
+    base = best_w;
+#endif
+    return (uint8_t)base;
+}
+
+static inline void tmds_balanced_pair(const uint8_t v, uint16_t *first, uint16_t *second) {
+    tmds_best_pair(tmds_level(v), first, second, (int *)0, (int *)0);
 }
 #endif
 
@@ -831,8 +949,14 @@ static inline bool hdmi_init() {
     sm_config_set_sideset(&c_c, 2,false,false);
     for (int i = 0; i < 2; i++) {
         pio_gpio_init(PIO_VIDEO, beginHDMI_PIN_clk + i);
+#if HDMI_SOFT_CLK
+        // See HDMI_SOFT_CLK: soften the board's strongest aggressor
+        gpio_set_drive_strength(beginHDMI_PIN_clk + i, GPIO_DRIVE_STRENGTH_8MA);
+        gpio_set_slew_rate(beginHDMI_PIN_clk + i, GPIO_SLEW_RATE_SLOW);
+#else
         gpio_set_drive_strength(beginHDMI_PIN_clk + i, GPIO_DRIVE_STRENGTH_12MA);
         gpio_set_slew_rate(beginHDMI_PIN_clk + i, GPIO_SLEW_RATE_FAST);
+#endif
     }
 
 #if ZERO2
@@ -1083,6 +1207,7 @@ void graphics_set_palette(uint8_t i, uint32_t color888) {
     // Both halves of the doubled pixel are legal TMDS words whose one-counts
     // add up to 10, so the pair leaves no running disparity behind
     // (see tmds_balanced_pair).
+    // tmds_balanced_pair also applies the level snap/clamp (see its comment)
     uint16_t rA, rB, gA, gB, bA, bB;
     tmds_balanced_pair(R, &rA, &rB);
     tmds_balanced_pair(G, &gA, &gB);
