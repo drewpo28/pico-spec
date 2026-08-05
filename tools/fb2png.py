@@ -89,7 +89,20 @@ def main():
     if use_zx or looks_default or looks_bogus:
         for i in range(16):
             pal[i] = ZX_PALETTE[i]
-        print("palette: using ZX standard for 0..15 (dumped palette looked default)")
+        # 16 = OSD orange; 17..239 = the stock G3R3B2 CLUT cube (grb_to_rgb888
+        # in Video.cpp). Needed for anything beyond plain ULA: ULA+ (64..127)
+        # and the pico-speccy Spectrum Next renderer (17..219) index into the
+        # cube, and the placeholder palette dump leaves those slots as garbage.
+        pal[16] = (0xFF, 0x7F, 0x00)
+        for i in range(17, 240):
+            g3 = (i >> 5) & 7
+            r3 = (i >> 2) & 7
+            b2 = i & 3
+            pal[i] = ((r3 << 5) | (r3 << 2) | (r3 >> 1),
+                      (g3 << 5) | (g3 << 2) | (g3 >> 1),
+                      (b2 << 6) | (b2 << 4) | (b2 << 2) | b2)
+        print("palette: using ZX standard 0..15 + G3R3B2 cube 16..239 "
+              "(dumped palette looked default)")
 
     # Auto-pick XOR variant if not forced. Try both, score by local smoothness
     # (lower neighbor-difference = correct layout). The HDMI/VGA serializer
@@ -116,7 +129,11 @@ def main():
     if auto_xor:
         s_xor = score_layout(True)
         s_noxor = score_layout(False)
-        use_xor = s_xor <= s_noxor
+        # Require a CLEAR win to pick the XOR layout: on a mostly-uniform
+        # screen (boot banner) the scores nearly tie and a coin-flip pick
+        # scrambles the text in 2-byte groups. NO-XOR is the correct layout
+        # for the current HDMI/VGA dumps, so it is the default on a tie.
+        use_xor = s_xor * 10 < s_noxor * 9
         print(f"layout: xor-score={s_xor} noxor-score={s_noxor} → {'XOR' if use_xor else 'NO-XOR'}")
     else:
         use_xor = not forced_no_xor

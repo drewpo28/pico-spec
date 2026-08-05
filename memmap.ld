@@ -63,6 +63,16 @@ SECTIONS
          * FLASH ... we will include any thing excluded here in .data below by default */
         *(.init)
         *libgcc.a:cmse_nonsecure_call.o
+        /* pico-spec: the ARM EH unwinder is cold code — it only runs on a C++
+         * throw, and this firmware never throws (no try/catch/throw anywhere;
+         * it is linked in solely because libstdc++'s __throw_* paths reference
+         * it). The EXCLUDE_FILE below sends all of libgcc to the RAM catch-all
+         * in .data, so claim these three objects for FLASH first (first match
+         * wins) — measured -4096 B of SRAM. The hot libgcc helpers (_ashldi3,
+         * _thumb1_case_*, dividers) stay in RAM. */
+        *libgcc.a:unwind-arm.o(.text* .rodata*)
+        *libgcc.a:pr-support.o(.text* .rodata*)
+        *libgcc.a:libunwind.o(.text* .rodata*)
         *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a:) .text*)
         *(.fini)
         /* Pull all c'tors into .text */

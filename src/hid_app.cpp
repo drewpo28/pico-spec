@@ -51,8 +51,14 @@ static struct
   uint16_t pid;
 }hid_info[CFG_TUH_HID];
 
-#define HID_SNAP_DESC_BYTES   48
-#define HID_SNAP_REPORT_BYTES 32
+// Bytes kept per HID instance for the OSD "HID devices" dump. Purely diagnostic:
+// the descriptor head is enough to recognise a report layout and 16 bytes cover
+// every gamepad report we decode (DS5, the longest, is 10 used bytes). Both are
+// per-slot .bss (x CFG_TUH_HID), so they were trimmed from 48/32 for RP2040.
+// Everything that copies into them clamps to these values (min(len, ...)) and the
+// dump prints desc_saved/last_report_saved, so shrinking only shortens the dump.
+#define HID_SNAP_DESC_BYTES   16
+#define HID_SNAP_REPORT_BYTES 16
 
 // Handler markers — what code path actually got the report.
 enum hid_handler_t : uint8_t {

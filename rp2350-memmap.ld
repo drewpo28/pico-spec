@@ -25,6 +25,11 @@ SECTIONS
         KEEP (*(.reset))
         *(.init)
         *libgcc.a:cmse_nonsecure_call.o
+        /* pico-spec: keep the cold ARM EH unwinder in FLASH — see the same
+         * block in memmap.ld (RP2040) for the rationale. ~3.9 KB of SRAM. */
+        *libgcc.a:unwind-arm.o(.text* .rodata*)
+        *libgcc.a:pr-support.o(.text* .rodata*)
+        *libgcc.a:libunwind.o(.text* .rodata*)
         *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a:) .text*)
         *(.fini)
         *crtbegin.o(.ctors)

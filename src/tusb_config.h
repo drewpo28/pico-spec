@@ -92,8 +92,17 @@
 // CONFIGURATION
 //--------------------------------------------------------------------
 
-// Size of buffer to hold descriptors and other data used for enumeration
-#define CFG_TUH_ENUMERATION_BUFSIZE 1024
+// Size of buffer to hold descriptors and other data used for enumeration.
+// 512 instead of TinyUSB's stock 1024: this is permanent .bss on every board and
+// RP2040 has only ~12 KB of heap left after the framebuffer. The hard requirement
+// is the configuration descriptor's wTotalLength — usbh.c aborts enumeration
+// (TU_ASSERT, so the device just never mounts) if it does not fit. Keyboards/mice
+// are <100 B, hubs ~25 B, and the largest thing we support is a DS4/DS5 pad with
+// its audio interfaces (~350 B), so 512 keeps real headroom. Symptom if some
+// exotic composite device ever exceeds it: the device is absent from OSD →
+// "HID devices" while g_tusb_assert_count (ZiFi console line) ticks up — raise
+// this back to 1024 in that case.
+#define CFG_TUH_ENUMERATION_BUFSIZE 512
 
 // A failed TU_ASSERT executes a bkpt instruction whenever a debug probe is
 // attached, freezing the session on every RECOVERABLE assert (e.g. cdc_host's
@@ -149,7 +158,14 @@
 #else
 #define CFG_TUH_CDC                 0
 #endif
-#define CFG_TUH_HID                 8 // composite devices (kbd + pad + extra ifs) can need many slots
+// HID interface slots. Composite devices (kbd + consumer keys, pads with extra
+// interfaces) eat more than one each, so this cannot be cut to the device count —
+// but every slot costs ~200 B of permanent .bss across four arrays
+// (_hidh_epbuf 72 + hid_snap 44 + hid_info 22 + _hidh_itf 14), which is why it is
+// 6 and not 8: keyboard (1-2) + mouse (1) + two pads (1-2 each) still fits, and
+// RP2040 needs the KB. A 7th interface is simply not serviced (tuh_hid_mount
+// asserts and that interface is ignored) — bump this if a real device needs it.
+#define CFG_TUH_HID                 6
 // USB mass-storage host (flash sticks in the file manager, FatFs volume "USB:").
 // RP2350 only — same SRAM reasoning as CDC above; RP2040 boards stay MSC-free.
 #if PICO_RP2350
@@ -167,8 +183,16 @@
 #endif
 
 //------------- HID -------------//
+// EPIN must stay 64 — the IN transfer is armed for the device's endpoint max
+// packet size, which is 64 for full-speed interrupt endpoints.
 #define CFG_TUH_HID_EPIN_BUFSIZE    64
-#define CFG_TUH_HID_EPOUT_BUFSIZE   64
+// EPOUT is only ever touched by tuh_hid_send_report() (rumble / LED output
+// reports over the interrupt OUT endpoint), which this firmware never calls:
+// keyboard LEDs go through the control pipe and XInput pads use xinput_host's own
+// epout_buf. Keep a token 8 bytes instead of 64 per slot. If HID output reports
+// are ever added, raise this to the largest report used — send_report() refuses
+// anything longer (len > CFG_TUH_HID_EPOUT_BUFSIZE returns false).
+#define CFG_TUH_HID_EPOUT_BUFSIZE   8
 
 //------------- CDC -------------//
 

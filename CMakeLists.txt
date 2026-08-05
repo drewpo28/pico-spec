@@ -332,6 +332,15 @@ elseif (NOT PICO_PLATFORM STREQUAL "rp2040")
     # independent AHB ports — HDMI DMA reading the framebuffer cannot stall
     # CPU access to Z80 RAM and vice versa.
     pico_set_linker_script(${PROJECT_NAME} "${CMAKE_SOURCE_DIR}/rp2350-memmap.ld")
+else ()
+    # RP2040 keeps the SDK's memmap_default.ld (no custom RAM regions needed
+    # there). Augment it with a fragment that pulls the cold ARM EH unwinder out
+    # of the RAM catch-all — worth ~4 KB of SRAM, which is most of the free heap
+    # left on a 264 KB part after the framebuffer. See the file's own comment.
+    target_link_options(${PROJECT_NAME} PRIVATE
+            "-T${CMAKE_SOURCE_DIR}/rp2040-unwind-flash.ld")
+    set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY
+            LINK_DEPENDS "${CMAKE_SOURCE_DIR}/rp2040-unwind-flash.ld")
 endif ()
 
 target_link_options(${PROJECT_NAME} PRIVATE -Xlinker --print-memory-usage --data-sections)

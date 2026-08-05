@@ -20,6 +20,21 @@ MEM_TYPE_NAME = {0: "SRAM", 1: "PSRAM_SPI", 2: "SWAP"}
 
 
 def load_mem():
+    # pico-speccy (8x8K slots): picospec_s{0-7}.bin; a missing slot file means
+    # an accessor-mode slot (not directly readable) — filled with zeros.
+    slot_files = [f"/tmp/picospec_s{i}.bin" for i in range(8)]
+    if any(os.path.exists(f) for f in slot_files):
+        pages = []
+        for f in slot_files:
+            if os.path.exists(f):
+                with open(f, "rb") as fh:
+                    data = fh.read()
+                if len(data) != 8192:
+                    raise ValueError(f"{f}: expected 8192 bytes, got {len(data)}")
+            else:
+                data = bytes(8192)
+            pages.append(data)
+        return b"".join(pages)
     pages = []
     for f in MEM_FILES:
         with open(f, "rb") as fh:
@@ -87,7 +102,11 @@ def hex_line(addr, mem):
 
 
 def main():
-    for f in MEM_FILES + [REGS_FILE]:
+    # Either the 8x8K slot set (pico-speccy) or the 4x16K legacy set must be
+    # present; load_mem() picks whichever exists.
+    have_slots = any(os.path.exists(f"/tmp/picospec_s{i}.bin") for i in range(8))
+    need = [REGS_FILE] if have_slots else MEM_FILES + [REGS_FILE]
+    for f in need:
         if not os.path.exists(f):
             print(f"Missing: {f}", file=sys.stderr)
             sys.exit(1)
