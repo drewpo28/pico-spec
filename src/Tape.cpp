@@ -2475,6 +2475,19 @@ bool Tape::TapePortRead() {
         }
     };
 
+    // True when PC sits just after an `IN A,(n)` whose result is tested the way
+    // a tape edge poll does: RRA / RLCA / AND n with bit 5 or 6 / BIT 6,A.
+    // Keyboard scans (XOR/CPL/AND 0x1F) don't match. This is the signature the
+    // generic turbo autostart below arms on, and it also means "a RAM loader is
+    // polling the tape right now" — whatever address it was assembled for.
+    auto isTapeEdgePoll = [](uint16_t pc) -> bool {
+        if (pc < 0x4000 || MemESP::readbyte(pc - 2) != 0xDB) return false;
+        uint8_t nextOp = MemESP::readbyte(pc);
+        return (nextOp == 0x1F) || (nextOp == 0x07) ||
+               (nextOp == 0xE6 && (MemESP::readbyte(pc + 1) & 0x60)) ||
+               (nextOp == 0xCB && MemESP::readbyte(pc + 1) == 0x77);
+    };
+
     // Signature check for Cerikopik/JJ turbo loaders installed at 0xFE00.
     // Only active when Config::flashload is ON (fast mode).
     bool loaderCommon = (tapeFileType == TAPE_FTYPE_TAP || tapeFileType == TAPE_FTYPE_TZX) &&
@@ -2567,6 +2580,7 @@ bool Tape::TapePortRead() {
                     // Skip if pc is in ROM LD-EDGE area (custom loaders call CALL 0x05E7)
                     if (!isCerikopikCandidate && !isJJCandidate &&
                         pc < 0xFE00 && !(pc >= 0x05E3 && pc <= 0x05F5) &&
+                        !isTapeEdgePoll(pc) &&
                         tapePhase == TAPE_PHASE_PURETONE) {
                         tapeStatus = TAPE_STOPPED;
                         tapePhase = TAPE_PHASE_STOPPED;
@@ -2584,8 +2598,13 @@ bool Tape::TapePortRead() {
         // Skip if pc is in ROM LD-EDGE area (0x05E3-0x05F5) — custom loaders
         // like Hollywood Poker call ROM LD-EDGE-1/2 (CALL 0x05E7) and pc lands
         // in ROM while the actual loader is at 0xFF80+.
+        // Skip too if pc is an active tape-edge poll: a RAM loader living below
+        // 0xFE00 (Bleepload sits at 0xCD00) is reading the tone right now, and
+        // stopping/replaying it never lets the loader collect the ~200 unbroken
+        // pilot pulses it needs to lock on.
         if (!isCerikopikCandidate && !isJJCandidate &&
             pc < 0xFE00 && !(pc >= 0x05E3 && pc <= 0x05F5) &&
+            !isTapeEdgePoll(pc) &&
             tapePhase == TAPE_PHASE_PURETONE) {
             tapeStatus = TAPE_STOPPED;
             tapePhase = TAPE_PHASE_STOPPED;
@@ -2634,25 +2653,15 @@ bool Tape::TapePortRead() {
                     tapeAutoPlay = true;
                     Play();
                     Read();
-                } else if (tapeCurBlock > 0 && pc >= 0x4000 &&
-                           MemESP::readbyte(pc - 2) == 0xDB) {
+                } else if (tapeCurBlock > 0 && isTapeEdgePoll(pc)) {
                     // Generic auto-start for RAM-based custom tape loaders.
-                    // Only trigger for IN A,(n) opcode (0xDB) — real tape loaders.
-                    // Skip IN r,(C) (0xED prefix) which is used by keyboard scans
-                    // and general port reads, not tape loading.
-                    // Additionally verify tape edge detection pattern after IN:
-                    // RRA (0x1F), RLCA (0x07), AND n (0xE6) with bit 5 or 6 set,
-                    // or BIT 6,A (0xCB 0x77). Keyboard scans use XOR/CPL/AND 0x1F
-                    // which don't match — prevents false auto-start during gameplay.
-                    uint8_t nextOp = MemESP::readbyte(pc);
-                    bool isTapeEdge = (nextOp == 0x1F) || (nextOp == 0x07) ||
-                        (nextOp == 0xE6 && (MemESP::readbyte(pc + 1) & 0x60)) ||
-                        (nextOp == 0xCB && MemESP::readbyte(pc + 1) == 0x77);
-                    if (isTapeEdge) {
-                        tapeAutoPlay = true;
-                        Play();
-                        Read();
-                    }
+                    // Only triggers on IN A,(n) (0xDB) followed by an edge test —
+                    // IN r,(C) (0xED prefix) and keyboard scans (XOR/CPL/AND 0x1F)
+                    // don't match, which is what keeps gameplay from auto-starting
+                    // the tape. See isTapeEdgePoll above.
+                    tapeAutoPlay = true;
+                    Play();
+                    Read();
                 }
             }
         } else { loopPC = pc; loopCount = 1; }
