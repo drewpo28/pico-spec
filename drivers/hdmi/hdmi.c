@@ -347,6 +347,92 @@ static uint tmds_encoder(const uint8_t d8) {
     return d_out;
 }
 
+// ============================================================
+// DC-balanced character pair for one doubled pixel
+//
+// Every framebuffer byte is transmitted as TWO TMDS characters (hardware pixel
+// doubling), and the pair used to be "character, character with D0-7 and D9
+// flipped". That pair is NEVER DC balanced: the two characters' one-counts add
+// up to 9 or 11, never 10, so every pixel pair leaves ±2 of running disparity
+// behind — +2 for the 128 byte values the encoder XOR-codes (dark colors), -2
+// for the 128 it XNOR-codes (bright ones). Uniform content therefore drifts by
+// ±640 per 320-byte line and, because the drift is content-dependent, it steps
+// from line to line. A receiver with a slow DC-restore loop follows that badly:
+// the slicing threshold walks off and the channel with the least margin starts
+// making bit errors — hw-observed on m1p1 + Samsung S27AG300N as yellow
+// horizontal streaks over a white screen (yellow = ch0/blue dropping out) and
+// a colored column at the left edge, while a more tolerant NEC panel is clean.
+//
+// Fix: pick the two characters as LEGAL TMDS representations whose one-counts
+// add up to exactly 10. A single byte value cannot always do that (its two
+// legal characters add up to 9 or 11), so the second character is allowed to
+// carry v±1 instead — verified over all 256 values that ±1 always suffices,
+// and one LSB on every other pixel of a doubled pair is invisible.
+// Bonus: both characters are now legal code words that decode to (almost)
+// exactly v; the old first character was an ill-formed word that strict
+// receivers may reject outright.
+//
+// All of this is palette-setup work — the ISR and DMA path are untouched.
+// Set to 0 to A/B against the old pairing.
+#define HDMI_TMDS_BALANCED_PAIR 1
+
+#if HDMI_TMDS_BALANCED_PAIR
+// 9-bit transition-minimised word: bits 0-7 = q_m, bit 8 = 1 when XOR was used
+static uint16_t tmds_qm(const uint8_t d8) {
+    int s1 = 0;
+    for (int i = 0; i < 8; i++) s1 += (d8 & (1 << i)) ? 1 : 0;
+    const bool is_xnor = (s1 > 4) || ((s1 == 4) && ((d8 & 1) == 0));
+    uint16_t q = d8 & 1;
+    for (int i = 1; i < 8; i++) {
+        const uint16_t prev = (q >> (i - 1)) & 1;
+        const uint16_t di = (d8 >> i) & 1;
+        const uint16_t bit = is_xnor ? (uint16_t)(1u - (prev ^ di)) : (uint16_t)(prev ^ di);
+        q |= (uint16_t)(bit << i);
+    }
+    if (!is_xnor) q |= 1u << 8;
+    return q;
+}
+
+// The two legal 10-bit characters for a q_m: D9=0 sends q_m as is, D9=1 sends
+// it inverted (D8, the XOR flag, is never inverted).
+static inline uint16_t tmds_rep(const uint16_t q, const int invert) {
+    return invert ? (uint16_t)((1u << 9) | (q & 0x100u) | ((~q) & 0xFFu)) : q;
+}
+
+static inline int tmds_ones(const uint16_t c) {
+    int n = 0;
+    for (int i = 0; i < 10; i++) n += (c >> i) & 1;
+    return n;
+}
+
+// Characters for the two halves of a doubled pixel of value v, one-counts
+// summing to 10 (zero disparity). The first character always carries v exactly;
+// the second may carry v-1 or v+1 when v alone cannot balance.
+static void tmds_balanced_pair(const uint8_t v, uint16_t *first, uint16_t *second) {
+    const uint16_t qv = tmds_qm(v);
+    uint8_t cand[3];
+    int nc = 0;
+    cand[nc++] = v;                       // exact pair when it happens to balance
+    if (v > 0) cand[nc++] = (uint8_t)(v - 1);
+    if (v < 255) cand[nc++] = (uint8_t)(v + 1);
+    for (int c = 0; c < nc; c++) {
+        const uint16_t qw = tmds_qm(cand[c]);
+        for (int i = 0; i < 2; i++) {
+            const uint16_t a = tmds_rep(qv, i);
+            for (int j = 0; j < 2; j++) {
+                const uint16_t b = tmds_rep(qw, j);
+                if (tmds_ones(a) + tmds_ones(b) == 10) {
+                    *first = a; *second = b;
+                    return;
+                }
+            }
+        }
+    }
+    // Unreachable for 8-bit values (checked exhaustively) — keep it safe anyway
+    *first = tmds_rep(qv, 0); *second = tmds_rep(qv, 1);
+}
+#endif
+
 static void pio_set_x(PIO pio, const int sm, uint32_t v) {
     uint instr_shift = pio_encode_in(pio_x, 4);
     uint instr_mov = pio_encode_mov(pio_x, pio_isr);
@@ -993,6 +1079,17 @@ void graphics_set_palette(uint8_t i, uint32_t color888) {
     const uint8_t R = (color888 >> 16) & 0xff;
     const uint8_t G = (color888 >> 8) & 0xff;
     const uint8_t B = (color888 >> 0) & 0xff;
+#if HDMI_TMDS_BALANCED_PAIR
+    // Both halves of the doubled pixel are legal TMDS words whose one-counts
+    // add up to 10, so the pair leaves no running disparity behind
+    // (see tmds_balanced_pair).
+    uint16_t rA, rB, gA, gB, bA, bB;
+    tmds_balanced_pair(R, &rA, &rB);
+    tmds_balanced_pair(G, &gA, &gB);
+    tmds_balanced_pair(B, &bA, &bB);
+    conv_color64[i * 2] = get_ser_diff_data(rA, gA, bA);
+    conv_color64[i * 2 + 1] = get_ser_diff_data(rB, gB, bB);
+#else
     conv_color64[i * 2] = get_ser_diff_data(tmds_encoder(R), tmds_encoder(G), tmds_encoder(B));
     // Second pixel of the pair: the opposite-disparity variant of the SAME
     // byte — flip TMDS data bits D0-7 AND the inversion flag D9 (keep D8).
@@ -1002,7 +1099,9 @@ void graphics_set_palette(uint8_t i, uint32_t color888) {
     // every character and reject the video period — black screen with
     // working Data Island audio. Serialized layout: symbol bit b occupies
     // bits [6b+2(b>=5) .. +5], so D0-7 = bits 0..49, D9 = bits 56..61.
+    // NB: this pairing is ±2 disparity per pixel — see HDMI_TMDS_BALANCED_PAIR.
     conv_color64[i * 2 + 1] = conv_color64[i * 2] ^ 0x3F03FFFFFFFFFFFFull;
+#endif
 };
 
 #define RGB888(r, g, b) ((r<<16) | (g << 8 ) | b )
