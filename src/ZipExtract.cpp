@@ -48,10 +48,6 @@ static char s_zip_fnBuf[252];
 
 const char* ZipExtract::TEMP_FILE = "/tmp/.zip_extract";
 
-// Static FIL to avoid ~560 bytes on stack (FIL contains 512-byte sector buffer)
-static FIL s_zipFile;
-static FIL s_outFile;
-
 static bool hasMatchingExt(const char* filename, uint8_t fileType) {
     const char* dot = strrchr(filename, '.');
     if (!dot || dot == filename) return false;
@@ -99,6 +95,44 @@ struct ZipEntry {
 #define ZIP_MAX_ENTRIES 16
 #endif
 
+// ── Per-operation working set ────────────────────────────────────────────────
+// The two FILs (a FIL carries a 512-byte sector buffer, ~600 B each — far too
+// big for the 4 KB core0 stack, which is why they were static) and the scan
+// table used to be permanent .bss: 2368 bytes resident for the whole session to
+// serve an operation that lasts a second or two. On a tight build (576p +
+// Gigascreen + no PSRAM leaves ~6 KB free) that is a third of the free heap.
+// Now allocated per operation through the Buffer pool, so the Gigascreen lease
+// taken below can back it as well.
+//
+// NOT PREFER_PSRAM: a FIL's sector buffer is a DMA target for the SD driver, and
+// bulk-DMAing over the QMI bus while PIO video streams from it is the one thing
+// XIP PSRAM must never be used for.
+struct ZipWork {
+    FIL      zip;
+    FIL      out;
+    ZipEntry entries[ZIP_MAX_ENTRIES];
+};
+static ZipWork* s_work = nullptr;
+
+// RAII. Nesting is a no-op (the outer scope owns the block) — extract() can be
+// reached from a download session that is itself inside one.
+struct ZipWorkGuard {
+    bool owner;
+    ZipWorkGuard() : owner(false) {
+        if (s_work) return;
+        s_work = (ZipWork*)Buffer::palloc(sizeof(ZipWork),
+                                          Buffer::NEED_POINTER | Buffer::USE_NET_ARENA);
+        owner = (s_work != nullptr);
+        if (!owner) {
+            Debug::log("ZIP: work block (%u B) alloc failed, largest=%u",
+                       (unsigned)sizeof(ZipWork), (unsigned)getLargestAllocatable());
+            s_zip_err = OSD_ZIP_NOMEM[Config::lang];
+        }
+    }
+    ~ZipWorkGuard() { if (owner) { Buffer::pfree(s_work); s_work = nullptr; } }
+    bool ok() const { return s_work != nullptr; }
+};
+
 string ZipExtract::extract(const string& zipPath, uint8_t fileType) {
     s_zip_err = nullptr;
 
@@ -113,14 +147,17 @@ string ZipExtract::extract(const string& zipPath, uint8_t fileType) {
     Debug::log("ZIP: extract '%s' arena=%d largest=%u", zipPath.c_str(),
                (int)Buffer::arenaActive(), (unsigned)getLargestAllocatable());
 
-    FIL& zipFile = s_zipFile;
+    ZipWorkGuard work;                  // FILs + scan table, freed on every exit
+    if (!work.ok()) return "";
+
+    FIL& zipFile = s_work->zip;
     if (f_open(&zipFile, zipPath.c_str(), FA_READ) != FR_OK)
         return "";
 
     FSIZE_t zipSize = f_size(&zipFile);
 
     // Phase 1: single-pass scan, collect matching entries
-    static ZipEntry entries[ZIP_MAX_ENTRIES];
+    ZipEntry* entries = s_work->entries;
     int entryCount = 0;
 
     LocalFileHeader hdr;
@@ -353,7 +390,7 @@ bool ZipExtract::extractFileInner(FIL* zipFile, uint16_t compression, uint32_t c
 }
 
 bool ZipExtract::extractStored(FIL* zipFile, uint32_t size, const char* outPath) {
-    FIL& outFile = s_outFile;
+    FIL& outFile = s_work->out;
     if (f_open(&outFile, outPath, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
         return false;
 
@@ -393,7 +430,7 @@ static void* zip_zalloc(void* /*opaque*/, size_t items, size_t size) {
 static void zip_zfree(void* /*opaque*/, void* p) { Buffer::pfree(p); }
 
 bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize, const char* outPath) {
-    FIL& outFile = s_outFile;
+    FIL& outFile = s_work->out;
     if (f_open(&outFile, outPath, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
         return false;
 
@@ -517,7 +554,10 @@ bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize, const cha
 }
 
 void ZipExtract::viewInfo(const string& zipPath) {
-    FIL& zipFile = s_zipFile;
+    ZipWorkGuard work;   // only the zip FIL is used here, but it is the same block
+    if (!work.ok()) return;
+
+    FIL& zipFile = s_work->zip;
     if (f_open(&zipFile, zipPath.c_str(), FA_READ) != FR_OK)
         return;
 
@@ -641,7 +681,10 @@ int ZipExtract::extractAll(const string& zipPath, const string& destDir) {
     s_zip_err = nullptr;
     NetArenaLease arena;   // same paused-emulator lease as extract() — see there
 
-    FIL& zipFile = s_zipFile;
+    ZipWorkGuard work;
+    if (!work.ok()) return 0;
+
+    FIL& zipFile = s_work->zip;
     if (f_open(&zipFile, zipPath.c_str(), FA_READ) != FR_OK)
         return 0;
 
