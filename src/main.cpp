@@ -50,6 +50,7 @@
 #include "ff.h"
 #include "psram_spi.h"
 #include "Debug.h"
+#include "Buffer.h"
 #ifdef KBDUSB
     #include "ps2kbd_mrmltr.h"
 #else
@@ -1491,6 +1492,24 @@ extern "C" int testPins(uint32_t pin0, uint32_t pin1);
 // session on recoverable asserts (dongle re-enumeration). Count and move on.
 volatile uint32_t g_tusb_assert_count = 0;
 extern "C" void picospec_tusb_assert_hook(void) { g_tusb_assert_count++; }
+
+extern "C" size_t getLargestAllocatable(void);   // OSDMain.cpp
+
+// TinyUSB's CDC-host stream FIFOs (PICO-SPEC PATCH in cdc_host.c). Upstream keeps
+// them in .bss, which cost 16 KB permanently on the boards that size them for
+// 921600 baud — spent even though most builds reach the ESP over GPIO UART and
+// never enumerate a USB-serial dongle. Now allocated when one is plugged in.
+// Must go through Buffer::palloc, not malloc: pico_malloc PANICS on OOM instead
+// of returning NULL, and a dongle appearing on a full heap has to degrade to
+// "not mounted", not to a dead machine. Called from tuh_task context (thread,
+// never an IRQ), so the heap allocator is safe to touch here.
+extern "C" void* picospec_usb_fifo_alloc(unsigned size) {
+    void* p = Buffer::palloc(size, Buffer::NEED_POINTER);
+    Debug::log("USB: CDC FIFO %u B -> %p (largest=%u)", size, p,
+               (unsigned)getLargestAllocatable());
+    return p;
+}
+extern "C" void picospec_usb_fifo_free(void* p) { Buffer::pfree(p); }
 
 int main() {
     uptime_init();   // capture pre-reboot uptime from watchdog scratch (see uptime_seconds)

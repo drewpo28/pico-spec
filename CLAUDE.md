@@ -453,6 +453,16 @@ MSC off + `CFG_TUH_DEVICE_MAX 5`). NOT hw-confirmed yet.
   (c) TU_ASSERT's bkpt is routed to a counting no-op (`CFG_TUSB_DEBUG_BREAKPOINT`
   in tusb_config.h → `g_tusb_assert_count` in main.cpp) — otherwise every
   recoverable assert freezes attached-debugger sessions.
+  (d) `cdc_host.c` allocates the CDC stream FIFOs instead of embedding them in
+  `cdch_interface_t`: upstream's arrays made `cdch_data` **16 KB of permanent
+  .bss** (2×`CFG_TUH_CDC_*_BUFSIZE`, sized for 921600 baud) on boards where the
+  ESP usually arrives over GPIO UART and no serial dongle is ever plugged in —
+  120 B now. Allocated in `make_new_itf` (a NULL return declines the interface),
+  released in `cdch_close` **and** in `set_config_complete`'s failure branch
+  (that path frees the slot without ever calling close — leak + double-alloc if
+  missed). Buffers come from `picospec_usb_fifo_alloc/free` (main.cpp →
+  `Buffer::palloc`, NOT malloc: pico_malloc panics on OOM). **Consequence: a CDC
+  dongle plugged into a full heap does not mount** (logged, not fatal).
   Diagnostics: the ZiFi 1 Hz `ZiFi CDC:` console line reports tx/rx/drop/queues +
   the stale/assert counters.
   Source compat: `usbh_class_driver_t::open` returns consumed length on 0.21+

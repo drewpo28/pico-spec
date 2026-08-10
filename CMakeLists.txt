@@ -61,7 +61,7 @@ set(ZERO2_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO
 # set(ILI9341 ON)
 # set(ST7789 ON)
 # set(SOFTTV ON)
-# set(PSRAM OFF)  #For Testing Only
+set(PSRAM OFF)  #For Testing Only
 
 # Display output (default: VGA_HDMI; override with -D flags, e.g. cmake -DSOFTTV=ON)
 if(NOT VGA_HDMI AND NOT SOFTTV AND NOT TFT AND NOT ILI9341 AND NOT TV)

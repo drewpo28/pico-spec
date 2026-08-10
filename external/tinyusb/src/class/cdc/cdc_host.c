@@ -30,6 +30,7 @@
 #include "tusb_option.h"
 
 #include <stdint.h>
+#include <stdlib.h>   // PICO-SPEC PATCH: malloc/free fallback for the FIFO hooks
 
 #if (CFG_TUH_ENABLED && CFG_TUH_CDC)
 
@@ -91,8 +92,16 @@ typedef struct {
     tu_edpt_stream_t tx;
     tu_edpt_stream_t rx;
 
-    uint8_t tx_ff_buf[CFG_TUH_CDC_TX_BUFSIZE];
-    uint8_t rx_ff_buf[CFG_TUH_CDC_RX_BUFSIZE];
+    // PICO-SPEC PATCH: pointers, not arrays. Upstream embeds both FIFOs in the
+    // interface struct, so cdch_data costs CFG_TUH_CDC_TX_BUFSIZE +
+    // CFG_TUH_CDC_RX_BUFSIZE of .bss permanently — 16 KB on the boards that size
+    // the FIFOs for 921600 baud, spent whether or not a USB-serial dongle is ever
+    // plugged in. Most pico-spec builds reach the ESP over GPIO UART and never
+    // enumerate one. Now allocated when a slot is claimed (make_new_itf) and
+    // released on unplug (cdch_close); a failed allocation just declines the
+    // interface. See picospec_usb_fifo_alloc below.
+    uint8_t *tx_ff_buf;
+    uint8_t *rx_ff_buf;
   } stream;
 } cdch_interface_t;
 
@@ -104,6 +113,47 @@ typedef struct {
 
 static cdch_interface_t cdch_data[CFG_TUH_CDC];
 CFG_TUH_MEM_SECTION static cdch_epbuf_t cdch_epbuf[CFG_TUH_CDC];
+
+// PICO-SPEC PATCH: host-supplied allocator for the stream FIFOs above. pico-spec
+// implements it over its tiered Buffer pool, which pre-checks the largest free
+// block — a bare malloc() is not usable here because pico_malloc PANICS on OOM
+// instead of returning NULL. Weak defaults keep this tree buildable standalone.
+// The endpoint DMA buffers (cdch_epbuf) stay static: they must live in USB RAM.
+TU_ATTR_WEAK void *picospec_usb_fifo_alloc(unsigned size) { return malloc(size); }
+TU_ATTR_WEAK void picospec_usb_fifo_free(void *p) { free(p); }
+
+// Allocate and wire up both FIFOs of a freshly claimed interface. Mirrors what
+// upstream's cdch_init() did once at boot for every slot.
+static bool cdch_stream_alloc(cdch_interface_t *p_cdc, cdch_epbuf_t *epbuf) {
+  p_cdc->stream.tx_ff_buf = (uint8_t *)picospec_usb_fifo_alloc(CFG_TUH_CDC_TX_BUFSIZE);
+  p_cdc->stream.rx_ff_buf = (uint8_t *)picospec_usb_fifo_alloc(CFG_TUH_CDC_RX_BUFSIZE);
+  if (p_cdc->stream.tx_ff_buf && p_cdc->stream.rx_ff_buf &&
+      tu_edpt_stream_init(&p_cdc->stream.tx, true, true, false, p_cdc->stream.tx_ff_buf,
+                          CFG_TUH_CDC_TX_BUFSIZE, epbuf->tx) &&
+      tu_edpt_stream_init(&p_cdc->stream.rx, true, false, false, p_cdc->stream.rx_ff_buf,
+                          CFG_TUH_CDC_RX_BUFSIZE, epbuf->rx)) {
+    return true;
+  }
+  TU_LOG_DRV("CDCh FIFO alloc failed (%u+%u)\r\n", CFG_TUH_CDC_TX_BUFSIZE, CFG_TUH_CDC_RX_BUFSIZE);
+  picospec_usb_fifo_free(p_cdc->stream.tx_ff_buf);
+  picospec_usb_fifo_free(p_cdc->stream.rx_ff_buf);
+  p_cdc->stream.tx_ff_buf = NULL;
+  p_cdc->stream.rx_ff_buf = NULL;
+  return false;
+}
+
+static void cdch_stream_release(cdch_interface_t *p_cdc) {
+  tu_edpt_stream_deinit(&p_cdc->stream.tx);
+  tu_edpt_stream_deinit(&p_cdc->stream.rx);
+  picospec_usb_fifo_free(p_cdc->stream.tx_ff_buf);
+  picospec_usb_fifo_free(p_cdc->stream.rx_ff_buf);
+  p_cdc->stream.tx_ff_buf = NULL;
+  p_cdc->stream.rx_ff_buf = NULL;
+  // The fifo now points at freed memory; make that unreachable rather than
+  // merely unused, so a stray read/write after close cannot land on the heap.
+  tu_memclr(&p_cdc->stream.tx, sizeof(p_cdc->stream.tx));
+  tu_memclr(&p_cdc->stream.rx, sizeof(p_cdc->stream.rx));
+}
 
 //--------------------------------------------------------------------+
 // Serial Driver
@@ -380,6 +430,12 @@ static cdch_interface_t * make_new_itf(uint8_t daddr, tusb_desc_interface_t cons
   for(uint8_t i=0; i<CFG_TUH_CDC; i++) {
     if (cdch_data[i].daddr == 0) {
       cdch_interface_t * p_cdc = &cdch_data[i];
+      // PICO-SPEC PATCH: the stream FIFOs are allocated with the slot instead of
+      // living in .bss (see cdch_interface_t). Claim daddr only once they exist —
+      // returning NULL here makes every caller decline the interface cleanly.
+      if (!cdch_stream_alloc(p_cdc, &cdch_epbuf[i])) {
+        return NULL;
+      }
       p_cdc->daddr              = daddr;
       p_cdc->bInterfaceNumber   = itf_desc->bInterfaceNumber;
       p_cdc->bInterfaceSubClass = itf_desc->bInterfaceSubClass;
@@ -647,24 +703,19 @@ bool tuh_cdc_set_line_coding(uint8_t idx, cdc_line_coding_t const *line_coding,
 
 bool cdch_init(void) {
   TU_LOG_DRV("sizeof(cdch_interface_t) = %u\r\n", sizeof(cdch_interface_t));
+  // PICO-SPEC PATCH: the per-slot stream init that used to run here now happens
+  // in make_new_itf, together with the FIFO allocation it depends on. Nothing is
+  // reserved until a serial dongle actually enumerates.
   tu_memclr(cdch_data, sizeof(cdch_data));
-  for (size_t i = 0; i < CFG_TUH_CDC; i++) {
-    cdch_interface_t *p_cdc = &cdch_data[i];
-    cdch_epbuf_t *epbuf = &cdch_epbuf[i];
-    TU_ASSERT(tu_edpt_stream_init(&p_cdc->stream.tx, true, true, false, p_cdc->stream.tx_ff_buf,
-                                  CFG_TUH_CDC_TX_BUFSIZE, epbuf->tx));
-    TU_ASSERT(tu_edpt_stream_init(&p_cdc->stream.rx, true, false, false, p_cdc->stream.rx_ff_buf,
-                                  CFG_TUH_CDC_RX_BUFSIZE, epbuf->rx));
-  }
-
   return true;
 }
 
 bool cdch_deinit(void) {
   for (size_t i = 0; i < CFG_TUH_CDC; i++) {
     cdch_interface_t *p_cdc = &cdch_data[i];
-    (void)tu_edpt_stream_deinit(&p_cdc->stream.tx);
-    (void)tu_edpt_stream_deinit(&p_cdc->stream.rx);
+    if (p_cdc->stream.tx_ff_buf || p_cdc->stream.rx_ff_buf) {
+      cdch_stream_release(p_cdc);   // PICO-SPEC PATCH: also gives the FIFOs back
+    }
   }
   return true;
 }
@@ -681,6 +732,7 @@ void cdch_close(uint8_t daddr) {
       p_cdc->mounted = false;
       tu_edpt_stream_close(&p_cdc->stream.tx);
       tu_edpt_stream_close(&p_cdc->stream.rx);
+      cdch_stream_release(p_cdc);   // PICO-SPEC PATCH: hand the FIFOs back on unplug
     }
   }
 }
@@ -788,6 +840,10 @@ static void set_config_complete(cdch_interface_t *p_cdc, bool success) {
     // clear the interface entry
     p_cdc->daddr            = 0;
     p_cdc->bInterfaceNumber = 0;
+    // PICO-SPEC PATCH: the slot is free again, so its FIFOs must go back too —
+    // cdch_close will never see this daddr, and make_new_itf would otherwise
+    // reuse the slot and overwrite the pointers, leaking 16 KB per failed enum.
+    cdch_stream_release(p_cdc);
   }
 
   // notify usbh that driver enumeration is complete
