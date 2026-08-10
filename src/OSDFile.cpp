@@ -1833,7 +1833,7 @@ static bool rfd_launch_tmp(string path) {
     if (ext == "zip") {
         string inner = ZipExtract::extract(path, DISK_ALLFILE); // → /tmp/...
         if (inner.empty() || inner == "\x1b") {
-            OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN);
+            OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN);
             return false;
         }
         path = inner;

@@ -326,6 +326,10 @@ static const char *OSD_ZIP_EXTRACTING[2] = { OSD_ZIP_EXTRACTING_EN,OSD_ZIP_EXTRA
 #define OSD_ZIP_BADMETHOD_ES " ZIP: compresion no admitida "
 static const char *OSD_ZIP_BADMETHOD[2] = { OSD_ZIP_BADMETHOD_EN,OSD_ZIP_BADMETHOD_ES };
 
+#define OSD_ZIP_NOMEM_EN " ZIP: not enough memory "
+#define OSD_ZIP_NOMEM_ES " ZIP: memoria insuficiente "
+static const char *OSD_ZIP_NOMEM[2] = { OSD_ZIP_NOMEM_EN,OSD_ZIP_NOMEM_ES };
+
 #define OSD_PROFI_LOADING_EN "  Loading Profi system...  \n  Please wait (SPI PSRAM)  "
 #define OSD_PROFI_LOADING_ES "  Cargando sistema Profi...  \n  Espere (SPI PSRAM)  "
 static const char *OSD_PROFI_LOADING[2] = { OSD_PROFI_LOADING_EN,OSD_PROFI_LOADING_ES };

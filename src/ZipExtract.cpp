@@ -1,5 +1,20 @@
 #include "pico.h"
 
+#include "ZipExtract.h"
+#include "Config.h"
+#include "messages.h"
+
+// Failure reason of the last extract()/extractAll(): nullptr → the generic
+// "no supported file in ZIP". Set for the cases the caller cannot tell apart on
+// its own (both return "" / 0), so a tight heap doesn't masquerade as a bad
+// archive. Also compiled on RP2040, where ZIP is stubbed out and every attempt
+// takes the generic branch.
+static const char* s_zip_err = nullptr;
+
+const char* ZipExtract::errMsg() {
+    return s_zip_err ? s_zip_err : OSD_ZIP_ERR[Config::lang];
+}
+
 #if !PICO_RP2040
 
 #include <stdio.h>
@@ -11,21 +26,21 @@
 
 using namespace std;
 
-#include "ZipExtract.h"
 #include "FileUtils.h"
 #include "Buffer.h"
+#include "NetArena.h"
 #include "MemESP.h"
 #include "AlfCart.h"
 #include "Video.h"
 #include "OSDMain.h"
-#include "Config.h"
 #include "ESPectrum.h"
-#include "messages.h"
 #include "Debug.h"
 
 extern Font Font6x8;
 
 #define ZIP_BUF_SIZE 512
+
+extern "C" size_t getLargestAllocatable(void);  // OSDMain.cpp — malloc panics on OOM
 
 // Shared filename scratch buffer — extract/extractAll/viewInfo each used a
 // 252-byte static; only one zip operation runs at a time.
@@ -85,6 +100,19 @@ struct ZipEntry {
 #endif
 
 string ZipExtract::extract(const string& zipPath, uint8_t fileType) {
+    s_zip_err = nullptr;
+
+    // The emulator is paused behind the OSD for the whole extract, so the dormant
+    // Gigascreen prev-FB can back the inflate state (~8 KB), the 32 KB LZ dict and
+    // the alt-stack instead of the tight heap. Taken here rather than at the call
+    // sites: there are a dozen of them (F5, Tape, Disk, IMG, SNA, ROM, OSDFile)
+    // and only the F5 one used to hold a lease, so every other route into a ZIP
+    // was inflating straight out of the heap. No-op on butter boards (palloc goes
+    // to XIP PSRAM) and when Gigascreen is off (there is no prev-FB to lend).
+    NetArenaLease arena;
+    Debug::log("ZIP: extract '%s' arena=%d largest=%u", zipPath.c_str(),
+               (int)Buffer::arenaActive(), (unsigned)getLargestAllocatable());
+
     FIL& zipFile = s_zipFile;
     if (f_open(&zipFile, zipPath.c_str(), FA_READ) != FR_OK)
         return "";
@@ -183,9 +211,9 @@ string ZipExtract::extract(const string& zipPath, uint8_t fileType) {
     // one rather than the generic "no supported file" message.
     if (e.compression != 0 && e.compression != 8) {
         f_close(&zipFile);
-        char m[40];
+        static char m[40];   // outlives the call — errMsg() hands it to the caller
         snprintf(m, sizeof(m), " ZIP: unsupported method %u ", e.compression);
-        OSD::osdCenteredMsg(m, LEVEL_WARN, 3000);
+        s_zip_err = m;
         return "";
     }
 
@@ -242,8 +270,6 @@ string ZipExtract::extractByIndex(const string& zipPath, int fileIndex) {
 // net_call_on_stack (OSDMain.cpp); this file is RP2350-only (Cortex-M33).
 #define ZIP_DEEP_STACK_SIZE 8192
 
-extern "C" size_t getLargestAllocatable(void);  // OSDMain.cpp — malloc panics on OOM
-
 // MSPLIM must be OFF (0) whenever SP crosses between stacks: the caller may
 // itself be on a heap alt-stack BELOW this one (archive download → extract runs
 // on net_call_on_stack's stack), and raising MSPLIM above a live SP means any
@@ -292,13 +318,22 @@ static void extractFileTramp(void* p) {
 bool ZipExtract::extractFile(FIL* zipFile, uint16_t compression, uint32_t compressedSize, uint32_t uncompressedSize, const char* outPath) {
     if (!outPath) outPath = TEMP_FILE;
     ZipDeepArgs a = { zipFile, compression, compressedSize, uncompressedSize, outPath, false };
+    // Take the alt-stack from the lent Gigascreen prev-FB when one is active: this
+    // was a bare malloc, so the lease could not help here at all and 12 KB of
+    // contiguous heap was demanded even with ~52 KB of arena sitting idle.
+    // Arena-or-heap only — deliberately NOT plain palloc(), whose heap→butter
+    // fallback could put the stack in XIP PSRAM, where every push/pop (IRQ frames
+    // included) would cross the QMI bus the video DMA is already streaming through.
     uint8_t* stk = nullptr;
-    if (getLargestAllocatable() >= ZIP_DEEP_STACK_SIZE + 4096)
+    if (Buffer::arenaActive())
+        stk = (uint8_t*)Buffer::palloc(ZIP_DEEP_STACK_SIZE,
+                                       Buffer::NEED_POINTER | Buffer::USE_NET_ARENA);
+    if (!stk && getLargestAllocatable() >= ZIP_DEEP_STACK_SIZE + 4096)
         stk = (uint8_t*)malloc(ZIP_DEEP_STACK_SIZE);
     if (stk) {
         void* top = (void*)(((uintptr_t)stk + ZIP_DEEP_STACK_SIZE) & ~(uintptr_t)7);
         zipCallOnStack(top, extractFileTramp, &a, stk);
-        free(stk);
+        Buffer::pfree(stk);
     } else {
         // Heap too tight for the alt-stack — run in place (pre-guard behavior;
         // the stack guard turns a repeat overflow into a clean fault, not
@@ -401,7 +436,14 @@ bool ZipExtract::extractDeflate(FIL* zipFile, uint32_t compressedSize, const cha
     }
     memset(dict, 0, TINFL_LZ_DICT_SIZE);
 
+    // The only way inflateInit2 fails here is MZ_MEM_ERROR from zip_zalloc — the
+    // ~8.2 KB inflate_state, the one allocation in this path with no fallback (the
+    // dict has the page-5/7 borrow above). Say so instead of letting the caller
+    // report "no supported file in ZIP" for what is plain OOM.
     if (inflateInit2(&stream, -MZ_DEFAULT_WINDOW_BITS, dict)) {
+        Debug::log("ZIP: inflateInit2 failed (state alloc), largest=%u",
+                   (unsigned)getLargestAllocatable());
+        s_zip_err = OSD_ZIP_NOMEM[Config::lang];
         if (dictBorrowedRam) VIDEO::SaveRect.restore_ram(dict, TINFL_LZ_DICT_SIZE);
         else                 Buffer::pfree(dict);
         f_close(&outFile);
@@ -596,6 +638,9 @@ void ZipExtract::viewInfo(const string& zipPath) {
 }
 
 int ZipExtract::extractAll(const string& zipPath, const string& destDir) {
+    s_zip_err = nullptr;
+    NetArenaLease arena;   // same paused-emulator lease as extract() — see there
+
     FIL& zipFile = s_zipFile;
     if (f_open(&zipFile, zipPath.c_str(), FA_READ) != FR_OK)
         return 0;

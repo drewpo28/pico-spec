@@ -58,6 +58,7 @@ visit https://zxespectrum.speccy.org/contacto
 #include "LEDIndicators.h"
 #include "sdcard.h"
 #include "ZipExtract.h"
+#include "NetArena.h"
 #include "pwm_audio.h"
 #include "Z80_JLS/z80.h"
 #include "roms.h"
@@ -741,32 +742,8 @@ void net_call_on_stack(void* new_top, void (*fn)(void*), void* arg) {
     );
 }
 
-// RAII: for the duration of a (paused) network session, lend the dormant
-// Gigascreen prev framebuffer to the Buffer pool so the alt-stack + TLS/socket
-// working set draws from those ~52 KB instead of the scarce heap. No-op unless
-// there's something to lend (Gigascreen on AND a butter-less board); on butter
-// boards palloc routes the TLS set to XIP PSRAM instead, so no lease is needed.
-struct NetArenaLease {
-    bool held = false;
-    bool released = false;
-    NetArenaLease() {
-        void* base; size_t size;
-        if (VIDEO::gigascreenLendRegion(base, size)) {
-            if (Buffer::lendArena(base, size)) held = true;
-            else VIDEO::gigascreenReclaimRegion();   // lend rejected → undo the detach
-        } else {
-            // Nothing lendable can still mean there IS a prev-FB — just a chunked one,
-            // which is not one region. Then it is released outright for the session
-            // (VIDEO::gigascreenReleaseForNet) so the heap, not the arena, gets those
-            // ~38 KB. No-op in every other case.
-            released = VIDEO::gigascreenReleaseForNet();
-        }
-    }
-    ~NetArenaLease() {
-        if (held) { Buffer::reclaimArena(); VIDEO::gigascreenReclaimRegion(); }
-        if (released) VIDEO::gigascreenRestoreAfterNet();
-    }
-};
+// NetArenaLease (the RAII prev-FB lease used below) now lives in NetArena.h —
+// ZIP extraction takes the same lease from ZipExtract.cpp.
 
 // Alloc/free the network alt-stack via the Buffer pool so it can come from the
 // lent arena (USE_NET_ARENA) when one is active, else heap. Returns nullptr on OOM.
@@ -2112,7 +2089,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     string fname = FileUtils::IMG_Path + mFile.substr(1);
                     if (FileUtils::getLCaseExt(fname) == "zip") {
                         string zipFname = ZipExtract::extract(fname, DISK_IMGFILE);
-                        if (zipFname.empty()) OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN);
+                        if (zipFname.empty()) OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN);
                         else if (zipFname != "\x1b") fname = zipFname;
                         else fname.clear();
                     }
@@ -2189,7 +2166,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                     string ext = FileUtils::getLCaseExt(fname);
                     if (ext == "zip") {
                         string zipFname = ZipExtract::extract(fname, DISK_DSKFILE);
-                        if (zipFname.empty()) { OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN); continue; }
+                        if (zipFname.empty()) { OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN); continue; }
                         if (zipFname == "\x1b") continue;
                         fname = zipFname;
                         ext = FileUtils::getLCaseExt(fname);
@@ -2299,7 +2276,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                 string fname = FileUtils::SNA_Path + mFile;
                 if (FileUtils::getLCaseExt(fname) == "zip") {
                     string zipFname = ZipExtract::extract(fname, DISK_SNAFILE);
-                    if (zipFname.empty()) { OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN); }
+                    if (zipFname.empty()) { OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN); }
                     else if (zipFname != "\x1b") fname = zipFname;
                     else fname.clear();
                 }
@@ -2427,7 +2404,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                         snprintf(msg, sizeof(msg), " Extracted %d file(s) ", count);
                         OSD::osdCenteredMsg(msg, LEVEL_INFO, 1000);
                     } else {
-                        OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN);
+                        OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN);
                     }
                     goto f5_retry;
                 }
@@ -2439,16 +2416,11 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
 
                 // ZIP archive — extract and replace fname/ext/mFile
                 if (ext == "zip") {
-                    // Lend the dormant Gigascreen prevFB to the extract's inflate
-                    // buffers on butter-less boards (no-op on butter — palloc routes
-                    // them to XIP PSRAM). Released right after the extract. The lease
-                    // helper only exists where Gigascreen + the net arena do (RP2350).
-#if !PICO_RP2040 && ZIFI_NET_CLIENT
-                    NetArenaLease zipLease;
-#endif
+                    // (The Gigascreen prevFB lease that used to be taken here now
+                    // lives inside ZipExtract::extract, so every entry point gets it.)
                     string zipFname = ZipExtract::extract(fname, DISK_ALLFILE);
                     if (zipFname.empty()) {
-                        OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN);
+                        OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN);
                         if (VIDEO::OSD) OSD::drawStats();
                         return;
                     }
@@ -2769,7 +2741,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         string fname = FileUtils::TAP_Path + mFile.substr(1);
                                         if (FileUtils::getLCaseExt(fname) == "zip") {
                                             string zipFname = ZipExtract::extract(fname, DISK_TAPFILE);
-                                            if (zipFname.empty()) { OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN); break; }
+                                            if (zipFname.empty()) { OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN); break; }
                                             if (zipFname == "\x1b") break;
                                             fname = zipFname;
                                             string zipBase = fname.substr(fname.rfind('/') + 1);
@@ -3086,7 +3058,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             string fname = FileUtils::DSK_Path + "/" + mFile;
                                             if (FileUtils::getLCaseExt(fname) == "zip") {
                                                 string zipFname = ZipExtract::extract(fname, DISK_DSKFILE);
-                                                if (zipFname.empty()) { OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN); break; }
+                                                if (zipFname.empty()) { OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN); break; }
                                                 if (zipFname == "\x1b") break;
                                                 fname = zipFname;
                                             }
@@ -3397,7 +3369,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             string fname = FileUtils::IMG_Path + mFile.substr(1);
                                             if (FileUtils::getLCaseExt(fname) == "zip") {
                                                 string zipFname = ZipExtract::extract(fname, DISK_IMGFILE);
-                                                if (zipFname.empty()) { OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN); break; }
+                                                if (zipFname.empty()) { OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN); break; }
                                                 if (zipFname == "\x1b") break;
                                                 fname = zipFname;
                                             }
@@ -3528,7 +3500,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             string fname = FileUtils::DSK_Path + "/" + mFile;
                                             if (FileUtils::getLCaseExt(fname) == "zip") {
                                                 string zipFname = ZipExtract::extract(fname, DISK_DSKFILE);
-                                                if (zipFname.empty()) { OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN); break; }
+                                                if (zipFname.empty()) { OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN); break; }
                                                 if (zipFname == "\x1b") break;
                                                 fname = zipFname;
                                             }
@@ -3678,7 +3650,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         string fname = FileUtils::SNA_Path + mFile;
                                         if (FileUtils::getLCaseExt(fname) == "zip") {
                                             string zipFname = ZipExtract::extract(fname, DISK_SNAFILE);
-                                            if (zipFname.empty()) { OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN); break; }
+                                            if (zipFname.empty()) { OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN); break; }
                                             if (zipFname == "\x1b") break;
                                             fname = zipFname;
                                         }
@@ -3874,7 +3846,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                             string fname = FileUtils::IMG_Path + mFile.substr(1);
                                             if (FileUtils::getLCaseExt(fname) == "zip") {
                                                 string zipFname = ZipExtract::extract(fname, DISK_IMGFILE);
-                                                if (zipFname.empty()) { OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN); break; }
+                                                if (zipFname.empty()) { OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN); break; }
                                                 if (zipFname == "\x1b") break;
                                                 fname = zipFname;
                                             }
@@ -6936,7 +6908,7 @@ void OSD::do_OSD(fabgl::VirtualKey KeytoESP, bool ALT, bool CTRL) {
                                         // the .rom/.bin inside before flashing.
                                         if (FileUtils::getLCaseExt(fname) == "zip") {
                                             string zf = ZipExtract::extract(fname, DISK_ROMFILE);
-                                            if (zf.empty()) { OSD::osdCenteredMsg(OSD_ZIP_ERR[Config::lang], LEVEL_WARN); fname.clear(); }
+                                            if (zf.empty()) { OSD::osdCenteredMsg(ZipExtract::errMsg(), LEVEL_WARN); fname.clear(); }
                                             else if (zf != "\x1b") fname = zf;
                                             else fname.clear();
                                         }
