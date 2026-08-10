@@ -61,7 +61,7 @@ set(ZERO2_DBG_UART   OFF CACHE BOOL "Enable Debug Probe UART1 on GP20/GP21 (ZERO
 # set(ILI9341 ON)
 # set(ST7789 ON)
 # set(SOFTTV ON)
-set(PSRAM OFF)  #For Testing Only
+# set(PSRAM OFF)  #For Testing Only
 
 # Display output (default: VGA_HDMI; override with -D flags, e.g. cmake -DSOFTTV=ON)
 if(NOT VGA_HDMI AND NOT SOFTTV AND NOT TFT AND NOT ILI9341 AND NOT TV)
@@ -72,7 +72,7 @@ endif()
 # PICO_RP2040 macro directly in the source guards (no separate define needed).
 
 set(CPU_MHZ 378)
-set (PORT_VERSION "1.2.29")
+set (PORT_VERSION "1.2.30")
 string(LENGTH "${PORT_VERSION}" PORT_VERSION_LEN)
 
 # Target board (default: PICO_PC; override with -D flags, e.g. cmake -DMURM2=ON)
