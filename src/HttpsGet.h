@@ -6,9 +6,11 @@
 //   http://   → plain ZiFiSock TCP (the :80 proxy fallback)
 //
 // Streams the response body to a sink callback (or straight to an SD file) so
-// nothing large is ever buffered in RAM. Handles Content-Length and
-// connection-close-delimited bodies; chunked Transfer-Encoding is rejected with
-// a clear error (the catalog/Pages endpoints send Content-Length). WiFi must
+// nothing large is ever buffered in RAM. Handles Content-Length,
+// connection-close-delimited AND chunked bodies (chunked since the 2026-07
+// spectrum4ever fix: dynamic backends — download.php, archive.org's
+// view_archive.php — omit Content-Length; Result.length stays 0, progress runs
+// indeterminate, completion = terminal chunk or clean EOF). WiFi must
 // already be associated (ZiFiAT::connect). RP2350 only, behind ZIFI_NET_CLIENT.
 // All calls from the OSD/main thread; blocking.
 
